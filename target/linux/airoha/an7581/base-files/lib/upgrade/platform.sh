@@ -6,6 +6,7 @@ platform_do_upgrade() {
 
 	case "$board" in
 		gemtek,w1700k-ubi)
+		econet,xr1710g-ubi)
 			fit_do_upgrade "$1"
 			;;
 		*)

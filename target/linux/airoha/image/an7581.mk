@@ -104,3 +104,27 @@ define Device/gemtek_w1700k-ubi
   SOC := an7581
 endef
 TARGET_DEVICES += gemtek_w1700k-ubi
+
+define Device/econet_xr1710g-ubi
+  DEVICE_VENDOR := Econet
+  DEVICE_MODEL := XR1710G
+  DEVICE_VARIANT := UBI
+  DEVICE_DTS := an7581-xr1710g-ubi
+  DEVICE_PACKAGES := airoha-en7581-mt7996-npu-firmware \
+		    fitblk kmod-i2c-an7581 kmod-hwmon-nct7802 \
+		    kmod-mt7996-firmware kmod-phy-rtl8261n \
+		    wpad-basic-mbedtls
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb := append-kernel | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | append-metadata
+  SOC := an7581
+endef
+TARGET_DEVICES += econet_xr1710g-ubi
