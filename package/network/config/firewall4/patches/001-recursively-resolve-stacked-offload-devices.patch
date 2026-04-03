@@ -1,0 +1,45 @@
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -425,18 +425,25 @@
+ 
+ function resolve_lower_devices(devstatus, devname) {
+ 	let dir = fs.opendir(`/sys/class/net/${devname}`);
+-	let devs = [];
++	let devs = [], e, stacked = false;
+ 
+-	if (dir) {
++	if (!dir)
++		return devs;
++
++	while ((e = dir.read()) != null) {
++		if (index(e, "lower_") !== 0)
++			continue;
++
++		stacked = true;
++		push(devs, ...resolve_lower_devices(devstatus, substr(e, 6)));
++	}
++
++	dir.close();
++
++	if (!stacked) {
+ 		switch (devstatus[devname]?.devtype) {
+ 		case 'vlan':
+ 		case 'bridge':
+-			let e;
+-
+-			while ((e = dir.read()) != null)
+-				if (index(e, "lower_") === 0)
+-					push(devs, ...resolve_lower_devices(devstatus, substr(e, 6)));
+-
+ 			break;
+ 
+ 		default:
+@@ -444,8 +451,6 @@
+ 
+ 			break;
+ 		}
+-
+-		dir.close();
+ 	}
+ 
+ 	return devs;
