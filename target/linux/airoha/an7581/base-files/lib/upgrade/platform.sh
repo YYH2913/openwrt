@@ -6,7 +6,11 @@ platform_do_upgrade() {
 
 	case "$board" in
 		gemtek,w1700k-ubi)
+			fit_do_upgrade "$1"
+			;;
 		econet,xr1710g-ubi)
+			IGNORE_ROOTFS_DATA_MAX=1 \
+			CI_REMOVE_UBIVOLS="config log" \
 			fit_do_upgrade "$1"
 			;;
 		*)

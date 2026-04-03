@@ -145,10 +145,17 @@ nand_attach_ubi() {
 			fi
 
 			if [ "$has_env" -gt 0 ]; then
-				>&2 ubimkvol /dev/$ubidev -n 0 -N ubootenv -s 1MiB
-				>&2 ubimkvol /dev/$ubidev -n 1 -N ubootenv2 -s 1MiB
+				>&2 ubimkvol /dev/$ubidev -n 0 -N ubootenv -s 1MiB || return 1
+				>&2 ubimkvol /dev/$ubidev -n 1 -N ubootenv2 -s 1MiB || return 1
 			fi
 		fi
+	fi
+
+	if [ "$has_env" -gt 0 ]; then
+		[ -n "$(nand_find_volume "$ubidev" ubootenv)" ] || \
+			>&2 ubimkvol /dev/$ubidev -N ubootenv -s 1MiB || return 1
+		[ -n "$(nand_find_volume "$ubidev" ubootenv2)" ] || \
+			>&2 ubimkvol /dev/$ubidev -N ubootenv2 -s 1MiB || return 1
 	fi
 
 	echo "$ubidev"
@@ -181,8 +188,12 @@ nand_detach_ubi() {
 nand_upgrade_prepare_ubi() {
 	local rootfs_length="$1"
 	local rootfs_type="$2"
-	local rootfs_data_max="$(fw_printenv -n rootfs_data_max 2> /dev/null)"
-	[ -n "$rootfs_data_max" ] && rootfs_data_max=$((rootfs_data_max))
+	local rootfs_data_max
+	local extra_vol extra_ubivol
+	if [ "${IGNORE_ROOTFS_DATA_MAX:-0}" -eq 0 ] && command -v fw_printenv >/dev/null 2>&1; then
+		rootfs_data_max="$(fw_printenv -n rootfs_data_max 2> /dev/null)"
+		[ -n "$rootfs_data_max" ] && rootfs_data_max=$((rootfs_data_max))
+	fi
 
 	local kernel_length="$3"
 	local has_env="${4:-0}"
@@ -211,11 +222,19 @@ nand_upgrade_prepare_ubi() {
 	[ "$kern_ubivol" ] && { nand_remove_ubiblock $kern_ubivol || return 1; }
 	[ "$root_ubivol" ] && { nand_remove_ubiblock $root_ubivol || return 1; }
 	[ "$data_ubivol" ] && { nand_remove_ubiblock $data_ubivol || return 1; }
+	for extra_vol in $CI_REMOVE_UBIVOLS; do
+		extra_ubivol="$( nand_find_volume $root_ubidev "$extra_vol" )"
+		[ -z "$extra_ubivol" ] || { nand_remove_ubiblock $extra_ubivol || return 1; }
+	done
 
 	# kill volumes
 	[ "$kern_ubivol" ] && ubirmvol /dev/$kern_ubidev -N "$CI_KERNPART" || :
 	[ "$root_ubivol" ] && ubirmvol /dev/$root_ubidev -N "$CI_ROOTPART" || :
 	[ "$data_ubivol" ] && ubirmvol /dev/$root_ubidev -N rootfs_data || :
+	for extra_vol in $CI_REMOVE_UBIVOLS; do
+		[ -n "$( nand_find_volume $root_ubidev "$extra_vol" )" ] && \
+			ubirmvol /dev/$root_ubidev -N "$extra_vol" || :
+	done
 
 	# create provisioning vol
 	if [ "${UPGRADE_OPT_ADD_PROVISIONING:-0}" -gt 0 ]; then

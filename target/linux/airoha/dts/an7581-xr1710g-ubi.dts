@@ -8,8 +8,9 @@
 #include "an7581.dtsi"
 
 / {
-	model = "XR1710G (OpenWrt U-Boot layout)";
-	compatible = "econet,xr1710g-ubi", "econet,xr1710g",
+	model = "XR1710G";
+	compatible = "econet,xr1710g-ubi", "gemtek,xr1710g-ubi",
+		     "econet,xr1710g", "gemtek,xr1710g",
 		     "airoha,an7581", "airoha,en7581";
 
 	aliases {
@@ -64,33 +65,6 @@
 			gpios = <&en7581_pinctrl 20 GPIO_ACTIVE_LOW>;
 		};
 
-		led_lan1_green: led-lan1-green {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <1>;
-			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
-		};
-
-		led_lan1_yellow: led-lan1-yellow {
-			color = <LED_COLOR_ID_YELLOW>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <1>;
-			gpios = <&en7581_pinctrl 33 GPIO_ACTIVE_LOW>;
-		};
-
-		led_lan2_green: led-lan2-green {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <2>;
-			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
-		};
-
-		led_lan2_yellow: led-lan2-yellow {
-			color = <LED_COLOR_ID_YELLOW>;
-			function = LED_FUNCTION_LAN;
-			function-enumerator = <2>;
-			gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
-		};
 	};
 };
 
@@ -123,7 +97,7 @@
 		};
 	};
 
-	/* Keep the GPIO-driven LED mapping compatible with the upstream switch nodes. */
+	/* LAN2/LAN3 LEDs are driven directly by the internal MT7530 switch. */
 	gswp1_led0_pins: gswp1-led0-pins {
 		mux {
 			function = "phy1_led0";
@@ -131,10 +105,24 @@
 		};
 	};
 
+	gswp1_led1_pins: gswp1-led1-pins {
+		mux {
+			function = "phy1_led1";
+			pins = "gpio43";
+		};
+	};
+
 	gswp2_led0_pins: gswp2-led0-pins {
 		mux {
 			function = "phy2_led0";
 			pins = "gpio34";
+		};
+	};
+
+	gswp2_led1_pins: gswp2-led1-pins {
+		mux {
+			function = "phy2_led1";
+			pins = "gpio44";
 		};
 	};
 
@@ -268,18 +256,21 @@
 			airoha,eth = <&eth>;
 
 			band@0 {
+				/* 2.4 GHz */
 				reg = <0>;
 				nvmem-cells = <&lan_mac 1>;
 				nvmem-cell-names = "mac-address";
 			};
 
 			band@1 {
+				/* 5 GHz */
 				reg = <1>;
 				nvmem-cells = <&lan_mac 2>;
 				nvmem-cell-names = "mac-address";
 			};
 
 			band@2 {
+				/* 6 GHz */
 				reg = <2>;
 				nvmem-cells = <&lan_mac 3>;
 				nvmem-cell-names = "mac-address";
@@ -301,6 +292,10 @@
 	status = "okay";
 };
 
+&afe {
+	status = "disabled";
+};
+
 &eth {
 	status = "okay";
 };
@@ -317,6 +312,7 @@
 
 	phy-handle = <&phy8>;
 	phy-mode = "usxgmii";
+
 	nvmem-cells = <&wan_mac 0>;
 	nvmem-cell-names = "mac-address";
 	openwrt,netdev-name = "wan";
@@ -324,9 +320,11 @@
 
 &gdm4 {
 	status = "okay";
+	airoha,lan-port;
 
 	phy-handle = <&phy5>;
 	phy-mode = "usxgmii";
+
 	nvmem-cells = <&lan_mac 0>;
 	nvmem-cell-names = "mac-address";
 	openwrt,netdev-name = "lan1";
@@ -343,8 +341,8 @@
 			compatible = "ethernet-phy-ieee802.3-c45";
 			reg = <5>;
 			reset-gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
-			reset-assert-us = <40000>;
-			reset-deassert-us = <150000>;
+			reset-assert-us = <200000>;
+			reset-deassert-us = <200000>;
 			interrupt-parent = <&en7581_pinctrl>;
 			interrupts = <22 IRQ_TYPE_LEVEL_LOW>;
 			realtek,pnswap-tx;
@@ -355,8 +353,8 @@
 			compatible = "ethernet-phy-ieee802.3-c45";
 			reg = <8>;
 			reset-gpios = <&en7581_pinctrl 31 GPIO_ACTIVE_LOW>;
-			reset-assert-us = <40000>;
-			reset-deassert-us = <150000>;
+			reset-assert-us = <200000>;
+			reset-deassert-us = <200000>;
 			interrupt-parent = <&en7581_pinctrl>;
 			interrupts = <23 IRQ_TYPE_LEVEL_LOW>;
 			realtek,pnswap-tx;
@@ -368,7 +366,7 @@
 &gsw_phy1 {
 	status = "okay";
 	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp1_led0_pins>;
+	pinctrl-0 = <&gswp1_led0_pins>, <&gswp1_led1_pins>;
 };
 
 &gsw_port1 {
@@ -376,15 +374,43 @@
 	label = "lan2";
 };
 
+&gsw_phy1_led0 {
+	function = LED_FUNCTION_LAN;
+	color = <LED_COLOR_ID_GREEN>;
+	status = "okay";
+	active-low;
+};
+
+&gsw_phy1_led1 {
+	function = LED_FUNCTION_LAN;
+	color = <LED_COLOR_ID_AMBER>;
+	status = "okay";
+	active-low;
+};
+
 &gsw_phy2 {
 	status = "okay";
 	pinctrl-names = "gbe-led";
-	pinctrl-0 = <&gswp2_led0_pins>;
+	pinctrl-0 = <&gswp2_led0_pins>, <&gswp2_led1_pins>;
 };
 
 &gsw_port2 {
 	status = "okay";
 	label = "lan3";
+};
+
+&gsw_phy2_led0 {
+	function = LED_FUNCTION_LAN;
+	color = <LED_COLOR_ID_GREEN>;
+	status = "okay";
+	active-low;
+};
+
+&gsw_phy2_led1 {
+	function = LED_FUNCTION_LAN;
+	color = <LED_COLOR_ID_AMBER>;
+	status = "okay";
+	active-low;
 };
 
 &uart2 {

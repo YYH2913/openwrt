@@ -11,6 +11,9 @@ if (fs.lsdir(path)) {
 	exit(0);
 }
 
+if (!fs.stat('/etc/fw_env.config'))
+	exit(0);
+
 let fp = fs.popen('fw_printenv');
 let raw = fp.read('all');
 fp.close();
