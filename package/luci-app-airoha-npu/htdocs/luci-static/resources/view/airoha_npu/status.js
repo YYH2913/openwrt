@@ -92,6 +92,11 @@ function fmtK(n) {
 	return n.toString();
 }
 function fmtQueue(n) { return hasCounter(n) ? n.toString() : '-'; }
+function fmtPages(n) {
+	if (!hasCounter(n)) return 'N/A';
+	if (n >= 1024) return (n / 1024).toFixed(1) + 'Kp';
+	return n.toString() + 'p';
+}
 
 function calcTotalMem(regions) {
 	var t = 0;
@@ -282,10 +287,17 @@ function renderFeDiagram(fe, ti, st) {
 	]);
 
 	// PSE buffer
-	var hasPse = hasCounter(fe.pse_used) && hasCounter(fe.pse_free);
-	var pseT = hasPse ? (fe.pse_used + fe.pse_free) : 0;
-	var pseP = hasPse && pseT > 0 ? ((fe.pse_used/pseT)*100).toFixed(1) : '0';
-	var pseCol = parseFloat(pseP)>80?'#f44336':parseFloat(pseP)>50?'#ff9800':'#4caf50';
+	var hasPseRuntime = hasCounter(fe.pse_used) && hasCounter(fe.pse_free);
+	var hasPseBudget = hasCounter(fe.pse_budget) && hasCounter(fe.pse_reserved) && hasCounter(fe.pse_total);
+	var pseT = hasPseRuntime ? (fe.pse_used + fe.pse_free) : (hasPseBudget ? fe.pse_total : 0);
+	var pseP = hasPseRuntime && pseT > 0 ? ((fe.pse_used / pseT) * 100).toFixed(1) :
+		(hasPseBudget && pseT > 0 ? ((fe.pse_budget / pseT) * 100).toFixed(1) : '0');
+	var pseCol = hasPseRuntime ?
+		(parseFloat(pseP)>80?'#f44336':parseFloat(pseP)>50?'#ff9800':'#4caf50') :
+		(hasPseBudget ? '#607d8b' : 'var(--soc-border)');
+	var pseText = hasPseRuntime ?
+		(fe.pse_used + ' used / ' + fe.pse_free + ' free (' + pseP + '%)') :
+		(hasPseBudget ? ('Configured: ' + fmtPages(fe.pse_budget) + ' shared / ' + fmtPages(fe.pse_reserved) + ' reserved') : 'Unavailable');
 
 	// PSE port cells (skip P7 since it's shown in CDM4/WiFi section)
 	var portCells = ports.filter(function(p){ return p.port !== 7; }).map(function(p) {
@@ -302,15 +314,17 @@ function renderFeDiagram(fe, ti, st) {
 	});
 
 	return E('div', { 'id': 'fe-diagram' }, [
-		!mmioValid ? E('div', { 'class': 'soc-muted', 'style': 'font-size:12px;margin-bottom:8px' }, 'Using netdev statistics for GDM traffic; some low-level FE counters are unavailable on this board/build.') : null,
+		!mmioValid ? E('div', { 'class': 'soc-muted', 'style': 'font-size:12px;margin-bottom:8px' }, hasPseBudget ?
+			'Using netdev statistics for GDM traffic; low-level FE runtime counters are unavailable, showing configured PSE budget.' :
+			'Using netdev statistics for GDM traffic; some low-level FE counters are unavailable on this board/build.') : null,
 		// PSE buffer bar
 		E('div', { 'class': 'soc-card', 'style': 'margin-bottom:10px' }, [
 			E('div', { 'style': 'display:flex;justify-content:space-between;margin-bottom:4px' }, [
 				E('span', { 'class': 'soc-text', 'style': 'font-weight:bold;font-size:13px' }, 'PSE Shared Buffer'),
-				E('span', { 'class': 'soc-muted', 'style': 'font-size:12px' }, hasPse ? (fe.pse_used+' used / '+fe.pse_free+' free ('+pseP+'%)') : 'Unavailable')
+				E('span', { 'class': 'soc-muted', 'style': 'font-size:12px' }, pseText)
 			]),
 			E('div', { 'class': 'soc-bar-track', 'style': 'height:8px' }, [
-				E('div', { 'style': 'background:'+(hasPse ? pseCol : 'var(--soc-border)')+';height:100%;width:'+(hasPse ? pseP : '0')+'%;border-radius:4px;transition:width .5s' })
+				E('div', { 'style': 'background:'+pseCol+';height:100%;width:'+((hasPseRuntime || hasPseBudget) ? pseP : '0')+'%;border-radius:4px;transition:width .5s' })
 			])
 		]),
 		// Row 1: GDM ports
