@@ -1191,7 +1191,7 @@ static int rtldsa_mst_find(struct rtl838x_switch_priv *priv, u16 msti)
 		return -EINVAL;
 
 	/* search for existing entry */
-	for (i = 0; i < priv->n_mst - 1; i++) {
+	for (i = 0; i < priv->r->n_mst - 1; i++) {
 		if (priv->msts[i].msti != msti)
 			continue;
 
@@ -1233,7 +1233,7 @@ static int rtldsa_mst_get(struct rtl838x_switch_priv *priv, u16 msti)
 		return ret;
 
 	/* search for free slot */
-	for (i = 0; i < priv->n_mst - 1; i++) {
+	for (i = 0; i < priv->r->n_mst - 1; i++) {
 		if (priv->msts[i].msti != 0)
 			continue;
 
@@ -1279,7 +1279,7 @@ static int rtldsa_mst_recycle_slot(struct rtl838x_switch_priv *priv, u16 msti, u
 	if (msti > 4095)
 		return -EINVAL;
 
-	if (old_mst_slot >= priv->n_mst)
+	if (old_mst_slot >= priv->r->n_mst)
 		return -EINVAL;
 
 	index = old_mst_slot - 1;
@@ -1320,7 +1320,7 @@ static bool rtldsa_mst_put_slot(struct rtl838x_switch_priv *priv, u16 mst_slot)
 	if (mst_slot == 0)
 		return 0;
 
-	if (mst_slot >= priv->n_mst)
+	if (mst_slot >= priv->r->n_mst)
 		return 0;
 
 	index = mst_slot - 1;
@@ -1419,7 +1419,7 @@ static int rtldsa_port_bridge_join(struct dsa_switch *ds, int port, struct dsa_b
 		priv->r->set_static_move_action(port, false);
 
 	/* Set to disabled in all MSTs, common code will take care of CIST */
-	for (i = 1; i < priv->n_mst; i++)
+	for (i = 1; i < priv->r->n_mst; i++)
 		rtldsa_port_xstp_state_set(priv, port, BR_STATE_DISABLED, i);
 
 	mutex_unlock(&priv->reg_mutex);
@@ -1442,7 +1442,7 @@ static void rtldsa_port_bridge_leave(struct dsa_switch *ds, int port, struct dsa
 		priv->r->set_static_move_action(port, true);
 
 	/* Set to forwarding in all MSTs, common code will take care of CIST */
-	for (i = 1; i < priv->n_mst; i++)
+	for (i = 1; i < priv->r->n_mst; i++)
 		rtldsa_port_xstp_state_set(priv, port, BR_STATE_FORWARDING, i);
 
 	mutex_unlock(&priv->reg_mutex);
@@ -1513,7 +1513,7 @@ void rtldsa_port_stp_state_set(struct dsa_switch *ds, int port, u8 state)
 		goto unlock;
 
 	/* for unbridged ports, also force the same state to the MSTIs */
-	for (i = 1; i < priv->n_mst; i++)
+	for (i = 1; i < priv->r->n_mst; i++)
 		rtldsa_port_xstp_state_set(priv, port, state, i);
 
 unlock:
@@ -1828,7 +1828,7 @@ static int rtldsa_find_l2_hash_entry(struct rtl838x_switch_priv *priv, u64 seed,
 
 	pr_debug("%s: using key %x, for seed %016llx\n", __func__, key, seed);
 	/* Loop over all entries in the hash-bucket and over the second block on 93xx SoCs */
-	for (int i = 0; i < priv->l2_bucket_size; i++) {
+	for (int i = 0; i < priv->r->l2_bucket_size; i++) {
 		entry = priv->r->read_l2_entry_using_hash(key, i, e);
 		pr_debug("valid %d, mac %016llx\n", e->valid, ether_addr_to_u64(&e->mac[0]));
 		if (must_exist && !e->valid)
@@ -2056,9 +2056,9 @@ static bool rtldsa_mac_is_unsnoop(const unsigned char *addr)
 	return false;
 }
 
-static int rtldsa_port_mdb_add(struct dsa_switch *ds, int port,
-					const struct switchdev_obj_port_mdb *mdb,
-					const struct dsa_db db)
+static int rtldsa_83xx_port_mdb_add(struct dsa_switch *ds, int port,
+				    const struct switchdev_obj_port_mdb *mdb,
+				    const struct dsa_db db)
 {
 	struct rtl838x_switch_priv *priv = ds->priv;
 	u64 mac = ether_addr_to_u64(mdb->addr);
@@ -2067,9 +2067,6 @@ static int rtldsa_port_mdb_add(struct dsa_switch *ds, int port,
 	int vid = mdb->vid;
 	u64 seed = priv->r->l2_hash_seed(mac, vid);
 	int mc_group;
-
-	if (priv->id >= 0x9300)
-		return -EOPNOTSUPP;
 
 	pr_debug("In %s port %d, mac %llx, vid: %d\n", __func__, port, mac, vid);
 
@@ -2137,6 +2134,12 @@ out:
 		dev_err(ds->dev, "failed to add MDB entry\n");
 
 	return err;
+}
+static int rtldsa_93xx_port_mdb_add(struct dsa_switch *ds, int port,
+				    const struct switchdev_obj_port_mdb *mdb,
+				    const struct dsa_db db)
+{
+	return -EOPNOTSUPP;
 }
 
 static int rtldsa_port_mdb_del(struct dsa_switch *ds, int port,
@@ -2498,20 +2501,6 @@ out:
 	return 0;
 }
 
-static int rtldsa_phy_read(struct dsa_switch *ds, int addr, int regnum)
-{
-	struct rtl838x_switch_priv *priv = ds->priv;
-
-	return mdiobus_read_nested(priv->parent_bus, addr, regnum);
-}
-
-static int rtldsa_phy_write(struct dsa_switch *ds, int addr, int regnum, u16 val)
-{
-	struct rtl838x_switch_priv *priv = ds->priv;
-
-	return mdiobus_write_nested(priv->parent_bus, addr, regnum, val);
-}
-
 static const struct flow_action_entry *rtldsa_rate_policy_extract(struct flow_cls_offload *cls)
 {
 	struct flow_rule *rule;
@@ -2635,9 +2624,6 @@ const struct dsa_switch_ops rtldsa_83xx_switch_ops = {
 	.get_tag_protocol	= rtldsa_get_tag_protocol,
 	.setup			= rtldsa_83xx_setup,
 
-	.phy_read		= rtldsa_phy_read,
-	.phy_write		= rtldsa_phy_write,
-
 	.phylink_get_caps	= rtldsa_83xx_phylink_get_caps,
 
 	.get_strings		= rtldsa_get_strings,
@@ -2673,7 +2659,7 @@ const struct dsa_switch_ops rtldsa_83xx_switch_ops = {
 	.port_fdb_del		= rtldsa_port_fdb_del,
 	.port_fdb_dump		= rtldsa_port_fdb_dump,
 
-	.port_mdb_add		= rtldsa_port_mdb_add,
+	.port_mdb_add		= rtldsa_83xx_port_mdb_add,
 	.port_mdb_del		= rtldsa_port_mdb_del,
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
@@ -2697,9 +2683,6 @@ const struct phylink_mac_ops rtldsa_93xx_phylink_mac_ops = {
 const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.get_tag_protocol	= rtldsa_get_tag_protocol,
 	.setup			= rtldsa_93xx_setup,
-
-	.phy_read		= rtldsa_phy_read,
-	.phy_write		= rtldsa_phy_write,
 
 	.phylink_get_caps	= rtldsa_93xx_phylink_get_caps,
 
@@ -2736,7 +2719,7 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_fdb_del		= rtldsa_port_fdb_del,
 	.port_fdb_dump		= rtldsa_port_fdb_dump,
 
-	.port_mdb_add		= rtldsa_port_mdb_add,
+	.port_mdb_add		= rtldsa_93xx_port_mdb_add,
 	.port_mdb_del		= rtldsa_port_mdb_del,
 
 	.port_mirror_add	= rtldsa_port_mirror_add,
