@@ -451,6 +451,14 @@ function device_htmode_append(config) {
 		config.ieee80211be = true;
 		append_vars(config, [ 'ieee80211be' ]);
 
+		/*
+		 * MT7996 benefits noticeably from explicit EHT beamforming enablement.
+		 * Keep this local to EHT mode to avoid affecting HE-only radios.
+		 */
+		append_raw('eht_su_beamformer=1');
+		append_raw('eht_su_beamformee=1');
+		append_raw('eht_mu_beamformer=1');
+
 		if (config.hw_mode == 'a')
 			append_vars(config, [ 'eht_oper_chwidth', 'eht_oper_centr_freq_seg0_idx' ]);
 	}

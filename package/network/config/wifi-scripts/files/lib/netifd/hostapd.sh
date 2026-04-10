@@ -261,7 +261,7 @@ hostapd_prepare_device_config() {
 	[ "$mbssid" -gt 0 ] && [ "$mbssid" -le 2 ] && append base_cfg "mbssid=$mbssid" "$N"
 
 	[ "$band" = "6g" ] && {
-		set_default reg_power_type 4
+		set_default reg_power_type 0
 		append base_cfg "he_6ghz_reg_pwr_type=$reg_power_type" "$N"
 	}
 
