@@ -1,0 +1,29 @@
+From d019a06b08b6bbb7c26126cd7cb8e571801c789e Mon Sep 17 00:00:00 2001
+From: YYH2913 <yyh2913@qq.com>
+Date: Sun, 12 Apr 2026 18:55:54 +0800
+Subject: [PATCH] cpufreq: airoha: fix config_clks callback signature
+
+OpenWrt carries an OPP backport on 6.18 that passes both the old and
+new OPP to config_clks(). Update the Airoha CPUFreq driver's NOP
+callback to match that interface.
+
+Signed-off-by: YYH2913 <yyh2913@qq.com>
+---
+ drivers/cpufreq/airoha-cpufreq.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/cpufreq/airoha-cpufreq.c b/drivers/cpufreq/airoha-cpufreq.c
+index b6b1cdc..e667f59 100644
+--- a/drivers/cpufreq/airoha-cpufreq.c
++++ b/drivers/cpufreq/airoha-cpufreq.c
+@@ -21,6 +21,7 @@ static struct platform_device *cpufreq_pdev;
+ /* NOP function to disable OPP from setting clock */
+ static int airoha_cpufreq_config_clks_nop(struct device *dev,
+ 					  struct opp_table *opp_table,
++					  struct dev_pm_opp *old_opp,
+ 					  struct dev_pm_opp *opp,
+ 					  void *data, bool scaling_down)
+ {
+-- 
+2.43.0
+

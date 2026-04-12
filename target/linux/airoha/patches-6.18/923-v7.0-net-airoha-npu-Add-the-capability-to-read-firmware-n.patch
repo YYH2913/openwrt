@@ -1,0 +1,149 @@
+From 7c5598ca871a35270399c8f6c4cb6b6bc9b05a36 Mon Sep 17 00:00:00 2001
+From: Lorenzo Bianconi <lorenzo@kernel.org>
+Date: Tue, 20 Jan 2026 11:17:18 +0100
+Subject: [PATCH] net: airoha: npu: Add the capability to read firmware names
+ from dts
+
+Some EN7581 boards ship board-specific NPU firmware images that depend on
+the attached Wi-Fi chipset. XR1710G already exposes these filenames through
+the device-tree `firmware-name` property and the firmware package installs
+the matching `en7581_MT7996_npu_*` blobs, but the 6.18 NPU driver still
+hardcodes the legacy generic filenames.
+
+Teach the driver to honor `firmware-name` when present while keeping the
+generic fallback for boards that still use the default EN7581 firmware
+pair.
+
+Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+Link: https://patch.msgid.link/20260120-airoha-npu-firmware-name-v4-2-88999628b4c1@kernel.org
+Signed-off-by: YYH2913 <yyh2913@qq.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c | 78 +++++++++++++++++-------
+ 1 file changed, 55 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index 0cb727a..f06e4c5 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -16,6 +16,8 @@
+ 
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
++#define NPU_EN7581_7996_FIRMWARE_DATA		"airoha/en7581_MT7996_npu_data.bin"
++#define NPU_EN7581_7996_FIRMWARE_RV32		"airoha/en7581_MT7996_npu_rv32.bin"
+ #define NPU_EN7581_FIRMWARE_RV32_MAX_SIZE	0x200000
+ #define NPU_EN7581_FIRMWARE_DATA_MAX_SIZE	0x10000
+ #define NPU_DUMP_SIZE				512
+@@ -182,49 +184,77 @@ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 	return ret;
+ }
+ 
+-static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
+-				   struct resource *res)
++static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
++				    const char *fw_name, int fw_max_size)
+ {
+ 	const struct firmware *fw;
+-	void __iomem *addr;
+ 	int ret;
+ 
+-	ret = request_firmware_direct(&fw, NPU_EN7581_FIRMWARE_RV32, dev);
++	ret = request_firmware_direct(&fw, fw_name, dev);
+ 	if (ret)
+ 		return ret == -ENOENT ? -EPROBE_DEFER : ret;
+ 
+-	if (fw->size > NPU_EN7581_FIRMWARE_RV32_MAX_SIZE) {
++	if (fw->size > fw_max_size) {
+ 		dev_err(dev, "%s: fw size too overlimit (%zu)\n",
+-			NPU_EN7581_FIRMWARE_RV32, fw->size);
++			fw_name, fw->size);
+ 		ret = -E2BIG;
+ 		goto out;
+ 	}
+ 
+-	addr = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(addr)) {
+-		ret = PTR_ERR(addr);
+-		goto out;
+-	}
+-
+ 	memcpy_toio(addr, fw->data, fw->size);
++
++out:
+ 	release_firmware(fw);
+ 
+-	ret = request_firmware_direct(&fw, NPU_EN7581_FIRMWARE_DATA, dev);
++	return ret;
++}
++
++static int airoha_npu_load_firmware_from_dts(struct device *dev,
++					     void __iomem *addr,
++					     void __iomem *base)
++{
++	const char *fw_names[2];
++	int ret;
++
++	ret = of_property_read_string_array(dev->of_node, "firmware-name",
++					    fw_names, ARRAY_SIZE(fw_names));
++	if (ret != ARRAY_SIZE(fw_names))
++		return -EINVAL;
++
++	ret = airoha_npu_load_firmware(dev, addr, fw_names[0],
++				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
+ 	if (ret)
+-		return ret == -ENOENT ? -EPROBE_DEFER : ret;
++		return ret;
+ 
+-	if (fw->size > NPU_EN7581_FIRMWARE_DATA_MAX_SIZE) {
+-		dev_err(dev, "%s: fw size too overlimit (%zu)\n",
+-			NPU_EN7581_FIRMWARE_DATA, fw->size);
+-		ret = -E2BIG;
+-		goto out;
++	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
++					fw_names[1],
++					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE);
++}
++
++static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
++				   struct resource *res)
++{
++	void __iomem *addr;
++	int ret;
++
++	addr = devm_ioremap_resource(dev, res);
++	if (IS_ERR(addr)) {
++		ret = PTR_ERR(addr);
++		return ret;
+ 	}
+ 
+-	memcpy_toio(base + REG_NPU_LOCAL_SRAM, fw->data, fw->size);
+-out:
+-	release_firmware(fw);
++	/* Prefer board-specific firmware names when exposed via DT. */
++	if (of_find_property(dev->of_node, "firmware-name", NULL))
++		return airoha_npu_load_firmware_from_dts(dev, addr, base);
+ 
+-	return ret;
++	ret = airoha_npu_load_firmware(dev, addr, NPU_EN7581_FIRMWARE_RV32,
++				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++	if (ret)
++		return ret;
++
++	return airoha_npu_load_firmware(dev, base + REG_NPU_LOCAL_SRAM,
++					NPU_EN7581_FIRMWARE_DATA,
++					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE);
+ }
+ 
+ static irqreturn_t airoha_npu_mbox_handler(int irq, void *npu_instance)
+@@ -751,6 +781,8 @@ module_platform_driver(airoha_npu_driver);
+ 
+ MODULE_FIRMWARE(NPU_EN7581_FIRMWARE_DATA);
+ MODULE_FIRMWARE(NPU_EN7581_FIRMWARE_RV32);
++MODULE_FIRMWARE(NPU_EN7581_7996_FIRMWARE_DATA);
++MODULE_FIRMWARE(NPU_EN7581_7996_FIRMWARE_RV32);
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
+ MODULE_DESCRIPTION("Airoha Network Processor Unit driver");
+-- 
+2.43.0
+

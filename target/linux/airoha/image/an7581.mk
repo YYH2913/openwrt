@@ -130,7 +130,9 @@ define Device/econet_xr1710g-ubi
 		    airoha-en7581-mt7996-npu-firmware \
 		    fitblk kmod-i2c-an7581 kmod-hwmon-nct7802 \
 		    kmod-mt7996-firmware kmod-phy-rtl8261n \
-		    luci-app-firewall luci-app-package-manager \
+		    luci-app-firewall luci-app-mlo \
+		    luci-app-package-manager \
+		    luci-i18n-mlo-zh-cn \
 		    luci-mod-admin-full \
 		    luci-proto-ppp luci-theme-bootstrap \
 		    rpcd-mod-rrdns uhttpd uhttpd-mod-ubus \
