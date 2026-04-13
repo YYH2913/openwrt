@@ -1,0 +1,28 @@
+From 72ed8cc4e261041e60765deba813d3b1fb9a2455 Mon Sep 17 00:00:00 2001
+From: YYH2913 <yyh2913@qq.com>
+Date: Mon, 13 Apr 2026 03:49:08 +0800
+Subject: [PATCH 3/4] netfilter: nft_flow_offload: add DEV_PATH_MTK_WDMA path
+
+Signed-off-by: YYH2913 <yyh2913@qq.com>
+---
+ net/netfilter/nft_flow_offload.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 988751a..f526335 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -222,6 +222,10 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			}
+ 			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ 			break;
++		case DEV_PATH_MTK_WDMA:
++			if (is_zero_ether_addr(info->h_source))
++				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
++			break;
+ 		default:
+ 			break;
+ 		}
+-- 
+2.43.0
+
