@@ -1,0 +1,84 @@
+From: YYH2913 <yyh2913@qq.com>
+Date: Mon, 13 Apr 2026 20:08:00 +0800
+Subject: [PATCH] wifi: mt76: mt7996: prefer recent TXS rate for station
+ stats
+
+The periodic UNI_ALL_STA_TXRX_RATE MCU event helps avoid stale station
+rate reporting when TXS is sparse under offload, but it does not behave
+like a negotiated link-speed indicator. Exporting it directly through
+NL80211_STA_INFO_TX_BITRATE can therefore produce stable but overly low
+rates compared with what the peer reports as its current link speed.
+
+Keep the MCU-backed wcid->rate fallback, but cache the most recent TXS
+decoded rate separately and prefer it for station statistics while it is
+fresh. This preserves the offload fallback while making iw/hostapd/LuCI
+closer to the actual recent transmit sample seen by the driver.
+
+Signed-off-by: YYH2913 <yyh2913@qq.com>
+
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 794d4fe4ba57..9bd97d77a195 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1279,6 +1279,7 @@ mt7996_mac_add_txs_skb(struct mt7996_dev *dev, struct mt76_wcid *wcid,
+ 	struct ieee80211_tx_info *info;
+ 	struct sk_buff_head list;
+ 	struct rate_info rate = {};
++	struct mt7996_sta_link *msta_link = NULL;
+ 	struct sk_buff *skb = NULL;
+ 	bool cck = false;
+ 	u32 txrate, txs, mode, stbc;
+@@ -1301,6 +1302,9 @@ mt7996_mac_add_txs_skb(struct mt7996_dev *dev, struct mt76_wcid *wcid,
+ 			info->status.rates[0].idx = -1;
+ 		}
+ 	}
++
++	if (wcid->sta)
++		msta_link = container_of(wcid, struct mt7996_sta_link, wcid);
+ 
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && wcid->sta) {
+ 		struct ieee80211_sta *sta;
+@@ -1411,6 +1415,11 @@ mt7996_mac_add_txs_skb(struct mt7996_dev *dev, struct mt76_wcid *wcid,
+ 		break;
+ 	}
+ 	wcid->rate = rate;
++	if (msta_link) {
++		msta_link->txs_rate = rate;
++		msta_link->txs_rate_update = jiffies;
++	}
++
+ 
+ out:
+ 	if (skb)
+diff --git a/mt7996/main.c b/mt7996/main.c
+index b07d65c80292..088f57dfef43 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1862,7 +1862,12 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+ 	struct mt7996_sta_link *msta_link = &msta->deflink;
+-	struct rate_info *txrate = &msta_link->wcid.rate;
++	const struct rate_info *txrate = &msta_link->wcid.rate;
++
++	if ((msta_link->txs_rate.legacy || msta_link->txs_rate.flags) &&
++	    time_is_after_jiffies(msta_link->txs_rate_update + HZ))
++		txrate = &msta_link->txs_rate;
++
+ 
+ 	if (txrate->legacy || txrate->flags) {
+ 		if (txrate->legacy) {
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index b523e971f78c..4d8f1278814a 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -224,6 +224,9 @@ struct mt7996_sta_link {
+ 
+ 	struct list_head rc_list;
+ 
++	struct rate_info txs_rate;
++	unsigned long txs_rate_update;
++
+ 	int ack_signal;
+ 	struct ewma_avg_signal avg_ack_signal;
+ 

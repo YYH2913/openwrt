@@ -1,0 +1,31 @@
+From: YYH2913 <yyh2913@qq.com>
+Date: Tue, 14 Apr 2026 00:18:00 +0800
+Subject: [PATCH] wifi: mt76: mt7996: use txrate STBC bit when decoding TXS
+ rate
+
+The mt7996 TXS decode path derives the exported station TX bitrate from
+MT_TXS0_TX_RATE, but unlike the generic connac helper it reads the STBC
+flag from MT_TXS3_RATE_STBC instead of MT_TX_RATE_STBC.
+
+For some EHT stations this results in the reported NSS being halved,
+causing userspace to see rates like 2882.3 Mbit/s @ 320 MHz EHT MCS 13
+NSS 1 even though the peer is operating at 2 spatial streams.
+
+Align mt7996 with the generic mt76 connac TXS rate decode and use the
+STBC bit embedded in the txrate field itself.
+
+Signed-off-by: YYH2913 <yyh2913@qq.com>
+
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 794d4fe4ba57..68103460d634 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1322,7 +1322,7 @@ mt7996_mac_add_txs_skb(struct mt7996_dev *dev, struct mt76_wcid *wcid,
+ 
+ 	rate.mcs = FIELD_GET(MT_TX_RATE_IDX, txrate);
+ 	rate.nss = FIELD_GET(MT_TX_RATE_NSS, txrate) + 1;
+-	stbc = le32_get_bits(txs_data[3], MT_TXS3_RATE_STBC);
++	stbc = FIELD_GET(MT_TX_RATE_STBC, txrate);
+ 
+ 	if (stbc && rate.nss > 1)
+ 		rate.nss >>= 1;

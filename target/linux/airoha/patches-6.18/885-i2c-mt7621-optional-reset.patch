@@ -1,6 +1,20 @@
+From 86ada0cf1a558431354a05e18920826148dba4dd Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 15 Apr 2026 10:56:24 +0800
+Subject: [PATCH] i2c: mt7621: make reset optional
+
+Some Airoha boards wire up the MT7621 I2C controller without a reset line. Use device_reset_optional() so the reset helper no longer fails when the reset control is absent.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/i2c/busses/i2c-mt7621.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/i2c/busses/i2c-mt7621.c b/drivers/i2c/busses/i2c-mt7621.c
+index 0a288c9..2e85667 100644
 --- a/drivers/i2c/busses/i2c-mt7621.c
 +++ b/drivers/i2c/busses/i2c-mt7621.c
-@@ -85,7 +85,7 @@ static void mtk_i2c_reset(struct mtk_i2c
+@@ -85,7 +85,7 @@ static void mtk_i2c_reset(struct mtk_i2c *i2c)
  {
  	int ret;
  
@@ -9,3 +23,6 @@
  	if (ret)
  		dev_err(i2c->dev, "I2C reset failed!\n");
  
+-- 
+2.43.0
+

@@ -1,3 +1,26 @@
+From 8993d0dbbb914231423a0a74cc2cfc7c1b044053 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 15 Apr 2026 10:56:25 +0800
+Subject: [PATCH] serial: 8250: add Airoha EN7523 support
+
+Add the EN7523-specific baud-rate helper and wire it into the 8250 core so Airoha boards can use the on-chip UARTs through the standard 8250 driver model.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/tty/serial/8250/8250_en7523.c | 94 +++++++++++++++++++++++++++
+ drivers/tty/serial/8250/8250_of.c     |  1 +
+ drivers/tty/serial/8250/8250_port.c   | 14 ++++
+ drivers/tty/serial/8250/Kconfig       | 10 +++
+ drivers/tty/serial/8250/Makefile      |  1 +
+ include/linux/serial_8250.h           |  1 +
+ include/uapi/linux/serial_core.h      |  1 +
+ include/uapi/linux/serial_reg.h       | 12 ++++
+ 8 files changed, 134 insertions(+)
+ create mode 100644 drivers/tty/serial/8250/8250_en7523.c
+
+diff --git a/drivers/tty/serial/8250/8250_en7523.c b/drivers/tty/serial/8250/8250_en7523.c
+new file mode 100644
+index 0000000..dfee707
 --- /dev/null
 +++ b/drivers/tty/serial/8250/8250_en7523.c
 @@ -0,0 +1,94 @@
@@ -95,9 +118,11 @@
 +}
 +
 +EXPORT_SYMBOL_GPL(en7523_set_uart_baud_rate);
+diff --git a/drivers/tty/serial/8250/8250_of.c b/drivers/tty/serial/8250/8250_of.c
+index d178b6c..7a47002 100644
 --- a/drivers/tty/serial/8250/8250_of.c
 +++ b/drivers/tty/serial/8250/8250_of.c
-@@ -341,6 +341,7 @@ static const struct of_device_id of_plat
+@@ -353,6 +353,7 @@ static const struct of_device_id of_platform_serial_table[] = {
  	{ .compatible = "ti,da830-uart", .data = (void *)PORT_DA830, },
  	{ .compatible = "nuvoton,wpcm450-uart", .data = (void *)PORT_NPCM, },
  	{ .compatible = "nuvoton,npcm750-uart", .data = (void *)PORT_NPCM, },
@@ -105,9 +130,11 @@
  	{ /* end of list */ },
  };
  MODULE_DEVICE_TABLE(of, of_platform_serial_table);
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index afc7602..9f80532 100644
 --- a/drivers/tty/serial/8250/8250_port.c
 +++ b/drivers/tty/serial/8250/8250_port.c
-@@ -248,6 +248,14 @@ static const struct serial8250_config uart_config[] = {
+@@ -253,6 +253,14 @@ static const struct serial8250_config uart_config[] = {
  		.rxtrig_bytes	= {1, 4, 8, 14},
  		.flags		= UART_CAP_FIFO,
  	},
@@ -122,7 +149,7 @@
  	[PORT_DA830] = {
  		.name		= "TI DA8xx/66AK2x",
  		.fifo_size	= 16,
-@@ -2780,6 +2788,12 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
+@@ -2782,6 +2790,12 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
  		serial8250_set_ier(port, termios);
  		serial8250_set_efr(port, termios);
  		serial8250_set_divisor(port, baud, quot, frac);
@@ -135,9 +162,11 @@
  		serial8250_set_fcr(port, termios);
  		serial8250_set_mctrl(port, port->mctrl);
  	}
+diff --git a/drivers/tty/serial/8250/Kconfig b/drivers/tty/serial/8250/Kconfig
+index f64ef08..ae19980 100644
 --- a/drivers/tty/serial/8250/Kconfig
 +++ b/drivers/tty/serial/8250/Kconfig
-@@ -355,6 +355,16 @@ config SERIAL_8250_ACORN
+@@ -356,6 +356,16 @@ config SERIAL_8250_ACORN
  	  system, say Y to this option.  The driver can handle 1, 2, or 3 port
  	  cards.  If unsure, say N.
  
@@ -154,9 +183,11 @@
  config SERIAL_8250_BCM2835AUX
  	tristate "BCM2835 auxiliar mini UART support"
  	depends on ARCH_BCM2835 || COMPILE_TEST
+diff --git a/drivers/tty/serial/8250/Makefile b/drivers/tty/serial/8250/Makefile
+index 9ec4d5f..c32dff4 100644
 --- a/drivers/tty/serial/8250/Makefile
 +++ b/drivers/tty/serial/8250/Makefile
-@@ -20,6 +20,7 @@ obj-$(CONFIG_SERIAL_8250_CONSOLE)	+= 825
+@@ -20,6 +20,7 @@ obj-$(CONFIG_SERIAL_8250_CONSOLE)	+= 8250_early.o
  
  obj-$(CONFIG_SERIAL_8250_ACCENT)	+= 8250_accent.o
  obj-$(CONFIG_SERIAL_8250_ACORN)		+= 8250_acorn.o
@@ -164,6 +195,32 @@
  obj-$(CONFIG_SERIAL_8250_ASPEED_VUART)	+= 8250_aspeed_vuart.o
  obj-$(CONFIG_SERIAL_8250_BCM2835AUX)	+= 8250_bcm2835aux.o
  obj-$(CONFIG_SERIAL_8250_BCM7271)	+= 8250_bcm7271.o
+diff --git a/include/linux/serial_8250.h b/include/linux/serial_8250.h
+index a95b2d1..caf0c5a 100644
+--- a/include/linux/serial_8250.h
++++ b/include/linux/serial_8250.h
+@@ -195,6 +195,7 @@ void serial8250_do_set_mctrl(struct uart_port *port, unsigned int mctrl);
+ void serial8250_do_set_divisor(struct uart_port *port, unsigned int baud,
+ 			       unsigned int quot);
+ int fsl8250_handle_irq(struct uart_port *port);
++int en7523_set_uart_baud_rate(struct uart_port *port, unsigned int baud);
+ void serial8250_handle_irq_locked(struct uart_port *port, unsigned int iir);
+ int serial8250_handle_irq(struct uart_port *port, unsigned int iir);
+ u16 serial8250_rx_chars(struct uart_8250_port *up, u16 lsr);
+diff --git a/include/uapi/linux/serial_core.h b/include/uapi/linux/serial_core.h
+index 9c007a1..9cab8cd 100644
+--- a/include/uapi/linux/serial_core.h
++++ b/include/uapi/linux/serial_core.h
+@@ -31,6 +31,7 @@
+ #define PORT_ALTR_16550_F128 28 /* Altera 16550 UART with 128 FIFOs */
+ #define PORT_RT2880	29	/* Ralink RT2880 internal UART */
+ #define PORT_16550A_FSL64 30	/* Freescale 16550 UART with 64 FIFOs */
++#define PORT_AIROHA    31	/* Airoha 16550 UART */
+ 
+ /*
+  * ARM specific type numbers.  These are not currently guaranteed
+diff --git a/include/uapi/linux/serial_reg.h b/include/uapi/linux/serial_reg.h
+index 9c987b0..7628eef 100644
 --- a/include/uapi/linux/serial_reg.h
 +++ b/include/uapi/linux/serial_reg.h
 @@ -383,5 +383,17 @@
@@ -184,24 +241,6 @@
 +
  #endif /* _LINUX_SERIAL_REG_H */
  
---- a/include/uapi/linux/serial_core.h
-+++ b/include/uapi/linux/serial_core.h
-@@ -31,6 +31,7 @@
- #define PORT_ALTR_16550_F128 28 /* Altera 16550 UART with 128 FIFOs */
- #define PORT_RT2880	29	/* Ralink RT2880 internal UART */
- #define PORT_16550A_FSL64 30	/* Freescale 16550 UART with 64 FIFOs */
-+#define PORT_AIROHA    31	/* Airoha 16550 UART */
- 
- /*
-  * ARM specific type numbers.  These are not currently guaranteed
---- a/include/linux/serial_8250.h
-+++ b/include/linux/serial_8250.h
-@@ -195,7 +195,8 @@ void serial8250_do_set_mctrl(struct uart_port *port, unsigned int mctrl);
- void serial8250_do_set_divisor(struct uart_port *port, unsigned int baud,
- 			       unsigned int quot);
- int fsl8250_handle_irq(struct uart_port *port);
-+int en7523_set_uart_baud_rate(struct uart_port *port, unsigned int baud);
- void serial8250_handle_irq_locked(struct uart_port *port, unsigned int iir);
- int serial8250_handle_irq(struct uart_port *port, unsigned int iir);
- u16 serial8250_rx_chars(struct uart_8250_port *up, u16 lsr);
- void serial8250_read_char(struct uart_8250_port *up, u16 lsr);
+-- 
+2.43.0
+

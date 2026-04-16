@@ -1,5 +1,5 @@
 From cc152837acb9cc58dd5b6c9d8899777c23e33be5 Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Sun, 12 Apr 2026 18:55:57 +0800
 Subject: [PATCH] nl80211: short-circuit the use_existing interface path
 
@@ -13,7 +13,7 @@ Short-circuit that case: if use_existing is allowed and the target
 ifname already exists, skip the create attempt and immediately reuse the
 interface.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  src/drivers/driver_nl80211.c | 36 +++++++++++++++++++++++-------------
  1 file changed, 23 insertions(+), 13 deletions(-)
@@ -80,4 +80,3 @@ index 413b6bd..8917204 100644
  
 -- 
 2.43.0
-

@@ -22,7 +22,7 @@ Fix two issues related to TX status reporting:
 
    Fix by replacing the GI-only update with a full rate update that
    uses all fields from the MCU response, matching the decode logic
-   already used in mt7996_mac_add_txs_skb().
+   already used in mt7996_mac_add_txs_skb(), while leaving the MCU NSS semantics unchanged.
 
 Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 Index: b/mt7996/mac.c

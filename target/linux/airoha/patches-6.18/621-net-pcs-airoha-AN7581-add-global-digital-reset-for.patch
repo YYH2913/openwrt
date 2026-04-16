@@ -29,14 +29,16 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 
 --- a/drivers/net/pcs/airoha/pcs-airoha.h
 +++ b/drivers/net/pcs/airoha/pcs-airoha.h
-@@ -1188,6 +1188,7 @@
+@@ -1188,8 +1188,9 @@ struct airoha_pcs_priv {
  	struct reset_control_bulk_data rsts[AIROHA_PCS_MAX_NUM_RSTS];
  
- 	bool manual_rx_calib;
+	bool manual_rx_calib;
 +	bool needs_full_init;
+ 
+	struct phylink_pcs pcs;
  };
  
- struct airoha_pcs_port {
+ struct airoha_pcs_match_data {
 --- a/drivers/net/pcs/airoha/pcs-airoha-common.c
 +++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
 @@ -422,6 +422,7 @@

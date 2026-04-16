@@ -27,25 +27,25 @@ Normally it's 1 for USB port 1 and 2 for USB port 2.
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 ---
  MAINTAINERS                         |   1 +
- drivers/phy/Kconfig          |  10 +
- drivers/phy/Makefile         |   1 +
- drivers/phy/phy-airoha-usb.c | 597 ++++++++++++++++++++++++++++
+ drivers/phy/airoha/Kconfig          |  10 +
+ drivers/phy/airoha/Makefile         |   1 +
+ drivers/phy/airoha/phy-airoha-usb.c | 597 ++++++++++++++++++++++++++++
  4 files changed, 609 insertions(+)
- create mode 100644 drivers/phy/phy-airoha-usb.c
+ create mode 100644 drivers/phy/airoha/phy-airoha-usb.c
 
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
-@@ -756,6 +756,7 @@ M:	Christian Marangi <ansuelsmth@gmail.c
+@@ -776,6 +776,7 @@ M:	Christian Marangi <ansuelsmth@gmail.c
  L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
  S:	Maintained
  F:	Documentation/devicetree/bindings/phy/airoha,an7581-usb-phy.yaml
-+F:	drivers/phy/phy-airoha-usb.c
++F:	drivers/phy/airoha/phy-airoha-usb.c
  F:	include/dt-bindings/phy/airoha,an7581-usb-phy.h
  
  AIRSPY MEDIA DRIVER
---- a/drivers/phy/Kconfig
-+++ b/drivers/phy/Kconfig
-@@ -87,6 +87,16 @@ config PHY_AIROHA_PCIE
+--- a/drivers/phy/airoha/Kconfig
++++ b/drivers/phy/airoha/Kconfig
+@@ -11,3 +11,13 @@ config PHY_AIROHA_PCIE
  	  Say Y here to add support for Airoha PCIe PHY driver.
  	  This driver create the basic PHY instance and provides initialize
  	  callback for PCIe GEN3 port.
@@ -59,21 +59,15 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 +	  Say 'Y' here to add support for Airoha USB PHY driver.
 +	  This driver create the basic PHY instance and provides initialize
 +	  callback for USB port.
+--- a/drivers/phy/airoha/Makefile
++++ b/drivers/phy/airoha/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
  
- config PHY_NXP_PTN3222
- 	tristate "NXP PTN3222 1-port eUSB2 to USB2 redriver"
---- a/drivers/phy/Makefile
-+++ b/drivers/phy/Makefile
-@@ -10,6 +10,7 @@ obj-$(CONFIG_PHY_XGENE)			+= phy-xgene.o
- obj-$(CONFIG_PHY_PISTACHIO_USB)		+= phy-pistachio-usb.o
- obj-$(CONFIG_PHY_SNPS_EUSB2)		+= phy-snps-eusb2.o
- obj-$(CONFIG_USB_LGM_PHY)		+= phy-lgm-usb.o
  obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
 +obj-$(CONFIG_PHY_AIROHA_USB)		+= phy-airoha-usb.o
- obj-$(CONFIG_PHY_NXP_PTN3222)		+= phy-nxp-ptn3222.o
- obj-y					+= allwinner/	\
 --- /dev/null
-+++ b/drivers/phy/phy-airoha-usb.c
++++ b/drivers/phy/airoha/phy-airoha-usb.c
 @@ -0,0 +1,596 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*

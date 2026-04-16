@@ -16,26 +16,17 @@ To avoid the second cause, let's use request_firmware_direct().
 
 Signed-off-by: Ziyang Huang <hzyitc@outlook.com>
 ---
- drivers/net/ethernet/airoha/airoha_npu.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
+ drivers/net/ethernet/airoha/airoha_npu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
 
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -188,7 +188,7 @@ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
- 	void __iomem *addr;
+@@ -202,7 +202,7 @@ static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
+ 	const struct firmware *fw;
  	int ret;
  
--	ret = request_firmware(&fw, NPU_EN7581_FIRMWARE_RV32, dev);
-+	ret = request_firmware_direct(&fw, NPU_EN7581_FIRMWARE_RV32, dev);
- 	if (ret)
- 		return ret == -ENOENT ? -EPROBE_DEFER : ret;
- 
-@@ -206,7 +206,7 @@ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
- 	memcpy_toio(addr, fw->data, fw->size);
- 	release_firmware(fw);
- 
--	ret = request_firmware(&fw, NPU_EN7581_FIRMWARE_DATA, dev);
-+	ret = request_firmware_direct(&fw, NPU_EN7581_FIRMWARE_DATA, dev);
+-	ret = request_firmware(&fw, fw_name, dev);
++	ret = request_firmware_direct(&fw, fw_name, dev);
  	if (ret)
  		return ret == -ENOENT ? -EPROBE_DEFER : ret;
  

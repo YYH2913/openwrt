@@ -1,3 +1,19 @@
+From 42a883269b784361fdf3695844d7e30a461b63c0 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 15 Apr 2026 10:56:26 +0800
+Subject: [PATCH] mtd: nand: add Airoha BMT implementation
+
+Import the Airoha bad block management helper used by the target so the shared MediaTek BMT interfaces can manage vendor NAND layouts on Airoha boards.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/mtd/nand/airoha_bmt.c | 575 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 575 insertions(+)
+ create mode 100644 drivers/mtd/nand/airoha_bmt.c
+
+diff --git a/drivers/mtd/nand/airoha_bmt.c b/drivers/mtd/nand/airoha_bmt.c
+new file mode 100644
+index 0000000..f6ef798
 --- /dev/null
 +++ b/drivers/mtd/nand/airoha_bmt.c
 @@ -0,0 +1,575 @@
@@ -576,3 +592,6 @@
 +	.get_mapping_block = get_mapping_block,
 +	.debug = debug,
 +};
+-- 
+2.43.0
+
