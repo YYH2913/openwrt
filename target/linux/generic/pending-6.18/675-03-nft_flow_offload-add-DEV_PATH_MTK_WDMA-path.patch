@@ -1,9 +1,9 @@
 From 72ed8cc4e261041e60765deba813d3b1fb9a2455 Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Mon, 13 Apr 2026 03:49:08 +0800
 Subject: [PATCH 3/4] netfilter: nft_flow_offload: add DEV_PATH_MTK_WDMA path
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  net/netfilter/nft_flow_offload.c | 4 ++++
  1 file changed, 4 insertions(+)
@@ -25,4 +25,3 @@ index 988751a..f526335 100644
  		}
 -- 
 2.43.0
-

@@ -1,9 +1,9 @@
 From 1933e4896f9d4494c6c7bc2127fba6723783f651 Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Mon, 13 Apr 2026 03:48:41 +0800
 Subject: [PATCH 2/4] netfilter: nft_flow_offload: add bridging support
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  net/netfilter/nft_flow_offload.c | 214 +++++++++++++++++++++++++++----
  1 file changed, 190 insertions(+), 24 deletions(-)

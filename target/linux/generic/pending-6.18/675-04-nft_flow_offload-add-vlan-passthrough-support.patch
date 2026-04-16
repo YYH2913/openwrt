@@ -1,9 +1,9 @@
 From ba6a1fa7bc09b319662572c7532323701ec2c9de Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Mon, 13 Apr 2026 03:49:35 +0800
 Subject: [PATCH 4/4] netfilter: nft_flow_offload: add VLAN passthrough support
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  net/netfilter/nft_flow_offload.c | 30 +++++++++++++++++++++++++++++-
  1 file changed, 29 insertions(+), 1 deletion(-)
@@ -59,4 +59,3 @@ index f526335..38b33be 100644
  		return -ENOENT;
 -- 
 2.43.0
-

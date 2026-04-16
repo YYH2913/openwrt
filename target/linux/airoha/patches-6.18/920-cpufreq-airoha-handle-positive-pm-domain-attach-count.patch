@@ -1,5 +1,5 @@
 From 28a85072c6e58f820ce69935939c1468e3632bda Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Sun, 12 Apr 2026 18:55:55 +0800
 Subject: [PATCH] cpufreq: airoha: handle positive PM domain attach count
 
@@ -7,7 +7,7 @@ dev_pm_domain_attach_list() returns the number of attached PM domains on
 success, not zero. Treat only negative values as failures, otherwise the
 driver aborts probe as soon as the CPU PM domain is available.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/cpufreq/airoha-cpufreq.c | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
@@ -27,4 +27,3 @@ index e667f59..f88a44e 100644
  	cpufreq_dt = platform_device_register_simple("cpufreq-dt", -1, NULL, 0);
 -- 
 2.43.0
-

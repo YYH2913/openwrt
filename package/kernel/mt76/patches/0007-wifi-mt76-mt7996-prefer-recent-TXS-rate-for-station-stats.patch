@@ -1,4 +1,4 @@
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Mon, 13 Apr 2026 20:08:00 +0800
 Subject: [PATCH] wifi: mt76: mt7996: prefer recent TXS rate for station
  stats
@@ -14,7 +14,7 @@ decoded rate separately and prefer it for station statistics while it is
 fresh. This preserves the offload fallback while making iw/hostapd/LuCI
 closer to the actual recent transmit sample seen by the driver.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 
 diff --git a/mt7996/mac.c b/mt7996/mac.c
 index 794d4fe4ba57..9bd97d77a195 100644

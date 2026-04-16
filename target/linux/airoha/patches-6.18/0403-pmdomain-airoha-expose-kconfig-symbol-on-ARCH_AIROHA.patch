@@ -1,5 +1,5 @@
 From e014d172830afbdd1feb863549c9ca91c52d79cd Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Sun, 12 Apr 2026 18:55:53 +0800
 Subject: [PATCH] pmdomain: airoha: expose Kconfig symbol on ARCH_AIROHA
 
@@ -12,7 +12,7 @@ never built.
 Move the Airoha-specific symbol out of the MediaTek-only menu and gate
 it on ARCH_AIROHA instead.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/pmdomain/mediatek/Kconfig | 25 +++++++++++++------------
  1 file changed, 13 insertions(+), 12 deletions(-)
@@ -59,4 +59,3 @@ index 0e34a51..0d0ac4f 100644
  endmenu
 -- 
 2.43.0
-

@@ -1,5 +1,5 @@
 From 3e8e3301869c449365c284be9ab1edf5c7bce945 Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Sun, 12 Apr 2026 18:55:52 +0800
 Subject: [PATCH] pmdomain: airoha: fall back to PLL registers when BL31
  GET_FREQ fails or ATF SMC is missing
@@ -14,7 +14,7 @@ programming on EN7581 whenever the SMC path is unavailable or unusable,
 while keeping the SMC path for platforms where firmware support is
 present.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  .../pmdomain/mediatek/airoha-cpu-pmdomain.c   | 189 +++++++++++++++++-
  1 file changed, 180 insertions(+), 9 deletions(-)
@@ -283,4 +283,3 @@ index 3b1d202..d64b7fa 100644
  	pd->flags = GENPD_FLAG_ALWAYS_ON;
 -- 
 2.43.0
-

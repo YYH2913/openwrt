@@ -1,5 +1,5 @@
 From 86e1f84e8c9a15c61985f2329e20462ff3d55ca0 Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Sun, 12 Apr 2026 18:55:56 +0800
 Subject: [PATCH] net: airoha: classify external lan ports from DT
 
@@ -18,7 +18,7 @@ traffic falls back to CPU forwarding.
 Allow board DTS files to mark external LAN ports explicitly and keep an
 OpenWrt netdev-name fallback for already named boards.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 14 ++++++++++++++
  drivers/net/ethernet/airoha/airoha_eth.h |  7 ++-----
@@ -83,4 +83,3 @@ index 48c2139..ecbd37d 100644
  static inline bool airoha_is_7581(struct airoha_eth *eth)
 -- 
 2.43.0
-

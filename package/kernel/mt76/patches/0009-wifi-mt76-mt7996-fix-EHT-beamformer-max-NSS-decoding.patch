@@ -1,4 +1,4 @@
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Tue, 14 Apr 2026 16:24:00 +0800
 Subject: [PATCH] wifi: mt76: mt7996: fix EHT beamformer max NSS decoding
 
@@ -13,7 +13,7 @@ advertises 2 spatial streams.
 
 Use the decoded maximum NSS as-is.
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 
 diff --git a/mt7996/mcu.c b/mt7996/mcu.c
 --- a/mt7996/mcu.c

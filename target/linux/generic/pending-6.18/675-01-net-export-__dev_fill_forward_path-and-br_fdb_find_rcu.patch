@@ -1,9 +1,9 @@
 From d4f7c34d056805f03336bb971966a4176e79d09f Mon Sep 17 00:00:00 2001
-From: YYH2913 <yyh2913@qq.com>
+From: Yanghan Ye <yyh94306@gmail.com>
 Date: Mon, 13 Apr 2026 03:48:10 +0800
 Subject: [PATCH 1/4] net: export __dev_fill_forward_path and br_fdb_find_rcu
 
-Signed-off-by: YYH2913 <yyh2913@qq.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  include/linux/netdevice.h |  2 ++
  net/bridge/br_fdb.c       |  1 +
@@ -106,4 +106,3 @@ index 6775134..df6cab2 100644
  /* must be called under rcu_read_lock(), as we dont take a reference */
 -- 
 2.43.0
-
