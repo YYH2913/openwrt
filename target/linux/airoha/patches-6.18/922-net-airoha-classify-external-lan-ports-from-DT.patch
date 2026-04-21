@@ -21,8 +21,8 @@ OpenWrt netdev-name fallback for already named boards.
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 14 ++++++++++++++
- drivers/net/ethernet/airoha/airoha_eth.h |  7 ++-----
- 2 files changed, 16 insertions(+), 5 deletions(-)
+ drivers/net/ethernet/airoha/airoha_eth.h |  6 +-----
+ 2 files changed, 15 insertions(+), 5 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
 index 5154c27..059b9c3 100644
@@ -60,10 +60,11 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/air
 index 48c2139..ecbd37d 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
-@@ -537,6 +537,7 @@ struct airoha_gdm_port {
+@@ -537,7 +537,8 @@ struct airoha_gdm_port {
  	struct airoha_eth *eth;
  	struct net_device *dev;
  	int id;
+ 	int nbq;
 +	bool lan;
  
  #if defined(CONFIG_PCS_AIROHA)
