@@ -46,6 +46,7 @@ netis,nx32u|\
 nokia,ea0326gmp|\
 openwrt,one|\
 qihoo,360t7|\
+qihoo,360t7-ubi|\
 routerich,ax3000-ubootmod|\
 routerich,be7200|\
 snr,snr-cpe-ax2|\
@@ -104,7 +105,10 @@ jdcloud,re-cp-03)
 		;;
 	esac
 	;;
+buffalo,wsr-3000ax4p|\
 buffalo,wsr-6000ax8|\
+elecom,wrc-x6000gsd|\
+elecom,wrc-x6000qs|\
 mercusys,mr80x-v3|\
 mercusys,mr85x|\
 mercusys,mr90x-v1|\
@@ -118,6 +122,7 @@ comfast,cf-e393ax|\
 iptime,ax3000m)
 	ubootenv_add_uci_config "/dev/mtd1" "0x0" "0x20000" "0x80000"
 	;;
+dlink,aquila-pro-ai-e30-a1|\
 dlink,aquila-pro-ai-m30-a1|\
 dlink,aquila-pro-ai-m60-a1)
 	ubootenv_add_uci_config "/dev/mtd1" "0x0" "0x40000" "0x40000"

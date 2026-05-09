@@ -30,6 +30,15 @@ define Device/hasivo_s1100wp-8gt-se
 endef
 TARGET_DEVICES += hasivo_s1100wp-8gt-se
 
+define Device/hasivo_s600wp-5gt-2sx-se
+  SOC := rtl9303
+  DEVICE_VENDOR := Hasivo
+  DEVICE_MODEL := S600WP-5GT-2SX-SE
+  IMAGE_SIZE := 12288k
+  $(Device/kernel-lzma)
+endef
+TARGET_DEVICES += hasivo_s600wp-5gt-2sx-se
+
 define Device/plasmacloud-common
   SOC := rtl9302
   UIMAGE_MAGIC := 0x93000000
@@ -216,3 +225,20 @@ define Device/zyxel_xgs1250-12-b1
   DEVICE_VARIANT := B1
 endef
 TARGET_DEVICES += zyxel_xgs1250-12-b1
+
+define Device/zyxel_xmg1915-10e
+  SOC := rtl9302
+  ZYXEL_VERS := ABWE
+  DEVICE_VENDOR := Zyxel
+  DEVICE_MODEL := XMG1915-10E
+  FLASH_ADDR := 0xb5290000
+ifeq ($(IB),)
+  ARTIFACTS := loader.bin
+  ARTIFACT/loader.bin := \
+    rt-loader-standalone | \
+    zynsig
+endif
+  $(Device/rt-loader-bootbase)
+  IMAGE_SIZE := 13760k
+endef
+TARGET_DEVICES += zyxel_xmg1915-10e
