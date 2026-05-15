@@ -522,8 +522,8 @@ endef
 $(eval $(call KernelPackage,crypto-hw-talitos))
 
 define KernelPackage/crypto-hw-eip93
-  TITLE:=MTK EIP93 crypto module
-  DEPENDS:=@(TARGET_ramips_mt7621||TARGET_airoha) \
+  TITLE:=SafeXcel EIP-93 Crypto Engine module
+  DEPENDS:=@(TARGET_airoha||TARGET_econet||TARGET_ramips_mt7621) \
 	+kmod-crypto-authenc \
 	+kmod-crypto-des \
 	+kmod-crypto-md5 \
@@ -540,10 +540,10 @@ define KernelPackage/crypto-hw-eip93
 endef
 
 define KernelPackage/crypto-hw-eip93/description
-Kernel module to enable EIP-93 Crypto engine as found
-in Mediatek MT7621 and Airoha SoCs.
-It enables DES/3DES/AES ECB/CBC/CTR and
-IPSEC offload with authenc(hmac(sha1/sha256), aes/cbc/rfc3686)
+Kernel module to enable EIP-93 Crypto engine as
+found in the Airoha / EcoNet / Mediatek MT7621 SoC.
+It enables DES/3DES/AES ECB/CBC/CTR and IPSEC offload
+with authenc(hmac(sha1/sha256), aes/cbc/rfc3686)
 endef
 
 $(eval $(call KernelPackage,crypto-hw-eip93))
