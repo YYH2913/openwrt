@@ -354,6 +354,21 @@
 			"type": "boolean",
 			"default": true
 		},
+		"eht_mu_beamformer": {
+			"description": "Whether EHT MU beamformer support is advertised.",
+			"type": "boolean",
+			"default": true
+		},
+		"eht_su_beamformee": {
+			"description": "Whether EHT SU beamformee support is advertised.",
+			"type": "boolean",
+			"default": true
+		},
+		"eht_su_beamformer": {
+			"description": "Whether EHT SU beamformer support is advertised.",
+			"type": "boolean",
+			"default": true
+		},
 		"hostapd_options": {
 			"type": "array",
 			"items": {
