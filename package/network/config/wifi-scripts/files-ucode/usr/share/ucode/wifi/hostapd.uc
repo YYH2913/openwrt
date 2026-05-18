@@ -447,6 +447,11 @@ function device_htmode_append(config) {
 
 		config.ieee80211be = true;
 
+		/* Hostapd masks these against the hardware EHT capabilities. */
+		set_default(config, 'eht_su_beamformer', true);
+		set_default(config, 'eht_su_beamformee', true);
+		set_default(config, 'eht_mu_beamformer', true);
+
 		if (!(eht_phy_cap[0] & 0x20))
 			config.eht_su_beamformer = false;
 		if (!(eht_phy_cap[0] & 0x40))
