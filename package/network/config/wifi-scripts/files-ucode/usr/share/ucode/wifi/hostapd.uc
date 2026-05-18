@@ -449,7 +449,14 @@ function device_htmode_append(config) {
 
 	if (wildcard(config.htmode, 'EHT*')) {
 		config.ieee80211be = true;
-		append_vars(config, [ 'ieee80211be' ]);
+		/* Hostapd masks these against the hardware EHT capabilities. */
+		set_default(config, 'eht_su_beamformer', true);
+		set_default(config, 'eht_su_beamformee', true);
+		set_default(config, 'eht_mu_beamformer', true);
+		append_vars(config, [
+			'ieee80211be',
+			'eht_su_beamformer', 'eht_su_beamformee', 'eht_mu_beamformer',
+		]);
 
 		if (config.hw_mode == 'a')
 			append_vars(config, [ 'eht_oper_chwidth', 'eht_oper_centr_freq_seg0_idx' ]);
