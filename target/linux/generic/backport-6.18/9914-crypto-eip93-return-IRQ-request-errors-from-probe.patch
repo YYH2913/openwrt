@@ -1,0 +1,31 @@
+From 040c5833580ba315b8cda268ef5daf2da9856607 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Mon, 25 May 2026 04:06:15 +0900
+Subject: [PATCH] crypto: eip93: return IRQ request errors from probe
+
+devm_request_threaded_irq() can fail, but eip93_crypto_probe()
+continues as if the interrupt handler was installed. Return the error
+immediately so the driver does not register algorithms for a device that
+cannot signal completions.
+
+Fixes: 9739f5f93b78 ("crypto: eip93 - Add Inside Secure SafeXcel EIP-93 crypto engine support")
+Originally-by: Mieczyslaw Nalewaj <namiltd@yahoo.com>
+Assisted-by: Codex:gpt-5.5
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/crypto/inside-secure/eip93/eip93-main.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-main.c b/drivers/crypto/inside-secure/eip93/eip93-main.c
+index 7dccfdeb7b11..276839e1a515 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.c
+@@ -433,6 +433,8 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 	ret = devm_request_threaded_irq(eip93->dev, eip93->irq, eip93_irq_handler,
+ 					NULL, IRQF_ONESHOT,
+ 					dev_name(eip93->dev), eip93);
++	if (ret)
++		return ret;
+ 
+ 	eip93->ring = devm_kcalloc(eip93->dev, 1, sizeof(*eip93->ring), GFP_KERNEL);
+ 	if (!eip93->ring)
