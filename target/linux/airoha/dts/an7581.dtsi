@@ -623,6 +623,13 @@
 			interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
+		/* Packet/IPsec SOE register window owned by the Ethernet driver. */
+		soe: soe@1fbfa000 {
+			compatible = "airoha,an7581-soe";
+			reg = <0x0 0x1fbfa000 0x0 0x268>;
+			interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		thermal: thermal-sensor@1efbd000 {
 			compatible = "airoha,en7581-thermal";
 			reg = <0x0 0x1efbd000 0x0 0xd5c>;
@@ -920,7 +927,15 @@
 				     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>,
-				     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+				     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 203 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 205 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 206 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 207 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 208 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 209 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 210 IRQ_TYPE_LEVEL_HIGH>;
 
 			memory-region = <&qdma0_buf>, <&qdma1_buf>;
 			memory-region-names = "qdma0-buf", "qdma1-buf";
