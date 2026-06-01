@@ -246,8 +246,7 @@ define KernelPackage/ipsec4
 	CONFIG_INET_AH \
 	CONFIG_INET_ESP \
 	CONFIG_INET_IPCOMP \
-	CONFIG_INET_XFRM_TUNNEL \
-	CONFIG_INET_ESP_OFFLOAD=n
+	CONFIG_INET_XFRM_TUNNEL
   FILES:=$(foreach mod,$(IPSEC4-m),$(LINUX_DIR)/net/$(mod).ko)
   AUTOLOAD:=$(call AutoLoad,32,$(notdir $(IPSEC4-m)))
 endef
@@ -264,6 +263,24 @@ endef
 $(eval $(call KernelPackage,ipsec4))
 
 
+define KernelPackage/ipsec4-offload
+  SUBMENU:=$(NETWORK_SUPPORT_MENU)
+  TITLE:=IPsec ESP offload support (IPv4)
+  DEPENDS:=+kmod-ipsec4
+  KCONFIG:= \
+	CONFIG_XFRM_OFFLOAD=y \
+	CONFIG_INET_ESP_OFFLOAD
+  FILES:=$(LINUX_DIR)/net/ipv4/esp4_offload.ko
+  AUTOLOAD:=$(call AutoLoad,33,esp4_offload)
+endef
+
+define KernelPackage/ipsec4-offload/description
+ Kernel module for IPv4 ESP transformation offload support.
+endef
+
+$(eval $(call KernelPackage,ipsec4-offload))
+
+
 IPSEC6-m = \
 	ipv6/ah6 \
 	ipv6/esp6 \
@@ -278,8 +295,7 @@ define KernelPackage/ipsec6
 	CONFIG_INET6_AH \
 	CONFIG_INET6_ESP \
 	CONFIG_INET6_IPCOMP \
-	CONFIG_INET6_XFRM_TUNNEL \
-	CONFIG_INET6_ESP_OFFLOAD=n
+	CONFIG_INET6_XFRM_TUNNEL
   FILES:=$(foreach mod,$(IPSEC6-m),$(LINUX_DIR)/net/$(mod).ko)
   AUTOLOAD:=$(call AutoLoad,32,$(notdir $(IPSEC6-m)))
 endef
@@ -294,6 +310,24 @@ define KernelPackage/ipsec6/description
 endef
 
 $(eval $(call KernelPackage,ipsec6))
+
+
+define KernelPackage/ipsec6-offload
+  SUBMENU:=$(NETWORK_SUPPORT_MENU)
+  TITLE:=IPsec ESP offload support (IPv6)
+  DEPENDS:=@IPV6 +kmod-ipsec6
+  KCONFIG:= \
+	CONFIG_XFRM_OFFLOAD=y \
+	CONFIG_INET6_ESP_OFFLOAD
+  FILES:=$(LINUX_DIR)/net/ipv6/esp6_offload.ko
+  AUTOLOAD:=$(call AutoLoad,33,esp6_offload)
+endef
+
+define KernelPackage/ipsec6-offload/description
+ Kernel module for IPv6 ESP transformation offload support.
+endef
+
+$(eval $(call KernelPackage,ipsec6-offload))
 
 
 define KernelPackage/iptunnel
