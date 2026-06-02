@@ -7,7 +7,7 @@ path is an XFRM packet-offload state rather than a plain neighbor
 transmit. This provides the rule allocation and redirect support used by
 SOE-backed ESP flows.
 
-Assisted-by: Codex:gpt-5.5 <codex@openai.invalid>
+Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 ---
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c

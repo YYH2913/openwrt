@@ -7,7 +7,7 @@ The header keeps the XFRM, SA lifetime and packet submission contracts
 local to the driver while providing stubs for builds without
 CONFIG_NET_AIROHA_SOE.
 
-Assisted-by: Codex:gpt-5.5 <codex@openai.invalid>
+Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 ---
 diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..bfaa9ef
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/airoha_soe.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,128 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/* Ethernet-facing declarations for the Airoha Secure Offload Engine (SOE)
 + * packet offload provider.
@@ -67,7 +67,8 @@ index 0000000..bfaa9ef
 +			     struct sk_buff *skb, struct net_device *rx_dev,
 +			     u16 foe_hash, u32 foe_reason, bool foe_valid);
 +bool airoha_soe_has_pending_rx(struct airoha_soe *soe);
-+int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst, u8 *sa_index,
++int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
++			     struct net_device *lower_dev, u8 *sa_index,
 +			     u8 *hop);
 +int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
 +		    struct sk_buff *skb, struct xfrm_state *x);
@@ -128,6 +129,7 @@ index 0000000..bfaa9ef
 +}
 +
 +static inline int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
++					   struct net_device *lower_dev,
 +					   u8 *sa_index, u8 *hop)
 +{
 +	return -EOPNOTSUPP;
