@@ -7,9 +7,63 @@ destinations and to reclassify SOE-decrypted packets whose secpath
 remains attached. This lets the Airoha PPE bind flows that pass through
 SOE ESP encapsulation or decapsulation.
 
-Assisted-by: Codex:gpt-5.5 <codex@openai.invalid>
+Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 ---
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index 0b7bdfd..731545a 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -19,8 +19,9 @@
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+ 
+-static int nf_flow_state_check(struct flow_offload *flow, int proto,
+-			       struct sk_buff *skb, unsigned int thoff)
++static int nf_flow_state_check(struct nf_flowtable *flow_table,
++			       struct flow_offload *flow, int proto,
++			       struct sk_buff *skb, unsigned int thoff)
+ {
+ 	struct tcphdr *tcph;
+ 
+@@ -34,9 +35,18 @@ static int nf_flow_state_check(struct flow_offload *flow, int proto,
+ 	}
+ 
+ 	if ((tcph->fin || tcph->rst) &&
+-	    !test_bit(NF_FLOW_CLOSING, &flow->flags))
++	    !test_bit(NF_FLOW_CLOSING, &flow->flags)) {
+ 		set_bit(NF_FLOW_CLOSING, &flow->flags);
++		flow_offload_teardown(flow);
+ 
++		/* Hardware XFRM/SOE flows can otherwise keep forwarding the
++		 * tail of short-lived TCP sessions until the next GC pass.
++		 */
++		if (test_bit(NF_FLOW_HW, &flow->flags) &&
++		    !test_bit(NF_FLOW_HW_DYING, &flow->flags))
++			nf_flow_offload_del(flow_table, flow);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -387,7 +397,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	iph = (struct iphdr *)(skb_network_header(skb) + ctx->offset);
+ 	thoff = (iph->ihl * 4) + ctx->offset;
+-	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
++	if (nf_flow_state_check(flow_table, flow, iph->protocol, skb, thoff))
+ 		return 0;
+ 
+ 	if (!nf_flow_dst_check(&tuplehash->tuple)) {
+@@ -673,7 +683,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	ip6h = (struct ipv6hdr *)(skb_network_header(skb) + ctx->offset);
+ 	thoff = sizeof(*ip6h) + ctx->offset;
+-	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
++	if (nf_flow_state_check(flow_table, flow, ip6h->nexthdr, skb, thoff))
+ 		return 0;
+ 
+ 	if (!nf_flow_dst_check(&tuplehash->tuple)) {
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 index 996a19f..291fc99 100644
 --- a/net/netfilter/nft_flow_offload.c
@@ -44,7 +98,19 @@ index 996a19f..291fc99 100644
  static void nft_default_forward_path(struct nf_flow_route *route,
  				     struct dst_entry *dst_cache,
  				     enum ip_conntrack_dir dir)
-@@ -416,6 +431,9 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+@@ -390,9 +406,10 @@ static int nft_dev_forward_path(const struct nft_pktinfo *pkt,
+ 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
+ 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+ 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+-		route->tuple[dir].xmit_type = info.xmit_type;
++		if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++			route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
+ 
+ 	return 0;
+ }
+@@ -416,6 +433,9 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
  {
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
@@ -54,7 +120,7 @@ index 996a19f..291fc99 100644
  	struct flowi fl;
  
  	memset(&fl, 0, sizeof(fl));
-@@ -441,7 +459,57 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+@@ -441,7 +461,57 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
  		break;
  	}
  
@@ -113,7 +179,7 @@ index 996a19f..291fc99 100644
  		return -ENOENT;
  
  	nf_route(nft_net(pkt), &other_dst, &fl, false, nft_pf(pkt));
-@@ -449,6 +517,11 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+@@ -449,6 +519,11 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
  		dst_release(this_dst);
  		return -ENOENT;
  	}
@@ -125,7 +191,34 @@ index 996a19f..291fc99 100644
  
  	nft_default_forward_path(route, this_dst, dir);
  	nft_default_forward_path(route, other_dst, !dir);
-@@ -556,9 +629,24 @@ static void nft_flow_set_dscp(const struct nft_pktinfo *pkt,
+@@ -456,12 +531,18 @@ static int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+-	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
+-		if (nft_dev_forward_path(pkt, false, route, ct, dir, ft) ||
+-		    nft_dev_forward_path(pkt, false, route, ct, !dir, ft)) {
+-			dst_release(route->tuple[dir].dst);
+-			dst_release(route->tuple[!dir].dst);
+-			return -ENOENT;
+-		}
++	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
++	    route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
++		if (nft_dev_forward_path(pkt, false, route, ct, dir, ft))
++			goto err_release;
++	}
++	if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
++	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
++		if (nft_dev_forward_path(pkt, false, route, ct, !dir, ft))
++			goto err_release;
+ 	}
+ 
+ 	return 0;
++
++err_release:
++	dst_release(route->tuple[dir].dst);
++	dst_release(route->tuple[!dir].dst);
++	return -ENOENT;
+ }
+@@ -556,18 +637,33 @@ static void nft_flow_set_dscp(const struct nft_pktinfo *pkt,
  
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {
@@ -152,7 +245,16 @@ index 996a19f..291fc99 100644
  	if (family == NFPROTO_IPV4) {
  		const struct ip_options *opt;
  
-@@ -590,6 +678,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 		opt = &(IPCB(skb)->opt);
+ 
+ 		if (unlikely(opt->optlen))
+ 			return true;
+ 	}
+ 
+ 	return false;
+ }
+
+@@ -590,6 +686,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  	struct nf_flow_route route = {};
  	enum ip_conntrack_info ctinfo;
  	struct flow_offload *flow;
@@ -160,33 +262,30 @@ index 996a19f..291fc99 100644
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
  	int ret;
-@@ -605,8 +694,13 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+@@ -605,8 +702,13 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  	case IPPROTO_TCP:
  		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
  					  sizeof(_tcph), &_tcph);
 -		if (unlikely(!tcph || tcph->fin || tcph->rst ||
 -			     !nf_conntrack_tcp_established(ct)))
--			goto out;
 +		if (unlikely(!tcph))
 +			goto out;
 +		if (unlikely(tcph->fin || tcph->rst))
-+			goto out;
+ 			goto out;
 +		if (unlikely(!nf_conntrack_tcp_established(ct))) {
 +			tcp_not_established = true;
 +			break;
 +		}
  		break;
  	case IPPROTO_UDP:
-@@ -654,8 +743,18 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
- 		if (nft_flow_route_routing(pkt, ct, &route, dir,
- 					   priv->flowtable) < 0)
+@@ -654,6 +756,16 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  			goto err_flow_route;
  	}
  
-+	/* XFRM/SOE packet offload can hide part of the plaintext TCP handshake
-+	 * from conntrack: the encrypted/decrypt side may be bound first, then
-+	 * the return tuple is learned as XFRM. Keep the normal TCP-established
-+	 * requirement for all non-XFRM routes.
++	/* XFRM packet offload can hide part of the plaintext TCP handshake from
++	 * conntrack. Once routing proves that either direction is an XFRM
++	 * packet-offload path, let the hardware rule be programmed; non-XFRM
++	 * traffic stays on the normal established-only path.
 +	 */
 +	if (tcp_not_established &&
 +	    route.tuple[IP_CT_DIR_ORIGINAL].xmit_type != FLOW_OFFLOAD_XMIT_XFRM &&
