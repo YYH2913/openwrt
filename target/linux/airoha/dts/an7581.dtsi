@@ -156,6 +156,9 @@
 	};
 
 	cpufreq: cpufreq {
+		reg = <0x0 0x1fa20000 0x0 0x2c0>,
+		      <0x0 0x1efbe000 0x0 0x800>;
+		reg-names = "chip-scu", "mcucfg";
 		compatible = "airoha,en7581-cpufreq";
 
 		operating-points-v2 = <&cpu_smcc_opp_table>;
@@ -466,6 +469,7 @@
 
 		pon_pcs: pcs@1fa08000 {
 			compatible = "airoha,an7581-pcs-pon";
+			#pcs-cells = <0>;
 			reg = <0x0 0x1fa08000 0x0 0x1000>,
 			      <0x0 0x1fa80000 0x0 0x60>,
 			      <0x0 0x1fa80a00 0x0 0x164>,
@@ -489,6 +493,7 @@
 
 		eth_pcs: pcs@1fa09000 {
 			compatible = "airoha,an7581-pcs-eth";
+			#pcs-cells = <0>;
 			reg = <0x0 0x1fa09000 0x0 0x1000>,
 			      <0x0 0x1fa70000 0x0 0x60>,
 			      <0x0 0x1fa70a00 0x0 0x164>,
@@ -580,10 +585,11 @@
 			#reset-cells = <1>;
 		};
 
-		rng@1faa1000 {
+		rng: rng@1faa1000 {
 			compatible = "airoha,en7581-trng";
 			reg = <0x0 0x1faa1000 0x0 0xc04>;
 			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
+			airoha,scu = <&chip_scu>;
 		};
 
 		usb0: usb@1fab0000 {
@@ -724,7 +730,7 @@
 			spi_nand: nand@0 {
 				compatible = "spi-nand";
 				reg = <0>;
-				spi-max-frequency = <50000000>;
+				spi-max-frequency = <33000000>;
 				spi-tx-bus-width = <1>;
 				spi-rx-bus-width = <2>;
 			};
