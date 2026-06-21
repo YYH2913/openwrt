@@ -66,8 +66,17 @@ ubootenv_add_mmc() {
 ubootenv_add_ubi_default() {
 	. /lib/upgrade/nand.sh
 	local envubi=$(nand_find_ubi ubi)
-	local envdev=/dev/$(nand_find_volume $envubi ubootenv)
-	local envdev2=/dev/$(nand_find_volume $envubi ubootenv2)
+	local envvol envvol2 envdev envdev2
+
+	[ -n "$envubi" ] || return 0
+
+	envvol="$(nand_find_volume $envubi ubootenv)"
+	envvol2="$(nand_find_volume $envubi ubootenv2)"
+	[ -n "$envvol" ] || return 0
+	[ -n "$envvol2" ] || return 0
+
+	envdev="/dev/$envvol"
+	envdev2="/dev/$envvol2"
 	ubootenv_add_uci_config "$envdev" "0x0" "0x1f000" "0x1f000" "1"
 	ubootenv_add_uci_config "$envdev2" "0x0" "0x1f000" "0x1f000" "1"
 }
