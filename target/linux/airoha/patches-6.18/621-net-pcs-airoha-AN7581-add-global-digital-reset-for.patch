@@ -29,32 +29,25 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 
 --- a/drivers/net/pcs/airoha/pcs-airoha.h
 +++ b/drivers/net/pcs/airoha/pcs-airoha.h
-@@ -1188,8 +1188,9 @@ struct airoha_pcs_priv {
- 	struct reset_control_bulk_data rsts[AIROHA_PCS_MAX_NUM_RSTS];
- 
-	bool manual_rx_calib;
-+	bool needs_full_init;
- 
-	struct phylink_pcs pcs;
+@@ -1663,2 +1663,3 @@ struct airoha_pcs_priv {
+ 	bool manual_rx_calib;
++	bool needs_full_init[2];
  };
- 
- struct airoha_pcs_match_data {
 --- a/drivers/net/pcs/airoha/pcs-airoha-common.c
 +++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
-@@ -422,6 +422,7 @@
- 		ret = data->bringup(priv, interface);
+@@ -513,6 +513,7 @@ static int airoha_pcs_config(struct phyl
+ 		ret = data->bringup(priv, index, interface);
  		if (ret)
  			return ret;
-+		priv->needs_full_init = true;
++		priv->needs_full_init[index] = true;
  	}
  
  	/* Set final configuration for various modes */
 --- a/drivers/net/pcs/airoha/pcs-an7581.c
 +++ b/drivers/net/pcs/airoha/pcs-an7581.c
-@@ -1363,6 +1363,29 @@
- 
- void an7581_pcs_phya_link_up(struct airoha_pcs_priv *priv)
+@@ -1997,4 +1997,27 @@ void an7581_pcs_phya_link_up(struct airo
  {
+ 	struct regmap *pcs_pma = priv->pcs_pma[index];
 +	u32 rst_mask = AIROHA_PCS_PMA_SW_HSG_RXPCS_RST_N |
 +		       AIROHA_PCS_PMA_SW_HSG_TXPCS_RST_N |
 +		       AIROHA_PCS_PMA_SW_XFI_RXPCS_BIST_RST_N |
@@ -72,45 +65,41 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 +
 +	/* Wait for any ongoing PCS reset to complete before proceeding. */
 +	for (i = 0; i < 50; i++) {
-+		regmap_read(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET, &val);
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET, &val);
 +		if ((val & rst_mask) == rst_mask)
 +			break;
 +		usleep_range(1000, 2000);
 +	}
 +
- 	/* Reset TXPCS on link up */
- 	regmap_clear_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
- 			  AIROHA_PCS_PMA_SW_HSG_TXPCS_RST_N);
-@@ -1371,6 +1394,32 @@
  
- 	regmap_set_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
+ 	/* Reset TXPCS on link up */
+@@ -2007,3 +2030,29 @@ void an7581_pcs_phya_link_up(struct airo
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
  			AIROHA_PCS_PMA_SW_HSG_TXPCS_RST_N);
 +
 +	if (priv->interface == PHY_INTERFACE_MODE_USXGMII ||
 +	    priv->interface == PHY_INTERFACE_MODE_10GBASER) {
-+		if (priv->needs_full_init) {
-+			priv->needs_full_init = false;
++		if (priv->needs_full_init[index]) {
++			priv->needs_full_init[index] = false;
 +			dev_dbg(priv->dev, "link_up: skipping global reset (bringup just ran)\n");
 +			return;
 +		}
 +
 +		dev_dbg(priv->dev, "link_up: performing global digital reset\n");
-+		an7581_pcs_cdr_reset(priv, priv->interface, false);
++		an7581_pcs_cdr_reset(priv, index, priv->interface, false);
 +
 +		/* Assert global reset (keep REF_RST_N high) */
-+		regmap_update_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
 +				   rst_mask, AIROHA_PCS_PMA_SW_REF_RST_N);
 +
 +		usleep_range(100, 200);
 +
 +		/* Deassert global reset */
-+		regmap_set_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
++		regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
 +				rst_mask);
 +
 +		usleep_range(5000, 7000);
 +
-+		an7581_pcs_cdr_reset(priv, priv->interface, false);
++		an7581_pcs_cdr_reset(priv, index, priv->interface, false);
 +	}
  }
- 
- static bool an7581_pcs_have_rx_signal(struct airoha_pcs_priv *priv)

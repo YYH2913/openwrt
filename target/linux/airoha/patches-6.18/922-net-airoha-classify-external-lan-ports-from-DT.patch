@@ -20,19 +20,16 @@ OpenWrt netdev-name fallback for already named boards.
 
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
- drivers/net/ethernet/airoha/airoha_eth.c | 14 ++++++++++++++
- drivers/net/ethernet/airoha/airoha_eth.h |  6 +-----
- 2 files changed, 15 insertions(+), 5 deletions(-)
+ drivers/net/ethernet/airoha/airoha_eth.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
 
-diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
-index 5154c27..059b9c3 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -79,6 +79,19 @@ static bool airhoa_is_phy_external(struct airoha_gdm_port *port)
+@@ -75,4 +75,17 @@ static void airoha_qdma_irq_disable(stru
+ 	airoha_qdma_set_irqmask(irq_bank, index, mask, 0);
  }
- #endif
  
-+static bool airoha_port_is_lan(struct device_node *np, u32 id)
++static bool airoha_dev_is_lan(struct device_node *np, u32 id)
 +{
 +	const char *name;
 +
@@ -45,42 +42,12 @@ index 5154c27..059b9c3 100644
 +	return id == AIROHA_GDM1_IDX;
 +}
 +
- static void airoha_set_macaddr(struct airoha_gdm_port *port, const u8 *addr)
- {
- 	struct airoha_eth *eth = port->qdma->eth;
-@@ -3103,6 +3116,7 @@ static int airoha_alloc_gdm_port(struct airoha_eth *eth,
- 	spin_lock_init(&port->stats.lock);
- 	port->eth = eth;
- 	port->dev = dev;
-+	port->lan = airoha_port_is_lan(np, id);
- 	port->id = id;
- 	eth->ports[p] = port;
- 
-diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index 48c2139..ecbd37d 100644
---- a/drivers/net/ethernet/airoha/airoha_eth.h
-+++ b/drivers/net/ethernet/airoha/airoha_eth.h
-@@ -537,7 +537,8 @@ struct airoha_gdm_port {
- 	struct airoha_eth *eth;
- 	struct net_device *dev;
- 	int id;
- 	int nbq;
-+	bool lan;
- 
- #if defined(CONFIG_PCS_AIROHA)
- 	struct phylink *phylink;
-@@ -636,11 +637,7 @@ u32 airoha_rmw(void __iomem *base, u32 offset, u32 mask, u32 val);
- 
- static inline bool airoha_is_lan_gdm_port(struct airoha_gdm_port *port)
- {
--	/* GDM1 port on EN7581 SoC is connected to the lan dsa switch.
--	 * GDM{2,3,4} can be used as wan port connected to an external
--	 * phy module.
--	 */
--	return port->id == 1;
-+	return port->lan;
- }
- 
- static inline bool airoha_is_7581(struct airoha_eth *eth)
--- 
-2.43.0
+ static int airoha_set_macaddr(struct airoha_gdm_dev *dev, const u8 *addr)
+@@ -3894,4 +3907,7 @@ static int airoha_alloc_gdm_device(struc
+ 	dev->port = port;
+ 	dev->eth = eth;
+ 	dev->nbq = nbq;
++	if (!airoha_dev_is_lan(np, port->id))
++		dev->flags |= AIROHA_PRIV_F_WAN;
++
+ 	port->devs[index] = dev;
