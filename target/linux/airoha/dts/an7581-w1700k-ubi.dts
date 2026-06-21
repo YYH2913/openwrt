@@ -339,6 +339,7 @@
 
 &gdm4 {
 	status = "okay";
+	airoha,lan-port;
 
 	managed = "in-band-status";
 	phy-handle = <&phy5>;
