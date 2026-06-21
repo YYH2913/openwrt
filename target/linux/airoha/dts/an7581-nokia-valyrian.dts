@@ -494,6 +494,7 @@
 
 &gdm4 {
 	status = "okay";
+	airoha,lan-port;
 
 	managed = "in-band-status";
 	phy-handle = <&as21xx>;
