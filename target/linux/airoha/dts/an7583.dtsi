@@ -591,8 +591,6 @@
 			reset-names = "mac", "phy", "xfi";
 
 			airoha,scu = <&scuclk>;
-
-			#pcs-cells = <0>;
 		};
 
 		eth_pcs: pcs@1fa09000 {
@@ -615,8 +613,6 @@
 			reset-names = "mac", "phy";
 
 			airoha,scu = <&scuclk>;
-
-			#pcs-cells = <0>;
 		};
 
 		eth: ethernet@1fb50000 {
