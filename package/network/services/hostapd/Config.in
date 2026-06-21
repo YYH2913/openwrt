@@ -33,15 +33,24 @@ config WPA_WOLFSSL
 
 config DRIVER_11AC_SUPPORT
 	bool
+	default y if TARGET_airoha_an7581_DEVICE_gemtek_w1700k-ubi
+	default y if TARGET_airoha_an7581_DEVICE_econet_xr1710g-ubi
+	default y if TARGET_airoha_an7581_DEVICE_nokia_valyrian
 	default n
 
 config DRIVER_11AX_SUPPORT
 	bool
+	default y if TARGET_airoha_an7581_DEVICE_gemtek_w1700k-ubi
+	default y if TARGET_airoha_an7581_DEVICE_econet_xr1710g-ubi
+	default y if TARGET_airoha_an7581_DEVICE_nokia_valyrian
 	default n
 	select WPA_MBO_SUPPORT
 
 config DRIVER_11BE_SUPPORT
 	bool
+	default y if TARGET_airoha_an7581_DEVICE_gemtek_w1700k-ubi
+	default y if TARGET_airoha_an7581_DEVICE_econet_xr1710g-ubi
+	default y if TARGET_airoha_an7581_DEVICE_nokia_valyrian
 	default n
 
 config WPA_ENABLE_WEP
