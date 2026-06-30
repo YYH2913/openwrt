@@ -1,0 +1,50 @@
+From dca2a8c9e7d28c785017aab5e55ba359cb374be0 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 13:57:54 +0800
+Subject: [PATCH 2/2] net: airoha: fix offload provider device link lifetime
+
+airoha_npu_get() and airoha_ppe_get_dev() create their managed device
+links while the consumer is probing. DL_FLAG_AUTOREMOVE_SUPPLIER leaves
+those links behind when the Wi-Fi consumer unbinds, contrary to the
+device-link API contract. A later driver reload can then inherit stale
+consumer state.
+
+Use DL_FLAG_AUTOREMOVE_CONSUMER so the driver core removes both links
+when the consumer probe fails or the consumer unbinds.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c | 2 +-
+ drivers/net/ethernet/airoha/airoha_ppe.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index 68a6667..f24d1d6 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -704,7 +704,7 @@ struct airoha_npu *airoha_npu_get(struct device *dev)
+ 		goto error_module_put;
+ 	}
+ 
+-	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER)) {
++	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+ 		dev_err(&pdev->dev,
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 743d208..6c01d58 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2292,7 +2292,7 @@ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ 	if (!eth)
+ 		goto error_module_put;
+ 
+-	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER)) {
++	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+ 		dev_err(&pdev->dev,
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
+-- 
+2.43.0
+

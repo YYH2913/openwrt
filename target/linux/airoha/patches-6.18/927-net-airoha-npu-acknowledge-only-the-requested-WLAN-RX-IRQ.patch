@@ -1,0 +1,36 @@
+From 2b1f16ab4176b6d809fdee4c5f813ceeba03a169 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 18:04:15 +0800
+Subject: [PATCH] net: airoha: npu: acknowledge only the requested WLAN RX IRQ
+
+REG_IRQ_STATUS contains the pending bits for both WLAN RX rings. The
+mt76 handler writes the value returned by wlan_get_irq_status() back to
+this write-one-to-clear register. Returning the complete register lets
+one ring handler clear the other ring pending bit.
+
+Mask the status with the requested ring bit, matching the per-ring
+interrupt handling in the Airoha SDK.
+
+Fixes: 03b7ca3ee5e1 ("net: airoha: npu: Add wlan irq management callbacks")
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index f24d1d6..90f21df 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -660,7 +660,7 @@ static u32 airoha_npu_wlan_irq_status_get(struct airoha_npu *npu, int q)
+ 	u32 val;
+ 
+ 	regmap_read(npu->regmap, REG_IRQ_STATUS, &val);
+-	return val;
++	return val & NPU_IRQ_RX_MASK(q);
+ }
+ 
+ static void airoha_npu_wlan_irq_enable(struct airoha_npu *npu, int q)
+-- 
+2.43.0
+

@@ -1,0 +1,131 @@
+From 6668b939b81d2f8479afffcd5e0b6dec15bb8e5f Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 11:23:21 +0800
+Subject: [PATCH] net: airoha: npu: fix watchdog work lifetime
+
+Register a cancellation action before each watchdog IRQ so devres
+unwinding frees the IRQ before synchronizing its work item. This closes
+probe-failure and remove races where an IRQ could queue work after the
+manual remove callback had canceled it.
+
+Expose a recovery wait helper and retain the last recovery status so
+consumers that encounter -EAGAIN can wait for the active recovery instead
+of rebooting the core a second time.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c  | 34 ++++++++++++++++-------
+ include/linux/soc/airoha/airoha_offload.h |  7 +++++
+ 2 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index 5a82867..949bae3 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -330,6 +330,7 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+ 
+ out:
+ 	spin_lock_bh(&npu->cores[0].lock);
++	npu->recovery_err = err;
+ 	npu->recovering = false;
+ 	spin_unlock_bh(&npu->cores[0].lock);
+ 	mutex_unlock(&npu->recovery_lock);
+@@ -343,6 +344,18 @@ int airoha_npu_recover(struct airoha_npu *npu)
+ }
+ EXPORT_SYMBOL_GPL(airoha_npu_recover);
+ 
++int airoha_npu_wait_recovery(struct airoha_npu *npu)
++{
++	int err;
++
++	mutex_lock(&npu->recovery_lock);
++	err = npu->recovery_err;
++	mutex_unlock(&npu->recovery_lock);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wait_recovery);
++
+ static void airoha_npu_wdt_work(struct work_struct *work)
+ {
+ 	struct airoha_npu_core *core;
+@@ -370,6 +383,13 @@ static void airoha_npu_wdt_work(struct work_struct *work)
+ 		dev_err(npu->dev, "failed to restart NPU core %d\n", c);
+ }
+ 
++static void airoha_npu_cancel_wdt_work(void *data)
++{
++	struct airoha_npu_core *core = data;
++
++	cancel_work_sync(&core->wdt_work);
++}
++
+ static irqreturn_t airoha_npu_wdt_handler(int irq, void *core_instance)
+ {
+ 	struct airoha_npu_core *core = core_instance;
+@@ -803,6 +823,10 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 		spin_lock_init(&core->lock);
+ 		core->npu = npu;
+ 		INIT_WORK(&core->wdt_work, airoha_npu_wdt_work);
++		err = devm_add_action_or_reset(dev, airoha_npu_cancel_wdt_work,
++					       core);
++		if (err)
++			return err;
+ 
+ 		irq = platform_get_irq(pdev, i + 1);
+ 		if (irq < 0)
+@@ -858,18 +882,8 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static void airoha_npu_remove(struct platform_device *pdev)
+-{
+-	struct airoha_npu *npu = platform_get_drvdata(pdev);
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(npu->cores); i++)
+-		cancel_work_sync(&npu->cores[i].wdt_work);
+-}
+-
+ static struct platform_driver airoha_npu_driver = {
+ 	.probe = airoha_npu_probe,
+-	.remove = airoha_npu_remove,
+ 	.driver = {
+ 		.name = "airoha-npu",
+ 		.of_match_table = of_airoha_npu_match,
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 03e87b1..4810185 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -176,6 +176,7 @@ struct airoha_npu {
+ 	/* serialize NPU core recovery */
+ 	struct mutex recovery_lock;
+ 	bool recovering;
++	int recovery_err;
+ 
+ 	struct airoha_npu_core {
+ 		struct airoha_npu *npu;
+@@ -221,6 +222,7 @@ struct airoha_npu {
+ struct airoha_npu *airoha_npu_get(struct device *dev);
+ void airoha_npu_put(struct airoha_npu *npu);
+ int airoha_npu_recover(struct airoha_npu *npu);
++int airoha_npu_wait_recovery(struct airoha_npu *npu);
+ 
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
+@@ -283,6 +285,11 @@ static inline int airoha_npu_recover(struct airoha_npu *npu)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int airoha_npu_wait_recovery(struct airoha_npu *npu)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
+ 	return -EOPNOTSUPP;
+-- 
+2.43.0
+

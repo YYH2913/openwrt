@@ -1,0 +1,111 @@
+From 203581db2a9682bfd9ee6fce976d9dfbcfe05573 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 13:57:17 +0800
+Subject: [PATCH 1/2] net: airoha: npu: close recovery synchronization race
+
+The recovery flag is checked while holding the selected mailbox core
+lock, but recovery currently updates it under the core 0 lock only. This
+is sufficient while all messages are forced through core 0, but it
+becomes a data race as soon as another mailbox core is enabled.
+
+Use an atomic recovery flag and, after setting it, acquire and release
+every core lock to drain requests which already passed the check. New
+requests then fail with -EAGAIN until the restart sequence and recovery
+status update are complete.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c  | 19 ++++++++++---------
+ include/linux/soc/airoha/airoha_offload.h |  3 ++-
+ 2 files changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index e96d754..68a6667 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -174,7 +174,7 @@ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 		return ret;
+ 
+ 	spin_lock_bh(&npu->cores[core].lock);
+-	if (npu->recovering) {
++	if (atomic_read(&npu->recovering)) {
+ 		ret = -EAGAIN;
+ 		goto unlock;
+ 	}
+@@ -304,24 +304,26 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&npu->recovery_lock);
++	atomic_set(&npu->recovering, 1);
++
++	/* Drain mailbox requests which passed the recovery check. */
++	for (i = 0; i < ARRAY_SIZE(npu->cores); i++) {
++		spin_lock_bh(&npu->cores[i].lock);
++		spin_unlock_bh(&npu->cores[i].lock);
++	}
+ 
+-	spin_lock_bh(&npu->cores[0].lock);
+-	npu->recovering = true;
+ 	err = regmap_read(npu->regmap, REG_CR_BOOT_CONFIG, &val);
+-	spin_unlock_bh(&npu->cores[0].lock);
+ 	if (err)
+ 		goto out;
+ 
+ 	val = (val & GENMASK(7, 0)) | BIT(8 + core);
+ 	for (i = 0; i < 2; i++) {
+-		spin_lock_bh(&npu->cores[0].lock);
+ 		err = regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, val);
+ 		if (!err && !core)
+ 			err = regmap_write(npu->regmap, REG_CR_NPU_MIB(0),
+ 					   U32_MAX);
+ 		if (!err)
+ 			err = regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 2);
+-		spin_unlock_bh(&npu->cores[0].lock);
+ 		if (err)
+ 			break;
+ 
+@@ -329,10 +331,8 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+ 	}
+ 
+ out:
+-	spin_lock_bh(&npu->cores[0].lock);
+ 	npu->recovery_err = err;
+-	npu->recovering = false;
+-	spin_unlock_bh(&npu->cores[0].lock);
++	atomic_set(&npu->recovering, 0);
+ 	mutex_unlock(&npu->recovery_lock);
+ 
+ 	return err;
+@@ -786,6 +786,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 
+ 	npu->dev = dev;
+ 	mutex_init(&npu->recovery_lock);
++	atomic_set(&npu->recovering, 0);
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
+ 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 4810185..be53f4f 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -6,6 +6,7 @@
+ #ifndef AIROHA_OFFLOAD_H
+ #define AIROHA_OFFLOAD_H
+ 
++#include <linux/atomic.h>
+ #include <linux/mutex.h>
+ #include <linux/skbuff.h>
+ #include <linux/spinlock.h>
+@@ -175,7 +176,7 @@ struct airoha_npu {
+ 	struct regmap *regmap;
+ 	/* serialize NPU core recovery */
+ 	struct mutex recovery_lock;
+-	bool recovering;
++	atomic_t recovering;
+ 	int recovery_err;
+ 
+ 	struct airoha_npu_core {
+-- 
+2.43.0
+
