@@ -19,18 +19,21 @@ current skb or reusing it for the opposite direction.
 
 Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
---- a/net/netfilter/nft_flow_offload.c
-+++ b/net/netfilter/nft_flow_offload.c
-@@ -8,6 +8,7 @@
+diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -7,6 +7,7 @@
  #include <linux/spinlock.h>
  #include <linux/netfilter/nf_conntrack_common.h>
  #include <linux/netfilter/nf_tables.h>
 +#include <net/flow_dissector.h>
  #include <net/ip.h>
- #include <net/flow.h>
- #include <net/route.h>
-@@ -137,6 +138,41 @@
+ #include <net/inet_dscp.h>
+ #include <net/netfilter/nf_tables.h>
+@@ -117,6 +118,41 @@
  	return __dev_fill_forward_path(ctx, ha, stack);
  }
  
@@ -72,7 +75,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  static void nft_br_vlan_dev_fill_forward_path(const struct nft_pktinfo *pkt,
  					      struct net_device_path_ctx *ctx)
  {
-@@ -211,12 +247,17 @@
+@@ -191,12 +227,17 @@
  		case DEV_PATH_ETHERNET:
  		case DEV_PATH_DSA:
  		case DEV_PATH_VLAN:
@@ -90,7 +93,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  			if (path->type == DEV_PATH_DSA) {
  				i = stack->num_paths;
  				break;
-@@ -311,12 +352,15 @@
+@@ -288,12 +329,15 @@
  		.dev	= dst->dev,
  	};
  	struct nft_forward_info info = {};
@@ -104,5 +107,5 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +	nft_flow_keys_init(ct, dir, &flow);
 +	ctx.flow = &flow;
  
- 	if (nft_flow_offload_is_bridging(pkt->skb)) {
- 		enum ip_conntrack_info pkt_ctinfo;
+ 	if (nft_flow_offload_is_bridging(pkt->skb) &&
+ 	    skb_mac_header_was_set(pkt->skb)) {

@@ -23,7 +23,7 @@ index eef8234..08d0936 100644
  #define AIROHA_MAX_NUM_GDM_PORTS	4
  #define AIROHA_MAX_NUM_GDM_DEVS		2
  #define AIROHA_MAX_NUM_QDMA		2
-@@ -200,18 +202,31 @@ struct airoha_queue {
+@@ -211,19 +213,32 @@ struct airoha_queue {
  	spinlock_t lock;
  	struct airoha_queue_entry *entry;
  	struct airoha_qdma_desc *desc;
@@ -39,6 +39,7 @@ index eef8234..08d0936 100644
  	int free_thr;
  	int buf_size;
  	bool txq_stopped;
+ 	bool flushing;
 +	bool rx_coherent;
 +	bool rx_drop_chain;
 +	void *rx_coherent_buf;
