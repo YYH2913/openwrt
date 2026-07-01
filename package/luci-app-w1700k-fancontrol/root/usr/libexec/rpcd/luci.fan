@@ -10,7 +10,7 @@ find_nct7802() {
 			return
 		fi
 	done
-	echo ""
+	echo "/sys/class/hwmon/hwmon5"  # fallback
 }
 
 # Dynamically find mt7996 WiFi hwmon devices
@@ -30,64 +30,34 @@ find_mt7996_hwmon() {
 	echo ""
 }
 
-# Dynamically find PHY hwmon devices if the PHY driver exposes any.
+# Dynamically find PHY hwmon devices (mt7530 DSA)
 find_phy_hwmon() {
 	local suffix="$1"  # :05 or :08
 	for hwmon in /sys/class/hwmon/hwmon*; do
-		[ -d "$hwmon" ] || continue
-
-		local device=$(readlink -f "$hwmon/device" 2>/dev/null)
-		case "$device" in
-			*"$suffix")
-				echo "$hwmon"
-				return
-				;;
-		esac
-
-		local name=$(cat "$hwmon/name" 2>/dev/null)
-		case "$name" in
-			*"$suffix")
-				echo "$hwmon"
-				return
-				;;
-		esac
+		if [ -f "$hwmon/name" ]; then
+			local name=$(cat "$hwmon/name" 2>/dev/null)
+			case "$name" in
+				*"$suffix")
+					echo "$hwmon"
+					return
+					;;
+			esac
+		fi
 	done
 	echo ""
 }
 
 HWMON=$(find_nct7802)
 
-json_temp() {
+read_temp() {
 	local file="$1"
-	local fault="${file%_input}_fault"
-	local temp digits
-
-	if [ ! -f "$file" ]; then
-		echo "null"
-		return
+	local temp=0
+	if [ -f "$file" ]; then
+		temp=$(cat "$file" 2>/dev/null || echo 0)
+		# Convert from milli-celsius to celsius
+		temp=$((temp / 1000))
 	fi
-
-	if [ -f "$fault" ] && [ "$(cat "$fault" 2>/dev/null)" = "1" ]; then
-		echo "null"
-		return
-	fi
-
-	temp=$(cat "$file" 2>/dev/null)
-	digits="${temp#-}"
-	case "$digits" in
-		''|*[!0-9]*)
-			echo "null"
-			return
-			;;
-	esac
-
-	if [ "$temp" -lt -40000 ] 2>/dev/null || [ "$temp" -gt 125000 ] 2>/dev/null; then
-		echo "null"
-		return
-	fi
-
-	# Convert from milli-celsius to celsius.
-	echo $((temp / 1000))
+	echo "$temp"
 }
 
 read_value() {
@@ -100,46 +70,39 @@ read_value() {
 }
 
 get_status() {
-	local temp_cpu temp_board temp_nct_local temp_phy1 temp_phy2
+	local temp_cpu temp_board temp_phy1 temp_phy2
 	local fan_rpm fan_pwm fan_mode fan_percentage
 
 	# Read CPU temperature from thermal zone (AN7581 SoC die temp)
-	temp_cpu=$(json_temp "/sys/class/thermal/thermal_zone0/temp")
+	temp_cpu=$(read_temp "/sys/class/thermal/thermal_zone0/temp")
 
-	# Read temperatures from NCT7802 fan controller.
-	# temp1 is the board thermistor used by the hardware fan curve. temp4 is
-	# the NCT7802 local sensor. temp2 is present on XR1710G but faulted.
-	temp_board="null"
-	temp_nct_local="null"
-	if [ -n "$HWMON" ]; then
-		temp_board=$(json_temp "${HWMON}/temp1_input")
-		temp_nct_local=$(json_temp "${HWMON}/temp4_input")
-	fi
+	# Read temperatures from NCT7802 fan controller (hwmon5)
+	# temp1 = board local (used by hardware fan curve), temp2 = external (disconnected), temp4 = external
+	temp_board=$(read_temp "${HWMON}/temp1_input")
 
-	# Read external RTL8261N PHY temperatures from hwmon:
-	# :05 is LAN1, :08 is WAN on XR1710G.
+	# Read PHY temperatures from mt7530 DSA switch sensors (dynamic lookup)
 	local phy1_hwmon=$(find_phy_hwmon ":05")
 	local phy2_hwmon=$(find_phy_hwmon ":08")
-	temp_phy1=$([ -n "$phy1_hwmon" ] && json_temp "$phy1_hwmon/temp1_input" || echo "null")
-	temp_phy2=$([ -n "$phy2_hwmon" ] && json_temp "$phy2_hwmon/temp1_input" || echo "null")
+	temp_phy1=$([ -n "$phy1_hwmon" ] && read_temp "$phy1_hwmon/temp1_input" || echo 0)
+	temp_phy2=$([ -n "$phy2_hwmon" ] && read_temp "$phy2_hwmon/temp1_input" || echo 0)
 
 	# Read fan status
-	fan_rpm=$([ -n "$HWMON" ] && read_value "${HWMON}/fan1_input" || echo 0)
-	fan_pwm=$([ -n "$HWMON" ] && read_value "${HWMON}/pwm1" || echo 0)
-	fan_mode=$([ -n "$HWMON" ] && read_value "${HWMON}/pwm1_enable" || echo 0)
+	fan_rpm=$(read_value "${HWMON}/fan1_input")
+	fan_pwm=$(read_value "${HWMON}/pwm1")
+	fan_mode=$(read_value "${HWMON}/pwm1_enable")
 
 	# Calculate percentage (0-255 -> 0-100)
 	fan_percentage=$((fan_pwm * 100 / 255))
 
 	# Get WiFi temperatures from mt7996 hwmon devices (dynamic lookup)
-	local wifi_24g="null" wifi_5g="null" wifi_6g="null"
+	local wifi_24g=0 wifi_5g=0 wifi_6g=0
 	local wifi_24g_hwmon=$(find_mt7996_hwmon 0)
 	local wifi_5g_hwmon=$(find_mt7996_hwmon 1)
 	local wifi_6g_hwmon=$(find_mt7996_hwmon 2)
 
-	[ -n "$wifi_24g_hwmon" ] && wifi_24g=$(json_temp "$wifi_24g_hwmon/temp1_input")
-	[ -n "$wifi_5g_hwmon" ] && wifi_5g=$(json_temp "$wifi_5g_hwmon/temp1_input")
-	[ -n "$wifi_6g_hwmon" ] && wifi_6g=$(json_temp "$wifi_6g_hwmon/temp1_input")
+	[ -n "$wifi_24g_hwmon" ] && wifi_24g=$(read_temp "$wifi_24g_hwmon/temp1_input")
+	[ -n "$wifi_5g_hwmon" ] && wifi_5g=$(read_temp "$wifi_5g_hwmon/temp1_input")
+	[ -n "$wifi_6g_hwmon" ] && wifi_6g=$(read_temp "$wifi_6g_hwmon/temp1_input")
 
 	# Get current UCI settings
 	local uci_mode=$(uci -q get fan.settings.mode || echo "auto")
@@ -155,8 +118,8 @@ get_status() {
 		3) mode_desc="Auto (Closed Loop)" ;;
 	esac
 
-	printf '{"temp_cpu":%s,"temp_board":%s,"temp_nct_local":%s,"temp_phy1":%s,"temp_phy2":%s,"wifi_24g":%s,"wifi_5g":%s,"wifi_6g":%s,"fan_rpm":%d,"fan_pwm":%d,"fan_percentage":%d,"fan_mode":%d,"fan_mode_desc":"%s","uci_mode":"%s","uci_preset":"%s","uci_manual_pwm":%d}' \
-		"$temp_cpu" "$temp_board" "$temp_nct_local" "$temp_phy1" "$temp_phy2" \
+	printf '{"temp_cpu":%d,"temp_board":%d,"temp_phy1":%d,"temp_phy2":%d,"wifi_24g":%d,"wifi_5g":%d,"wifi_6g":%d,"fan_rpm":%d,"fan_pwm":%d,"fan_percentage":%d,"fan_mode":%d,"fan_mode_desc":"%s","uci_mode":"%s","uci_preset":"%s","uci_manual_pwm":%d}' \
+		"$temp_cpu" "$temp_board" "$temp_phy1" "$temp_phy2" \
 		"$wifi_24g" "$wifi_5g" "$wifi_6g" \
 		"$fan_rpm" "$fan_pwm" "$fan_percentage" \
 		"$fan_mode" "$mode_desc" \

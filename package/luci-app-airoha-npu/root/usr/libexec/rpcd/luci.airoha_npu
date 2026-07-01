@@ -2,37 +2,21 @@
 
 # Airoha SoC Status RPC backend for LuCI (NPU + CPU + Overclock)
 
-export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
-
 . /lib/functions.sh
-
-have_devmem() {
-	command -v devmem > /dev/null 2>&1 && return 0
-	command -v busybox > /dev/null 2>&1 || return 1
-	busybox --list 2>/dev/null | grep -qx 'devmem'
-}
-
-run_devmem() {
-	if command -v devmem > /dev/null 2>&1; then
-		devmem "$@"
-		return $?
-	fi
-
-	if command -v busybox > /dev/null 2>&1 && \
-	   busybox --list 2>/dev/null | grep -qx 'devmem'; then
-		busybox devmem "$@"
-		return $?
-	fi
-
-	return 127
-}
 
 get_status() {
 	# === NPU Status ===
-	local npu_fw="$(ls /lib/firmware/airoha/en7581*npu_rv32.bin 2> /dev/null || true)"
-	local npu_ver="Unknown"
+	# Read the actually-loaded NPU firmware path from DTS (firmware-name property).
+	local npu_fw=""
+	local npu_dt="/proc/device-tree/soc/npu@1e900000/firmware-name"
+	if [ -f "$npu_dt" ]; then
+		# firmware-name is a string list (null-separated). First entry is the rv32 code.
+		local fw_rel=$(tr '\0' '\n' < "$npu_dt" 2>/dev/null | grep -m1 "rv32")
+		[ -n "$fw_rel" ] && npu_fw="/lib/firmware/$fw_rel"
+	fi
 
-	if [ -f "$npu_fw" ]; then
+	local npu_ver="Unknown"
+	if [ -n "$npu_fw" ] && [ -f "$npu_fw" ]; then
 		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
 		[ -z "$npu_ver" ] && npu_ver="Unknown"
 	fi
@@ -102,9 +86,9 @@ get_status() {
 
 	# Read actual PLL frequency from hardware (detects overclock)
 	local pll_freq=0
-	if have_devmem; then
-		local pcw_raw=$(run_devmem 0x1fa202b4 2>/dev/null)
-		local chg_raw=$(run_devmem 0x1fa202b8 2>/dev/null)
+	if command -v devmem > /dev/null 2>&1; then
+		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
+		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
 		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
 			pcw_raw=$((pcw_raw))
 			chg_raw=$((chg_raw))
@@ -314,7 +298,7 @@ set_overclock() {
 		return
 	fi
 
-	if ! have_devmem; then
+	if ! command -v devmem > /dev/null 2>&1; then
 		echo '{"error":"devmem not available"}'
 		return
 	fi
@@ -333,59 +317,59 @@ set_overclock() {
 	echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
 
 	# Read current register values
-	local cur_clkmux=$(($(run_devmem 0x1fa201e0)))
-	local cur_pcw=$(($(run_devmem 0x1fa202b4)))
-	local cur_chg=$(($(run_devmem 0x1fa202b8)))
+	local cur_clkmux=$(($(devmem 0x1fa201e0)))
+	local cur_pcw=$(($(devmem 0x1fa202b4)))
+	local cur_chg=$(($(devmem 0x1fa202b8)))
 
 	# Step 1: Enable PLL2 path in CLK_MUX (set bit 2)
-	run_devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux | 0x4)))
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux | 0x4)))
 
 	# Step 2: MCUCFG switch to PLL2 (sel=3 in bits[10:9])
-	local cur_u=$(($(run_devmem 0x1efbe640)))
-	run_devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u & 0xFFFFFFE0) | 0x12)))
-	local cur_s=$(($(run_devmem 0x1efbe7c0)))
-	run_devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s & 0xFFFFF9FF) | (3 << 9))))
+	local cur_u=$(($(devmem 0x1efbe640)))
+	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u & 0xFFFFFFE0) | 0x12)))
+	local cur_s=$(($(devmem 0x1efbe7c0)))
+	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s & 0xFFFFF9FF) | (3 << 9))))
 
 	# Step 3: Unlock PLL registers
-	local cur_p=$(($(run_devmem 0x1fa20268)))
-	run_devmem 0x1fa20268 32 $(printf "0x%08X" $(((cur_p & 0xFFFFFF00) | 0x12)))
+	local cur_p=$(($(devmem 0x1fa20268)))
+	devmem 0x1fa20268 32 $(printf "0x%08X" $(((cur_p & 0xFFFFFF00) | 0x12)))
 
 	# Step 4: Write new PCW integer
-	run_devmem 0x1fa202b4 32 $(printf "0x%08X" $(((cur_pcw & 0x00FFFFFF) | (pcw_int << 24))))
+	devmem 0x1fa202b4 32 $(printf "0x%08X" $(((cur_pcw & 0x00FFFFFF) | (pcw_int << 24))))
 
 	# Step 5: Write posdiv and toggle CHG bit
 	local chg_bit=$((cur_chg & 1))
 	local cleared=$((cur_chg & 0xFFFFFF8E))
 	if [ "$chg_bit" -eq 1 ]; then
-		run_devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4))))
+		devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4))))
 	else
-		run_devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4) | 1)))
+		devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4) | 1)))
 	fi
 
 	# Step 6: Wait for PLL lock
 	sleep 0.02
 
 	# Step 7: Enable ARMPLL path in CLK_MUX (set bit 0)
-	local cur_clkmux2=$(($(run_devmem 0x1fa201e0)))
-	run_devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux2 | 0x1)))
+	local cur_clkmux2=$(($(devmem 0x1fa201e0)))
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux2 | 0x1)))
 
 	# Step 8: MCUCFG switch back to ARMPLL
-	local cur_u2=$(($(run_devmem 0x1efbe640)))
-	run_devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u2 & 0xFFFFFFE0) | 0x12)))
-	local cur_s2=$(($(run_devmem 0x1efbe7c0)))
-	run_devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s2 & 0xFFFFF9FF) | (1 << 9))))
+	local cur_u2=$(($(devmem 0x1efbe640)))
+	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u2 & 0xFFFFFFE0) | 0x12)))
+	local cur_s2=$(($(devmem 0x1efbe7c0)))
+	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s2 & 0xFFFFF9FF) | (1 << 9))))
 
 	# Step 9: Clear PLL2 path in CLK_MUX
-	local cur_clkmux3=$(($(run_devmem 0x1fa201e0)))
-	run_devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux3 & 0xFFFFFFFB)))
+	local cur_clkmux3=$(($(devmem 0x1fa201e0)))
+	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux3 & 0xFFFFFFFB)))
 
 	# Step 10: Re-lock PLL registers
-	local cur_p2=$(($(run_devmem 0x1fa20268)))
-	run_devmem 0x1fa20268 32 $(printf "0x%08X" $((cur_p2 & 0xFFFFFF00)))
+	local cur_p2=$(($(devmem 0x1fa20268)))
+	devmem 0x1fa20268 32 $(printf "0x%08X" $((cur_p2 & 0xFFFFFF00)))
 
 	# Verify
-	local final_pcw=$(($(run_devmem 0x1fa202b4)))
-	local final_chg=$(($(run_devmem 0x1fa202b8)))
+	local final_pcw=$(($(devmem 0x1fa202b4)))
+	local final_chg=$(($(devmem 0x1fa202b8)))
 	local read_pcw=$(( (final_pcw >> 24) & 0x7F ))
 	local read_posdiv=$(( (final_chg >> 4) & 7 ))
 	local read_freq
@@ -399,270 +383,127 @@ set_overclock() {
 		"$target_mhz" "$read_freq" "$read_pcw" "$read_posdiv"
 }
 
-devmem_read32() {
-	local addr="$1"
-	local out
-
-	out="$(run_devmem "$addr" 32 2>/dev/null)" || return 1
-	[ -n "$out" ] || return 1
-
-	printf '%u\n' "$((out))"
-}
-
-read_netdev_stat() {
-	local dev="$1"
-	local stat="$2"
-	local path="/sys/class/net/$dev/statistics/$stat"
-
-	[ -r "$path" ] || return 1
-	cat "$path" 2>/dev/null || return 1
-}
-
-read_of_reg_be32() {
-	local file="$1"
-	local hex
-
-	[ -r "$file" ] || return 1
-	hex="$(hexdump -v -n 4 -e '1/1 "%02x"' "$file" 2>/dev/null)" || return 1
-	[ ${#hex} -eq 8 ] || return 1
-
-	printf '%u\n' "$((0x$hex))"
-}
-
-find_gdm_netdev() {
-	local port_id="$1"
-	local netdev path driver reg of_reg
-
-	for path in /sys/class/net/*; do
-		[ -e "$path/device/driver" ] || continue
-
-		driver="$(basename "$(readlink -f "$path/device/driver" 2>/dev/null)")"
-		case "$driver" in
-			airoha*eth|*airoha*eth*) ;;
-			*) continue ;;
-		esac
-
-		of_reg="$path/of_node/reg"
-		[ -r "$of_reg" ] || of_reg="$path/device/of_node/reg"
-		[ -r "$of_reg" ] || continue
-
-		reg="$(read_of_reg_be32 "$of_reg")" || continue
-		[ "$reg" -eq "$port_id" ] || continue
-
-		netdev="${path##*/}"
-		printf '%s\n' "$netdev"
-		return 0
-	done
-
-	return 1
-}
-
-load_gdm_stats_from_netdev() {
-	local prefix="$1"
-	local port_id="$2"
-	local dev tx rx txd rxd
-
-	dev="$(find_gdm_netdev "$port_id")" || return 1
-	tx="$(read_netdev_stat "$dev" tx_packets)" || return 1
-	rx="$(read_netdev_stat "$dev" rx_packets)" || return 1
-	txd="$(read_netdev_stat "$dev" tx_dropped)" || return 1
-	rxd="$(read_netdev_stat "$dev" rx_dropped)" || return 1
-
-	eval "${prefix}_source=\"netdev\""
-	eval "${prefix}_dev=\"\$dev\""
-	eval "${prefix}_tx=$tx"
-	eval "${prefix}_rx=$rx"
-	eval "${prefix}_txd=$txd"
-	eval "${prefix}_rxd=$rxd"
-
-	return 0
-}
-
-load_gdm_stats_from_mmio() {
-	local prefix="$1"
-	local port_id="$2"
-	local tx txd rx rxd
-
-	case "$port_id" in
-	1)
-		tx="$(devmem_read32 0x1fb50604)" || return 1
-		txd="$(devmem_read32 0x1fb50608)" || return 1
-		rx="$(devmem_read32 0x1fb50648)" || return 1
-		rxd="$(devmem_read32 0x1fb5064c)" || return 1
-		;;
-	2)
-		tx="$(devmem_read32 0x1fb51604)" || return 1
-		txd="$(devmem_read32 0x1fb51608)" || return 1
-		rx="$(devmem_read32 0x1fb51648)" || return 1
-		rxd="$(devmem_read32 0x1fb5164c)" || return 1
-		;;
-	4)
-		tx="$(devmem_read32 0x1fb52604)" || return 1
-		txd="$(devmem_read32 0x1fb52608)" || return 1
-		rx="$(devmem_read32 0x1fb52648)" || return 1
-		rxd="$(devmem_read32 0x1fb5264c)" || return 1
-		;;
-	esac
-
-	eval "${prefix}_source=\"mmio\""
-	eval "${prefix}_tx=$tx"
-	eval "${prefix}_rx=$rx"
-	eval "${prefix}_txd=$txd"
-	eval "${prefix}_rxd=$rxd"
-
-	return 0
-}
-
-json_gdm() {
-	local prefix="$1"
-	local tx rx txd rxd dev source
-
-	eval "tx=\${${prefix}_tx}"
-	eval "rx=\${${prefix}_rx}"
-	eval "txd=\${${prefix}_txd}"
-	eval "rxd=\${${prefix}_rxd}"
-	eval "dev=\${${prefix}_dev}"
-	eval "source=\${${prefix}_source}"
-
-	: "${tx:=null}"
-	: "${rx:=null}"
-	: "${txd:=null}"
-	: "${rxd:=null}"
-	: "${source:=unknown}"
-
-	if [ -n "$dev" ]; then
-		printf '{"tx":%s,"tx_drop":%s,"rx":%s,"rx_drop":%s,"source":"%s","dev":"%s"}' \
-			"$tx" "$txd" "$rx" "$rxd" "$source" "$dev"
-	else
-		printf '{"tx":%s,"tx_drop":%s,"rx":%s,"rx_drop":%s,"source":"%s"}' \
-			"$tx" "$txd" "$rx" "$rxd" "$source"
-	fi
-}
-
-json_null_pse_ports() {
-	local i first=1
-
-	printf '['
-	for i in 0 1 2 3 4 5 6 7 8 9; do
-		[ "$first" -eq 1 ] || printf ','
-		first=0
-		printf '{"port":%d,"iq":null,"oq":null,"drops":null}' "$i"
-	done
-	printf ']'
-}
-
 get_frame_engine() {
-	local has_devmem=0
-	local mmio_valid=false
-	local pse_ports pse_used_json="null" pse_free_json="null"
-	local pse_budget_json="null" pse_reserved_json="null" pse_total_json="null"
-	local pse_runtime_json=false
-	local cdm1_json='{"tx":null,"rx_cpu":null,"rx_hwf":null,"rx_cpu_drop":null,"rx_hwf_drop":null}'
-	local cdm2_json='{"tx":null,"rx_cpu":null,"rx_hwf":null,"rx_cpu_drop":null,"rx_hwf_drop":null}'
-	local gdm_mmio_activity=0 gdm_netdev_activity=0
-
-	have_devmem && has_devmem=1
-
-	load_gdm_stats_from_netdev gdm1 1 || [ "$has_devmem" -eq 0 ] || load_gdm_stats_from_mmio gdm1 1 || true
-	load_gdm_stats_from_netdev gdm2 2 || [ "$has_devmem" -eq 0 ] || load_gdm_stats_from_mmio gdm2 2 || true
-	load_gdm_stats_from_netdev gdm4 4 || [ "$has_devmem" -eq 0 ] || load_gdm_stats_from_mmio gdm4 4 || true
-
-	gdm_netdev_activity=$(( ${gdm1_tx:-0} + ${gdm1_rx:-0} + ${gdm2_tx:-0} + ${gdm2_rx:-0} + ${gdm4_tx:-0} + ${gdm4_rx:-0} ))
+	if ! command -v devmem > /dev/null 2>&1; then
+		echo '{"error":"devmem not available"}'
+		return
+	fi
 
 	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
-	if [ "$has_devmem" -eq 1 ]; then
-		local i reg_q reg_d qval dval iq oq first=1
-		local pse_ports_tmp=""
-		local pse_used pse_free pse_budget pse_reserved pse_total
-		local cdm1_tx cdm1_rxcpu cdm1_rxhwf cdm1_rxcpud cdm1_rxhwfd
-		local cdm2_tx cdm2_rxcpu cdm2_rxhwf cdm2_rxcpud cdm2_rxhwfd
-		local mmio_ok=1 cdm_mmio_ok=0 pse_cfg_ok=1
+	local i reg_q reg_d pse_ports=""
+	for i in 0 1 2 3 4 5 6 7 8 9; do
+		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
+		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
+		local qval=$(($(devmem $reg_q)))
+		local dval=$(($(devmem $reg_d)))
+		local iq=$(( (qval >> 16) & 0xFFFF ))
+		local oq=$(( qval & 0xFFFF ))
+		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
+		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
+	done
 
-		local fq_cfg buf_set
-		fq_cfg="$(devmem_read32 0x1fb5008c)" || pse_cfg_ok=0
-		buf_set="$(devmem_read32 0x1fb50090)" || pse_cfg_ok=0
-		if [ "$pse_cfg_ok" -eq 1 ]; then
-			pse_total=$(( fq_cfg & 0x7FFF ))
-			pse_reserved=$(( buf_set & 0x7FFF ))
-			pse_budget=$(( pse_total - pse_reserved ))
-			[ "$pse_budget" -ge 0 ] || pse_budget=0
-			pse_budget_json="$pse_budget"
-			pse_reserved_json="$pse_reserved"
-			pse_total_json="$pse_total"
-		fi
+	# PSE shared buffer
+	local psb=$(($(devmem 0x1fb50104)))
+	local pse_used=$(( (psb >> 16) & 0xFFFF ))
+	local pse_free=$(( psb & 0x7FFF ))
 
-		for i in 0 1 2 3 4 5 6 7 8 9; do
-			reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
-			reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
-			qval="$(devmem_read32 "$reg_q")" || { mmio_ok=0; break; }
-			dval="$(devmem_read32 "$reg_d")" || { mmio_ok=0; break; }
-			iq=$(( (qval >> 16) & 0xFFFF ))
-			oq=$(( qval & 0xFFFF ))
-			[ "$first" -eq 1 ] || pse_ports_tmp="${pse_ports_tmp},"
-			first=0
-			pse_ports_tmp="${pse_ports_tmp}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
-		done
-		[ "$mmio_ok" -eq 1 ] && pse_ports="[$pse_ports_tmp]"
+	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
+	# Read as hex to handle large 32-bit counters
+	local gdm1_tx=$(($(devmem 0x1fb50604)))
+	local gdm1_txd=$(($(devmem 0x1fb50608)))
+	local gdm1_rx=$(($(devmem 0x1fb50648)))
+	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
 
-		if [ "$mmio_ok" -eq 1 ]; then
-			local psb
-			psb="$(devmem_read32 0x1fb50104)" || mmio_ok=0
-			if [ "$mmio_ok" -eq 1 ]; then
-				pse_used=$(( (psb >> 16) & 0xFFFF ))
-				pse_free=$(( psb & 0x7FFF ))
-				pse_used_json="$pse_used"
-				pse_free_json="$pse_free"
-				pse_runtime_json=true
-			fi
-		fi
+	local gdm2_tx=$(($(devmem 0x1fb51604)))
+	local gdm2_txd=$(($(devmem 0x1fb51608)))
+	local gdm2_rx=$(($(devmem 0x1fb51648)))
+	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
 
-		if [ "$mmio_ok" -eq 1 ]; then
-			cdm1_tx="$(devmem_read32 0x1fb50580)" || mmio_ok=0
-			cdm1_rxcpu="$(devmem_read32 0x1fb50590)" || mmio_ok=0
-			cdm1_rxhwf="$(devmem_read32 0x1fb50594)" || mmio_ok=0
-			cdm1_rxcpud="$(devmem_read32 0x1fb505a0)" || mmio_ok=0
-			cdm1_rxhwfd="$(devmem_read32 0x1fb505a4)" || mmio_ok=0
-			cdm2_tx="$(devmem_read32 0x1fb51580)" || mmio_ok=0
-			cdm2_rxcpu="$(devmem_read32 0x1fb51590)" || mmio_ok=0
-			cdm2_rxhwf="$(devmem_read32 0x1fb51594)" || mmio_ok=0
-			cdm2_rxcpud="$(devmem_read32 0x1fb515a0)" || mmio_ok=0
-			cdm2_rxhwfd="$(devmem_read32 0x1fb515a4)" || mmio_ok=0
-			[ "$mmio_ok" -eq 1 ] && cdm_mmio_ok=1
-		fi
+	local gdm4_tx=$(($(devmem 0x1fb52604)))
+	local gdm4_txd=$(($(devmem 0x1fb52608)))
+	local gdm4_rx=$(($(devmem 0x1fb52648)))
+	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
 
-		if [ "$cdm_mmio_ok" -eq 1 ]; then
-			cdm1_json=$(printf '{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}' \
-				"$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd")
-			cdm2_json=$(printf '{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}' \
-				"$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd")
-		fi
+	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
+	local cdm1_tx=$(($(devmem 0x1fb50580)))
+	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
+	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
+	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
+	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
 
-		if [ "$mmio_ok" -eq 1 ]; then
-			gdm_mmio_activity=$(( ${pse_used:-0} + ${pse_free:-0} + ${cdm1_tx:-0} + ${cdm1_rxcpu:-0} + ${cdm1_rxhwf:-0} + ${cdm2_tx:-0} + ${cdm2_rxcpu:-0} + ${cdm2_rxhwf:-0} ))
-			if [ "$gdm_netdev_activity" -gt 0 ] && [ "$gdm_mmio_activity" -eq 0 ]; then
-				mmio_ok=0
-			fi
-		fi
+	local cdm2_tx=$(($(devmem 0x1fb51580)))
+	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
+	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
+	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
+	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
 
-		if [ "$mmio_ok" -eq 1 ]; then
-			mmio_valid=true
-		fi
+	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
+	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
+	printf '"gdm2":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm2_tx" "$gdm2_txd" "$gdm2_rx" "$gdm2_rxd"
+	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
+	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
+	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
+}
+
+get_vlan_offload() {
+	local val
+	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null)
+	printf '{"enabled":%d}' "${val:-0}"
+}
+
+set_vlan_offload() {
+	local enabled
+	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
+
+	# jsonfilter returns empty string for integer 0; treat empty as 0
+	[ -z "$enabled" ] && enabled="0"
+
+	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
+		echo '{"error":"enabled must be 0 or 1"}'
+		return
 	fi
 
-	[ -n "$pse_ports" ] || pse_ports="$(json_null_pse_ports)"
+	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
+		echo '{"error":"failed - bridge module may not be loaded"}'
+		return
+	fi
 
-	printf '{"mmio_valid":%s,"pse_ports":%s,"pse_used":%s,"pse_free":%s,"pse_runtime":%s,"pse_budget":%s,"pse_reserved":%s,"pse_total":%s,' \
-		"$mmio_valid" "$pse_ports" "$pse_used_json" "$pse_free_json" "$pse_runtime_json" "$pse_budget_json" "$pse_reserved_json" "$pse_total_json"
-	printf '"gdm1":%s,' "$(json_gdm gdm1)"
-	printf '"gdm2":%s,' "$(json_gdm gdm2)"
-	printf '"gdm4":%s,' "$(json_gdm gdm4)"
-	printf '"cdm1":%s,' "$cdm1_json"
-	printf '"cdm2":%s}' "$cdm2_json"
+	# Persist across reboots
+	echo "net.bridge.bridge-nf-filter-vlan-tagged=$enabled" > /etc/sysctl.d/14-vlan-offload.conf
+	printf '{"result":"ok","enabled":%d}' "$enabled"
+}
+
+get_pppoe_offload() {
+	local val
+	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
+	printf '{"enabled":%d}' "${val:-0}"
+}
+
+set_pppoe_offload() {
+	local enabled
+	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
+
+	# jsonfilter returns empty string for integer 0; treat empty as 0
+	[ -z "$enabled" ] && enabled="0"
+
+	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
+		echo '{"error":"enabled must be 0 or 1"}'
+		return
+	fi
+
+	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
+		echo '{"error":"failed - bridge module may not be loaded"}'
+		return
+	fi
+
+	# Persist across reboots
+	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$enabled" > /etc/sysctl.d/15-pppoe-offload.conf
+	printf '{"result":"ok","enabled":%d}' "$enabled"
 }
 
 case "$1" in
 	list)
-		echo '{"getStatus":{},"getPpeEntries":{},"getTokenInfo":{},"getFrameEngine":{},"setGovernor":{"governor":"str"},"setMaxFreq":{"freq":"int"},"setOverclock":{"freq_mhz":"int"}}'
+		echo '{"getStatus":{},"getPpeEntries":{},"getTokenInfo":{},"getFrameEngine":{},"setGovernor":{"governor":"str"},"setMaxFreq":{"freq":"int"},"setOverclock":{"freq_mhz":"int"},"getVlanOffload":{},"setVlanOffload":{"enabled":"int"},"getPPPoEOffload":{},"setPPPoEOffload":{"enabled":"int"}}'
 		;;
 	call)
 		case "$2" in
@@ -689,6 +530,20 @@ case "$1" in
 				;;
 			getFrameEngine)
 				get_frame_engine
+				;;
+			getVlanOffload)
+				get_vlan_offload
+				;;
+			setVlanOffload)
+				read input
+				set_vlan_offload "$input"
+				;;
+			getPPPoEOffload)
+				get_pppoe_offload
+				;;
+			setPPPoEOffload)
+				read input
+				set_pppoe_offload "$input"
 				;;
 			*)
 				echo '{"error":"Invalid method"}'
