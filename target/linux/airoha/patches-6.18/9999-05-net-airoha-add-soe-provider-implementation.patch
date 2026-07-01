@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..a591a7a
 --- /dev/null
 +++ b/drivers/net/ethernet/airoha/airoha_soe.c
-@@ -0,0 +1,1921 @@
+@@ -0,0 +1,1927 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Airoha Secure Offload Engine (SOE) provider for the Ethernet driver.
 + *
@@ -924,7 +924,7 @@ index 0000000..a591a7a
 +
 +	airoha_soe_push_hop_desc(skb, sa->index, encrypt, foe_idx);
 +
-+	skb->dev = dev->dev;
++	skb->dev = netdev_from_priv(dev);
 +	skb_set_queue_mapping(skb, AIROHA_SOE_QDMA_TX_RING);
 +
 +	if (!dev->soe_xmit_skb)
@@ -1376,11 +1376,13 @@ index 0000000..a591a7a
 +	if (!state || !state->sa)
 +		return -ENODEV;
 +
-+	if (!state->dev || !state->dev->dev || !state->dev->eth ||
-+	    !(state->dev->dev->features & NETIF_F_HW_ESP))
++	if (!state->dev || !state->dev->eth)
 +		return -ENODEV;
 +
-+	state_dev = state->dev->dev;
++	state_dev = netdev_from_priv(state->dev);
++	if (!(state_dev->features & NETIF_F_HW_ESP))
++		return -ENODEV;
++
 +	if (state_dev != lower_dev) {
 +		struct airoha_gdm_dev *lower_gdm;
 +
@@ -1549,6 +1551,7 @@ index 0000000..a591a7a
 +{
 +	struct airoha_soe_xfrm_state *state;
 +	struct net_device *lower_dev = x->xso.dev;
++	struct net_device *state_dev;
 +	unsigned long handle;
 +	int err = -EHOSTUNREACH;
 +
@@ -1557,9 +1560,12 @@ index 0000000..a591a7a
 +
 +	handle = xfrm_dev_state_lower_handle(x, lower_dev);
 +	state = (struct airoha_soe_xfrm_state *)handle;
-+	if (!state || !state->sa || !state->dev || !state->dev->dev ||
-+	    state->dev->dev->xfrmdev_ops != &airoha_soe_xfrmdev_ops ||
-+	    !(state->dev->dev->features & NETIF_F_HW_ESP))
++	if (!state || !state->sa || !state->dev)
++		goto drop;
++
++	state_dev = netdev_from_priv(state->dev);
++	if (state_dev->xfrmdev_ops != &airoha_soe_xfrmdev_ops ||
++	    !(state_dev->features & NETIF_F_HW_ESP))
 +		goto drop;
 +
 +	if (skb_is_gso(skb))
