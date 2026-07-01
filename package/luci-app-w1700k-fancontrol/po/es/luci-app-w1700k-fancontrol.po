@@ -12,8 +12,8 @@ msgstr ""
 "X-Generator: Poedit 3.8\n"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:129
-msgid "LAN1 PHY"
-msgstr "PHY de LAN1"
+msgid "10G PHY"
+msgstr "PHY de 10G"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:137
 msgid "2.4 GHz Radio"
@@ -150,8 +150,8 @@ msgid "Status"
 msgstr "Estado"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:130
-msgid "WAN PHY"
-msgstr "PHY de WAN"
+msgid "Switch PHY"
+msgstr "PHY del conmutador"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:125
 msgid "System"
