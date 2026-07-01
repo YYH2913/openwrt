@@ -35,13 +35,13 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	int			num_vlans;
 @@ -3359,6 +3361,9 @@ int dev_get_iflink(const struct net_devi
  int dev_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb);
- int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
- 			  struct net_device_path_stack *stack);
+ int __dev_fill_forward_path(struct net_device_path_ctx *ctx, const u8 *daddr,
+ 			    struct net_device_path_stack *stack);
 +int dev_fill_forward_path_flow(const struct net_device *dev, const u8 *daddr,
 +			       const struct flow_keys *flow,
 +			       struct net_device_path_stack *stack);
- int __dev_fill_forward_path(struct net_device_path_ctx *ctx, const u8 *daddr,
- 			    struct net_device_path_stack *stack);
+ int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+ 			  struct net_device_path_stack *stack);
  struct net_device *dev_get_by_name(struct net *net, const char *name);
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
