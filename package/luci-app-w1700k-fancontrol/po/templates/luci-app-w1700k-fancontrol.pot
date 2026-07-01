@@ -2,7 +2,7 @@ msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:129
-msgid "LAN1 PHY"
+msgid "10G PHY"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:137
@@ -140,7 +140,7 @@ msgid "Status"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:130
-msgid "WAN PHY"
+msgid "Switch PHY"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:125

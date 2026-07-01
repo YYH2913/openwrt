@@ -11,7 +11,7 @@ find_nct7802() {
 			return
 		fi
 	done
-	echo ""
+	echo "/sys/class/hwmon/hwmon5"  # fallback
 }
 
 HWMON=$(find_nct7802)

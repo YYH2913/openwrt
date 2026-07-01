@@ -9,32 +9,16 @@ var callFanStatus = rpc.declare({
 	method: 'getStatus'
 });
 
-function hasTemp(temp) {
-	return temp !== null && temp !== undefined && temp !== '' && !isNaN(Number(temp));
-}
-
 function tempColor(temp) {
-	if (!hasTemp(temp)) return '#adb5bd';
-
-	temp = Number(temp);
 	if (temp <= 40) return '#28a745';      // Green - cool
 	if (temp <= 55) return '#ffc107';      // Yellow - warm
 	if (temp <= 70) return '#fd7e14';      // Orange - hot
 	return '#dc3545';                       // Red - critical
 }
 
-function tempPercentage(temp) {
-	if (!hasTemp(temp)) return 0;
-	return Math.min(100, Math.max(0, (Number(temp) / 100) * 100));
-}
-
-function formatTemp(temp) {
-	return hasTemp(temp) ? Number(temp) + '\u00B0C' : _('Unavailable');
-}
-
 function createTempGauge(label, temp, id) {
 	var color = tempColor(temp);
-	var percentage = tempPercentage(temp);
+	var percentage = Math.min(100, Math.max(0, (temp / 100) * 100));
 
 	return E('div', { 'class': 'cbi-value', 'style': 'margin-bottom: 10px;' }, [
 		E('label', { 'class': 'cbi-value-title', 'style': 'width: 150px;' }, label),
@@ -48,7 +32,7 @@ function createTempGauge(label, temp, id) {
 						'style': 'width: ' + percentage + '%; height: 100%; background: ' + color + '; transition: width 0.3s, background 0.3s;'
 					})
 				]),
-				E('span', { 'id': id + '-value', 'style': 'font-weight: bold; min-width: 88px;' }, formatTemp(temp))
+				E('span', { 'id': id + '-value', 'style': 'font-weight: bold; min-width: 50px;' }, temp + '\u00B0C')
 			])
 		])
 	]);
@@ -79,10 +63,10 @@ function updateGauge(id, temp) {
 	var value = document.getElementById(id + '-value');
 	if (bar && value) {
 		var color = tempColor(temp);
-		var percentage = tempPercentage(temp);
+		var percentage = Math.min(100, Math.max(0, (temp / 100) * 100));
 		bar.style.width = percentage + '%';
 		bar.style.background = color;
-		value.textContent = formatTemp(temp);
+		value.textContent = temp + '\u00B0C';
 	}
 }
 
@@ -140,20 +124,19 @@ return view.extend({
 					E('div', { 'style': 'flex: 1; min-width: 300px;' }, [
 						E('h4', { 'style': 'margin: 0 0 10px 0; color: #666;' }, _('System')),
 						E('div', { 'class': 'cbi-section-node' }, [
-							createTempGauge(_('CPU'), status.temp_cpu, 'temp-cpu'),
-							createTempGauge(_('Board (Fan Curve)'), status.temp_board, 'temp-board'),
-							createTempGauge(_('NCT7802 Local'), status.temp_nct_local, 'temp-nct-local'),
-							createTempGauge(_('LAN1 PHY'), status.temp_phy1, 'temp-phy1'),
-							createTempGauge(_('WAN PHY'), status.temp_phy2, 'temp-phy2')
+							createTempGauge(_('CPU'), status.temp_cpu || 0, 'temp-cpu'),
+							createTempGauge(_('Board (Fan Curve)'), status.temp_board || 0, 'temp-board'),
+							createTempGauge(_('LAN2 10G PHY'), status.temp_phy1 || 0, 'temp-phy1'),
+							createTempGauge(_('WAN 10G PHY'), status.temp_phy2 || 0, 'temp-phy2')
 						])
 					]),
 					// WiFi Temperatures
 					E('div', { 'style': 'flex: 1; min-width: 300px;', 'id': 'wifi-temps-section' }, [
 						E('h4', { 'style': 'margin: 0 0 10px 0; color: #666;' }, _('WiFi')),
 						E('div', { 'class': 'cbi-section-node' }, [
-							createTempGauge(_('2.4 GHz Radio'), status.wifi_24g, 'temp-wifi24g'),
-							createTempGauge(_('5 GHz Radio'), status.wifi_5g, 'temp-wifi5g'),
-							createTempGauge(_('6 GHz Radio'), status.wifi_6g, 'temp-wifi6g')
+							createTempGauge(_('2.4 GHz Radio'), status.wifi_24g || 0, 'temp-wifi24g'),
+							createTempGauge(_('5 GHz Radio'), status.wifi_5g || 0, 'temp-wifi5g'),
+							createTempGauge(_('6 GHz Radio'), status.wifi_6g || 0, 'temp-wifi6g')
 						])
 					])
 				])
@@ -166,15 +149,14 @@ return view.extend({
 				status = status || {};
 
 				// Update temperature gauges
-				updateGauge('temp-cpu', status.temp_cpu);
-				updateGauge('temp-board', status.temp_board);
-				updateGauge('temp-nct-local', status.temp_nct_local);
-				updateGauge('temp-phy1', status.temp_phy1);
-				updateGauge('temp-phy2', status.temp_phy2);
+				updateGauge('temp-cpu', status.temp_cpu || 0);
+				updateGauge('temp-board', status.temp_board || 0);
+				updateGauge('temp-phy1', status.temp_phy1 || 0);
+				updateGauge('temp-phy2', status.temp_phy2 || 0);
 
-				updateGauge('temp-wifi24g', status.wifi_24g);
-				updateGauge('temp-wifi5g', status.wifi_5g);
-				updateGauge('temp-wifi6g', status.wifi_6g);
+				updateGauge('temp-wifi24g', status.wifi_24g || 0);
+				updateGauge('temp-wifi5g', status.wifi_5g || 0);
+				updateGauge('temp-wifi6g', status.wifi_6g || 0);
 
 				// Update fan gauge
 				updateFanGauge(status.fan_rpm || 0, status.fan_percentage || 0);
