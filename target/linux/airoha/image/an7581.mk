@@ -130,8 +130,10 @@ define Device/econet_xr1710g-ubi
 		    -kmod-input-gpio-keys-polled -kmod-leds-pwm \
 		    -kmod-pwm-airoha \
 		    airoha-en7581-mt7996-npu-firmware \
-		    fitblk kmod-i2c-an7581 kmod-hwmon-nct7802 \
+		    apk-mbedtls fitblk \
+		    kmod-i2c-an7581 kmod-hwmon-nct7802 \
 		    kmod-mt7996-firmware rtl8261n-firmware \
+		    luci \
 		    luci-app-firewall luci-app-mlo \
 		    luci-app-package-manager \
 		    luci-i18n-mlo-zh-cn \
