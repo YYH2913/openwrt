@@ -6,9 +6,9 @@ LuCI application for fan control and thermal monitoring on W1700K router (Airoha
 
 - **Real-time Temperature Monitoring**
   - CPU temperature (AN7581 SoC die)
-  - Board temperature (NCT7802Y thermistor - used for fan curve)
-  - NCT7802Y local temperature
-  - PHY temperatures when exposed by the PHY driver
+  - Board temperature (NCT7802Y local sensor - used for fan curve)
+  - 10G PHY temperature
+  - Switch PHY temperature
   - WiFi radio temperatures (2.4 GHz, 5 GHz, 6 GHz from MT7996)
 
 - **Fan Speed Control**
@@ -46,8 +46,8 @@ LuCI application for fan control and thermal monitoring on W1700K router (Airoha
 |  +----------------+    |   - RPM input    |                        |
 |  |  PHY Sensors   |    |   - Auto curve   |                        |
 |  |                |    +------------------+                        |
-|  |  LAN1 PHY temp |             |                                  |
-|  |  WAN PHY temp  |      +------+------+                           |
+|  |  10G PHY temp  |             |                                  |
+|  |  Switch temp   |      +------+------+                           |
 |  +----------------+      |             |                           |
 |                          |    FAN      |                           |
 |                          |   (PWM)     |                           |
@@ -129,7 +129,7 @@ chmod +x /etc/init.d/fan
 
 - OpenWrt with LuCI
 - Airoha AN7581 target (`@TARGET_airoha`)
-- NCT7802Y fan controller
+- NCT7802Y fan controller (hwmon5)
 - MT7996 WiFi (for radio temperature monitoring)
 
 ## Files
@@ -192,15 +192,14 @@ config curve 'custom'
 | Sensor | Source | Description |
 |--------|--------|-------------|
 | CPU | `/sys/class/thermal/thermal_zone0/temp` | AN7581 SoC die temperature |
-| Board | dynamic `nct7802` hwmon `temp1_input` | Board thermistor / fan curve input |
-| NCT7802 Local | dynamic `nct7802` hwmon `temp4_input` | NCT7802Y local sensor |
-| LAN1 PHY | dynamic RTL8261N PHY hwmon for MDIO `:05` | LAN1 external 10G-capable PHY |
-| WAN PHY | dynamic RTL8261N PHY hwmon for MDIO `:08` | WAN external 10G-capable PHY |
-| WiFi 2.4G | dynamic `mt7996_phy0.0` hwmon `temp1_input` | MT7996 2.4 GHz radio |
-| WiFi 5G | dynamic `mt7996_phy0.1` hwmon `temp1_input` | MT7996 5 GHz radio |
-| WiFi 6G | dynamic `mt7996_phy0.2` hwmon `temp1_input` | MT7996 6 GHz radio |
-| Fan RPM | dynamic `nct7802` hwmon `fan1_input` | NCT7802Y tachometer input |
-| Fan PWM | dynamic `nct7802` hwmon `pwm1` | NCT7802Y PWM output (0-255) |
+| Board | `/sys/class/hwmon/hwmon5/temp1_input` | NCT7802Y local sensor (fan curve input) |
+| 10G PHY | `/sys/class/hwmon/hwmon0/temp1_input` | 10 Gigabit Ethernet PHY |
+| Switch PHY | `/sys/class/hwmon/hwmon1/temp1_input` | Gigabit switch PHY |
+| WiFi 2.4G | `/sys/class/hwmon/hwmon2/temp1_input` | MT7996 2.4 GHz radio |
+| WiFi 5G | `/sys/class/hwmon/hwmon3/temp1_input` | MT7996 5 GHz radio |
+| WiFi 6G | `/sys/class/hwmon/hwmon4/temp1_input` | MT7996 6 GHz radio |
+| Fan RPM | `/sys/class/hwmon/hwmon5/fan1_input` | NCT7802Y tachometer input |
+| Fan PWM | `/sys/class/hwmon/hwmon5/pwm1` | NCT7802Y PWM output (0-255) |
 
 ## Fan Curve Details
 

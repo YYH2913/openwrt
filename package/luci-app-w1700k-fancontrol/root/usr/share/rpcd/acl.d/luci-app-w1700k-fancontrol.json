@@ -7,8 +7,7 @@
 			},
 			"uci": [ "fan" ],
 			"file": {
-				"/sys/class/hwmon/hwmon*/*": [ "read" ],
-				"/sys/class/thermal/thermal_zone*/*": [ "read" ]
+				"/sys/class/hwmon/hwmon5/*": [ "read" ]
 			}
 		},
 		"write": {

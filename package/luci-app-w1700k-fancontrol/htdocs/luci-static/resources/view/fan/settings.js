@@ -9,6 +9,15 @@ var callGetAllCurves = rpc.declare({
 	method: 'getAllCurves'
 });
 
+function fanPresetLabel(preset) {
+	switch (preset) {
+	case 'quiet': return _('Quiet');
+	case 'performance': return _('Performance');
+	case 'custom': return _('Custom');
+	default: return _('Balanced');
+	}
+}
+
 function drawCurveCanvas(canvasId, curves, activePreset) {
 	var canvas = document.getElementById(canvasId);
 	if (!canvas) return;
@@ -55,7 +64,7 @@ function drawCurveCanvas(canvasId, curves, activePreset) {
 	ctx.fillStyle = '#333';
 	ctx.font = '12px sans-serif';
 	ctx.textAlign = 'center';
-	ctx.fillText('Temperature (\u00B0C)', width / 2, height - 5);
+	ctx.fillText(_('Temperature (\u00B0C)'), width / 2, height - 5);
 
 	ctx.save();
 	ctx.translate(12, height / 2);
@@ -121,7 +130,7 @@ function drawCurveCanvas(canvasId, curves, activePreset) {
 		ctx.fillRect(width - 100, legendY, 15, 15);
 		ctx.fillStyle = '#333';
 		ctx.textAlign = 'left';
-		ctx.fillText(preset.charAt(0).toUpperCase() + preset.slice(1), width - 80, legendY + 12);
+		ctx.fillText(fanPresetLabel(preset), width - 80, legendY + 12);
 		legendY += 20;
 	});
 }
