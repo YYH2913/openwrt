@@ -496,6 +496,23 @@
 		reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <40000>;
 		reset-deassert-us = <150000>;
+
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_AMBER>;
+				function = LED_FUNCTION_WAN;
+			};
+
+			led@1 {
+				reg = <1>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = LED_FUNCTION_WAN;
+			};
+		};
 	};
 
 	ethernet-phy-package@16 {
