@@ -389,6 +389,14 @@ get_frame_engine() {
 		return
 	fi
 
+	# Bail out if the frame engine has not been initialized yet.
+	# On first boot the PPE clocks may still be gated; accessing frame-engine
+	# registers via /dev/mem would hang the AHB bus and deadlock rpcd.
+	if [ ! -f "/sys/kernel/debug/ppe/entries" ]; then
+		echo '{"error":"frame engine not ready"}'
+		return
+	fi
+
 	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
 	local i reg_q reg_d pse_ports=""
 	for i in 0 1 2 3 4 5 6 7 8 9; do
