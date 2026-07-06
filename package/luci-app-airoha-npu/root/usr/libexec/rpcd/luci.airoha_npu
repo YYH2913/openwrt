@@ -4,6 +4,50 @@
 
 . /lib/functions.sh
 
+# Timeout-protected hardware register read via devmem.
+# Prevents rpcd/LuCI hang when a register bus stalls.
+# Usage: _devmem_read <address> [timeout_sec]
+# Returns register value (hex or decimal) on success, "0" on timeout/error.
+_devmem_read() {
+	local addr="$1"
+	local to="${2:-2}"
+	local val="" tmp pid i
+
+	# Preferred path: busybox/coreutils timeout
+	if command -v timeout >/dev/null 2>&1; then
+		val=$(timeout "$to" devmem "$addr" 2>/dev/null) || val=""
+		echo "${val:-0}"
+		return 0
+	fi
+
+	# Fallback: background process + manual kill-on-timeout
+	tmp="/tmp/_dm_${$}"
+	( devmem "$addr" >"$tmp" 2>/dev/null ) &
+	pid=$!
+	i=0
+	while [ "$i" -lt "$to" ]; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -9 "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+		rm -f "$tmp"
+		echo "0"
+		return 0
+	fi
+
+	wait "$pid" 2>/dev/null
+	if [ -f "$tmp" ] && [ -s "$tmp" ]; then
+		read -r val <"$tmp" 2>/dev/null
+	fi
+	rm -f "$tmp"
+	echo "${val:-0}"
+	return 0
+}
+
 get_status() {
 	# === NPU Status ===
 	# Read the actually-loaded NPU firmware path from DTS (firmware-name property).
@@ -32,55 +76,15 @@ get_status() {
 		fi
 	fi
 
-	# Run all potentially-blocking hardware reads in parallel with a
-	# single 2 s deadline — never wait() on any child so D-state
-	# cannot hang rpcd.
 	local npu_clock=0
-	local offload_bound=0
-	local offload_total=0
-	local pll_freq=0
-	local tmp_clk="/tmp/npu_clk_$$.tmp"
-	local tmp_bound="/tmp/npu_bound_$$.tmp"
-	local tmp_ent="/tmp/npu_ent_$$.tmp"
-	local tmp_pcw="/tmp/pll_pcw_$$.tmp"
-	local tmp_chg="/tmp/pll_chg_$$.tmp"
-
-	[ -f "/sys/kernel/debug/clk/npu/clk_rate" ] && \
-		(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null > "$tmp_clk") &
-	(cat /sys/kernel/debug/ppe/bind 2>/dev/null | grep -c "^[0-9a-fA-F]" > "$tmp_bound") &
-	(cat /sys/kernel/debug/ppe/entries 2>/dev/null | grep -c "^[0-9a-fA-F]" > "$tmp_ent") &
-	if command -v devmem > /dev/null 2>&1; then
-		(devmem 0x1fa202b4 2>/dev/null > "$tmp_pcw") &
-		(devmem 0x1fa202b8 2>/dev/null > "$tmp_chg") &
+	if [ -f "/sys/kernel/debug/clk/npu/clk_rate" ]; then
+		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
 	fi
-	# Poll up to 2 s in 100 ms steps — break as soon as ppe data
-	# (the most likely to block) arrives.  When hardware is
-	# responsive this returns in a single tick.
-	local _poll=0
-	while [ $_poll -lt 20 ] && [ ! -s "$tmp_bound" ]; do
-		usleep 100000
-		_poll=$((_poll + 1))
-	done
-
-	[ -s "$tmp_clk" ] && npu_clock=$(cat "$tmp_clk")
-	[ -s "$tmp_bound" ] && offload_bound=$(cat "$tmp_bound")
-	[ -s "$tmp_ent" ] && offload_total=$(cat "$tmp_ent")
-	if [ -s "$tmp_pcw" ] && [ -s "$tmp_chg" ]; then
-		local pcw_raw=$(cat "$tmp_pcw")
-		local chg_raw=$(cat "$tmp_chg")
-		pcw_raw=$((pcw_raw))
-		chg_raw=$((chg_raw))
-		local pcw_int=$(( (pcw_raw >> 24) & 0x7F ))
-		local pll_posdiv=$(( (chg_raw >> 4) & 7 ))
-		if [ "$pll_posdiv" -eq 0 ]; then
-			pll_freq=$((pcw_int * 50))
-		else
-			pll_freq=$((pcw_int * 50 / (1 << pll_posdiv)))
-		fi
-	fi
-	rm -f "$tmp_clk" "$tmp_bound" "$tmp_ent" "$tmp_pcw" "$tmp_chg"
 
 	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
+
+	local offload_bound=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | grep -c "^[0-9a-fA-F]")
+	local offload_total=$(cat /sys/kernel/debug/ppe/entries 2>/dev/null | grep -c "^[0-9a-fA-F]")
 
 	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
 	local regions="[]"
@@ -124,6 +128,24 @@ get_status() {
 		cpu_avail_freqs=$(cat "$cpufreq_path/scaling_available_frequencies" 2>/dev/null || echo "")
 	fi
 
+	# Read actual PLL frequency from hardware (detects overclock)
+	local pll_freq=0
+	if command -v devmem > /dev/null 2>&1; then
+		local pcw_raw=$(_devmem_read 0x1fa202b4)
+		local chg_raw=$(_devmem_read 0x1fa202b8)
+		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
+			pcw_raw=$((pcw_raw))
+			chg_raw=$((chg_raw))
+			local pcw_int=$(( (pcw_raw >> 24) & 0x7F ))
+			local pll_posdiv=$(( (chg_raw >> 4) & 7 ))
+			if [ "$pll_posdiv" -eq 0 ]; then
+				pll_freq=$((pcw_int * 50))
+			else
+				pll_freq=$((pcw_int * 50 / (1 << pll_posdiv)))
+			fi
+		fi
+	fi
+
 	# Count online CPUs
 	local cpu_count=0
 	if [ -d "/sys/devices/system/cpu" ]; then
@@ -143,77 +165,56 @@ get_ppe_entries() {
 		return
 	fi
 
-	# Reading the debugfs file can block inside the kernel even when
-	# the interface is up.  Run awk in a background process with a
-	# hard 2 s deadline.  Never wait() on the child — if debugfs puts
-	# it in D-state, wait() would block rpcd permanently.
-	local tmp="/tmp/ppe_entries_$$.json"
+	awk '
+	BEGIN {
+		printf "{\"entries\":["
+		first = 1
+	}
+	/^[0-9a-fA-F]+ / {
+		if (first == 0) printf ","
+		first = 0
 
-	(
-		awk '
-		BEGIN {
-			printf "{\"entries\":["
-			first = 1
-		}
-		/^[0-9a-fA-F]+ / {
-			if (first == 0) printf ","
-			first = 0
+		index_val = $1
+		state = $2
 
-			index_val = $1
-			state = $2
-
-			type = ""
+		type = ""
+		subtype = ""
+		if ($3 == "IPv4" || $3 == "IPv6") {
+			type = $3
+			subtype = $4
+		} else if ($3 == "L2B" || $4 == "L2B") {
+			type = "L2B"
 			subtype = ""
-			if ($3 == "IPv4" || $3 == "IPv6") {
-				type = $3
-				subtype = $4
-			} else if ($3 == "L2B" || $4 == "L2B") {
-				type = "L2B"
-				subtype = ""
-			} else {
-				type = $3
-				subtype = $4
-			}
-
-			orig = ""
-			match($0, /orig=[^ ]+/)
-			if (RSTART > 0) {
-				orig = substr($0, RSTART+5, RLENGTH-5)
-			}
-
-			new_flow = ""
-			match($0, /new=[^ ]+/)
-			if (RSTART > 0) {
-				new_flow = substr($0, RSTART+4, RLENGTH-4)
-			}
-
-			eth = ""
-			match($0, /eth=[^ ]+/)
-			if (RSTART > 0) {
-				eth = substr($0, RSTART+4, RLENGTH-4)
-			}
-
-			printf "{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s %s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\"}", \
-				index_val, state, type, subtype, orig, new_flow, eth
+		} else {
+			type = $3
+			subtype = $4
 		}
-		END {
-			printf "]}"
+
+		orig = ""
+		match($0, /orig=[^ ]+/)
+		if (RSTART > 0) {
+			orig = substr($0, RSTART+5, RLENGTH-5)
 		}
-		' "$entries_file" > "$tmp" 2>/dev/null
-	) &
 
-	local _poll=0
-	while [ $_poll -lt 20 ] && [ ! -s "$tmp" ]; do
-		usleep 100000
-		_poll=$((_poll + 1))
-	done
+		new_flow = ""
+		match($0, /new=[^ ]+/)
+		if (RSTART > 0) {
+			new_flow = substr($0, RSTART+4, RLENGTH-4)
+		}
 
-	if [ -s "$tmp" ]; then
-		cat "$tmp"
-	else
-		echo '{"entries":[]}'
-	fi
-	rm -f "$tmp"
+		eth = ""
+		match($0, /eth=[^ ]+/)
+		if (RSTART > 0) {
+			eth = substr($0, RSTART+4, RLENGTH-4)
+		}
+
+		printf "{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s %s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\"}", \
+			index_val, state, type, subtype, orig, new_flow, eth
+	}
+	END {
+		printf "]}"
+	}
+	' "$entries_file" 2>/dev/null || echo '{"entries":[]}'
 }
 
 get_token_info() {
@@ -242,59 +243,40 @@ get_token_info() {
 		return
 	fi
 
-	# Same protection as getPpeEntries: the debugfs read can block
-	# inside the kernel.  Run awk in background, 2 s deadline, never wait.
-	local tmp_tok="/tmp/npu_token_$$.json"
-
-	(
-		awk -v stations="$sta_json" '
-		BEGIN {
-			tc=0; ts=0; npu=0
-			tq_n=0
+	awk -v stations="$sta_json" '
+	BEGIN {
+		tc=0; ts=0; npu=0
+		tq_n=0
+	}
+	/^  token_count:/ { tc=$2+0; ts=$4+0 }
+	/status:.*active/ { npu=1 }
+	/band [0-9]/ {
+		gsub(/\|/, " ")
+		for(i=1;i<=NF;i++) {
+			if($i=="band") tq_band[tq_n]=$(i+1)+0
+			if($i=="npu" || $i=="dma") tq_type[tq_n]=$i
 		}
-		/^  token_count:/ { tc=$2+0; ts=$4+0 }
-		/status:.*active/ { npu=1 }
-		/band [0-9]/ {
-			gsub(/\|/, " ")
-			for(i=1;i<=NF;i++) {
-				if($i=="band") tq_band[tq_n]=$(i+1)+0
-				if($i=="npu" || $i=="dma") tq_type[tq_n]=$i
+		cnt=0
+		for(i=1;i<=NF;i++) {
+			if($i ~ /^[0-9]+$/ && $(i-1)!="band") {
+				tq_v[tq_n,cnt++]=$i+0
 			}
-			cnt=0
-			for(i=1;i<=NF;i++) {
-				if($i ~ /^[0-9]+$/ && $(i-1)!="band") {
-					tq_v[tq_n,cnt++]=$i+0
-				}
-			}
-			tq_n++
 		}
-		END {
-			printf "{\"token_count\":%d,\"token_size\":%d,\"npu_active\":%s,\"tx_queues\":[", \
-				tc, ts, (npu?"true":"false")
+		tq_n++
+	}
+	END {
+		printf "{\"token_count\":%d,\"token_size\":%d,\"npu_active\":%s,\"tx_queues\":[", \
+			tc, ts, (npu?"true":"false")
 
-			for(i=0;i<tq_n;i++) {
-				if(i>0) printf ","
-				printf "{\"band\":%d,\"type\":\"%s\",\"ndesc\":%d,\"queued\":%d,\"head\":%d,\"tail\":%d}", \
-					tq_band[i], tq_type[i], tq_v[i,0], tq_v[i,1], tq_v[i,2], tq_v[i,3]
-			}
-
-			printf "],\"station_counts\":[%s]}", stations
+		for(i=0;i<tq_n;i++) {
+			if(i>0) printf ","
+			printf "{\"band\":%d,\"type\":\"%s\",\"ndesc\":%d,\"queued\":%d,\"head\":%d,\"tail\":%d}", \
+				tq_band[i], tq_type[i], tq_v[i,0], tq_v[i,1], tq_v[i,2], tq_v[i,3]
 		}
-		' "$token_file" > "$tmp_tok" 2>/dev/null
-	) &
 
-	local _poll=0
-	while [ $_poll -lt 20 ] && [ ! -s "$tmp_tok" ]; do
-		usleep 100000
-		_poll=$((_poll + 1))
-	done
-
-	if [ -s "$tmp_tok" ]; then
-		cat "$tmp_tok"
-	else
-		printf '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[%s]}' "$sta_json"
-	fi
-	rm -f "$tmp_tok"
+		printf "],\"station_counts\":[%s]}", stations
+	}
+	' "$token_file" 2>/dev/null || printf '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[%s]}' "$sta_json"
 }
 
 set_governor() {
@@ -378,41 +360,22 @@ set_overclock() {
 	# Lock governor to performance to prevent cpufreq from fighting
 	echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
 
-	# Read current register values in parallel with a 2 s deadline.
-	# These are clock-controller registers (not frame-engine) and are
-	# generally safe, but protect against a stuck AHB bus anyway.
-	local cur_clkmux=0 cur_pcw=0 cur_chg=0
-	local tmp_oc_cm="/tmp/oc_cm_$$.tmp"
-	local tmp_oc_pc="/tmp/oc_pc_$$.tmp"
-	local tmp_oc_cg="/tmp/oc_cg_$$.tmp"
-	(devmem 0x1fa201e0 2>/dev/null > "$tmp_oc_cm") &
-	(devmem 0x1fa202b4 2>/dev/null > "$tmp_oc_pc") &
-	(devmem 0x1fa202b8 2>/dev/null > "$tmp_oc_cg") &
-	local _poll=0
-	while [ $_poll -lt 20 ]; do
-		[ -s "$tmp_oc_cm" ] && [ -s "$tmp_oc_pc" ] && [ -s "$tmp_oc_cg" ] && break
-		usleep 100000
-		_poll=$((_poll + 1))
-	done
-	if [ -s "$tmp_oc_cm" ]; then cur_clkmux=$(( $(cat "$tmp_oc_cm") ))
-	else rm -f "$tmp_oc_cm" "$tmp_oc_pc" "$tmp_oc_cg"; echo '{"error":"PLL register read timeout"}'; return; fi
-	if [ -s "$tmp_oc_pc" ]; then cur_pcw=$(( $(cat "$tmp_oc_pc") ))
-	else rm -f "$tmp_oc_cm" "$tmp_oc_pc" "$tmp_oc_cg"; echo '{"error":"PLL register read timeout"}'; return; fi
-	if [ -s "$tmp_oc_cg" ]; then cur_chg=$(( $(cat "$tmp_oc_cg") ))
-	else rm -f "$tmp_oc_cm" "$tmp_oc_pc" "$tmp_oc_cg"; echo '{"error":"PLL register read timeout"}'; return; fi
-	rm -f "$tmp_oc_cm" "$tmp_oc_pc" "$tmp_oc_cg"
+	# Read current register values
+	local cur_clkmux=$(($(_devmem_read 0x1fa201e0)))
+	local cur_pcw=$(($(_devmem_read 0x1fa202b4)))
+	local cur_chg=$(($(_devmem_read 0x1fa202b8)))
 
 	# Step 1: Enable PLL2 path in CLK_MUX (set bit 2)
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux | 0x4)))
 
 	# Step 2: MCUCFG switch to PLL2 (sel=3 in bits[10:9])
-	local cur_u=$(($(devmem 0x1efbe640)))
+	local cur_u=$(($(_devmem_read 0x1efbe640)))
 	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u & 0xFFFFFFE0) | 0x12)))
-	local cur_s=$(($(devmem 0x1efbe7c0)))
+	local cur_s=$(($(_devmem_read 0x1efbe7c0)))
 	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s & 0xFFFFF9FF) | (3 << 9))))
 
 	# Step 3: Unlock PLL registers
-	local cur_p=$(($(devmem 0x1fa20268)))
+	local cur_p=$(($(_devmem_read 0x1fa20268)))
 	devmem 0x1fa20268 32 $(printf "0x%08X" $(((cur_p & 0xFFFFFF00) | 0x12)))
 
 	# Step 4: Write new PCW integer
@@ -431,26 +394,26 @@ set_overclock() {
 	sleep 0.02
 
 	# Step 7: Enable ARMPLL path in CLK_MUX (set bit 0)
-	local cur_clkmux2=$(($(devmem 0x1fa201e0)))
+	local cur_clkmux2=$(($(_devmem_read 0x1fa201e0)))
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux2 | 0x1)))
 
 	# Step 8: MCUCFG switch back to ARMPLL
-	local cur_u2=$(($(devmem 0x1efbe640)))
+	local cur_u2=$(($(_devmem_read 0x1efbe640)))
 	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u2 & 0xFFFFFFE0) | 0x12)))
-	local cur_s2=$(($(devmem 0x1efbe7c0)))
+	local cur_s2=$(($(_devmem_read 0x1efbe7c0)))
 	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s2 & 0xFFFFF9FF) | (1 << 9))))
 
 	# Step 9: Clear PLL2 path in CLK_MUX
-	local cur_clkmux3=$(($(devmem 0x1fa201e0)))
+	local cur_clkmux3=$(($(_devmem_read 0x1fa201e0)))
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux3 & 0xFFFFFFFB)))
 
 	# Step 10: Re-lock PLL registers
-	local cur_p2=$(($(devmem 0x1fa20268)))
+	local cur_p2=$(($(_devmem_read 0x1fa20268)))
 	devmem 0x1fa20268 32 $(printf "0x%08X" $((cur_p2 & 0xFFFFFF00)))
 
 	# Verify
-	local final_pcw=$(($(devmem 0x1fa202b4)))
-	local final_chg=$(($(devmem 0x1fa202b8)))
+	local final_pcw=$(($(_devmem_read 0x1fa202b4)))
+	local final_chg=$(($(_devmem_read 0x1fa202b8)))
 	local read_pcw=$(( (final_pcw >> 24) & 0x7F ))
 	local read_posdiv=$(( (final_chg >> 4) & 7 ))
 	local read_freq
@@ -470,20 +433,13 @@ get_frame_engine() {
 		return
 	fi
 
-	# This function reads 30+ frame-engine registers via /dev/mem.
-	# If the PPE clock is gated during early boot, any single devmem
-	# access will hang the AHB bus and deadlock rpcd.  Run the entire
-	# register scan in a background subshell with a 3 s deadline.
-	local tmp="/tmp/fe_$$.json"
-
-	(
 	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
 	local i reg_q reg_d pse_ports=""
 	for i in 0 1 2 3 4 5 6 7 8 9; do
 		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
 		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
-		local qval=$(($(devmem $reg_q)))
-		local dval=$(($(devmem $reg_d)))
+		local qval=$(($(_devmem_read $reg_q)))
+		local dval=$(($(_devmem_read $reg_d)))
 		local iq=$(( (qval >> 16) & 0xFFFF ))
 		local oq=$(( qval & 0xFFFF ))
 		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
@@ -491,38 +447,39 @@ get_frame_engine() {
 	done
 
 	# PSE shared buffer
-	local psb=$(($(devmem 0x1fb50104)))
+	local psb=$(($(_devmem_read 0x1fb50104)))
 	local pse_used=$(( (psb >> 16) & 0xFFFF ))
 	local pse_free=$(( psb & 0x7FFF ))
 
 	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
-	local gdm1_tx=$(($(devmem 0x1fb50604)))
-	local gdm1_txd=$(($(devmem 0x1fb50608)))
-	local gdm1_rx=$(($(devmem 0x1fb50648)))
-	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
+	# Read as hex to handle large 32-bit counters
+	local gdm1_tx=$(($(_devmem_read 0x1fb50604)))
+	local gdm1_txd=$(($(_devmem_read 0x1fb50608)))
+	local gdm1_rx=$(($(_devmem_read 0x1fb50648)))
+	local gdm1_rxd=$(($(_devmem_read 0x1fb5064c)))
 
-	local gdm2_tx=$(($(devmem 0x1fb51604)))
-	local gdm2_txd=$(($(devmem 0x1fb51608)))
-	local gdm2_rx=$(($(devmem 0x1fb51648)))
-	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
+	local gdm2_tx=$(($(_devmem_read 0x1fb51604)))
+	local gdm2_txd=$(($(_devmem_read 0x1fb51608)))
+	local gdm2_rx=$(($(_devmem_read 0x1fb51648)))
+	local gdm2_rxd=$(($(_devmem_read 0x1fb5164c)))
 
-	local gdm4_tx=$(($(devmem 0x1fb52604)))
-	local gdm4_txd=$(($(devmem 0x1fb52608)))
-	local gdm4_rx=$(($(devmem 0x1fb52648)))
-	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
+	local gdm4_tx=$(($(_devmem_read 0x1fb52604)))
+	local gdm4_txd=$(($(_devmem_read 0x1fb52608)))
+	local gdm4_rx=$(($(_devmem_read 0x1fb52648)))
+	local gdm4_rxd=$(($(_devmem_read 0x1fb5264c)))
 
 	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
-	local cdm1_tx=$(($(devmem 0x1fb50580)))
-	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
-	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
-	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
-	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
+	local cdm1_tx=$(($(_devmem_read 0x1fb50580)))
+	local cdm1_rxcpu=$(($(_devmem_read 0x1fb50590)))
+	local cdm1_rxhwf=$(($(_devmem_read 0x1fb50594)))
+	local cdm1_rxcpud=$(($(_devmem_read 0x1fb505a0)))
+	local cdm1_rxhwfd=$(($(_devmem_read 0x1fb505a4)))
 
-	local cdm2_tx=$(($(devmem 0x1fb51580)))
-	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
-	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
-	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
-	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
+	local cdm2_tx=$(($(_devmem_read 0x1fb51580)))
+	local cdm2_rxcpu=$(($(_devmem_read 0x1fb51590)))
+	local cdm2_rxhwf=$(($(_devmem_read 0x1fb51594)))
+	local cdm2_rxcpud=$(($(_devmem_read 0x1fb515a0)))
+	local cdm2_rxhwfd=$(($(_devmem_read 0x1fb515a4)))
 
 	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
 	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
@@ -530,20 +487,6 @@ get_frame_engine() {
 	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
 	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
 	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
-	) > "$tmp" 2>/dev/null &
-
-	local _poll=0
-	while [ $_poll -lt 30 ] && [ ! -s "$tmp" ]; do
-		usleep 100000
-		_poll=$((_poll + 1))
-	done
-
-	if [ -s "$tmp" ]; then
-		cat "$tmp"
-	else
-		echo '{"error":"frame engine not ready"}'
-	fi
-	rm -f "$tmp"
 }
 
 get_vlan_offload() {
