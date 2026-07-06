@@ -4,6 +4,50 @@
 
 . /lib/functions.sh
 
+# Timeout-protected hardware register read via devmem.
+# Prevents rpcd/LuCI hang when a register bus stalls.
+# Usage: _devmem_read <address> [timeout_sec]
+# Returns register value (hex or decimal) on success, "0" on timeout/error.
+_devmem_read() {
+	local addr="$1"
+	local to="${2:-2}"
+	local val="" tmp pid i
+
+	# Preferred path: busybox/coreutils timeout
+	if command -v timeout >/dev/null 2>&1; then
+		val=$(timeout "$to" devmem "$addr" 2>/dev/null) || val=""
+		echo "${val:-0}"
+		return 0
+	fi
+
+	# Fallback: background process + manual kill-on-timeout
+	tmp="/tmp/_dm_${$}"
+	( devmem "$addr" >"$tmp" 2>/dev/null ) &
+	pid=$!
+	i=0
+	while [ "$i" -lt "$to" ]; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -9 "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+		rm -f "$tmp"
+		echo "0"
+		return 0
+	fi
+
+	wait "$pid" 2>/dev/null
+	if [ -f "$tmp" ] && [ -s "$tmp" ]; then
+		read -r val <"$tmp" 2>/dev/null
+	fi
+	rm -f "$tmp"
+	echo "${val:-0}"
+	return 0
+}
+
 get_status() {
 	# === NPU Status ===
 	# Read the actually-loaded NPU firmware path from DTS (firmware-name property).
@@ -87,8 +131,8 @@ get_status() {
 	# Read actual PLL frequency from hardware (detects overclock)
 	local pll_freq=0
 	if command -v devmem > /dev/null 2>&1; then
-		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
-		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
+		local pcw_raw=$(_devmem_read 0x1fa202b4)
+		local chg_raw=$(_devmem_read 0x1fa202b8)
 		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
 			pcw_raw=$((pcw_raw))
 			chg_raw=$((chg_raw))
@@ -317,21 +361,21 @@ set_overclock() {
 	echo performance > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
 
 	# Read current register values
-	local cur_clkmux=$(($(devmem 0x1fa201e0)))
-	local cur_pcw=$(($(devmem 0x1fa202b4)))
-	local cur_chg=$(($(devmem 0x1fa202b8)))
+	local cur_clkmux=$(($(_devmem_read 0x1fa201e0)))
+	local cur_pcw=$(($(_devmem_read 0x1fa202b4)))
+	local cur_chg=$(($(_devmem_read 0x1fa202b8)))
 
 	# Step 1: Enable PLL2 path in CLK_MUX (set bit 2)
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux | 0x4)))
 
 	# Step 2: MCUCFG switch to PLL2 (sel=3 in bits[10:9])
-	local cur_u=$(($(devmem 0x1efbe640)))
+	local cur_u=$(($(_devmem_read 0x1efbe640)))
 	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u & 0xFFFFFFE0) | 0x12)))
-	local cur_s=$(($(devmem 0x1efbe7c0)))
+	local cur_s=$(($(_devmem_read 0x1efbe7c0)))
 	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s & 0xFFFFF9FF) | (3 << 9))))
 
 	# Step 3: Unlock PLL registers
-	local cur_p=$(($(devmem 0x1fa20268)))
+	local cur_p=$(($(_devmem_read 0x1fa20268)))
 	devmem 0x1fa20268 32 $(printf "0x%08X" $(((cur_p & 0xFFFFFF00) | 0x12)))
 
 	# Step 4: Write new PCW integer
@@ -350,26 +394,26 @@ set_overclock() {
 	sleep 0.02
 
 	# Step 7: Enable ARMPLL path in CLK_MUX (set bit 0)
-	local cur_clkmux2=$(($(devmem 0x1fa201e0)))
+	local cur_clkmux2=$(($(_devmem_read 0x1fa201e0)))
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux2 | 0x1)))
 
 	# Step 8: MCUCFG switch back to ARMPLL
-	local cur_u2=$(($(devmem 0x1efbe640)))
+	local cur_u2=$(($(_devmem_read 0x1efbe640)))
 	devmem 0x1efbe640 32 $(printf "0x%08X" $(((cur_u2 & 0xFFFFFFE0) | 0x12)))
-	local cur_s2=$(($(devmem 0x1efbe7c0)))
+	local cur_s2=$(($(_devmem_read 0x1efbe7c0)))
 	devmem 0x1efbe7c0 32 $(printf "0x%08X" $(((cur_s2 & 0xFFFFF9FF) | (1 << 9))))
 
 	# Step 9: Clear PLL2 path in CLK_MUX
-	local cur_clkmux3=$(($(devmem 0x1fa201e0)))
+	local cur_clkmux3=$(($(_devmem_read 0x1fa201e0)))
 	devmem 0x1fa201e0 32 $(printf "0x%08X" $((cur_clkmux3 & 0xFFFFFFFB)))
 
 	# Step 10: Re-lock PLL registers
-	local cur_p2=$(($(devmem 0x1fa20268)))
+	local cur_p2=$(($(_devmem_read 0x1fa20268)))
 	devmem 0x1fa20268 32 $(printf "0x%08X" $((cur_p2 & 0xFFFFFF00)))
 
 	# Verify
-	local final_pcw=$(($(devmem 0x1fa202b4)))
-	local final_chg=$(($(devmem 0x1fa202b8)))
+	local final_pcw=$(($(_devmem_read 0x1fa202b4)))
+	local final_chg=$(($(_devmem_read 0x1fa202b8)))
 	local read_pcw=$(( (final_pcw >> 24) & 0x7F ))
 	local read_posdiv=$(( (final_chg >> 4) & 7 ))
 	local read_freq
@@ -394,8 +438,8 @@ get_frame_engine() {
 	for i in 0 1 2 3 4 5 6 7 8 9; do
 		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
 		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
-		local qval=$(($(devmem $reg_q)))
-		local dval=$(($(devmem $reg_d)))
+		local qval=$(($(_devmem_read $reg_q)))
+		local dval=$(($(_devmem_read $reg_d)))
 		local iq=$(( (qval >> 16) & 0xFFFF ))
 		local oq=$(( qval & 0xFFFF ))
 		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
@@ -403,39 +447,39 @@ get_frame_engine() {
 	done
 
 	# PSE shared buffer
-	local psb=$(($(devmem 0x1fb50104)))
+	local psb=$(($(_devmem_read 0x1fb50104)))
 	local pse_used=$(( (psb >> 16) & 0xFFFF ))
 	local pse_free=$(( psb & 0x7FFF ))
 
 	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
 	# Read as hex to handle large 32-bit counters
-	local gdm1_tx=$(($(devmem 0x1fb50604)))
-	local gdm1_txd=$(($(devmem 0x1fb50608)))
-	local gdm1_rx=$(($(devmem 0x1fb50648)))
-	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
+	local gdm1_tx=$(($(_devmem_read 0x1fb50604)))
+	local gdm1_txd=$(($(_devmem_read 0x1fb50608)))
+	local gdm1_rx=$(($(_devmem_read 0x1fb50648)))
+	local gdm1_rxd=$(($(_devmem_read 0x1fb5064c)))
 
-	local gdm2_tx=$(($(devmem 0x1fb51604)))
-	local gdm2_txd=$(($(devmem 0x1fb51608)))
-	local gdm2_rx=$(($(devmem 0x1fb51648)))
-	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
+	local gdm2_tx=$(($(_devmem_read 0x1fb51604)))
+	local gdm2_txd=$(($(_devmem_read 0x1fb51608)))
+	local gdm2_rx=$(($(_devmem_read 0x1fb51648)))
+	local gdm2_rxd=$(($(_devmem_read 0x1fb5164c)))
 
-	local gdm4_tx=$(($(devmem 0x1fb52604)))
-	local gdm4_txd=$(($(devmem 0x1fb52608)))
-	local gdm4_rx=$(($(devmem 0x1fb52648)))
-	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
+	local gdm4_tx=$(($(_devmem_read 0x1fb52604)))
+	local gdm4_txd=$(($(_devmem_read 0x1fb52608)))
+	local gdm4_rx=$(($(_devmem_read 0x1fb52648)))
+	local gdm4_rxd=$(($(_devmem_read 0x1fb5264c)))
 
 	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
-	local cdm1_tx=$(($(devmem 0x1fb50580)))
-	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
-	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
-	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
-	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
+	local cdm1_tx=$(($(_devmem_read 0x1fb50580)))
+	local cdm1_rxcpu=$(($(_devmem_read 0x1fb50590)))
+	local cdm1_rxhwf=$(($(_devmem_read 0x1fb50594)))
+	local cdm1_rxcpud=$(($(_devmem_read 0x1fb505a0)))
+	local cdm1_rxhwfd=$(($(_devmem_read 0x1fb505a4)))
 
-	local cdm2_tx=$(($(devmem 0x1fb51580)))
-	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
-	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
-	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
-	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
+	local cdm2_tx=$(($(_devmem_read 0x1fb51580)))
+	local cdm2_rxcpu=$(($(_devmem_read 0x1fb51590)))
+	local cdm2_rxhwf=$(($(_devmem_read 0x1fb51594)))
+	local cdm2_rxcpud=$(($(_devmem_read 0x1fb515a0)))
+	local cdm2_rxhwfd=$(($(_devmem_read 0x1fb515a4)))
 
 	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
 	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
