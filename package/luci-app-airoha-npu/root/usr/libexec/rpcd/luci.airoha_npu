@@ -2,50 +2,25 @@
 
 # Airoha SoC Status RPC backend for LuCI (NPU + CPU + Overclock)
 
+2026.7.7
+
 . /lib/functions.sh
 
-# Timeout-protected hardware register read via devmem.
-# Prevents rpcd/LuCI hang when a register bus stalls.
-# Usage: _devmem_read <address> [timeout_sec]
-# Returns register value (hex or decimal) on success, "0" on timeout/error.
+# Check if NPU bus driver is loaded and ready for register access.
+# Returns 0 (true) if ready, 1 (false) otherwise.
+_npu_bus_ready() {
+	[ -d "/sys/bus/platform/drivers/airoha-npu" ] && \
+		ls -1 "/sys/bus/platform/drivers/airoha-npu" 2>/dev/null | grep -q '\.npu$'
+}
+
+# Hardware register read via devmem.
+# Caller MUST guard with _npu_bus_ready before using.
 _devmem_read() {
 	local addr="$1"
-	local to="${2:-2}"
-	local val="" tmp pid i
+	local val=""
 
-	# Preferred path: busybox/coreutils timeout
-	if command -v timeout >/dev/null 2>&1; then
-		val=$(timeout "$to" devmem "$addr" 2>/dev/null) || val=""
-		echo "${val:-0}"
-		return 0
-	fi
-
-	# Fallback: background process + manual kill-on-timeout
-	tmp="/tmp/_dm_${$}"
-	( devmem "$addr" >"$tmp" 2>/dev/null ) &
-	pid=$!
-	i=0
-	while [ "$i" -lt "$to" ]; do
-		kill -0 "$pid" 2>/dev/null || break
-		sleep 1
-		i=$((i + 1))
-	done
-
-	if kill -0 "$pid" 2>/dev/null; then
-		kill -9 "$pid" 2>/dev/null
-		wait "$pid" 2>/dev/null
-		rm -f "$tmp"
-		echo "0"
-		return 0
-	fi
-
-	wait "$pid" 2>/dev/null
-	if [ -f "$tmp" ] && [ -s "$tmp" ]; then
-		read -r val <"$tmp" 2>/dev/null
-	fi
-	rm -f "$tmp"
+	val=$(devmem "$addr" 2>/dev/null) || val=""
 	echo "${val:-0}"
-	return 0
 }
 
 get_status() {
@@ -130,7 +105,7 @@ get_status() {
 
 	# Read actual PLL frequency from hardware (detects overclock)
 	local pll_freq=0
-	if command -v devmem > /dev/null 2>&1; then
+	if _npu_bus_ready && command -v devmem > /dev/null 2>&1; then
 		local pcw_raw=$(_devmem_read 0x1fa202b4)
 		local chg_raw=$(_devmem_read 0x1fa202b8)
 		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
@@ -430,6 +405,11 @@ set_overclock() {
 get_frame_engine() {
 	if ! command -v devmem > /dev/null 2>&1; then
 		echo '{"error":"devmem not available"}'
+		return
+	fi
+
+	if ! _npu_bus_ready; then
+		echo '{"error":"NPU bus not ready"}'
 		return
 	fi
 
