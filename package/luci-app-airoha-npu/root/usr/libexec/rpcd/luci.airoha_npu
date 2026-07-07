@@ -2,7 +2,7 @@
 
 # Airoha SoC Status RPC backend for LuCI (NPU + CPU + Overclock)
 
-2026.7.7
+#2026.7.7
 
 . /lib/functions.sh
 
