@@ -1,0 +1,68 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:1434
+msgid "Airoha FlowSense"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:301
+msgid "Index"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:302
+msgid "State"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:303
+msgid "Type"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:304
+msgid "Original"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:305
+msgid "Translated"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:321
+msgid "No entries"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:262
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:277
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:292
+msgid "Disabled"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:263
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:278
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:293
+msgid "Enabled"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:259
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:274
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:289
+msgid "Error: "
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:1452
+msgid "HW Flow Offload"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:1456
+msgid "VLAN Offload"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/airoha_flowsense/status.js:1460
+msgid "PPPoE Offload"
+msgstr ""
+
+#: root/usr/share/luci/menu.d/luci-app-airoha-flowsense.json:3
+msgid "FlowSense"
+msgstr ""
+
+#: root/usr/share/rpcd/acl.d/luci-app-airoha-flowsense.json:3
+msgid "Grant access to Airoha FlowSense offload & PPE monitor"
+msgstr ""

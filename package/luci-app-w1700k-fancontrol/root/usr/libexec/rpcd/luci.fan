@@ -30,19 +30,18 @@ find_mt7996_hwmon() {
 	echo ""
 }
 
-# Dynamically find PHY hwmon devices (mt7530 DSA)
+# Dynamically find PHY hwmon devices (mt7530 DSA — RTL8261N registers
+# hwmon with NULL name, so match the device-symlink target instead).
 find_phy_hwmon() {
 	local suffix="$1"  # :05 or :08
 	for hwmon in /sys/class/hwmon/hwmon*; do
-		if [ -f "$hwmon/name" ]; then
-			local name=$(cat "$hwmon/name" 2>/dev/null)
-			case "$name" in
-				*"$suffix")
-					echo "$hwmon"
-					return
-					;;
-			esac
-		fi
+		local target=$(readlink -f "$hwmon/device" 2>/dev/null)
+		case "$target" in
+			*"$suffix")
+				echo "$hwmon"
+				return
+				;;
+		esac
 	done
 	echo ""
 }

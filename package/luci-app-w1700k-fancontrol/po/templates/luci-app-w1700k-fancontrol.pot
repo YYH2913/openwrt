@@ -2,7 +2,7 @@ msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:129
-msgid "10G PHY"
+msgid "10G PHY 1"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:137
@@ -140,7 +140,7 @@ msgid "Status"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:130
-msgid "Switch PHY"
+msgid "10G PHY 2"
 msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:125
@@ -153,4 +153,8 @@ msgstr ""
 
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:135
 msgid "WiFi"
+msgstr ""
+
+#: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/settings.js:206
+msgid "NCT7802 hardware fixes point 5 at full speed (255) — this value is stored but not written to the fan controller."
 msgstr ""

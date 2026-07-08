@@ -52,7 +52,7 @@ function createFanGauge(rpm, pwm, percentage) {
 					})
 				]),
 				E('span', { 'id': 'fan-value', 'style': 'font-weight: bold;' },
-					rpm + ' RPM (' + percentage + '%)')
+					rpm + ' RPM (' + percentage + '%) PWM: ' + pwm)
 			])
 		])
 	]);
@@ -70,12 +70,12 @@ function updateGauge(id, temp) {
 	}
 }
 
-function updateFanGauge(rpm, percentage) {
+function updateFanGauge(rpm, pwm, percentage) {
 	var bar = document.getElementById('fan-bar');
 	var value = document.getElementById('fan-value');
 	if (bar && value) {
 		bar.style.width = percentage + '%';
-		value.textContent = rpm + ' RPM (' + percentage + '%)';
+		value.textContent = rpm + ' RPM (' + percentage + '%) PWM: ' + pwm;
 	}
 }
 
@@ -126,8 +126,8 @@ return view.extend({
 						E('div', { 'class': 'cbi-section-node' }, [
 							createTempGauge(_('CPU'), status.temp_cpu || 0, 'temp-cpu'),
 							createTempGauge(_('Board (Fan Curve)'), status.temp_board || 0, 'temp-board'),
-							createTempGauge(_('LAN2 10G PHY'), status.temp_phy1 || 0, 'temp-phy1'),
-							createTempGauge(_('WAN 10G PHY'), status.temp_phy2 || 0, 'temp-phy2')
+							createTempGauge(_('10G PHY 1'), status.temp_phy1 || 0, 'temp-phy1'),
+							createTempGauge(_('10G PHY 2'), status.temp_phy2 || 0, 'temp-phy2')
 						])
 					]),
 					// WiFi Temperatures
@@ -159,7 +159,7 @@ return view.extend({
 				updateGauge('temp-wifi6g', status.wifi_6g || 0);
 
 				// Update fan gauge
-				updateFanGauge(status.fan_rpm || 0, status.fan_percentage || 0);
+				updateFanGauge(status.fan_rpm || 0, status.fan_pwm || 0, status.fan_percentage || 0);
 
 				// Update mode display
 				var modeEl = document.getElementById('fan-mode');

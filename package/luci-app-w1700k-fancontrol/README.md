@@ -7,8 +7,8 @@ LuCI application for fan control and thermal monitoring on W1700K router (Airoha
 - **Real-time Temperature Monitoring**
   - CPU temperature (AN7581 SoC die)
   - Board temperature (NCT7802Y local sensor - used for fan curve)
-  - 10G PHY temperature
-  - Switch PHY temperature
+  - 10G PHY 1 temperature
+  - 10G PHY 2 temperature
   - WiFi radio temperatures (2.4 GHz, 5 GHz, 6 GHz from MT7996)
 
 - **Fan Speed Control**
@@ -46,7 +46,7 @@ LuCI application for fan control and thermal monitoring on W1700K router (Airoha
 |  +----------------+    |   - RPM input    |                        |
 |  |  PHY Sensors   |    |   - Auto curve   |                        |
 |  |                |    +------------------+                        |
-|  |  10G PHY temp  |             |                                  |
+|  |  10G PHY 1 temp  |             |                                  |
 |  |  Switch temp   |      +------+------+                           |
 |  +----------------+      |             |                           |
 |                          |    FAN      |                           |
@@ -193,8 +193,8 @@ config curve 'custom'
 |--------|--------|-------------|
 | CPU | `/sys/class/thermal/thermal_zone0/temp` | AN7581 SoC die temperature |
 | Board | `/sys/class/hwmon/hwmon5/temp1_input` | NCT7802Y local sensor (fan curve input) |
-| 10G PHY | `/sys/class/hwmon/hwmon0/temp1_input` | 10 Gigabit Ethernet PHY |
-| Switch PHY | `/sys/class/hwmon/hwmon1/temp1_input` | Gigabit switch PHY |
+| 10G PHY 1 | `/sys/class/hwmon/hwmon0/temp1_input` | 10 Gigabit Ethernet PHY (lan2, RTL826x) |
+| 10G PHY 2 | `/sys/class/hwmon/hwmon1/temp1_input` | 10 Gigabit Ethernet PHY (wan, RTL826x) |
 | WiFi 2.4G | `/sys/class/hwmon/hwmon2/temp1_input` | MT7996 2.4 GHz radio |
 | WiFi 5G | `/sys/class/hwmon/hwmon3/temp1_input` | MT7996 5 GHz radio |
 | WiFi 6G | `/sys/class/hwmon/hwmon4/temp1_input` | MT7996 6 GHz radio |

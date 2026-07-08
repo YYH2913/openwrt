@@ -7,7 +7,7 @@
 			},
 			"uci": [ "fan" ],
 			"file": {
-				"/sys/class/hwmon/hwmon5/*": [ "read" ]
+				"/sys/class/hwmon/hwmon*/*": [ "read" ]
 			}
 		},
 		"write": {

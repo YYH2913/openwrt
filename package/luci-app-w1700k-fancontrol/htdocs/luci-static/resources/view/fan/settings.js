@@ -202,10 +202,13 @@ return view.extend({
 			o = s.taboption('points', form.Value, 'point' + i + '_pwm', _('Point %d PWM (0-255)').format(i));
 			o.datatype = 'range(0,255)';
 			o.rmempty = false;
+			if (i === 5) {
+				o.description = _('NCT7802 hardware fixes point 5 at full speed (255) — this value is stored but not written to the fan controller.');
+			}
 		}
 
 		// Draw curve after render
-		m.render().then(function(node) {
+		return m.render().then(function(node) {
 			requestAnimationFrame(function() {
 				var preset = uci.get('fan', 'settings', 'curve_preset') || 'balanced';
 				drawCurveCanvas('curve-canvas', curves, preset);
@@ -220,7 +223,5 @@ return view.extend({
 			});
 			return node;
 		});
-
-		return m.render();
 	}
 });

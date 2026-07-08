@@ -9,7 +9,7 @@ PKG_LICENSE:=Apache-2.0
 LUCI_TITLE:=LuCI Airoha FlowSense — Offload & PPE Monitor
 LUCI_DEPENDS:=+luci-base @TARGET_airoha
 
-include $(TOPDIR)/feeds/luci/luci.mk
+include ../../luci.mk
 
 define Package/luci-app-airoha-flowsense/conffiles
 /etc/config/npu-monitor

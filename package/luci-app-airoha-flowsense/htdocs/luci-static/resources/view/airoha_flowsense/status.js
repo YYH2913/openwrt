@@ -137,10 +137,18 @@ function calcTotalMem(regions) {
 	return t >= 1024 ? (t/1024).toFixed(0)+' MiB' : t+' KiB';
 }
 
-function tokenHealth(c, s) {
-	if (!s) return { text: 'N/A', color: '#888' };
-	var p = c/s*100;
-	return p < 50 ? { text:'Healthy', color:'#4caf50' } : p < 80 ? { text:'Warning', color:'#ff9800' } : { text:'Critical', color:'#f44336' };
+function pleHealth(free) {
+	if (typeof free !== 'number' || free < 0) return { text: 'N/A', color: '#888' };
+	if (free >= 1000000) return { text: 'OK',   color: '#4caf50' };
+	if (free >=  100000) return { text: 'WARN', color: '#ff9800' };
+	return { text: 'CRIT', color: '#f44336' };
+}
+
+function formatPleCount(free) {
+	if (typeof free !== 'number' || free < 0) return '—';
+	if (free >= 1000000) return (free/1000000).toFixed(1) + 'M';
+	if (free >= 1000)    return Math.round(free/1000) + 'K';
+	return free + '';
 }
 
 function getBandStats(ti, b) {
@@ -843,7 +851,7 @@ function updateCompassSVG(cs, mode, ppe) {
 }
 
 /* ── CPU/NPU Load Tachometer ── */
-function buildCpuNpuTacho(cs, ppe, st) {
+function buildCpuNpuTacho(cs, ppe, st, ti) {
 	st = st || {};
 	var cpuPct     = cs.cpuPct || 0;
 	var ppeBound   = (ppe.bnd || {}).total || 0;
@@ -866,8 +874,8 @@ function buildCpuNpuTacho(cs, ppe, st) {
 	// Outer ring (CW, r=71-81): CPU frequency, 500–1400 MHz
 	var FREQ_MIN = 500, FREQ_MAX = 1400;
 	var freqLit = Math.round(Math.max(0, Math.min(TICKS, (freqMhz - FREQ_MIN) / (FREQ_MAX - FREQ_MIN) * TICKS)));
-	// Inner ring (anti-CW, r=57-67): CPU load, 0–40% = full scale (more sensitive)
-	var cpuLit = Math.round(Math.min(cpuPct, 40) / 40 * TICKS);
+	// Inner ring (anti-CW, r=57-67): CPU load, 0–100% = full scale
+	var cpuLit = Math.round(Math.min(cpuPct, 100) / 100 * TICKS);
 
 	var cx = 150, cy = 150;
 	var p = [];
@@ -917,50 +925,71 @@ function buildCpuNpuTacho(cs, ppe, st) {
 	p.push('<text x="150" y="190" text-anchor="middle" fill="'+npuColor+'" font-size="13" font-weight="700" font-family="monospace">'+offloadPct+'%</text>');
 	p.push('<text x="150" y="200" text-anchor="middle" fill="var(--soc-muted)" font-size="7" font-family="monospace" letter-spacing="1.5">OFFLOADED</text>');
 
+	// PLE pool — curved textPath at r=91, south arc (CCW 160°→20°), outside the freq ring.
+	// Matches the "UNB/BND FLOWS" curved-text style used on the WiFi band gauges.
+	var pleFree = (ti && typeof ti.ple_free === 'number') ? ti.ple_free : -1;
+	var pleH    = pleHealth(pleFree);
+	var pleStr  = formatPleCount(pleFree);
+	var plR  = 91;
+	var plSX = (150 + plR * Math.cos(160 * Math.PI / 180)).toFixed(1);
+	var plSY = (150 + plR * Math.sin(160 * Math.PI / 180)).toFixed(1);
+	var plEX = (150 + plR * Math.cos( 20 * Math.PI / 180)).toFixed(1);
+	var plEY = (150 + plR * Math.sin( 20 * Math.PI / 180)).toFixed(1);
+	p.push('<defs><path id="cn-ple-arc" d="M '+plSX+' '+plSY+' A '+plR+' '+plR+' 0 0 0 '+plEX+' '+plEY+'" fill="none"/></defs>');
+	p.push('<text font-size="8" font-family="monospace" fill="'+pleH.color+'" opacity="0.9" letter-spacing="1"><textPath href="#cn-ple-arc" startOffset="50%" text-anchor="middle">PLE '+pleStr+' ● '+pleH.text+'</textPath></text>');
+
 	return p.join('');
 }
 
-function _cnPpeRingStyle(ppe) {
-	// Solid PPE-state ring: invisible=no flows or UNB-only, cyan=BND present
+function _cnPpeRingStyle(ppe, ti) {
+	// PLE pool health overrides the BND-based cyan default when the WiFi TX buffer pool
+	// drops toward zero — that's the precursor signal for mt7996 SER / TX wedge.
+	var ple = (ti && typeof ti.ple_free === 'number') ? ti.ple_free : -1;
+	if (ple >= 0 && ple < 100000) {
+		return { style: 'filter:blur(6px);opacity:0.85', color: '#f44336' };
+	}
+	if (ple >= 0 && ple < 1000000) {
+		return { style: 'filter:blur(5px);opacity:0.7',  color: '#ff9800' };
+	}
+
+	// Default: cyan-on-BND, invisible when no BND
 	var bnd = (ppe && ppe.bnd) ? (ppe.bnd.total || 0) : 0;
-	var unb = (ppe && ppe.unb) ? (ppe.unb.total || 0) : 0;
 	if (bnd === 0) return { style: 'opacity:0', color: '#00c8ff' };
-	// BND >= 1: cyan ring, brighter as BND count grows (saturates ~100 flows)
 	var intensity = Math.min(1, bnd / 100);
 	var blur = (3 + intensity * 6).toFixed(1);
 	var op   = (0.5 + intensity * 0.45).toFixed(2);
 	return { style: 'filter:blur('+blur+'px);opacity:'+op, color: '#00c8ff' };
 }
 
-function buildCpuNpuCompassSVG(cs, ppe, st) {
+function buildCpuNpuCompassSVG(cs, ppe, st, ti) {
 	// viewBox tightly wraps the tachometer (r=102 outer circle + glow headroom + silver ring)
-	var ring = _cnPpeRingStyle(ppe);
+	var ring = _cnPpeRingStyle(ppe, ti);
 	return '<svg viewBox="30 30 240 240" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:213px;display:block;margin:0 auto">' +
 	'<defs>' +
 	'<filter id="f-cn-cpu" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur in="SourceGraphic" stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
 	'<filter id="f-cn-npu" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur in="SourceGraphic" stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>' +
 	'</defs>' +
-	// PPE-state ring rendered BEFORE outer circle so the circle fill covers the inward bleed
+	// PPE/PLE-state ring rendered BEFORE outer circle so the circle fill covers the inward bleed
 	'<circle id="cn-glow" cx="150" cy="150" r="104" fill="none" stroke="'+ring.color+'" stroke-width="6" style="'+ring.style+'"/>' +
 	// Outer border — tight around the tachometer content
 	'<circle cx="150" cy="150" r="102" style="fill:var(--soc-card-bg)" stroke="var(--soc-border)" stroke-width="1"/>' +
-	'<g id="cn-tacho">'+buildCpuNpuTacho(cs, ppe, st)+'</g>' +
-	// Solid silver outer ring — sits outside the cyan PPE glow ring
+	'<g id="cn-tacho">'+buildCpuNpuTacho(cs, ppe, st, ti)+'</g>' +
+	// Solid silver outer ring — sits outside the PPE/PLE glow ring
 	'<circle cx="150" cy="150" r="109" fill="none" stroke="#222222" stroke-width="2.5"/>' +
 	'</svg>';
 }
 
-function updateCpuNpuCompassSVG(cs, ppe, st) {
-	// Update PPE-state ring on the outer border
+function updateCpuNpuCompassSVG(cs, ppe, st, ti) {
+	// Update PPE/PLE-state ring on the outer border
 	var glow = document.getElementById('cn-glow');
 	if (glow) {
-		var ring = _cnPpeRingStyle(ppe);
+		var ring = _cnPpeRingStyle(ppe, ti);
 		glow.setAttribute('stroke', ring.color);
 		glow.setAttribute('style', ring.style);
 	}
 
 	var tg = document.getElementById('cn-tacho');
-	if (tg) tg.innerHTML = buildCpuNpuTacho(cs, ppe, st);
+	if (tg) tg.innerHTML = buildCpuNpuTacho(cs, ppe, st, ti);
 }
 
 /* ── WiFi Band Tachometers ── */
@@ -1399,7 +1428,7 @@ return view.extend({
 		compassSvgWrap.innerHTML = buildCompassSVG(cs, mode, ppe);
 
 		var cnWrap = E('div', { 'id': 'cpu-npu-svg-wrap', 'style': 'flex-shrink:0' });
-		cnWrap.innerHTML = buildCpuNpuCompassSVG(cs, ppe, st);
+		cnWrap.innerHTML = buildCpuNpuCompassSVG(cs, ppe, st, ti);
 
 		var view = E('div',{'class':'cbi-map'},[
 			E('h2',{},_('Airoha FlowSense')),
@@ -1463,7 +1492,7 @@ return view.extend({
 				updateCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode);
 
 				// CPU/NPU Load compass update
-				updateCpuNpuCompassSVG(cs, ppe, st);
+				updateCpuNpuCompassSVG(cs, ppe, st, ti);
 
 				// WiFi band tachometers
 				var wbands = (wifi && Array.isArray(wifi.bands)) ? wifi.bands : [];
