@@ -154,7 +154,3 @@ msgstr ""
 #: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/status.js:135
 msgid "WiFi"
 msgstr ""
-
-#: feeds/luci/applications/luci-app-w1700k-fancontrol/htdocs/luci-static/resources/view/fan/settings.js:206
-msgid "NCT7802 hardware fixes point 5 at full speed (255) — this value is stored but not written to the fan controller."
-msgstr ""
