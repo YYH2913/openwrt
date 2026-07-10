@@ -168,7 +168,7 @@
 
 		partition@700000 {
 			label = "ubi";
-			reg = <0x00700000 0x1d9c0000>;
+			reg = <0x00700000 0x1b700000>;
 			compatible = "linux,ubi";
 
 			volumes {
@@ -196,15 +196,10 @@
 			};
 		};
 
-		/*
-		 * Reserve the final 250 eraseblocks (31.25 MiB) for the stock
-		 * bootloader's BMT/BBT handling on the 512 MiB SPI-NAND.
-		 * Otherwise U-Boot may erase/write into the end of the "ubi"
-		 * partition during recovery or sysupgrade flows.
-		 */
-		reserved_bmt@1e0c0000 {
+		/* reserved for bad block table */
+		reserved_bmt@1be00000 {
 			label = "reserved_bmt";
-			reg = <0x1e0c0000 0x01f40000>;
+			reg = <0x1be00000 0x04200000>;
 			read-only;
 		};
 	};
@@ -309,6 +304,10 @@
 	status = "okay";
 };
 
+&pon_pcs {
+	status = "okay";
+};
+
 &gdm1 {
 	status = "okay";
 
@@ -326,6 +325,10 @@
 	nvmem-cells = <&wan_mac 0>;
 	nvmem-cell-names = "mac-address";
 	openwrt,netdev-name = "wan";
+};
+
+&eth_pcs {
+	status = "okay";
 };
 
 &gdm4 {
