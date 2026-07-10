@@ -4,6 +4,105 @@
 
 . /lib/functions.sh
 
+HARDWARE_BLOCKED_FILE="/tmp/luci-airoha-npu.hardware-blocked"
+
+_is_en7581() {
+	case "$EN7581_SOC" in
+		1) return 0 ;;
+		0) return 1 ;;
+	esac
+
+	if [ -r /proc/device-tree/compatible ] &&
+		tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null |
+		grep -Eq '^airoha,(an|en)7581$'; then
+		EN7581_SOC=1
+		return 0
+	fi
+
+	EN7581_SOC=0
+	return 1
+}
+
+# Run a hardware probe behind a wall-clock deadline. The command itself runs
+# below two disposable shells, so killing those shells never waits for a
+# devmem/debugfs reader that is stuck in uninterruptible sleep.
+_run_with_deadline() {
+	local seconds="$1"
+	local tag="$2"
+	local base="/tmp/luci-airoha-npu.${tag}.$$"
+	local output="${base}.out"
+	local done="${base}.done"
+	local child_file="${base}.child"
+	local worker timer child rc elapsed
+	shift 2
+
+	[ -e "$HARDWARE_BLOCKED_FILE" ] && return 125
+	rm -f "$output" "$done" "$child_file"
+
+	(
+		HARDWARE_DEADLINE_ACTIVE=1
+		"$@" >"$output" 2>/dev/null &
+		child=$!
+		printf '%s\n' "$child" >"$child_file"
+		wait "$child"
+		printf '%s\n' "$?" >"$done"
+	) >/dev/null 2>&1 &
+	worker=$!
+
+	sleep "$seconds" >/dev/null 2>&1 &
+	timer=$!
+
+	# Current OpenWrt ash supports wait -n. If an older shell rejects it,
+	# both jobs remain alive and the coarse polling fallback is used.
+	wait -n 2>/dev/null
+	if kill -0 "$worker" 2>/dev/null && kill -0 "$timer" 2>/dev/null; then
+		elapsed=0
+		while [ "$elapsed" -lt "$seconds" ] && [ ! -e "$done" ]; do
+			sleep 1
+			elapsed=$((elapsed + 1))
+		done
+	fi
+
+	if [ -e "$done" ]; then
+		kill "$timer" 2>/dev/null
+		wait "$timer" 2>/dev/null
+		wait "$worker" 2>/dev/null
+		read -r rc <"$done" 2>/dev/null
+
+		if [ "${rc:-1}" -eq 0 ] && [ -s "$output" ]; then
+			cat "$output"
+			rm -f "$output" "$done" "$child_file"
+			return 0
+		fi
+
+		rm -f "$output" "$done" "$child_file"
+		return 1
+	fi
+
+	if [ -s "$child_file" ]; then
+		read -r child <"$child_file" 2>/dev/null
+		case "$child" in
+			*[!0-9]*|'') ;;
+			*) kill -9 "$child" 2>/dev/null ;;
+		esac
+	fi
+
+	# The worker shell is killable even when its hardware-reading descendant
+	# is not. Never wait for the descendant itself.
+	kill -9 "$worker" 2>/dev/null
+	wait "$worker" 2>/dev/null
+	kill "$timer" 2>/dev/null
+	wait "$timer" 2>/dev/null
+	rm -f "$output" "$done" "$child_file"
+	printf '%s\n' "$tag timed out" >"$HARDWARE_BLOCKED_FILE"
+	logger -t luci.airoha_npu "hardware probe '$tag' timed out after ${seconds}s; disabling hardware polling until reboot" 2>/dev/null
+	return 124
+}
+
+_devmem_read_raw() {
+	devmem "$1" 2>/dev/null
+}
+
 # Timeout-protected hardware register read via devmem.
 # Prevents rpcd/LuCI hang when a register bus stalls.
 # Usage: _devmem_read <address> [timeout_sec]
@@ -11,44 +110,24 @@
 _devmem_read() {
 	local addr="$1"
 	local to="${2:-2}"
-	local val="" tmp pid i
+	local val=""
 
-	# Preferred path: busybox/coreutils timeout
-	if command -v timeout >/dev/null 2>&1; then
-		val=$(timeout "$to" devmem "$addr" 2>/dev/null) || val=""
-		echo "${val:-0}"
-		return 0
-	fi
-
-	# Fallback: background process + manual kill-on-timeout
-	tmp="/tmp/_dm_${$}"
-	( devmem "$addr" >"$tmp" 2>/dev/null ) &
-	pid=$!
-	i=0
-	while [ "$i" -lt "$to" ]; do
-		kill -0 "$pid" 2>/dev/null || break
-		sleep 1
-		i=$((i + 1))
-	done
-
-	if kill -0 "$pid" 2>/dev/null; then
-		kill -9 "$pid" 2>/dev/null
-		wait "$pid" 2>/dev/null
-		rm -f "$tmp"
+	if ! _is_en7581; then
 		echo "0"
-		return 0
+		return 1
 	fi
 
-	wait "$pid" 2>/dev/null
-	if [ -f "$tmp" ] && [ -s "$tmp" ]; then
-		read -r val <"$tmp" 2>/dev/null
+	if [ "$HARDWARE_DEADLINE_ACTIVE" = "1" ]; then
+		val=$(_devmem_read_raw "$addr") || val=""
+	else
+		val=$(_run_with_deadline "$to" devmem _devmem_read_raw "$addr") || val=""
 	fi
-	rm -f "$tmp"
+
 	echo "${val:-0}"
-	return 0
+	[ -n "$val" ]
 }
 
-get_status() {
+_get_status_raw() {
 	# === NPU Status ===
 	# Read the actually-loaded NPU firmware path from DTS (firmware-name property).
 	local npu_fw=""
@@ -157,7 +236,7 @@ get_status() {
 		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_count:-0}" "${pll_freq:-0}"
 }
 
-get_ppe_entries() {
+_get_ppe_entries_raw() {
 	local entries_file="/sys/kernel/debug/ppe/entries"
 
 	if [ ! -f "$entries_file" ]; then
@@ -217,7 +296,7 @@ get_ppe_entries() {
 	' "$entries_file" 2>/dev/null || echo '{"entries":[]}'
 }
 
-get_token_info() {
+_get_token_info_raw() {
 	local token_file="/sys/kernel/debug/ieee80211/phy0/mt76/token_info"
 
 	# Gather per-band WiFi station stats (count, retries, failures)
@@ -347,6 +426,11 @@ set_overclock() {
 		return
 	fi
 
+	if ! _is_en7581; then
+		echo '{"error":"overclock is not supported on this SoC"}'
+		return
+	fi
+
 	# Calculate PCW and posdiv
 	local posdiv pcw_int
 	if [ "$target_mhz" -lt 1000 ]; then
@@ -390,8 +474,9 @@ set_overclock() {
 		devmem 0x1fa202b8 32 $(printf "0x%08X" $((cleared | (posdiv << 4) | 1)))
 	fi
 
-	# Step 6: Wait for PLL lock
-	sleep 0.02
+	# Step 6: Wait for PLL lock. This image has no usleep and its sleep
+	# applet does not accept fractional values, so use a conservative delay.
+	sleep 1
 
 	# Step 7: Enable ARMPLL path in CLK_MUX (set bit 0)
 	local cur_clkmux2=$(($(_devmem_read 0x1fa201e0)))
@@ -427,7 +512,7 @@ set_overclock() {
 		"$target_mhz" "$read_freq" "$read_pcw" "$read_posdiv"
 }
 
-get_frame_engine() {
+_get_frame_engine_raw() {
 	if ! command -v devmem > /dev/null 2>&1; then
 		echo '{"error":"devmem not available"}'
 		return
@@ -487,6 +572,42 @@ get_frame_engine() {
 	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
 	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
 	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
+}
+
+get_status() {
+	if ! _run_with_deadline 3 status _get_status_raw; then
+		echo '{"error":"hardware status unavailable","npu_version":"Unknown","npu_loaded":false,"npu_device":"","npu_clock":0,"npu_cores":0,"offload_bound":0,"offload_total":0,"memory_regions":[],"cpu_cur_freq":0,"cpu_hw_freq":0,"cpu_governor":"unknown","cpu_avail_governors":"","cpu_min_freq":0,"cpu_max_freq":0,"cpu_avail_freqs":"","cpu_count":0,"pll_freq_mhz":0}'
+	fi
+}
+
+get_ppe_entries() {
+	if ! _run_with_deadline 3 ppe _get_ppe_entries_raw; then
+		echo '{"entries":[]}'
+	fi
+}
+
+get_token_info() {
+	if ! _run_with_deadline 3 token _get_token_info_raw; then
+		echo '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[]}'
+	fi
+}
+
+get_frame_engine() {
+	if ! _is_en7581; then
+		echo '{"error":"frame engine is not supported on this SoC"}'
+		return
+	fi
+
+	# Presence of the PPE debugfs node is the earliest reliable indication
+	# that the frame-engine clocks and driver initialization have completed.
+	if [ ! -r /sys/kernel/debug/ppe/entries ]; then
+		echo '{"error":"frame engine not ready"}'
+		return
+	fi
+
+	if ! _run_with_deadline 3 frame _get_frame_engine_raw; then
+		echo '{"error":"frame engine unavailable"}'
+	fi
 }
 
 get_vlan_offload() {
