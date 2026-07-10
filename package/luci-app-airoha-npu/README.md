@@ -32,20 +32,20 @@ Real-time monitoring and management dashboard for the Airoha AN7581 SoC on OpenW
 ### NPU & Offload Engine
 - NPU firmware version (TLB format), clock frequency, core count
 - NPU load status (active/inactive) and reserved memory regions
-- WiFi token pool health indicator with in-flight count
+- WiFi token pool and per-band queue state
 - PPE flow offload summary (bound / total entries)
 - Per-band WiFi status cards (2.4 GHz, 5 GHz, 6 GHz):
-  - Client count and link health indicator (Good / Fair / Poor)
+  - Client count and connection state
   - NPU vs DMA path badge
-  - TX retry rate percentage with color-coded thresholds
+  - TX retry rate for host DMA queues (hidden for NPU queues whose packet counters bypass the host)
 
 ### Frame Engine Visualization
 - **PSE Shared Buffer** usage bar (congestion indicator)
 - **GDM port cards** with live TX/RX packet counters and drop counts:
-  - GDM1: Internal Switch (1G LAN3/4)
+  - GDM1: Internal Switch (1G LAN2/3)
   - GDM2: WAN (USXGMII 10G)
-  - GDM4: LAN2 (USXGMII 10G)
-- **CDM offload ratio** bars — HW-forwarded (PPE) vs CPU-path packets
+  - GDM4: LAN1 (USXGMII 2.5G)
+- **CDM path counters** — TX, CPU RX, hardware-forwarded RX, and drops
 - **PSE Port Queue Status** grid (P0-P9) with IQ/OQ queue depths and drop counts
 
 ### PPE Flow Offload Table
@@ -53,7 +53,7 @@ Real-time monitoring and management dashboard for the Airoha AN7581 SoC on OpenW
 - Auto-refreshes every 5 seconds
 
 ### Theme Support
-- Auto-detects dark/light mode by sampling page background luminance at runtime
+- Uses the active theme mode, with rendered-background detection as a fallback
 - Works with Glass, Bootstrap, Bootstrap-dark, and any LuCI theme
 - No hardcoded colors — uses CSS custom properties throughout
 
@@ -63,7 +63,7 @@ Real-time monitoring and management dashboard for the Airoha AN7581 SoC on OpenW
 - Airoha AN7581 target (`@TARGET_airoha`)
 - PPE debugfs (`/sys/kernel/debug/ppe/entries`)
 - **`devmem`** busybox applet — required for Frame Engine register access and CPU overclock (`CONFIG_BUSYBOX_DEFAULT_DEVMEM=y`)
-- WiFi token_info debugfs for per-band WiFi stats (`/sys/kernel/debug/ieee80211/phy0/mt76/token_info`)
+- WiFi token_info debugfs for per-band WiFi stats (`/sys/kernel/debug/ieee80211/phy*/mt76/token_info`)
 - Optional: [air_tools](https://github.com/merbanan/air_tools) scripts for additional Frame Engine debugging
 
 ## Installation
@@ -103,7 +103,7 @@ ssh root@router 'chmod +x /usr/libexec/rpcd/luci.airoha_npu && /etc/init.d/rpcd 
 | CPU frequency | `/sys/devices/system/cpu/cpufreq/policy0/` | Yes |
 | Overclock PLL | `devmem` registers (0x1fa202b4, 0x1fa202b8) | devmem |
 | PPE entries | `/sys/kernel/debug/ppe/{entries,bind}` | Yes |
-| WiFi token pool | `/sys/kernel/debug/ieee80211/phy0/mt76/token_info` | Optional |
+| WiFi token pool | `/sys/kernel/debug/ieee80211/phy*/mt76/token_info` | Optional |
 | WiFi station stats | `iw dev <iface> station dump` | Optional |
 | Frame Engine (GDM/CDM/PSE) | `devmem` registers (0x1fb50xxx-0x1fb53xxx) | devmem |
 
