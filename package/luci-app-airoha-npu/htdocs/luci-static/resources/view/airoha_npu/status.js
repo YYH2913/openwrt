@@ -16,6 +16,21 @@ var callSetVlanOffload = rpc.declare({ object: 'luci.airoha_npu', method: 'setVl
 var callGetPPPoEOffload = rpc.declare({ object: 'luci.airoha_npu', method: 'getPPPoEOffload' });
 var callSetPPPoEOffload = rpc.declare({ object: 'luci.airoha_npu', method: 'setPPPoEOffload', params: ['enabled'] });
 
+function loadStatusData() {
+	// Probe the guarded status endpoint first. If hardware access times out,
+	// the backend circuit breaker is set before the remaining probes run.
+	return L.resolveDefault(callNpuStatus(), {}).then(function(status) {
+		return Promise.all([
+			status,
+			L.resolveDefault(callPpeEntries(), { entries: [] }),
+			L.resolveDefault(callTokenInfo(), { tx_queues: [], station_counts: [] }),
+			L.resolveDefault(callFrameEngine(), { error: 'unavailable' }),
+			L.resolveDefault(callGetVlanOffload(), { enabled: 0 }),
+			L.resolveDefault(callGetPPPoEOffload(), { enabled: 0 })
+		]);
+	});
+}
+
 /* ── Theme-adaptive CSS ── */
 var themeCSS = '\
 .soc-card{background:var(--soc-card-bg);border:1px solid var(--soc-border);border-radius:8px;padding:14px;transition:border-color .3s}\
@@ -169,7 +184,7 @@ function updateBandChip(band, stats) {
 
 /* ── Frame Engine Diagram (with WiFi bands, NPU, PPE flows) ── */
 function renderFeDiagram(fe, ti, st) {
-	if (!fe || fe.error) return E('div', { 'class': 'soc-muted' }, 'devmem not available on this build');
+	if (!fe || fe.error) return E('div', { 'class': 'soc-muted' }, _('Not available'));
 	ti = ti || {}; st = st || {};
 
 	var ports = Array.isArray(fe.pse_ports) ? fe.pse_ports : [];
@@ -435,7 +450,7 @@ function renderPPPoEOffloadSelect(enabled) {
 /* ── Main View ── */
 return view.extend({
 	load: function() {
-		return Promise.all([ callNpuStatus(), callPpeEntries(), callTokenInfo(), callFrameEngine(), callGetVlanOffload(), callGetPPPoEOffload() ]);
+		return loadStatusData();
 	},
 
 	render: function(data) {
@@ -495,7 +510,7 @@ return view.extend({
 		]);
 
 		poll.add(L.bind(function() {
-			return Promise.all([ callNpuStatus(), callPpeEntries(), callTokenInfo(), callFrameEngine(), callGetVlanOffload(), callGetPPPoEOffload() ]).then(L.bind(function(d) {
+			return loadStatusData().then(L.bind(function(d) {
 				injectCSS();
 				var st=d[0]||{}, ppe=d[1]||{}, ti=d[2]||{}, fe=d[3]||{}, vo=d[4]||{}, po=d[5]||{};
 				var entries = Array.isArray(ppe.entries)?ppe.entries:[];
