@@ -37,8 +37,6 @@ platform_do_upgrade() {
 			fit_do_upgrade "$1"
 			;;
 		econet,xr1710g-ubi)
-			IGNORE_ROOTFS_DATA_MAX=1 \
-			CI_REMOVE_UBIVOLS="config log" \
 			fit_do_upgrade "$1"
 			;;
 		*)

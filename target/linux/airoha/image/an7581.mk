@@ -127,6 +127,11 @@ define Device/econet_xr1710g-ubi
   DEVICE_MODEL := XR1710G
   DEVICE_VARIANT := UBI
   DEVICE_DTS := an7581-xr1710g-ubi
+  DEVICE_COMPAT_VERSION := 2.0
+  DEVICE_COMPAT_MESSAGE := The XR1710G BMT/BBT boundary has changed. Install \
+       an XR1710G chainloader/U-Boot using the new layout first, then boot \
+       recovery/initramfs and fully recreate UBI. A normal sysupgrade that \
+       preserves configuration is unsafe.
   DEVICE_PACKAGES := -airoha-en7581-npu-firmware \
 		    -kmod-input-gpio-keys-polled -kmod-leds-pwm \
 		    -kmod-pwm-airoha \
