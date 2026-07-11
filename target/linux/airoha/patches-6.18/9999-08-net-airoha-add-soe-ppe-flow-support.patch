@@ -13,7 +13,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -6,16 +6,23 @@
+@@ -6,15 +6,22 @@
  
  #include <linux/ip.h>
  #include <linux/ipv6.h>
@@ -26,7 +26,6 @@ diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/air
 +#include <linux/sysfs.h>
 +#include <linux/tcp.h>
 +#include <linux/udp.h>
- #include <linux/if_vlan.h>
 +#include <net/ipv6.h>
 +#include <net/netfilter/nf_flow_table.h>
  #include <net/pkt_cls.h>
