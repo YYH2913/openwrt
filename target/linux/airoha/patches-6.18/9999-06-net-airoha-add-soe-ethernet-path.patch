@@ -13,19 +13,17 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -6,11 +6,13 @@
+@@ -6,9 +6,11 @@
  #include <linux/of.h>
  #include <linux/of_net.h>
  #include <linux/of_reserved_mem.h>
 +#include <linux/moduleparam.h>
  #include <linux/platform_device.h>
  #include <linux/tcp.h>
- #include <linux/if_vlan.h>
  #include <linux/pcs/pcs.h>
  #include <linux/u64_stats_sync.h>
 +#include <linux/unaligned.h>
  #include <net/dst_metadata.h>
- #include <net/ip6_checksum.h>
  #include <net/page_pool/helpers.h>
 @@ -20,6 +22,67 @@
  
@@ -736,7 +734,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  
  	if (!(diff & NETIF_F_GRO_HW))
  		return 0;
-@@ -2589,6 +2977,120 @@
+@@ -2589,6 +2977,123 @@
  	return 0;
  }
  
@@ -751,8 +749,8 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
 +	struct netdev_queue *txq;
 +	struct airoha_queue *q;
 +	LIST_HEAD(tx_list);
++	dma_addr_t addr;
 +	int i = 0, qid;
-+	void *data;
 +	u16 index;
 +
 +	/* Submit through the active QDMA for this netdev; inactive QDMA rings
@@ -768,6 +766,8 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
 +	}
 +
 +	spin_lock_bh(&q->lock);
++	if (q->flushing)
++		goto error_unlock;
 +
 +	txq = skb_get_tx_queue(netdev, skb);
 +	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
@@ -779,22 +779,20 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
 +		return -EBUSY;
 +	}
 +
-+	len = skb_headlen(skb);
-+	data = skb->data;
-+
 +	e = list_first_entry(&q->tx_list, struct airoha_queue_entry, list);
++	len = skb_headlen(skb);
++	addr = dma_map_single(netdev->dev.parent, skb->data, len,
++			      DMA_TO_DEVICE);
++	if (unlikely(dma_mapping_error(netdev->dev.parent, addr)))
++		goto error_unlock;
++
++	e->dma_type = AIROHA_DMA_MAP_SINGLE;
 +	index = e - q->entry;
 +
 +	while (true) {
 +		struct airoha_qdma_desc *desc = &q->desc[index];
 +		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-+		dma_addr_t addr;
 +		u32 val;
-+
-+		addr = dma_map_single(netdev->dev.parent, data, len,
-+				      DMA_TO_DEVICE);
-+		if (unlikely(dma_mapping_error(netdev->dev.parent, addr)))
-+			goto error_unmap;
 +
 +		list_move_tail(&e->list, &tx_list);
 +		e->skb = i == nr_frags - 1 ? skb : NULL;
@@ -819,8 +817,13 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
 +		if (++i == nr_frags)
 +			break;
 +
-+		data = skb_frag_address(frag);
 +		len = skb_frag_size(frag);
++		addr = skb_frag_dma_map(netdev->dev.parent, frag, 0, len,
++					DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(netdev->dev.parent, addr)))
++			goto error_unmap;
++
++		e->dma_type = AIROHA_DMA_MAP_PAGE;
 +	}
 +	q->queued += i;
 +
@@ -841,12 +844,10 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
 +	return 0;
 +
 +error_unmap:
-+	list_for_each_entry(e, &tx_list, list) {
-+		dma_unmap_single(netdev->dev.parent, e->dma_addr, e->dma_len,
-+				 DMA_TO_DEVICE);
-+		e->dma_addr = 0;
-+	}
++	list_for_each_entry(e, &tx_list, list)
++		airoha_unmap_xmit_buf(dev->eth, e);
 +	list_splice(&tx_list, &q->tx_list);
++error_unlock:
 +	spin_unlock_bh(&q->lock);
 +	rcu_read_unlock();
 +
@@ -857,15 +858,15 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
  				   struct net_device *netdev)
  {
-@@ -2598,6 +3100,7 @@
+@@ -2598,6 +3103,7 @@
  	struct airoha_qdma *qdma;
  	struct netdev_queue *txq;
  	struct airoha_queue *q;
 +	bool soe_decrypt_skb = false;
  	LIST_HEAD(tx_list);
+ 	dma_addr_t addr;
  	int i = 0, qid;
- 	void *data;
-@@ -2638,6 +3141,11 @@
+@@ -2638,6 +3144,11 @@
  	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
  	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
  
@@ -877,7 +878,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  	q = &qdma->q_tx[qid];
  	if (WARN_ON_ONCE(!q->ndesc))
  		goto error;
-@@ -2710,12 +3218,24 @@
+@@ -2710,12 +3221,24 @@
  		q->txq_stopped = true;
  	}
  
@@ -903,7 +904,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  	rcu_read_unlock();
  
  	return NETDEV_TX_OK;
-@@ -3941,6 +4461,7 @@
+@@ -3941,6 +4464,7 @@
  		dev->flags |= AIROHA_PRIV_F_WAN;
  
  	port->devs[index] = dev;
@@ -911,7 +912,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  
  	return airoha_setup_phylink(netdev);
  }
-@@ -4120,6 +4641,10 @@
+@@ -4120,6 +4644,10 @@
  	strscpy(eth->napi_dev->name, "qdma_eth", sizeof(eth->napi_dev->name));
  	platform_set_drvdata(pdev, eth);
  
@@ -922,7 +923,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  	err = airoha_hw_init(pdev, eth);
  	if (err)
  		goto error_netdev_free;
-@@ -4168,6 +4693,7 @@
+@@ -4168,6 +4696,7 @@
  			netdev = netdev_from_priv(dev);
  			if (netdev->reg_state == NETREG_REGISTERED)
  				unregister_netdev(netdev);
@@ -930,7 +931,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  			if (dev->phylink)
  				phylink_destroy(dev->phylink);
  			of_node_put(netdev->dev.of_node);
-@@ -4176,6 +4702,7 @@
+@@ -4176,6 +4705,7 @@
  	}
  	airoha_hw_cleanup(eth);
  error_netdev_free:
@@ -938,7 +939,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/air
  	free_netdev(eth->napi_dev);
  	platform_set_drvdata(pdev, NULL);
  
-@@ -4206,12 +4733,14 @@
+@@ -4206,12 +4736,14 @@
  
  			netdev = netdev_from_priv(dev);
  			unregister_netdev(netdev);
