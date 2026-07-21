@@ -1,0 +1,86 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 15 Jul 2026 12:00:00 +0800
+Subject: [PATCH] partname: resolve PARTLABEL root devices
+
+The partname driver only limits rootfs_data lookup to the root block device
+when root= contains a /dev path. With root=PARTLABEL=rootfs it rejects the
+lookup unless the unsafe all-device fallback is explicitly enabled. This
+leaves valid GPT rootfs_data partitions unused and makes rootdisk place the
+overlay after the squashfs image instead.
+
+Resolve PARTLABEL through sysfs first, then use the existing
+sibling-partition scan on the root block device.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ libfstools/partname.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+--- a/libfstools/partname.c
++++ b/libfstools/partname.c
+@@ -76,6 +76,45 @@ static char *rootdevname(char *devpath)
+ 	return basename(devpath);
+ }
+ 
++static bool rootdev_from_partlabel(const char *label, char *rootdev, size_t len)
++{
++	char ueventglob[BUFLEN], partname[BUFLEN], devpath[BUFLEN];
++	char *devname, *tmp;
++	bool found = false;
++	glob_t gl;
++	int j;
++
++	snprintf(ueventglob, sizeof(ueventglob), "%s/*/uevent", block_dir_name);
++	if (glob(ueventglob, GLOB_NOESCAPE, NULL, &gl))
++		return false;
++
++	for (j = 0; j < gl.gl_pathc; j++) {
++		if (!get_var_from_file(gl.gl_pathv[j], "PARTNAME",
++				       partname, sizeof(partname)))
++			continue;
++		if (strcmp(partname, label))
++			continue;
++
++		if (snprintf(devpath, sizeof(devpath), "%s", gl.gl_pathv[j]) >=
++		    (int)sizeof(devpath))
++			continue;
++
++		tmp = strrchr(devpath, '/');
++		if (!tmp)
++			continue;
++
++		*tmp = '\0';
++		devname = basename(devpath);
++		snprintf(rootdev, len, "%s", devname);
++		rootdevname(rootdev);
++		found = true;
++		break;
++	}
++
++	globfree(&gl);
++	return found;
++}
++
+ static struct volume *partname_volume_find(char *name)
+ {
+ 	struct partname_volume *p;
+@@ -83,6 +122,7 @@ static struct volume *partname_volume_fi
+ 	char namebuf[BUFLEN];
+ 	char rootparam[BUFLEN];
+ 	char *rootdev = NULL, *devname, *tmp;
++	char rootdevbuf[BUFLEN];
+ 	int j;
+ 	bool found = false;
+ 	bool allow_fallback = false;
+@@ -113,6 +153,10 @@ static struct volume *partname_volume_fi
+ 		rootdev = rootdevname(rootparam);
+ 		/* find partition on same device as rootfs */
+ 		snprintf(ueventgstr, sizeof(ueventgstr), "%s/%s/*/uevent", block_dir_name, rootdev);
++	} else if (has_root && !strncmp(rootparam, "PARTLABEL=", 10) &&
++		   rootdev_from_partlabel(rootparam + 10, rootdevbuf, sizeof(rootdevbuf))) {
++		rootdev = rootdevbuf;
++		snprintf(ueventgstr, sizeof(ueventgstr), "%s/%s/*/uevent", block_dir_name, rootdev);
+ 	} else {
+ 		/* For compatibility, devices with root= params must explicitly opt into this fallback. */
+ 		if (has_root && !allow_fallback)
