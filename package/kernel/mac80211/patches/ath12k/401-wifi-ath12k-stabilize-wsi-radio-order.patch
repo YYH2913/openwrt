@@ -1,0 +1,118 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 17 Jul 2026 12:00:00 +0800
+Subject: [PATCH] wifi: ath12k: stabilize WSI radio order
+
+The device which probes first owns the combined wiphy, and the radios in
+that wiphy are currently ordered by PCI probe order.  Probe order is not
+stable for a multi-device WSI group, so both the wiphy device path and its
+radio indices can change across boots.
+
+ath12k already derives a stable, controller-relative index for every WSI
+device from the device tree graph.  Build the pdev map in that order before
+allocating the mac80211 hardware.  Single-device groups keep their existing
+pdev order.
+
+This keeps the cfg80211 radio indices, per-radio addresses and wiphy parent
+device stable without adding another device-tree property.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 60 +++++++++++++++++----------
+ 1 file changed, 37 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -14389,13 +14389,28 @@ static void ath12k_mac_set_device_defaul
+ 	ab->free_vdev_map = (1LL << total_vdev) - 1;
+ }
+ 
++static struct ath12k_base *
++ath12k_mac_get_ab_by_wsi_index(struct ath12k_hw_group *ag, u8 index)
++{
++	struct ath12k_base *ab;
++	int i;
++
++	for (i = 0; i < ag->num_devices; i++) {
++		ab = ag->ab[i];
++		if (ab && ab->wsi_info.index == index)
++			return ab;
++	}
++
++	return NULL;
++}
++
+ int ath12k_mac_allocate(struct ath12k_hw_group *ag)
+ {
+ 	struct ath12k_pdev_map pdev_map[ATH12K_GROUP_MAX_RADIO];
+-	int mac_id, device_id, total_radio, num_hw;
++	int mac_id, device_id, total_radio, num_hw, map_idx;
+ 	struct ath12k_base *ab;
+ 	struct ath12k_hw *ah;
+-	int ret, i, j;
++	int ret, i;
+ 	u8 radio_per_hw;
+ 
+ 	total_radio = 0;
+@@ -14424,35 +14439,37 @@ int ath12k_mac_allocate(struct ath12k_hw
+ 	else
+ 		radio_per_hw = 1;
+ 
++	/* PCI probe order is not stable for a WSI group.  Its DT graph index
++	 * is stable and already validated by the group setup code, so expose
++	 * radios to cfg80211 in that order.  A single device retains firmware
++	 * pdev order.
++	 */
++	map_idx = 0;
++	for (device_id = 0; device_id < ag->num_devices; device_id++) {
++		if (ag->num_devices > 1)
++			ab = ath12k_mac_get_ab_by_wsi_index(ag, device_id);
++		else
++			ab = ag->ab[device_id];
++
++		if (!ab)
++			return -ENOSPC;
++
++		for (mac_id = 0; mac_id < ab->num_radios; mac_id++) {
++			pdev_map[map_idx].ab = ab;
++			pdev_map[map_idx].pdev_idx = mac_id;
++			map_idx++;
++		}
++	}
++
+ 	num_hw = total_radio / radio_per_hw;
+ 
+ 	ag->num_hw = 0;
+-	device_id = 0;
+-	mac_id = 0;
+ 	for (i = 0; i < num_hw; i++) {
+-		for (j = 0; j < radio_per_hw; j++) {
+-			if (device_id >= ag->num_devices || !ag->ab[device_id]) {
+-				ret = -ENOSPC;
+-				goto err;
+-			}
+-
+-			ab = ag->ab[device_id];
+-			pdev_map[j].ab = ab;
+-			pdev_map[j].pdev_idx = mac_id;
+-			mac_id++;
+-
+-			/* If mac_id falls beyond the current device MACs then
+-			 * move to next device
+-			 */
+-			if (mac_id >= ab->num_radios) {
+-				mac_id = 0;
+-				device_id++;
+-			}
+-		}
+-
+-		ab = pdev_map->ab;
++		map_idx = i * radio_per_hw;
++		ab = pdev_map[map_idx].ab;
+ 
+-		ah = ath12k_mac_hw_allocate(ag, pdev_map, radio_per_hw);
++		ah = ath12k_mac_hw_allocate(ag, &pdev_map[map_idx],
++					    radio_per_hw);
+ 		if (!ah) {
+ 			ath12k_warn(ab, "failed to allocate mac80211 hw device for hw_idx %d\n",
+ 				    i);
