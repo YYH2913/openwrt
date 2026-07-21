@@ -13,6 +13,20 @@ PKG_FLAGS:=nonshared
 
 include $(INCLUDE_DIR)/package.mk
 
+ASKEY_SBE1V1K_BDF:=board-askey_sbe1v1k.qcn9274
+
+define Download/askey-sbe1v1k-bdf
+  FILE:=$(ASKEY_SBE1V1K_BDF)
+  URL:=https://github.com/openwrt/firmware_qca-wireless/raw/0d2b3c0c42b5cae549e59f1a3f003216ed4d6c4b/
+  HASH:=5ed8477ace2ce31236d756de24f31e7169acc69d8df18e5b81e7fdea0715e97a
+endef
+$(eval $(call Download,askey-sbe1v1k-bdf))
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	$(CP) $(DL_DIR)/$(ASKEY_SBE1V1K_BDF) $(PKG_BUILD_DIR)/
+endef
+
 define Build/Compile
 endef
 
