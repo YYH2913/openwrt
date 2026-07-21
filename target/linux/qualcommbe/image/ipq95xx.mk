@@ -26,8 +26,18 @@ define Device/askey_sbe1v1k
 	DEVICE_DTS_CONFIG := config@rtq7300t-rev0
 	KERNEL_LOADADDR := 0x42080000
 	SOC := ipq9570
-	DEVICE_PACKAGES := ath12k-firmware-qcn9274 f2fsck ipq-wifi-askey_sbe1v1k kmod-ath12k \
-		kmod-hwmon-pwmfan kmod-phy-realtek mkfsck mkf2fs rtl826x-firmware
+	KERNEL_INSTALL := 1
+	KERNEL_SIZE := 32768k
+	IMAGE_SIZE := 1056m
+	SUPPORTED_DEVICES += spectrum,sbe1v1k
+	IMAGES := sysupgrade.bin recovery.bin
+	DEVICE_PACKAGES := ath12k-firmware-qcn9274 block-mount f2fsck ipq-wifi-askey_sbe1v1k \
+		kmod-ath12k kmod-hwmon-pwmfan kmod-phy-realtek mkf2fs rtl826x-firmware \
+		luci-ssl luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
+		luci-i18n-package-manager-zh-cn curl nano htop tcpdump ethtool-full \
+		iperf3 bind-dig pciutils usbutils
+	IMAGE/recovery.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-rootfs | \
+		pad-rootfs | check-size $$$$(IMAGE_SIZE) | append-metadata
 endef
 TARGET_DEVICES += askey_sbe1v1k
 
