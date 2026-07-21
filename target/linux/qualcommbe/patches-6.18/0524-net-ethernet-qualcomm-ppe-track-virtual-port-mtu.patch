@@ -1,0 +1,123 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 21:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: track virtual port MTU
+
+The vendor PPE driver programs the port MTU and MRU when a wireless
+virtual port is allocated and updates them on a netdevice MTU change.
+Do the same for native virtual ports.  Without this, the APPE port row
+retains its reset value and jumbo traffic either punts or trips the L2
+MTU exception instead of following an otherwise valid hardware flow.
+
+Use redirect-to-CPU for both failures so an oversized frame remains on
+the software path.  Program the row before publishing a new virtual-port
+binding and roll the hardware port back if the MTU setup fails.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c | 70 ++++++++++++++++++++++
+ 1 file changed, 70 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -153,6 +153,39 @@ static int ppe_vp_hw_set(struct ppe_devi
+ 	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue);
+ }
+ 
++static int ppe_vp_hw_set_mtu(struct ppe_device *ppe_dev, int vp, int mtu)
++{
++	u32 reg, maxframe, tbl[3];
++	int ret;
++
++	if (mtu < 0 || mtu + ETH_HLEN >
++	    FIELD_MAX(PPE_MRU_MTU_CTRL_W0_MTU))
++		return -EINVAL;
++
++	maxframe = mtu + ETH_HLEN;
++	reg = PPE_MRU_MTU_CTRL_TBL_ADDR + PPE_MRU_MTU_CTRL_TBL_INC * vp;
++	ret = regmap_bulk_read(ppe_dev->regmap, reg, tbl, ARRAY_SIZE(tbl));
++	if (ret)
++		return ret;
++
++	PPE_MRU_MTU_CTRL_SET_MRU(tbl, maxframe);
++	PPE_MRU_MTU_CTRL_SET_MTU(tbl, maxframe);
++	PPE_MRU_MTU_CTRL_SET_MRU_CMD(tbl, PPE_ACTION_REDIRECT_TO_CPU);
++	PPE_MRU_MTU_CTRL_SET_MTU_CMD(tbl, PPE_ACTION_REDIRECT_TO_CPU);
++	PPE_MRU_MTU_CTRL_SET_RX_CNT_EN(tbl, true);
++	PPE_MRU_MTU_CTRL_SET_TX_CNT_EN(tbl, true);
++
++	return regmap_bulk_write(ppe_dev->regmap, reg, tbl,
++				 ARRAY_SIZE(tbl));
++}
++
++static void ppe_vp_hw_rollback(struct ppe_device *ppe_dev,
++			       struct ppe_vp_slot *slot, int vp)
++{
++	if (ppe_vp_hw_set_queue(ppe_dev, vp, false, 0))
++		slot->poisoned = true;
++}
++
+ /* Netfilter ingress hook on a virtual port's bound device: offload the
+  * wireless->wired uplink. It runs on the receive path before the bridge,
+  * so it sees the frame with its L2 header already pulled and, for a routed
+@@ -419,6 +452,13 @@ int ppe_vp_get(struct ppe_device *ppe_de
+ 		mutex_unlock(&vp->lock);
+ 		return ret;
+ 	}
++	ret = ppe_vp_hw_set_mtu(ppe_dev, PPE_VP_PORT_BASE + free, dev->mtu);
++	if (ret) {
++		ppe_vp_hw_rollback(ppe_dev, &vp->slots[free],
++				   PPE_VP_PORT_BASE + free);
++		mutex_unlock(&vp->lock);
++		return ret;
++	}
+ 
+ 	/* Publish the mapping before its optional ingress hook goes live. */
+ 	vp->slots[free].refcnt = 1;
+@@ -500,6 +540,13 @@ int ppe_vp_ds_attach(struct ppe_device *
+ 	if (ret)
+ 		goto out;
+ 
++	ret = ppe_vp_hw_set_mtu(ppe_dev, PPE_VP_PORT_BASE + free, dev->mtu);
++	if (ret) {
++		ppe_vp_hw_rollback(ppe_dev, &vp->slots[free],
++				   PPE_VP_PORT_BASE + free);
++		goto out;
++	}
++
+ 	vp->slots[free].refcnt = 1;
+ 	vp->slots[free].direct = true;
+ 	vp->slots[free].ds_node = node;
+@@ -719,6 +766,7 @@ static int ppe_vp_netdev_event(struct no
+ 	struct ppe_vp *vp = container_of(nb, struct ppe_vp, notifier);
+ 	bool cleared = false, carrier_up = false;
+ 	int carrier = -1, i;
++	int ret;
+ 
+ 	switch (event) {
+ 	case NETDEV_UNREGISTER:
+@@ -727,6 +775,7 @@ static int ppe_vp_netdev_event(struct no
+ 	case NETDEV_CHANGEUPPER:
+ 	case NETDEV_UP:
+ 	case NETDEV_DOWN:
++	case NETDEV_CHANGEMTU:
+ 		break;
+ 	default:
+ 		return NOTIFY_DONE;
+@@ -755,6 +804,13 @@ static int ppe_vp_netdev_event(struct no
+ 			cleared = true;
+ 			carrier = PPE_VP_PORT_BASE + i;
+ 		} else {
++			if (event == NETDEV_CHANGEMTU) {
++				ret = ppe_vp_hw_set_mtu(vp->ppe_dev,
++						    PPE_VP_PORT_BASE + i, dev->mtu);
++				if (ret)
++					netdev_warn(dev, "failed to update PPE VP MTU: %d\n",
++						    ret);
++			}
+ 			if (event == NETDEV_CHANGEUPPER)
+ 				WRITE_ONCE(vp->slots[i].host_mac,
+ 					   ppe_vp_host_mac(bound));
+-- 
+2.43.0

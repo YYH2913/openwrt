@@ -1,9 +1,0 @@
-case "$(board_name)" in
-askey,sbe1v1k)
-	uci -q set firewall.@defaults[0].flow_offloading='1'
-	uci -q set firewall.@defaults[0].flow_offloading_hw='1'
-	uci commit firewall
-	;;
-esac
-
-exit 0
