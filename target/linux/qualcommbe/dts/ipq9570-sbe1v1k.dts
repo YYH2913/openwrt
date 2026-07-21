@@ -198,6 +198,9 @@
 };
 
 &sdhc_1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
 	bus-width = <8>;
 	max-frequency = <384000000>;
 	mmc-ddr-1_8v;
@@ -482,7 +485,7 @@
 &mdio {
 	status = "okay";
 
-	rtl8261be_0: ethernet-phy@5 {
+	rtl8261be_0: ethernet-phy@0 {
 		compatible = "ethernet-phy-ieee802.3-c45";
 		reg = <0>;
 		reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
