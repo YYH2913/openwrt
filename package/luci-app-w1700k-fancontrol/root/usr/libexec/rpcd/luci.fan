@@ -10,7 +10,7 @@ find_nct7802() {
 			return
 		fi
 	done
-	echo "/sys/class/hwmon/hwmon5"  # fallback
+	return 1
 }
 
 # Dynamically find mt7996 WiFi hwmon devices
