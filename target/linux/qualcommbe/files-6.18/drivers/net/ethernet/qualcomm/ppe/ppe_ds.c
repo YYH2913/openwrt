@@ -218,7 +218,7 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 	struct qcom_ppe_ds_node *node =
 		container_of(napi, struct qcom_ppe_ds_node, rxfill_napi);
 	struct edma_rxfill_ring *ring = &node->rxfill;
-	u32 cons, done = 0, request, status;
+	u32 cons, done = 0, filled, request, status;
 
 	do {
 		regmap_read(ppe_ds_regmap(node),
@@ -228,8 +228,14 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 		request = (cons - ring->prod_idx + ring->count - 1) &
 			  (ring->count - 1);
 		request = min_t(u32, request, budget - done);
-		ppe_ds_refill(node, request);
-		done += request;
+		filled = ppe_ds_refill(node, request);
+		done += filled;
+		/* A short allocation leaves free descriptors in the ring. Keep
+		 * NAPI scheduled so refill is retried without depending on another
+		 * low-threshold edge from an already-starved ring.
+		 */
+		if (filled != request)
+			return budget;
 		if (done >= budget)
 			return done;
 
@@ -989,6 +995,7 @@ int qcom_ppe_ds_start(struct qcom_ppe_ds_node *node)
 	regmap_write(regmap,
 		     ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)),
 		     EDMA_TX_INT_MASK_PKT_INT);
+	ppe_vp_ds_node_state(node->ds->ppe_dev, node->id, true);
 	atomic64_inc(&node->stats.starts);
 out:
 	mutex_unlock(&node->lock);
@@ -1010,6 +1017,7 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 		goto out;
 
 	WRITE_ONCE(node->state, PPE_DS_REGISTERED);
+	ppe_vp_ds_node_state(node->ds->ppe_dev, node->id, false);
 	if (node->ops->quiesce)
 		node->ops->quiesce(node);
 
@@ -1028,6 +1036,13 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 	regmap_clear_bits(regmap,
 			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
 			  EDMA_TXDESC_CTRL_TXEN_MASK);
+	ret = regmap_read_poll_timeout(regmap,
+			 ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+			 val, !(val & EDMA_TXDESC_CTRL_TXEN_MASK),
+			 PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+	if (ret)
+		dev_warn(node->client, "REO2PPE ring %u did not stop: %d\n",
+			 node->reo2ppe.id, ret);
 	regmap_clear_bits(regmap,
 			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
 			  EDMA_RXDESC_RX_EN);

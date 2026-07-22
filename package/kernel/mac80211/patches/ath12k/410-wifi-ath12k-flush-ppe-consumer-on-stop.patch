@@ -1,0 +1,30 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 12:15:00 +0800
+Subject: [PATCH] wifi: ath12k: flush PPE consumer during stop
+
+The PPE core quiesces normal producer notifications before it drains the
+REO2PPE completion ring.  Completion callbacks from that final drain still
+return RX buffers to ath12k, so advance the WLAN consumer to the matching
+EDMA position even while the rest of direct switching is quiesced.  This
+keeps both owners synchronized across the next start and avoids replaying
+already-completed descriptors after recovery.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -383,7 +383,7 @@ static void ath12k_ppe_ds_reo_cons_updat
+ 	struct hal_srng *srng;
+ 	u16 cons;
+ 
+-	if (!ppe->node || READ_ONCE(ppe->quiesced))
++	if (!ppe->node)
+ 		return;
+ 
+ 	cons = qcom_ppe_ds_reo2ppe_cons(ppe->node);
+-- 
+2.43.0

@@ -1,0 +1,196 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 12:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: quiesce direct virtual ports
+
+Keep direct virtual ports tied only to running direct-switch nodes.  A WLAN
+restart previously left the port and its queue active while the associated
+EDMA ring was disabled, so existing hardware flows could continue sending
+packets into a stopped ring.
+
+Track node availability, move a shared port to another running node when
+possible, and otherwise disable the hardware port until its node restarts.
+Reject new flow references while no node is available and keep the
+flowtable carrier state synchronized with the hardware state.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c | 103 +++++++++++++++++++--
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.h |   1 +
+ 2 files changed, 96 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -80,6 +80,7 @@ struct ppe_vp {
+ 	struct mutex lock;		/* serialises slot allocation */
+ 	struct notifier_block notifier;
+ 	bool inject_disabled;
++	bool ds_node_up[PPE_VP_DS_NODES];
+ 	struct ppe_vp_slot slots[PPE_VP_SLOTS];
+ };
+ 
+@@ -425,6 +426,11 @@ int ppe_vp_get(struct ppe_device *ppe_de
+ 
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+ 		if (rcu_access_pointer(vp->slots[i].dev) == dev) {
++			if (vp->slots[i].direct &&
++			    vp->slots[i].ds_node == PPE_VP_DS_NODE_NONE) {
++				mutex_unlock(&vp->lock);
++				return -ENETDOWN;
++			}
+ 			/* One hook cannot represent two differently ordered
+ 			 * flowtables. Keep the later rule in software.
+ 			 */
+@@ -500,6 +506,10 @@ int ppe_vp_ds_attach(struct ppe_device *
+ 		ret = -ESHUTDOWN;
+ 		goto out;
+ 	}
++	if (!vp->ds_node_up[node]) {
++		ret = -ENETDOWN;
++		goto out;
++	}
+ 
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+ 		if (rcu_access_pointer(vp->slots[i].dev) == dev) {
+@@ -563,6 +573,21 @@ out:
+ 	return ret;
+ }
+ 
++static void ppe_vp_ds_disable(struct ppe_device *ppe_dev,
++			      struct ppe_vp_slot *slot, int port)
++{
++	int ret;
++
++	ret = ppe_vp_hw_set_queue(ppe_dev, port, false, 0);
++	if (ret) {
++		slot->poisoned = true;
++		dev_err(ppe_dev->dev,
++			"failed to quiesce direct VP %d, quarantining slot: %d\n",
++			port, ret);
++	}
++	slot->ds_node = PPE_VP_DS_NODE_NONE;
++}
++
+ bool ppe_vp_ds_detach(struct ppe_device *ppe_dev, int port, int node)
+ {
+ 	struct ppe_vp *vp = ppe_dev->vp;
+@@ -586,7 +611,7 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 		goto out_unlock;
+ 	if (slot->ds_node == node && !slot->ds_node_refs[node]) {
+ 		for (next = 0; next < PPE_VP_DS_NODES; next++)
+-			if (slot->ds_node_refs[next])
++			if (slot->ds_node_refs[next] && vp->ds_node_up[next])
+ 				break;
+ 		if (next < PPE_VP_DS_NODES) {
+ 			ret = ppe_vp_hw_set_queue(ppe_dev, port, true,
+@@ -595,13 +620,13 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 				dev_err(ppe_dev->dev,
+ 					"failed to move VP %d to DS node %d: %d\n",
+ 					port, next, ret);
+-				slot->ds_node = PPE_VP_DS_NODE_NONE;
++				ppe_vp_ds_disable(ppe_dev, slot, port);
+ 				carrier_down = true;
+ 			} else {
+ 				slot->ds_node = next;
+ 			}
+ 		} else {
+-			slot->ds_node = PPE_VP_DS_NODE_NONE;
++			ppe_vp_ds_disable(ppe_dev, slot, port);
+ 			carrier_down = true;
+ 		}
+ 	}
+@@ -613,6 +638,72 @@ out_unlock:
+ 	return true;
+ }
+ 
++void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	u64 carrier_down = 0, carrier_up = 0;
++	int i, next, port, ret;
++
++	if (!vp || node < 0 || node >= PPE_VP_DS_NODES)
++		return;
++
++	mutex_lock(&vp->lock);
++	vp->ds_node_up[node] = up;
++	for (i = 0; i < PPE_VP_SLOTS; i++) {
++		struct ppe_vp_slot *slot = &vp->slots[i];
++		struct net_device *dev = rcu_access_pointer(slot->dev);
++
++		if (!slot->direct || !dev || !slot->ds_node_refs[node])
++			continue;
++		port = PPE_VP_PORT_BASE + i;
++
++		if (up) {
++			if (slot->ds_node != PPE_VP_DS_NODE_NONE)
++				continue;
++			ret = ppe_vp_hw_set_queue(ppe_dev, port, true, slot->ds_queues[node]);
++			if (ret) {
++				dev_err(ppe_dev->dev,
++					"failed to activate VP %d on DS node %d: %d\n",
++					port, node, ret);
++				continue;
++			}
++			slot->ds_node = node;
++			if (netif_carrier_ok(dev))
++				carrier_up |= BIT_ULL(i);
++			else
++				carrier_down |= BIT_ULL(i);
++			continue;
++		}
++
++		if (slot->ds_node != node)
++			continue;
++		for (next = 0; next < PPE_VP_DS_NODES; next++)
++			if (slot->ds_node_refs[next] && vp->ds_node_up[next])
++				break;
++		if (next < PPE_VP_DS_NODES) {
++			ret = ppe_vp_hw_set_queue(ppe_dev, port, true, slot->ds_queues[next]);
++			if (!ret) {
++				slot->ds_node = next;
++				continue;
++			}
++			dev_err(ppe_dev->dev,
++				"failed to move VP %d from DS node %d to %d: %d\n",
++				port, node, next, ret);
++		}
++
++		ppe_vp_ds_disable(ppe_dev, slot, port);
++		carrier_down |= BIT_ULL(i);
++	}
++	mutex_unlock(&vp->lock);
++
++	for (i = 0; i < PPE_VP_SLOTS; i++) {
++		if (carrier_down & BIT_ULL(i))
++			ppe_flowtable_port_carrier(ppe_dev, PPE_VP_PORT_BASE + i, false);
++		else if (carrier_up & BIT_ULL(i))
++			ppe_flowtable_port_carrier(ppe_dev, PPE_VP_PORT_BASE + i, true);
++	}
++}
++
+ /**
+  * ppe_vp_put - Release a virtual port
+  * @ppe_dev: PPE device
+@@ -815,7 +906,9 @@ static int ppe_vp_netdev_event(struct no
+ 				WRITE_ONCE(vp->slots[i].host_mac,
+ 					   ppe_vp_host_mac(bound));
+ 			carrier = PPE_VP_PORT_BASE + i;
+-			carrier_up = netif_carrier_ok(dev);
++			carrier_up = netif_carrier_ok(dev) &&
++				     (!vp->slots[i].direct ||
++				      vp->slots[i].ds_node != PPE_VP_DS_NODE_NONE);
+ 		}
+ 		break;
+ 	}
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -66,4 +66,5 @@ void ppe_vp_flow_del(struct ppe_device *
+ int ppe_vp_ds_attach(struct ppe_device *ppe_dev, struct net_device *dev,
+ 		     int queue, int node);
+ bool ppe_vp_ds_detach(struct ppe_device *ppe_dev, int vp, int node);
++void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up);
+ #endif
+-- 
+2.43.0
