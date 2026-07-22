@@ -1,0 +1,76 @@
+#!/bin/sh
+
+section()
+{
+	printf '\n=== %s ===\n' "$1"
+}
+
+show_file()
+{
+	if [ -r "$1" ]; then
+		cat "$1"
+	else
+		printf 'unavailable: %s\n' "$1"
+	fi
+}
+
+section SYSTEM
+ubus call system board 2>/dev/null || true
+uname -a
+
+section CONFIG
+printf 'flow_offloading=%s\n' "$(uci -q get firewall.@defaults[0].flow_offloading || printf missing)"
+printf 'flow_offloading_hw=%s\n' "$(uci -q get firewall.@defaults[0].flow_offloading_hw || printf missing)"
+
+section NFT
+if command -v nft >/dev/null 2>&1; then
+	nft list ruleset 2>&1
+else
+	printf 'unavailable: nft\n'
+fi
+
+section INTERFACES
+ip address show 2>&1
+
+section LINKS
+for dev in lan1 wan; do
+	printf '\n-- %s --\n' "$dev"
+	if command -v ethtool >/dev/null 2>&1; then
+		ethtool "$dev" 2>&1
+	else
+		printf 'unavailable: ethtool\n'
+	fi
+done
+
+if ! grep -qs ' /sys/kernel/debug debugfs ' /proc/mounts; then
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+fi
+
+section DIRECT_SWITCH
+show_file /sys/kernel/debug/ppe/direct_switch
+
+section FLOWS
+show_file /sys/kernel/debug/ppe/flows
+
+section FLOW_ROWS
+show_file /sys/kernel/debug/ppe/flow_rows
+
+section PIPELINE
+show_file /sys/kernel/debug/ppe/pipeline_state
+
+section REASONS
+show_file /sys/kernel/debug/ppe/reason_counters
+
+section CONNTRACK
+if [ -r /proc/net/nf_conntrack ]; then
+	printf 'HW_OFFLOAD=%s\n' "$(grep -c '\[HW_OFFLOAD\]' /proc/net/nf_conntrack)"
+	printf 'OFFLOAD=%s\n' "$(grep -c '\[OFFLOAD\]' /proc/net/nf_conntrack)"
+else
+	printf 'unavailable: /proc/net/nf_conntrack\n'
+fi
+
+section INTERRUPTS
+grep -Ei 'ppe|edma|reo2ppe|ppe2tcl|rxfill|txcmpl' /proc/interrupts 2>/dev/null || true
+
+section LOG
+dmesg | grep -Ei 'qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
