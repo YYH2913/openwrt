@@ -1,0 +1,79 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 12:00:00 +0800
+Subject: [PATCH] wifi: ath12k: avoid linear PPE RX owner lookup
+
+PPE direct-switch completions return the cookie-converted RX descriptor
+address.  Determining its owner currently scans every RX descriptor page of
+every device in the WSI group.  With three QCN9274 devices that puts dozens
+of range comparisons in the per-packet completion path.
+
+RX descriptors already carry both their device id and original cookie.  Use
+those to resolve the device and look the descriptor up through the existing
+SPT helper in constant time.  Validate the returned address first and require
+the SPT lookup to reproduce the exact pointer before accepting it.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 29 ++++++++++++++---------------
+ 1 file changed, 14 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -2,6 +2,7 @@
+ /* Qualcomm QCN9274 PPE direct-switch support. */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/mm.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/ppe-ds.h>
+ 
+@@ -337,31 +338,28 @@ static struct ath12k_base *
+ ath12k_ppe_ds_rx_desc_owner(struct ath12k_base *ab,
+ 			    struct ath12k_rx_desc_info *rx_desc)
+ {
+-	struct ath12k_rx_desc_info *page;
+ 	struct ath12k_base *src_ab;
+-	uintptr_t addr = (uintptr_t)rx_desc;
+-	uintptr_t start, end;
+-	int i, j;
++	u32 cookie;
++	u8 device_id;
+ 
+-	if (!ab->ag || !rx_desc)
++	if (!ab->ag || !rx_desc || !virt_addr_valid(rx_desc) ||
++	    !IS_ALIGNED((uintptr_t)rx_desc, __alignof__(*rx_desc)))
+ 		return NULL;
+ 
+-	for (i = 0; i < ab->ag->num_devices; i++) {
+-		src_ab = ab->ag->ab[i];
+-		if (!src_ab || !src_ab->dp.rxbaddr)
+-			continue;
+-		for (j = 0; j < ATH12K_NUM_RX_SPT_PAGES(src_ab); j++) {
+-			page = src_ab->dp.rxbaddr[j];
+-			if (!page)
+-				continue;
+-			start = (uintptr_t)page;
+-			end = (uintptr_t)(page + ATH12K_MAX_SPT_ENTRIES);
+-			if (addr >= start && addr < end)
+-				return src_ab;
+-		}
+-	}
++	device_id = rx_desc->device_id;
++	if (device_id >= ab->ag->num_devices)
++		return NULL;
++
++	src_ab = ab->ag->ab[device_id];
++	if (!src_ab || !src_ab->dp.rxbaddr ||
++	    rx_desc->magic != ATH12K_DP_RX_DESC_MAGIC)
++		return NULL;
++
++	cookie = READ_ONCE(rx_desc->cookie);
++	if (ath12k_dp_get_rx_desc(src_ab, cookie) != rx_desc)
++		return NULL;
+ 
+-	return NULL;
++	return src_ab;
+ }
+ 
+ static void ath12k_ppe_ds_reo_cons_update(struct ath12k_base *ab)
