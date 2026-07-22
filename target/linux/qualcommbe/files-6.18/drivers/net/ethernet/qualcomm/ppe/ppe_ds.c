@@ -188,7 +188,7 @@ static int ppe_ds_ppe2tcl_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct edma_rxdesc_ring, napi);
 	struct qcom_ppe_ds_node *node =
 		container_of(ring, struct qcom_ppe_ds_node, ppe2tcl);
-	u32 prod;
+	u32 prod, status;
 
 	regmap_read(ppe_ds_regmap(node),
 		    ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(ring->ring_id)), &prod);
@@ -196,8 +196,14 @@ static int ppe_ds_ppe2tcl_poll(struct napi_struct *napi, int budget)
 	node->ops->ppe2tcl_produce(node, prod);
 	atomic64_inc(&node->stats.ppe2tcl_updates);
 
+	/* INT_STAT is clear-on-read. Keep NAPI scheduled if the ring advanced
+	 * after the producer-index snapshot.
+	 */
 	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXDESC_INT_STAT(ring->ring_id)), &prod);
+		    ppe_ds_reg(EDMA_REG_RXDESC_INT_STAT(ring->ring_id)), &status);
+	if (status & EDMA_RXDESC_RING_INT_STATUS_MASK)
+		return budget;
+
 	if (napi_complete_done(napi, 0) &&
 	    READ_ONCE(node->state) == PPE_DS_STARTED)
 		regmap_write(ppe_ds_regmap(node),
@@ -212,25 +218,36 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 	struct qcom_ppe_ds_node *node =
 		container_of(napi, struct qcom_ppe_ds_node, rxfill_napi);
 	struct edma_rxfill_ring *ring = &node->rxfill;
-	u32 cons, request;
+	u32 cons, done = 0, request, status;
 
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)), &cons);
-	cons &= EDMA_RXFILL_CONS_IDX_MASK;
-	request = (cons - ring->prod_idx + ring->count - 1) &
-		  (ring->count - 1);
-	request = min_t(u32, request, budget);
-	ppe_ds_refill(node, request);
+	do {
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)),
+			    &cons);
+		cons &= EDMA_RXFILL_CONS_IDX_MASK;
+		request = (cons - ring->prod_idx + ring->count - 1) &
+			  (ring->count - 1);
+		request = min_t(u32, request, budget - done);
+		ppe_ds_refill(node, request);
+		done += request;
+		if (done >= budget)
+			return done;
 
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXFILL_INT_STAT(ring->ring_id)), &cons);
-	if (napi_complete_done(napi, request) &&
+		/* Refill again when the consumer advanced after our snapshot. */
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_RXFILL_INT_STAT(ring->ring_id)),
+			    &status);
+		if ((status & PPE_DS_RXFILL_INT) && !request)
+			return budget;
+	} while (status & PPE_DS_RXFILL_INT);
+
+	if (napi_complete_done(napi, done) &&
 	    READ_ONCE(node->state) == PPE_DS_STARTED)
 		regmap_write(ppe_ds_regmap(node),
 			     ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(ring->ring_id)),
 			     PPE_DS_RXFILL_INT);
 
-	return request;
+	return done;
 }
 
 static u32 ppe_ds_txcmpl_reap(struct qcom_ppe_ds_node *node, u32 budget)
@@ -243,6 +260,8 @@ static u32 ppe_ds_txcmpl_reap(struct qcom_ppe_ds_node *node, u32 budget)
 	prod &= EDMA_TXCMPL_PROD_IDX_MASK;
 	count = min_t(u32, EDMA_DESC_AVAIL_COUNT(prod, cons, ring->count),
 		      budget);
+	if (count)
+		dma_rmb();
 
 	for (i = 0; i < count; i++) {
 		struct edma_txcmpl_desc *desc = EDMA_TXCMPL_DESC(ring, cons);
@@ -269,10 +288,21 @@ static int ppe_ds_txcmpl_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct edma_txcmpl_ring, napi);
 	struct qcom_ppe_ds_node *node =
 		container_of(ring, struct qcom_ppe_ds_node, txcmpl);
-	u32 done;
+	u32 done = 0, status;
 
-	done = ppe_ds_txcmpl_reap(node, budget);
-	if (done < budget && napi_complete_done(napi, done) &&
+	do {
+		done += ppe_ds_txcmpl_reap(node, budget - done);
+		if (done >= budget)
+			return done;
+
+		/* TX_INT_STAT is clear-on-read. Reap again when an event raced
+		 * with the producer-index snapshot before unmasking the IRQ.
+		 */
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_TX_INT_STAT(ring->id)), &status);
+	} while (status & EDMA_TXCMPL_RING_INT_STATUS_MASK);
+
+	if (napi_complete_done(napi, done) &&
 	    READ_ONCE(node->state) == PPE_DS_STARTED)
 		regmap_write(ppe_ds_regmap(node),
 			     ppe_ds_reg(EDMA_REG_TX_INT_MASK(ring->id)),
