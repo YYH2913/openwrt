@@ -33,6 +33,7 @@ struct qcom_ppe_ds_txcmpl {
  * @ppe2tcl_refill: supply WLAN buffers to the EDMA fill ring
  * @ppe2tcl_release: release one unused WLAN transmit buffer
  * @reo2ppe_complete: release WLAN RX buffers consumed by PPE
+ * @ring_reset: reset WLAN ring pointers to the EDMA-selected empty positions
  * @quiesce: stop WLAN from accessing the direct-switch rings
  */
 struct qcom_ppe_ds_ops {
@@ -44,6 +45,8 @@ struct qcom_ppe_ds_ops {
 	void (*reo2ppe_complete)(struct qcom_ppe_ds_node *node,
 				 struct qcom_ppe_ds_txcmpl *buffers,
 				 u32 count);
+	int (*ring_reset)(struct qcom_ppe_ds_node *node, u16 ppe2tcl,
+			  u16 reo2ppe);
 	void (*quiesce)(struct qcom_ppe_ds_node *node);
 };
 

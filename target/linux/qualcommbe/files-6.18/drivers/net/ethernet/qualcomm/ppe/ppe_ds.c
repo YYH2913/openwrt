@@ -710,6 +710,50 @@ static void ppe_ds_release_pending_fill(struct qcom_ppe_ds_node *node)
 		     ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(ring->ring_id)), cons);
 }
 
+static int ppe_ds_reset_ring_indices(struct qcom_ppe_ds_node *node)
+{
+	struct regmap *regmap = ppe_ds_regmap(node);
+	u32 ppe2tcl, reo2ppe, data;
+
+	/* Drop descriptors left across a WLAN restart and resume both owners at
+	 * the same empty position.  EDMA retains these indexes while the UMAC
+	 * and its software SRNG state can be reset independently.
+	 */
+	regmap_read(regmap,
+		    ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(node->ppe2tcl.ring_id)),
+		    &ppe2tcl);
+	ppe2tcl &= EDMA_RXDESC_PROD_IDX_MASK;
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_RXDESC_CONS_IDX(node->ppe2tcl.ring_id)),
+		     ppe2tcl);
+
+	regmap_read(regmap,
+		    ppe_ds_reg(EDMA_REG_TXDESC_CONS_IDX(node->reo2ppe.id)),
+		    &reo2ppe);
+	reo2ppe &= EDMA_TXDESC_CONS_IDX_MASK;
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_TXDESC_PROD_IDX(node->reo2ppe.id)),
+		     reo2ppe);
+
+	regmap_read(regmap,
+		    ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
+		    &data);
+	node->txcmpl.cons_idx = data & EDMA_TXCMPL_PROD_IDX_MASK;
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
+		     node->txcmpl.cons_idx);
+
+	regmap_read(regmap,
+		    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
+		    &data);
+	node->rxfill.prod_idx = data & EDMA_RXFILL_CONS_IDX_MASK;
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
+		     node->rxfill.prod_idx);
+
+	return node->ops->ring_reset(node, ppe2tcl, reo2ppe);
+}
+
 struct qcom_ppe_ds_node *
 qcom_ppe_ds_node_alloc_id(struct device *client,
 			  const struct qcom_ppe_ds_ops *ops, int requested_id,
@@ -719,7 +763,7 @@ qcom_ppe_ds_node_alloc_id(struct device *client,
 	struct ppe_ds *ds;
 	int id;
 
-	if (!client || !ops || !ops->ppe2tcl_produce ||
+	if (!client || !ops || !ops->ppe2tcl_produce || !ops->ring_reset ||
 	    !ops->ppe2tcl_refill || !ops->reo2ppe_complete)
 		return ERR_PTR(-EINVAL);
 
@@ -896,6 +940,13 @@ int qcom_ppe_ds_start(struct qcom_ppe_ds_node *node)
 	}
 
 	regmap = ppe_ds_regmap(node);
+	ret = ppe_ds_reset_ring_indices(node);
+	if (ret) {
+		dev_err(node->client,
+			"PPE direct-switch node %d WLAN ring reset failed: %d\n",
+			node->id, ret);
+		goto out;
+	}
 	filled = ppe_ds_refill(node, node->rxfill.count - 1);
 	if (filled != node->rxfill.count - 1) {
 		dev_err(node->client,

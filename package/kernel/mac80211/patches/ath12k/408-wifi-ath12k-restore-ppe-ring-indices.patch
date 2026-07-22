@@ -1,0 +1,103 @@
+From: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+Date: Tue, 8 Nov 2022 22:42:37 -0800
+Subject: [PATCH] wifi: ath12k: restore PPE ring indices after restart
+
+EDMA retains its PPE2TCL and REO2PPE indexes while a QCN9274 UMAC can be
+reset independently.  Resume the WLAN hardware, shadow pointers and the
+HAL SRNG caches at the empty positions selected by the PPE direct-switch
+core.  Starting one side at zero after SSR otherwise makes EDMA consume
+stale descriptors or stalls the direct path entirely.
+
+Based-on: cc51c4d638df1d1ab4d1e90c957f4c588e57d577
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0348-QSDK-DP-wifi-ath12k-Enable-UMAC-reset-support-for-DS-mode.patch
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/25a5a8b3c8ea7b90df5666290c42cfc8f5090533
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Signed-off-by: Ramya Gnanasekar <quic_rgnanase@qti.qualcomm.com>
+Signed-off-by: Balamurugan S <quic_bselvara@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 61 +++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -411,6 +411,66 @@ ath12k_ppe_ds_reo2ppe_complete(struct qc
+ 	ath12k_ppe_ds_reo_cons_update(ab);
+ }
+ 
++static int ath12k_ppe_ds_ring_reset(struct qcom_ppe_ds_node *node,
++				     u16 ppe2tcl, u16 reo2ppe)
++{
++	struct ath12k_base *ab = ath12k_ppe_ds_ab(node);
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	struct hal_srng *srng;
++	u32 pointer, reg;
++
++	if (ppe2tcl >= DP_PPE2TCL_RING_SIZE ||
++	    reo2ppe >= DP_REO2PPE_RING_SIZE)
++		return -EINVAL;
++
++	/* PPE2TCL is a WLAN source ring.  Empty it at EDMA's producer and
++	 * restore both the target registers and the shadow pointer read by
++	 * ath12k_hal_srng_access_begin().
++	 */
++	srng = &ab->hal.srng_list[ppe->ppe2tcl_ring.ring_id];
++	pointer = ppe2tcl * srng->entry_size;
++	spin_lock_bh(&srng->lock);
++	if (!srng->initialized || srng->ring_dir != HAL_SRNG_DIR_SRC ||
++	    pointer >= srng->ring_size) {
++		spin_unlock_bh(&srng->lock);
++		return -EINVAL;
++	}
++	reg = srng->hwreg_base[HAL_SRNG_REG_GRP_R2];
++	ath12k_hif_write32(ab, reg, pointer);
++	ath12k_hif_write32(ab, reg + HAL_TCL1_RING_TP_OFFSET, pointer);
++	WRITE_ONCE(*srng->u.src_ring.tp_addr, pointer);
++	srng->u.src_ring.hp = pointer;
++	srng->u.src_ring.cached_tp = pointer;
++	srng->u.src_ring.reap_hp =
++		(pointer + srng->ring_size - srng->entry_size) % srng->ring_size;
++	spin_unlock_bh(&srng->lock);
++
++	/* REO2PPE is a WLAN destination ring.  Its hardware producer and
++	 * EDMA consumer must start at the same retained index.
++	 */
++	srng = &ab->hal.srng_list[ppe->reo2ppe_ring.ring_id];
++	pointer = reo2ppe * srng->entry_size;
++	spin_lock_bh(&srng->lock);
++	if (!srng->initialized || srng->ring_dir != HAL_SRNG_DIR_DST ||
++	    pointer >= srng->ring_size) {
++		spin_unlock_bh(&srng->lock);
++		return -EINVAL;
++	}
++	reg = srng->hwreg_base[HAL_SRNG_REG_GRP_R2];
++	ath12k_hif_write32(ab, reg, pointer);
++	ath12k_hif_write32(ab, reg + HAL_REO1_RING_TP_OFFSET, pointer);
++	WRITE_ONCE(*srng->u.dst_ring.hp_addr, pointer);
++	srng->u.dst_ring.tp = pointer;
++	srng->u.dst_ring.cached_hp = pointer;
++	srng->u.dst_ring.last_hp = pointer;
++	spin_unlock_bh(&srng->lock);
++
++	ath12k_dbg(ab, ATH12K_DBG_HAL,
++		   "PPE direct-switch rings restored: ppe2tcl=%u reo2ppe=%u\n",
++		   ppe2tcl, reo2ppe);
++	return 0;
++}
++
+ static void ath12k_ppe_ds_quiesce(struct qcom_ppe_ds_node *node)
+ {
+ 	struct ath12k_base *ab = ath12k_ppe_ds_ab(node);
+@@ -423,6 +483,7 @@ static const struct qcom_ppe_ds_ops ath1
+ 	.ppe2tcl_refill = ath12k_ppe_ds_ppe2tcl_refill,
+ 	.ppe2tcl_release = ath12k_ppe_ds_ppe2tcl_release,
+ 	.reo2ppe_complete = ath12k_ppe_ds_reo2ppe_complete,
++	.ring_reset = ath12k_ppe_ds_ring_reset,
+ 	.quiesce = ath12k_ppe_ds_quiesce,
+ };
+ 
+-- 
+2.43.0
