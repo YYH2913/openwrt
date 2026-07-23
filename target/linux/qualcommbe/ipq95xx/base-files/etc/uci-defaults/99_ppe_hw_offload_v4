@@ -7,7 +7,7 @@ askey,sbe1v1k)
 		changed=1
 	fi
 
-	# A sysupgrade keeps /etc/config/firewall.  Earlier images wrote these
+	# A sysupgrade keeps /etc/config/firewall. Earlier images wrote these
 	# options as disabled, so merely filling missing values leaves PPE
 	# flowtable offload inactive after an upgrade.
 	if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" != '1' ]; then

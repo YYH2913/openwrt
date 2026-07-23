@@ -28,7 +28,7 @@ dev="$DEVICENAME"
 	flock 9 || exit 0
 
 	nft list flowtable inet fw4 ft 2>/dev/null |
-		grep -Fq "\"$dev\"" && exit 0
+		grep -Fq "$dev" && exit 0
 	/etc/init.d/firewall reload >/dev/null 2>&1
 ) &
 
