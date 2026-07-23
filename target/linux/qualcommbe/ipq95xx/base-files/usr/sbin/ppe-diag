@@ -38,6 +38,27 @@ section CONFIG
 printf 'flow_offloading=%s\n' "$(uci -q get firewall.@defaults[0].flow_offloading || printf missing)"
 printf 'flow_offloading_hw=%s\n' "$(uci -q get firewall.@defaults[0].flow_offloading_hw || printf missing)"
 
+section MODULES
+if command -v lsmod >/dev/null 2>&1; then
+	lsmod | grep -E '(^| )qcom_ppe|nf_flow_table|nft_flow_offload|nft_flow_table' || true
+else
+	printf 'unavailable: lsmod\n'
+fi
+
+section FW4
+if command -v fw4 >/dev/null 2>&1; then
+	fw4 print 2>&1
+else
+	printf 'unavailable: fw4\n'
+fi
+
+section FLOWTABLE
+if command -v nft >/dev/null 2>&1; then
+	nft list flowtable inet fw4 ft 2>&1
+else
+	printf 'unavailable: nft\n'
+fi
+
 section NFT
 if command -v nft >/dev/null 2>&1; then
 	nft list ruleset 2>&1
@@ -79,6 +100,13 @@ else
 			"$(cat "$path/hairpin_mode" 2>/dev/null || printf unknown)" \
 			"$(cat "$path/isolated" 2>/dev/null || printf unknown)"
 	done
+fi
+
+section QDISC
+if command -v tc >/dev/null 2>&1; then
+	tc -s qdisc show 2>&1
+else
+	printf 'unavailable: tc\n'
 fi
 
 section LINKS
