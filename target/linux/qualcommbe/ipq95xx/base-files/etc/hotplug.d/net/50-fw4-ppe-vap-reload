@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# fw4 starts before hostapd creates the AP VAPs.  Refresh its flowtable once
-# a VAP exists so resolve_lower_devices() can include the bridge port.
+# fw4 starts before hostapd creates the AP VAPs. Refresh its flowtable once
+# a VAP is attached so resolve_lower_devices() can include the bridge port.
 [ "$ACTION" = "add" ] || exit 0
 [ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ] || exit 0
 
@@ -10,15 +10,25 @@ case "$DEVICENAME" in
 	*) exit 0 ;;
 esac
 
-(
-	exec 9>/var/lock/fw4-ppe-vap-reload.lock
-	flock -n 9 || exit 0
+dev="$DEVICENAME"
 
-	# Allow netifd to enslave the VAP and ath12k to attach its PPE VP.
-	sleep 2
-	[ -d "/sys/class/net/$DEVICENAME/brport" ] || exit 0
+(
+	# A net hotplug add event can arrive before netifd enslaves the VAP to
+	# br-lan. This is especially common while the three QCN9274 radios start.
+	tries=15
+	while [ ! -d "/sys/class/net/$dev/brport" ] && [ "$tries" -gt 0 ]; do
+		sleep 1
+		tries=$((tries - 1))
+	done
+	[ -d "/sys/class/net/$dev/brport" ] || exit 0
+
+	exec 9>/var/lock/fw4-ppe-vap-reload.lock
+	# Serialize events instead of dropping a later VAP while an earlier VAP
+	# reload is in progress. Each waiter verifies its own interface afterwards.
+	flock 9 || exit 0
+
 	nft list flowtable inet fw4 ft 2>/dev/null |
-		grep -Fq "\"$DEVICENAME\"" && exit 0
+		grep -Fq "\"$dev\"" && exit 0
 	/etc/init.d/firewall reload >/dev/null 2>&1
 ) &
 
