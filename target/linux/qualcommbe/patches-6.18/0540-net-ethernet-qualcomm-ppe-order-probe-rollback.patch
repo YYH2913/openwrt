@@ -1,0 +1,41 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: order direct-switch probe rollback
+
+The direct-switch setup runs after the PPE ports, flowtable and virtual
+ports have been initialized.  Its failure unwind used to tear down the
+virtual ports before unbinding and draining the flowtable, unlike the
+normal remove path.  A rule teardown racing this short probe-failure
+window could therefore call ppe_vp_put() after the virtual-port state had
+been dismantled.
+
+Quiesce virtual-port injection, unregister the PPE ports, then drain the
+flowtable before tearing down the virtual ports.  This gives both normal
+remove and the probe-error path the same lifetime ordering.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -265,11 +265,15 @@ static int qcom_ppe_probe(struct platform_device *pdev)
+ 	ppe_debugfs_setup(ppe_dev);
+ 	ret = ppe_ds_setup(ppe_dev);
+ 	if (ret) {
+-		ppe_debugfs_teardown(ppe_dev);
+-		ppe_vp_teardown(ppe_dev);
++		/* The PPE ports are already live here. Match remove ordering so
++		 * flow destruction cannot outlive its virtual port.
++		 */
++		ppe_vp_inject_disable(ppe_dev);
++		ppe_port_mac_deinit(ppe_dev);
+ 		ppe_flowtable_destroy(ppe_dev);
++		ppe_vp_teardown(ppe_dev);
+ 		ppe_bridge_destroy(ppe_dev);
+-		ppe_port_mac_deinit(ppe_dev);
++		ppe_debugfs_teardown(ppe_dev);
+ 		edma_destroy(ppe_dev);
+ 		return dev_err_probe(dev, ret, "PPE direct-switch setup failed\n");
+ 	}
+-- 
+2.43.0
