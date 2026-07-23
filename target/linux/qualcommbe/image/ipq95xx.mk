@@ -33,6 +33,7 @@ define Device/askey_sbe1v1k
 	IMAGES := sysupgrade.bin recovery.bin
 	DEVICE_PACKAGES := ath12k-firmware-qcn9274 block-mount f2fsck ipq-wifi-askey_sbe1v1k \
 		kmod-ath12k kmod-hwmon-pwmfan kmod-phy-realtek mkf2fs rtl826x-firmware \
+		ds-lite map kmod-sched-core \
 		luci-ssl luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
 		luci-i18n-package-manager-zh-cn curl nano htop tcpdump ethtool-full \
 		iperf3 bind-dig pciutils usbutils
