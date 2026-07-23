@@ -1,0 +1,65 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: ath12k: publish PPE direct VAP forwarding path
+
+ath12k enables mac80211's Ethernet encapsulation mode on QCN9274. In
+that mode mac80211 asks the driver to resolve a forward path for an AP
+VAP. Without a net_fill_forward_path callback, a routed flow through a
+bridge stops at the bridge device instead of the associated VAP.
+
+The PPE flowtable can route to a direct-switch VAP, but cannot use the
+bridge master as its redirect device. For an active PPEDS VAP, terminate
+the path at the VAP itself. The direct-switch virtual port and peer route
+already select the radio and WLAN queue, so there is no further netdevice
+to resolve.
+
+Keep all non-PPEDS VAPs on the existing unsupported path.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13132,6 +13132,30 @@
+ 	return 0;
+ }
+ 
++/* A PPEDS VAP is the terminal hardware endpoint for the flowtable. Its
++ * virtual port and peer map select the WLAN radio and queue, so there is
++ * no lower netdevice to resolve beyond this VAP.
++ */
++static int ath12k_mac_op_net_fill_forward_path(struct ieee80211_hw *hw,
++						struct ieee80211_vif *vif,
++						struct ieee80211_sta *sta,
++						struct net_device_path_ctx *ctx,
++						struct net_device_path *path)
++{
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct ath12k_link_vif *arvif = &ahvif->deflink;
++
++	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab) ||
++	    arvif->ppe_vp < 64)
++		return -EOPNOTSUPP;
++
++	path->type = DEV_PATH_ETHERNET;
++	path->dev = ctx->dev;
++	ctx->dev = NULL;
++
++	return 0;
++}
++
+ static const struct ieee80211_ops ath12k_ops = {
+ 	.tx				= ath12k_mac_op_tx,
+ 	.wake_tx_queue			= ieee80211_handle_wake_tx_queue,
+@@ -13190,6 +13214,7 @@ static const struct ieee80211_ops ath12k
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	.link_sta_add_debugfs           = ath12k_debugfs_link_sta_op_add,
+ #endif
++	.net_fill_forward_path		= ath12k_mac_op_net_fill_forward_path,
+ 	.net_setup_tc			= ath12k_mac_op_net_setup_tc,
+ };
+ 
+-- 
+2.43.0
