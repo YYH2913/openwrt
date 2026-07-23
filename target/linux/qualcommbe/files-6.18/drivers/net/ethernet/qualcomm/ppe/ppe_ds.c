@@ -1335,6 +1335,11 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 	ppe_vp_ds_node_state(node->ds->ppe_dev, node->id, false);
 	if (node->ops->quiesce)
 		node->ops->quiesce(node);
+	/* The WLAN client updates the shared rings from its own NAPI context.
+	 * Its quiesce callback prevents new work, while this barrier waits for a
+	 * poll that had already passed the state check before EDMA is stopped.
+	 */
+	synchronize_net();
 
 	regmap = ppe_ds_regmap(node);
 	ppe_ds_napi_quiesce(node);
