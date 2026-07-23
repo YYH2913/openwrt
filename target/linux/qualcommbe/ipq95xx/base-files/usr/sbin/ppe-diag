@@ -14,6 +14,22 @@ show_file()
 	fi
 }
 
+show_named_file()
+{
+	printf '\n-- %s --\n' "$1"
+	show_file "$2"
+}
+
+show_ppe_counters()
+{
+	show_named_file cpu_code /sys/kernel/debug/ppe/cpu_code
+	show_named_file port_rx /sys/kernel/debug/ppe/port_rx
+	show_named_file port_tx /sys/kernel/debug/ppe/port_tx
+	show_named_file edma_err_stats /sys/kernel/debug/ppe/edma/stats/err_stats
+	show_named_file edma_rx_ring_stats /sys/kernel/debug/ppe/edma/stats/rx_ring_stats
+	show_named_file edma_tx_ring_stats /sys/kernel/debug/ppe/edma/stats/tx_ring_stats
+}
+
 section SYSTEM
 ubus call system board 2>/dev/null || true
 uname -a
@@ -97,6 +113,12 @@ show_file /sys/kernel/debug/ppe/virtual_ports
 section FLOWS_BEFORE
 show_file /sys/kernel/debug/ppe/flows
 
+section PPE_COUNTERS_BEFORE
+show_ppe_counters
+
+section SOFTIRQS_BEFORE
+grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null || true
+
 sleep 5
 
 section DIRECT_SWITCH_AFTER
@@ -107,6 +129,12 @@ show_file /sys/kernel/debug/ppe/virtual_ports
 
 section FLOWS_AFTER
 show_file /sys/kernel/debug/ppe/flows
+
+section PPE_COUNTERS_AFTER
+show_ppe_counters
+
+section SOFTIRQS_AFTER
+grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null || true
 
 section FLOW_ROWS
 show_file /sys/kernel/debug/ppe/flow_rows
