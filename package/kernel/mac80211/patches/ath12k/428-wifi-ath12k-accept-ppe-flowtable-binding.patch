@@ -1,0 +1,81 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: ath12k: accept PPE flowtable binding on direct VAPs
+
+fw4 expands a bridged LAN into all lower devices before it creates its
+hardware flowtable. That includes the ath12k VAPs in br-lan. mac80211
+forwards the TC_SETUP_FT request to the wireless driver, but ath12k did
+not implement net_setup_tc, so the VAP returned -EOPNOTSUPP and fw4
+silently fell back to a software flowtable for every device.
+
+The PPE port driver is still the sole owner of flowtable rules. A
+direct-switch VAP only needs to accept the binding so it can remain an
+ingress member of the flowtable; the PPE callback installed through a
+physical port receives and programs the actual flow entries. Keep all
+other TC requests and non-direct-switch ath12k devices unsupported.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7,5 +7,6 @@
+ #include <net/mac80211.h>
+ #include <net/cfg80211.h>
++#include <net/flow_offload.h>
+ #include <linux/etherdevice.h>
+ #include <linux/of_net.h>
+ 
+@@ -13097,6 +13097,40 @@ static void ath12k_mac_op_set_rekey_data
+ 			&rekey_data->replay_ctr, sizeof(rekey_data->replay_ctr));
+ }
+ 
++/* A PPE direct-switch VAP is an ingress member of fw4's hardware
++ * flowtable. Rule programming stays with the PPE physical-port callback;
++ * accepting this bind prevents the VAP from forcing fw4 to software-only
++ * offload.
++ */
++static int ath12k_mac_op_net_setup_tc(struct ieee80211_hw *hw,
++				      struct ieee80211_vif *vif,
++				      struct net_device *dev,
++				      enum tc_setup_type type, void *type_data)
++{
++	struct flow_block_offload *bo = type_data;
++	struct ath12k_vif *ahvif;
++	struct ath12k_link_vif *arvif;
++
++	if (type != TC_SETUP_FT)
++		return -EOPNOTSUPP;
++
++	/* mac80211 can call this while tearing a VAP down, after vif
++	 * driver data has ceased to be valid. No state was attached here,
++	 * so its matching unbind is intentionally a no-op.
++	 */
++	if (bo->command == FLOW_BLOCK_UNBIND)
++		return 0;
++	if (bo->command != FLOW_BLOCK_BIND)
++		return -EOPNOTSUPP;
++
++	ahvif = ath12k_vif_to_ahvif(vif);
++	arvif = &ahvif->deflink;
++	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab))
++		return -EOPNOTSUPP;
++
++	return 0;
++}
++
+ static const struct ieee80211_ops ath12k_ops = {
+ 	.tx				= ath12k_mac_op_tx,
+ 	.wake_tx_queue			= ieee80211_handle_wake_tx_queue,
+@@ -13155,6 +13175,7 @@ static const struct ieee80211_ops ath12k
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	.link_sta_add_debugfs           = ath12k_debugfs_link_sta_op_add,
+ #endif
++	.net_setup_tc			= ath12k_mac_op_net_setup_tc,
+ };
+ 
+ void ath12k_mac_update_freq_range(struct ath12k *ar,
+-- 
+2.43.0
