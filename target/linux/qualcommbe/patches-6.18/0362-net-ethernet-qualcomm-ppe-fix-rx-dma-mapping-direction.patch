@@ -24,7 +24,6 @@ Signed-off-by: Igor Kravchenko <igor.kravchenko05@gmail.com>
  drivers/net/ethernet/qualcomm/ppe/edma_cfg_rx.c | 26 ++++++++++++++++++++++++++
  drivers/net/ethernet/qualcomm/ppe/edma_rx.c     |  4 ++--
  drivers/net/ethernet/qualcomm/ppe/edma_rx.h     |  2 ++
- 3 files changed, 30 insertions(+), 2 deletions(-)
 
 --- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
 +++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
