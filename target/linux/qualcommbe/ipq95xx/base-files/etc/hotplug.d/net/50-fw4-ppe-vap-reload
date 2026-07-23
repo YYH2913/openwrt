@@ -27,9 +27,16 @@ dev="$DEVICENAME"
 	# reload is in progress. Each waiter verifies its own interface afterwards.
 	flock 9 || exit 0
 
-	nft list flowtable inet fw4 ft 2>/dev/null |
-		grep -Fq "$dev" && exit 0
-	/etc/init.d/firewall reload >/dev/null 2>&1
+	# netifd can publish the bridge member just after the net hotplug event.
+	# Verify the rendered flowtable and retry the reload while that state settles.
+	tries=10
+	while [ "$tries" -gt 0 ]; do
+		nft list flowtable inet fw4 ft 2>/dev/null |
+			grep -Fq "$dev" && exit 0
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
+		sleep 1
+		tries=$((tries - 1))
+	done
 ) &
 
 exit 0
