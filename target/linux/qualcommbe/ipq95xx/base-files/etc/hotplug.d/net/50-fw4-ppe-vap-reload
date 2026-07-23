@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# fw4 starts before hostapd creates the AP VAPs.  Refresh its flowtable once
+# a VAP exists so resolve_lower_devices() can include the bridge port.
+[ "$ACTION" = "add" ] || exit 0
+[ "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" = "1" ] || exit 0
+
+case "$DEVICENAME" in
+	wl*-ap*|phy*-ap*|ap-mld*) ;;
+	*) exit 0 ;;
+esac
+
+(
+	exec 9>/var/lock/fw4-ppe-vap-reload.lock
+	flock -n 9 || exit 0
+
+	# Allow netifd to enslave the VAP and ath12k to attach its PPE VP.
+	sleep 2
+	[ -d "/sys/class/net/$DEVICENAME/brport" ] || exit 0
+	nft list flowtable inet fw4 ft 2>/dev/null |
+		grep -Fq "\"$DEVICENAME\"" && exit 0
+	/etc/init.d/firewall reload >/dev/null 2>&1
+) &
+
+exit 0
