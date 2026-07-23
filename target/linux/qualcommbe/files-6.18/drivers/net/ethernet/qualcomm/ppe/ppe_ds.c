@@ -1128,12 +1128,6 @@ int qcom_ppe_ds_node_id(struct qcom_ppe_ds_node *node)
 }
 EXPORT_SYMBOL_GPL(qcom_ppe_ds_node_id);
 
-int qcom_ppe_ds_queue_start(struct qcom_ppe_ds_node *node)
-{
-	return node ? node->queue_start : -EINVAL;
-}
-EXPORT_SYMBOL_GPL(qcom_ppe_ds_queue_start);
-
 int qcom_ppe_ds_register(struct qcom_ppe_ds_node *node,
 			 const struct qcom_ppe_ds_reg *reg)
 {

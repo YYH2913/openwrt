@@ -87,7 +87,6 @@ qcom_ppe_ds_node_alloc_id(struct device *client,
 			  size_t priv_size);
 void *qcom_ppe_ds_priv(struct qcom_ppe_ds_node *node);
 int qcom_ppe_ds_node_id(struct qcom_ppe_ds_node *node);
-int qcom_ppe_ds_queue_start(struct qcom_ppe_ds_node *node);
 
 int qcom_ppe_ds_register(struct qcom_ppe_ds_node *node,
 			 const struct qcom_ppe_ds_reg *reg);
