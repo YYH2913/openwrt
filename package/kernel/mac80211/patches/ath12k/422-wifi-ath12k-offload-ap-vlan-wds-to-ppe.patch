@@ -1,5 +1,5 @@
-From: Yanghan Ye <yyh94306@gmail.com>
-Date: Thu, 23 Jul 2026 00:20:00 +0800
+From: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+Date: Mon, 26 May 2025 18:29:55 -0700
 Subject: [PATCH] wifi: ath12k: offload AP VLAN WDS peers to PPE
 
 AP_VLAN interfaces do not own firmware vdevs, but a four-address WDS
@@ -19,6 +19,8 @@ datapath is rebuilt.
 
 Based-on: ba31901cc92e3aa4aa2799876745af447b8a8bae
 Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-10-QSDK-DP-wifi-Enable-DS-support-for-WDS-AP_VLAN-inter.patch
+Signed-off-by: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
 Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
@@ -220,7 +222,7 @@ index aa2ce64..0d0a640 100644
  	ath12k_hif_write32(ab, ATH12K_PPE_VP_TABLE_BASE +
  			   profile * ATH12K_PPE_VP_TABLE_STRIDE, value);
  }
-@@ -1019,16 +1017,193 @@ static int ath12k_ppe_ds_vif_program(struct ath12k_link_vif *arvif)
+@@ -1019,16 +1017,203 @@ static int ath12k_ppe_ds_vif_program(struct ath12k_link_vif *arvif)
  		 u32_encode_bits(arvif->vdev_id, ATH12K_PPE_VP_VDEV_ID) |
  		 u32_encode_bits(arvif->ppe_search_idx,
  				 ATH12K_PPE_VP_SEARCH_IDX);
@@ -352,6 +354,16 @@ index aa2ce64..0d0a640 100644
 +	if (!ab || vlan->ppe_vlan_vp < 64)
 +		return;
 +	ppe = &ab->dp.ppe_ds;
++	/* Firmware recovery tears down the PPEDS node before mac80211
++	 * removes AP_VLAN interfaces. The node teardown already releases
++	 * its virtual ports, so avoid accessing the dismantled datapath.
++	 */
++	if (!ppe->node) {
++		vlan->ppe_vlan_vp = -1;
++		vlan->ppe_vlan_profile = -1;
++		vlan->ppe_vlan_route_programmed = false;
++		return;
++	}
 +
 +	if (vlan->ppe_vlan_route_programmed && parent)
 +		ath12k_ppe_ds_vlan_route_apply(vlan, parent, false);
@@ -415,7 +427,7 @@ index aa2ce64..0d0a640 100644
  	u32 refcount;
  	int bank_id = DP_INVALID_BANK_ID;
  	int released_search = -1, released_bank = DP_INVALID_BANK_ID;
-@@ -1043,7 +1217,7 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+@@ -1043,7 +1227,7 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
  	if (arvif->ppe_vp >= 64) {
  		ret = ath12k_ppe_ds_vif_program(arvif);
  		if (!ret)
@@ -424,7 +436,7 @@ index aa2ce64..0d0a640 100644
  		if (ret != -ENOENT)
  			return ret;
  
-@@ -1082,6 +1256,18 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+@@ -1082,6 +1266,18 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
  		    "PPE direct-switch vdev %u attached: netdev=%s vp=%d profile=%d bank=%d refs=%u\n",
  		    arvif->vdev_id, wdev->netdev->name, vp, profile,
  		    refcount > 1 ? bank_id : arvif->bank_id, refcount);
@@ -443,7 +455,7 @@ index aa2ce64..0d0a640 100644
  	return 0;
  
  err_profile:
-@@ -1101,21 +1287,28 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
+@@ -1101,21 +1297,36 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
  	struct ath12k_base *ab;
  	struct ath12k_ppe_ds *ppe;
  	struct ieee80211_vif *vif;
@@ -457,6 +469,14 @@ index aa2ce64..0d0a640 100644
  		return;
  	ab = arvif->ar->ab;
  	ppe = &ab->dp.ppe_ds;
++	/* ath12k_core_reconfigure_on_crash() frees the PPEDS node before
++	 * mac80211 tears down VIFs. qcom_ppe_ds_node_free() has already
++	 * detached its VPs in that case, so only discard the stale cache.
++	 */
++	if (!ppe->node) {
++		ath12k_ppe_ds_vif_invalidate(arvif);
++		return;
++	}
  	vif = ath12k_ahvif_to_vif(arvif->ahvif);
 +	if (vif->type == NL80211_IFTYPE_AP)
 +		list_for_each_entry(vlan, &arvif->ahvif->ppe_vlan_list,
@@ -474,7 +494,7 @@ index aa2ce64..0d0a640 100644
  	if (last && vif->type == NL80211_IFTYPE_STATION) {
  		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
  				   search_idx * 4, 0);
-@@ -1127,6 +1320,88 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
+@@ -1127,6 +1338,88 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
  	arvif->ppe_search_idx = -1;
  }
  
@@ -563,7 +583,7 @@ index aa2ce64..0d0a640 100644
  void ath12k_ppe_ds_peer_route(struct ath12k *ar,
  			      struct ath12k_link_vif *arvif,
  			      struct ath12k_link_sta *arsta, bool enable)
-@@ -1135,15 +1410,33 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+@@ -1135,15 +1428,33 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
  	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
  	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
  	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
@@ -601,7 +621,7 @@ index aa2ce64..0d0a640 100644
  		if (enable)
  			map = u32_encode_bits(arvif->ast_idx,
  					      ATH12K_PPE_SEARCH_AST_IDX) |
-@@ -1153,60 +1446,104 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+@@ -1153,60 +1464,104 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
  				   arvif->ppe_search_idx * 4, map);
  	}
  
