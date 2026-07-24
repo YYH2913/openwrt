@@ -13,19 +13,27 @@ esac
 
 pending=/var/run/fw4-ppe-vap-reload.pending
 
+trigger_vap_ready()
+{
+	local state="/sys/class/net/$DEVICENAME/brport/state"
+
+	[ -r "$state" ] && [ "$(cat "$state" 2>/dev/null)" = "3" ]
+}
+
 vap_ports_ready()
 {
 	local state found=0
 
-	# fw4 verifies every lower device in all zones before it accepts hardware
-	# offload.  Reloading while any AP VAP is still disabled makes it fall back
-	# to a software flowtable, then needlessly repeats the transition.
+	# A disabled AP VAP can remain attached to br-lan indefinitely.  It has no
+	# direct-switch endpoint and must not hold up the active VAP which caused
+	# this event.  Later VAP add events refresh the flowtable as each one enters
+	# forwarding.
 	for state in /sys/class/net/wl*-ap*/brport/state \
 		     /sys/class/net/phy*-ap*/brport/state \
 		     /sys/class/net/ap-mld*/brport/state; do
 		[ -r "$state" ] || continue
+		[ "$(cat "$state" 2>/dev/null)" = "3" ] || continue
 		found=1
-		[ "$(cat "$state" 2>/dev/null)" = "3" ] || return 1
 	done
 
 	[ "$found" = "1" ]
@@ -42,6 +50,7 @@ flowtable_ready()
 		    /sys/class/net/phy*-ap*/brport/state \
 		    /sys/class/net/ap-mld*/brport/state; do
 		[ -r "$path" ] || continue
+		[ "$(cat "$path" 2>/dev/null)" = "3" ] || continue
 		current=${path%/brport/state}
 		current=${current##*/}
 		printf '%s\n' "$table" | grep -Fq "$current" || return 1
@@ -65,15 +74,16 @@ printf '%s\n' "$token" > "$pending"
 	[ "$(cat "$pending" 2>/dev/null)" = "$token" ] || exit 0
 
 	# Direct-switch VPs are allocated just before the AP bridge port enters
-	# forwarding.  Wait for every currently bridged AP VAP, rather than
-	# repeatedly rebuilding fw4 while one radio is still recovering.
+	# forwarding.  Do not make an intentionally disabled sibling VAP block the
+	# active one: it has no endpoint for fw4 to bind at this point.
 	tries=120
-	while ! vap_ports_ready && [ "$tries" -gt 0 ]; do
+	while ! trigger_vap_ready && [ "$tries" -gt 0 ]; do
 		sleep 1
 		tries=$((tries - 1))
 	done
-	vap_ports_ready || exit 0
+	trigger_vap_ready || exit 0
 	sleep 2
+	trigger_vap_ready || exit 0
 	vap_ports_ready || exit 0
 
 	flowtable_ready && exit 0
