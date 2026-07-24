@@ -1,0 +1,68 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] fw4: retain hardware offload on compatible devices
+
+fw4 currently validates all flowtable devices as one hardware-offload
+set. A single virtual or otherwise unsupported interface makes the
+kernel reject the FLOW_BLOCK bind and fw4 then drops hardware offload
+for every interface.
+
+Keep the existing fast path when the complete device set can be bound.
+If it cannot, build a compatible set incrementally and emit
+the hardware flowtable for that set. This leaves PPE-capable Wi-Fi and
+Ethernet interfaces accelerated in configurations which also contain
+VPN, container, or other software-only interfaces.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ root/usr/share/ucode/fw4.uc | 38 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/root/usr/share/ucode/fw4.uc b/root/usr/share/ucode/fw4.uc
+index 5ed0a5f..6b43c9f 100644
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -528,11 +528,33 @@ return {
+ 		devices = sort(uniq(devices));
+ 
+-		if (!nft_try_hw_offload(devices)) {
+-			this.warn('Hardware flow offloading unavailable, falling back to software offloading');
+-			this.state.defaults.flow_offloading_hw = false;
+-
+-			return null;
+-		}
+-
+-		return devices;
++		if (nft_try_hw_offload(devices))
++			return devices;
++
++		let hw_devices = [];
++		let rejected_devices = [];
++
++		/*
++		 * A flowtable with the offload flag binds a TC block to every
++		 * device. Do not let an unrelated software-only device disable
++		 * PPE offload for compatible endpoints.
++		 */
++		for (let device in devices) {
++			let candidate = [ ...hw_devices, device ];
++
++			if (nft_try_hw_offload(candidate))
++				push(hw_devices, device);
++			else
++				push(rejected_devices, device);
++		}
++
++		if (length(hw_devices)) {
++			this.warn(`Hardware flow offloading unavailable on devices: ${join(', ', rejected_devices)}; excluding them from the hardware flowtable`);
++
++			return hw_devices;
++		}
++
++		this.warn('Hardware flow offloading unavailable, falling back to software offloading');
++		this.state.defaults.flow_offloading_hw = false;
++
++		return null;
+ 	},
+-- 
+2.50.1
