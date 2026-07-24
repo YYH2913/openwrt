@@ -6,14 +6,14 @@ Add a networking design document for the PPE offload series: the
 architecture of the L2 switchdev bridge offload, VLAN-aware bridging,
 multicast and the netfilter flowtable offload, the datapath invariants
 the implementation relies on, the sources the hardware programming was
-derived from, and what remains unimplemented or unverified on
-hardware.
+derived from, and the feature and hardware-validation limits that
+remain.
 
 Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 ---
 --- /dev/null
 +++ b/Documentation/networking/qualcomm-ppe-offload.rst
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,318 @@
 +.. SPDX-License-Identifier: GPL-2.0-only
 +
 +Qualcomm PPE hardware offload
@@ -287,30 +287,36 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +Structural models from mainline: mtk_ppe_offload.c for the flowtable
 +glue, the DSA drivers for assisted learning and switchdev conventions.
 +
++Implemented APPE extensions
++---------------------------
++
++Two APPE-only datapaths extend the baseline PPE offload:
++
++ - Wireless direct switching (the vendor's PPE-DS) attaches QCN9274
++   ath12k VAPs to the three reserved direct-switch EDMA ring sets. The
++   PPE and Wi-Fi hardware exchange eligible routed flows through their
++   PPE2TCL and REO2PPE rings without the ordinary CPU/EDMA virtual-port
++   handoff. The setup shares virtual ports across MLO links and handles
++   recovery and VAP recreation. Devices without the ``qcom,ppe-ds``
++   capability retain the ordinary virtual-port fallback.
++ - The on-die tunnel engine offloads IPIP6 flows for DS-Lite, MAP-E FMRs
++   and fixed-endpoint raw IPv6 LWT tunnels. A shared transaction owns the
++   decapsulation row, encapsulation template, tunnel port, virtual port
++   and L3 interfaces, and resolves the IPv6 route and neighbour before
++   publishing either flow direction. The supported underlay is a PPE
++   physical port with an optional 802.1Q VLAN and lifecycle-owned PPPoE;
++   malformed or unrepresentable configurations stay on the software path.
++
 +Remaining work
 +--------------
 +
 +Not yet implemented, in rough order of usefulness:
 +
-+ - Wireless direct switching (the vendor's PPE-DS): the downlink to a
-+   wireless client is offloaded through a virtual port, but it still
-+   crosses the CPU once. Direct switching hands the flow between the
-+   PPE and the Wi-Fi hardware with no CPU touch, which needs Wi-Fi
-+   driver ring support the mainline ath12k does not have. The current
-+   virtual-port downlink and source-tagged uplink both cross EDMA.
-+ - Tunnels: the SoC has an on-die tunnel engine (the tunnel lookup
-+   block, whose PPPoE session table this series already uses, plus the
-+   tunnel fields of the egress L3 interfaces) able to terminate and
-+   generate IPIP6, VXLAN, GENEVE and MAP-T traffic without an external
-+   accelerator. QWRT uses one IPIP6 lifecycle for DS-Lite and MAP-E,
-+   with FMRs distinguishing MAP-E; MAP-T instead pairs IPv4 and IPv6
-+   connections through hardware translation maps. Its generated outer
-+   L2 header can carry two VLAN tags and optional PPPoE. The current
-+   flowtable recognizes lightweight-route tunnel metadata and IPIP6
-+   redirect devices, but dispatches both only to a rejecting stub; none
-+   of those tunnel lifecycles is implemented. IPsec remains separate: it
-+   needs the EIP-197 crypto engine, a separate
-+   device with its own firmware, and is out of scope.
++ - Other tunnel families: VXLAN, GENEVE and MAP-T. MAP-T needs stateless
++   IPv4/IPv6 translation and paired translation rules rather than the
++   IPIP6 transaction above. IPsec remains separate: it needs the EIP-197
++   crypto engine, a separate device with its own firmware, and is out of
++   scope.
 + - QoS beyond the root TBF offload and the mainline scheduler defaults
 +   (the hardware also has per-queue and flow shapers and a full
 +   scheduler hierarchy), and NAT66.
@@ -322,5 +328,7 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +hit_age while the aging engine is off (otherwise idle-looking active
 +stations are aged and immediately re-learned, a transient flood); that
 +the unmodified egress tag mode preserves tags end to end on
-+VLAN-unaware bridges; and whether a long hardware flow aging timer is
-+usable as a revalidation net for the stale-route blind spot above.
++VLAN-unaware bridges; whether a long hardware flow aging timer is usable
++as a revalidation net for the stale-route blind spot above; and the
++direct-switch and tunnel datapaths under sustained traffic on each
++supported radio and underlay combination.
