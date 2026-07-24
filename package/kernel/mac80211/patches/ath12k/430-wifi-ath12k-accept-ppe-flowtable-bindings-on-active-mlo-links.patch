@@ -1,0 +1,85 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: ath12k: accept PPE flowtable bindings on active MLO links
+
+fw4 probes every lower device of a bridge before it creates an offloaded
+flowtable. The direct-VAP callback currently checks only the VIF's
+embedded default link. An MLO VAP can have its active radio links in the
+RCU-protected link array while that default link has no datapath endpoint,
+so the probe incorrectly returns -EOPNOTSUPP and fw4 falls back to software
+offload.
+
+Keep the default-link fast path for ordinary VAPs, then inspect the active
+MLO links under RCU. A VAP is an acceptable flowtable member as soon as
+any link has an allocated direct-switch VP; per-peer routing still selects
+the precise radio when a flow is installed.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 35 ++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13098,6 +13098,34 @@ static void ath12k_mac_op_set_rekey_data
+ 			&rekey_data->replay_ctr, sizeof(rekey_data->replay_ctr));
+ }
+ 
++static bool ath12k_mac_ppe_ds_vif_ready(struct ath12k_vif *ahvif)
++{
++	struct ath12k_link_vif *arvif = &ahvif->deflink;
++	int link_id;
++	bool ready = false;
++
++	if (arvif->ar && ath12k_ppe_ds_enabled(arvif->ar->ab) &&
++	    READ_ONCE(arvif->ppe_vp) >= 64)
++		return true;
++
++	/* An MLO VIF can have no active default link. The link pointers are
++	 * published under RCU while channel contexts are reassigned.
++	 */
++	rcu_read_lock();
++	for (link_id = 0; link_id < ATH12K_NUM_MAX_LINKS; link_id++) {
++		arvif = rcu_dereference(ahvif->link[link_id]);
++		if (!arvif || !arvif->ar ||
++		    !ath12k_ppe_ds_enabled(arvif->ar->ab) ||
++		    READ_ONCE(arvif->ppe_vp) < 64)
++			continue;
++		ready = true;
++		break;
++	}
++	rcu_read_unlock();
++
++	return ready;
++}
++
+ /* A PPE direct-switch VAP is an ingress member of fw4's hardware
+  * flowtable. Rule programming stays with the PPE physical-port callback;
+  * accepting this bind prevents the VAP from forcing fw4 to software-only
+@@ -13110,7 +13138,6 @@ static int ath12k_mac_op_net_setup_tc(st
+ {
+ 	struct flow_block_offload *bo = type_data;
+ 	struct ath12k_vif *ahvif;
+-	struct ath12k_link_vif *arvif;
+ 
+ 	if (type != TC_SETUP_FT)
+ 		return -EOPNOTSUPP;
+@@ -13123,15 +13150,15 @@ static int ath12k_mac_op_net_setup_tc(st
+ 		return 0;
+ 	if (bo->command != FLOW_BLOCK_BIND)
+ 		return -EOPNOTSUPP;
++	if (bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
+ 
+ 	ahvif = ath12k_vif_to_ahvif(vif);
+-	arvif = &ahvif->deflink;
+ 	/* The netdevice can be bridged before vdev start reaches the PPEDS
+ 	 * attach point. Reject that transient state so the VAP hotplug retry
+ 	 * reloads fw4 only after this VAP has a hardware endpoint.
+ 	 */
+-	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab) ||
+-	    arvif->ppe_vp < 64)
++	if (!ath12k_mac_ppe_ds_vif_ready(ahvif))
+ 		return -EOPNOTSUPP;
+ 
+ 	return 0;
