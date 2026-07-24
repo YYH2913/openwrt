@@ -28,11 +28,15 @@ dev="$DEVICENAME"
 	flock 9 || exit 0
 
 	# netifd can publish the bridge member just after the net hotplug event.
-	# Verify the rendered flowtable and retry the reload while that state settles.
+	# Verify both the rendered VAP and hardware-offload flag. A VAP can be
+	# present in a temporarily software-only table while ath12k direct-switch
+	# setup is still settling; keep retrying in that case.
 	tries=10
 	while [ "$tries" -gt 0 ]; do
-		nft list flowtable inet fw4 ft 2>/dev/null |
-			grep -Fq "$dev" && exit 0
+		if nft list flowtable inet fw4 ft 2>/dev/null | grep -Fq "$dev" &&
+		   nft list flowtable inet fw4 ft 2>/dev/null | grep -Fq 'flags offload'; then
+			exit 0
+		fi
 		/etc/init.d/firewall reload >/dev/null 2>&1 || true
 		sleep 1
 		tries=$((tries - 1))
