@@ -1201,6 +1201,60 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(qcom_ppe_ds_register);
 
+/* Stop every EDMA ring before releasing any memory it can still access.
+ * The caller has already quiesced the WLAN producer and holds node->lock.
+ */
+static void ppe_ds_hw_stop(struct qcom_ppe_ds_node *node)
+{
+	struct regmap *regmap = ppe_ds_regmap(node);
+	int ret;
+	u32 reg, val;
+
+	ppe_ds_napi_quiesce(node);
+
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+			  EDMA_TXDESC_CTRL_TXEN_MASK);
+	ret = regmap_read_poll_timeout(regmap,
+				       ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+				       val, !(val & EDMA_TXDESC_CTRL_TXEN_MASK),
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+	if (ret)
+		dev_warn(node->client, "REO2PPE ring %u did not stop: %d\n",
+			 node->reo2ppe.id, ret);
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+			  EDMA_RXDESC_RX_EN);
+	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id));
+	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE_DONE(node->ppe2tcl.ring_id));
+	ret = regmap_read_poll_timeout(regmap, reg,
+				       val, val & PPE_DS_RING_DISABLE,
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+	if (ret)
+		dev_warn(node->client, "PPE2TCL ring %u did not stop: %d\n",
+			 node->ppe2tcl.ring_id, ret);
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
+			  EDMA_RXFILL_RING_EN);
+	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id));
+	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE_DONE(node->rxfill.ring_id));
+	ret = regmap_read_poll_timeout(regmap, reg,
+				       val, val & PPE_DS_RING_DISABLE,
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+	if (ret)
+		dev_warn(node->client, "RXFILL ring %u did not stop: %d\n",
+			 node->rxfill.ring_id, ret);
+
+	/* Descriptors already fetched by EDMA can reach the completion ring after
+	 * every ring enable bit is clear.
+	 */
+	usleep_range(5000, 6000);
+	ppe_ds_txcmpl_reap(node, node->txcmpl.count - 1);
+	ppe_ds_release_pending_fill(node);
+}
+
 int qcom_ppe_ds_start(struct qcom_ppe_ds_node *node)
 {
 	struct regmap *regmap;
@@ -1292,17 +1346,13 @@ int qcom_ppe_ds_start(struct qcom_ppe_ds_node *node)
 
 err_start:
 	WRITE_ONCE(node->state, PPE_DS_REGISTERED);
-	ppe_ds_napi_quiesce(node);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
-			  EDMA_TXDESC_CTRL_TXEN_MASK);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
-			  EDMA_RXDESC_RX_EN);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
-			  EDMA_RXFILL_RING_EN);
-	ppe_ds_release_pending_fill(node);
+	if (node->ops->quiesce)
+		node->ops->quiesce(node);
+	/* Keep a WLAN poll that raced the state change from touching the shared
+	 * rings while their EDMA side is shut down.
+	 */
+	synchronize_net();
+	ppe_ds_hw_stop(node);
 	dev_err(node->client,
 		"PPE direct-switch node %d failed to start: %d\n",
 		node->id, ret);
@@ -1314,10 +1364,6 @@ EXPORT_SYMBOL_GPL(qcom_ppe_ds_start);
 
 void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 {
-	struct regmap *regmap;
-	int ret;
-	u32 reg, val;
-
 	if (!node)
 		return;
 
@@ -1335,52 +1381,7 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 	 */
 	synchronize_net();
 
-	regmap = ppe_ds_regmap(node);
-	ppe_ds_napi_quiesce(node);
-
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
-			  EDMA_TXDESC_CTRL_TXEN_MASK);
-	ret = regmap_read_poll_timeout(regmap,
-				       ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
-				       val, !(val & EDMA_TXDESC_CTRL_TXEN_MASK),
-				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
-	if (ret)
-		dev_warn(node->client, "REO2PPE ring %u did not stop: %d\n",
-			 node->reo2ppe.id, ret);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
-			  EDMA_RXDESC_RX_EN);
-	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id));
-	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
-	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE_DONE(node->ppe2tcl.ring_id));
-	ret = regmap_read_poll_timeout(regmap,
-				       reg,
-				       val, val & PPE_DS_RING_DISABLE,
-				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
-	if (ret)
-		dev_warn(node->client, "PPE2TCL ring %u did not stop: %d\n",
-			 node->ppe2tcl.ring_id, ret);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
-			  EDMA_RXFILL_RING_EN);
-	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id));
-	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
-	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE_DONE(node->rxfill.ring_id));
-	ret = regmap_read_poll_timeout(regmap,
-				       reg,
-				       val, val & PPE_DS_RING_DISABLE,
-				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
-	if (ret)
-		dev_warn(node->client, "RXFILL ring %u did not stop: %d\n",
-			 node->rxfill.ring_id, ret);
-
-	/* Match the vendor stop sequence: descriptors already fetched by EDMA
-	 * can reach the completion ring after all ring enable bits are clear.
-	 */
-	usleep_range(5000, 6000);
-	ppe_ds_txcmpl_reap(node, node->txcmpl.count - 1);
-	ppe_ds_release_pending_fill(node);
+	ppe_ds_hw_stop(node);
 	atomic64_inc(&node->stats.stops);
 out:
 	mutex_unlock(&node->lock);
