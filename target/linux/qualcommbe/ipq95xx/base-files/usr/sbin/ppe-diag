@@ -45,6 +45,27 @@ else
 	printf 'unavailable: lsmod\n'
 fi
 
+section PPEDS_ABI
+if [ -r /proc/kallsyms ]; then
+	if grep -qw qcom_ppe_ds_start /proc/kallsyms; then
+		printf 'qcom_ppe_ds_start=present\n'
+	else
+		printf 'qcom_ppe_ds_start=missing\n'
+	fi
+	if grep -qw qcom_ppe_ds_vp_alloc /proc/kallsyms; then
+		printf 'qcom_ppe_ds_vp_alloc=present\n'
+	else
+		printf 'qcom_ppe_ds_vp_alloc=missing\n'
+	fi
+	if grep -qw qcom_ppe_ds_queue_start /proc/kallsyms; then
+		printf 'legacy_qcom_ppe_ds_queue_start=present\n'
+	else
+		printf 'legacy_qcom_ppe_ds_queue_start=absent\n'
+	fi
+else
+	printf 'unavailable: /proc/kallsyms\n'
+fi
+
 section FW4
 if command -v fw4 >/dev/null 2>&1; then
 	fw4 print 2>&1
