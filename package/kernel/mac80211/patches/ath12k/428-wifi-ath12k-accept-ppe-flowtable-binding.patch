@@ -10,14 +10,17 @@ silently fell back to a software flowtable for every device.
 The PPE port driver is still the sole owner of flowtable rules. A
 direct-switch VAP only needs to accept the binding so it can remain an
 ingress member of the flowtable; the PPE callback installed through a
-physical port receives and programs the actual flow entries. Keep all
-other TC requests and non-direct-switch ath12k devices unsupported.
+physical port receives and programs the actual flow entries. Do not accept
+the bind until ath12k has allocated its direct virtual port: otherwise an
+early firewall reload can install a flowtable before the VAP is usable by
+PPEDS. Keep all other TC requests and non-direct-switch ath12k devices
+unsupported.
 
 Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
- drivers/net/wireless/ath/ath12k/mac.c | 35 +++++++++++++++++++++++++++++++++++
- 1 file changed, 35 insertions(+)
+ drivers/net/wireless/ath/ath12k/mac.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
 
 --- a/drivers/net/wireless/ath/ath12k/mac.c
 +++ b/drivers/net/wireless/ath/ath12k/mac.c
@@ -28,7 +31,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  #include <linux/etherdevice.h>
  #include <linux/of_net.h>
  
-@@ -13097,6 +13097,40 @@ static void ath12k_mac_op_set_rekey_data
+@@ -13097,6 +13097,45 @@ static void ath12k_mac_op_set_rekey_data
  			&rekey_data->replay_ctr, sizeof(rekey_data->replay_ctr));
  }
  
@@ -60,7 +63,12 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +
 +	ahvif = ath12k_vif_to_ahvif(vif);
 +	arvif = &ahvif->deflink;
-+	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab))
++	/* The netdevice can be bridged before vdev start reaches the PPEDS
++	 * attach point. Reject that transient state so the VAP hotplug retry
++	 * reloads fw4 only after this VAP has a hardware endpoint.
++	 */
++	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab) ||
++	    arvif->ppe_vp < 64)
 +		return -EOPNOTSUPP;
 +
 +	return 0;
@@ -69,7 +77,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  static const struct ieee80211_ops ath12k_ops = {
  	.tx				= ath12k_mac_op_tx,
  	.wake_tx_queue			= ieee80211_handle_wake_tx_queue,
-@@ -13155,6 +13175,7 @@ static const struct ieee80211_ops ath12k
+@@ -13155,6 +13194,7 @@ static const struct ieee80211_ops ath12k {
  #ifdef CPTCFG_ATH12K_DEBUGFS
  	.link_sta_add_debugfs           = ath12k_debugfs_link_sta_op_add,
  #endif
