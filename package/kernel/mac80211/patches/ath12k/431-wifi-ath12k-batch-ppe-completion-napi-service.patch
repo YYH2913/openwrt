@@ -1,0 +1,77 @@
+From: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Date: Mon, 4 Aug 2025 19:18:12 +0530
+Subject: [PATCH] wifi: ath12k: batch PPE completion NAPI service
+
+The QSDK PPEDS completion NAPI handles up to 256 completion records per
+poll and charges those records to NAPI at a four-to-one ratio.  The native
+direct-switch implementation services one completion per NAPI budget unit,
+which can leave the WBM PPE completion ring as the throughput limiter under
+sustained multi-gigabit downlink traffic.
+
+Keep the native generic IRQ-group and SRNG locking model, but give its PPE
+completion path the same bounded batch size.  If the bounded service budget
+is exhausted, report the whole NAPI budget so the poll remains scheduled;
+otherwise report the amortized work count.  This prevents an incomplete
+completion ring from being mistaken for an idle one.
+
+Based-on: 41c027804556a6adc68fa0d79400fb96655a909e
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0486-QSDK-DP-wifi-ath12k-Fixes-to-improve-DS-DL-performan.patch
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c  | 22 ++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/ppe.h |  2 ++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -941,6 +941,10 @@ int ath12k_dp_service_srng(struct ath12k_base *ab,
+ 	int tot_work_done = 0;
+ 	enum dp_monitor_mode monitor_mode;
+ 	u8 ring_mask;
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	int ppeds_budget;
++	int ppeds_done;
++#endif
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	if (ab->hw_params->ring_mask->ppe2tcl[grp_id])
+@@ -950,7 +954,23 @@ int ath12k_dp_service_srng(struct ath12k_base *ab,
+ 		ath12k_ppe_ds_service_reo2ppe(ab);
+ 
+ 	if (ab->hw_params->ring_mask->ppeds_tx_cmpl[grp_id]) {
+-		work_done = ath12k_ppe_ds_service_tx_completion(ab, budget);
++		ppeds_budget = min_t(int,
++			budget * ATH12K_PPE_DS_TX_CMPL_NAPI_SCALE - 1,
++			ATH12K_PPE_DS_TX_CMPL_MAX_BUDGET);
++		ppeds_done = ath12k_ppe_ds_service_tx_completion(ab,
++							ppeds_budget);
++
++		/*
++		 * QSDK amortizes four PPEDS completions into one NAPI work item.
++		 * A full bounded batch may still leave ring entries pending, so
++		 * consume the remaining NAPI budget to keep polling in that case.
++		 */
++		if (ppeds_done == ppeds_budget)
++			work_done = budget;
++		else
++			work_done = DIV_ROUND_UP(ppeds_done,
++						 ATH12K_PPE_DS_TX_CMPL_NAPI_SCALE);
++
+ 		budget -= work_done;
+ 		tot_work_done += work_done;
+ 		if (budget <= 0)
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -10,6 +10,8 @@ struct ath12k_vif;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ #define ATH12K_PPE_DS_NAPI_WEIGHT 128
++#define ATH12K_PPE_DS_TX_CMPL_NAPI_SCALE 4
++#define ATH12K_PPE_DS_TX_CMPL_MAX_BUDGET 256
+ 
+ bool ath12k_ppe_ds_enabled(struct ath12k_base *ab);
+ int ath12k_ppe_ds_attach(struct ath12k_base *ab);
+-- 
+2.43.0
