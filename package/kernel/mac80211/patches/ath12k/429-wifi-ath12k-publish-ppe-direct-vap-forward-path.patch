@@ -12,17 +12,23 @@ the path at the VAP itself. The direct-switch virtual port and peer route
 already select the radio and WLAN queue, so there is no further netdevice
 to resolve.
 
+For an MLO station, resolve the VAP state from the station's associated
+link rather than the VIF's default link. The normal ath12k transmit path
+uses that same link, and the PPE peer-to-VP map is only owned by it. This
+also prevents an inactive default link from rejecting an otherwise valid
+hardware flow.
+
 Keep all non-PPEDS VAPs on the existing unsupported path.
 
 Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
- drivers/net/wireless/ath/ath12k/mac.c | 24 ++++++++++++++++++++++++
- 1 file changed, 24 insertions(+)
+ drivers/net/wireless/ath/ath12k/mac.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
 
 --- a/drivers/net/wireless/ath/ath12k/mac.c
 +++ b/drivers/net/wireless/ath/ath12k/mac.c
-@@ -13132,6 +13132,30 @@
+@@ -13132,6 +13132,47 @@
  	return 0;
  }
  
@@ -36,8 +42,25 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +						struct net_device_path_ctx *ctx,
 +						struct net_device_path *path)
 +{
-+	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
-+	struct ath12k_link_vif *arvif = &ahvif->deflink;
++	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
++	struct ath12k_link_sta *arsta;
++	struct ath12k_link_vif *arvif;
++
++	/* mac80211 invokes this callback under rcu_read_lock(). An MLO
++	 * flow must use the associated link: it owns both normal data TX
++	 * selection and the PPE peer-to-VP routing entry.
++	 */
++	if (sta->mlo) {
++		if (ahsta->assoc_link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++			return -EOPNOTSUPP;
++		arsta = rcu_dereference(ahsta->link[ahsta->assoc_link_id]);
++	} else {
++		arsta = &ahsta->deflink;
++	}
++
++	if (!arsta || !arsta->arvif)
++		return -EOPNOTSUPP;
++	arvif = arsta->arvif;
 +
 +	if (!arvif->ar || !ath12k_ppe_ds_enabled(arvif->ar->ab) ||
 +	    arvif->ppe_vp < 64)
