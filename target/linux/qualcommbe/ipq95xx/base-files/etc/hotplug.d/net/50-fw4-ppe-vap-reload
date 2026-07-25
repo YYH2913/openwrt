@@ -13,6 +13,11 @@ esac
 
 pending=/var/run/fw4-ppe-vap-reload.pending
 
+log()
+{
+	logger -t ppe-flowtable "$*"
+}
+
 trigger_vap_ready()
 {
 	local state="/sys/class/net/$DEVICENAME/brport/state"
@@ -81,12 +86,20 @@ printf '%s\n' "$token" > "$pending"
 		sleep 1
 		tries=$((tries - 1))
 	done
-	trigger_vap_ready || exit 0
+	if ! trigger_vap_ready; then
+		log "$DEVICENAME did not reach bridge forwarding"
+		exit 0
+	fi
 	sleep 2
-	trigger_vap_ready || exit 0
-	vap_ports_ready || exit 0
+	if ! trigger_vap_ready || ! vap_ports_ready; then
+		log "$DEVICENAME left bridge forwarding before PPE flowtable bind"
+		exit 0
+	fi
 
-	flowtable_ready && exit 0
+	if flowtable_ready; then
+		log "$DEVICENAME already present in the hardware flowtable"
+		exit 0
+	fi
 
 	# fw4 performs the hardware capability probe and atomically falls back to
 	# software when an endpoint is unavailable.  A short, bounded retry covers
@@ -95,12 +108,16 @@ printf '%s\n' "$token" > "$pending"
 	while [ "$tries" -gt 0 ]; do
 		[ "$(cat "$pending" 2>/dev/null)" = "$token" ] || exit 0
 		if flowtable_ready; then
+			log "$DEVICENAME bound to the hardware flowtable"
 			exit 0
 		fi
+		log "$DEVICENAME requesting hardware flowtable reload ($tries remaining)"
 		/etc/init.d/firewall reload >/dev/null 2>&1 || true
 		sleep 5
 		tries=$((tries - 1))
 	done
+
+	log "$DEVICENAME could not be bound to the hardware flowtable"
 ) &
 
 exit 0

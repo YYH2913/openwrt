@@ -216,7 +216,7 @@ uci -q show wireless 2>&1 || true
 
 section LOG
 if command -v logread >/dev/null 2>&1; then
-	logread 2>&1 | grep -Ei 'dhcp|dnsmasq|hostapd|sta-|associated|authorized|qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 500
+	logread 2>&1 | grep -Ei 'dhcp|dnsmasq|hostapd|sta-|associated|authorized|qcom_ppe|ppe-flowtable|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 500
 else
 	dmesg | grep -Ei 'qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
 fi
