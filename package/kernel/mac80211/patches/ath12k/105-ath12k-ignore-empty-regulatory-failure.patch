@@ -1,0 +1,51 @@
+From 21fe54205e83a906a109cf294800e04f5d39bbb6 Mon Sep 17 00:00:00 2001
+From: Sathishkumar Muruganandam <murugana@qti.qualcomm.com>
+Date: Fri, 18 Jul 2025 17:34:47 +0530
+Subject: [PATCH] wifi: ath12k: handle empty failed regulatory events
+
+Some QCN9274 firmware versions send a regulatory event with no rules when
+the requested country cannot be applied.  The parser currently treats that
+event as malformed before looking at the firmware status, and the caller
+then executes an unconditional WARN_ON().  Keep the existing regulatory
+domain for failed updates and avoid warning from the WMI receive path.
+
+Based-on: 21fe54205e83a906a109cf294800e04f5d39bbb6
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0441-UPSTREAM-CP-wifi-ath12k-handle-invalid-country-in-reg-chanlist-ext-event.patch
+Signed-off-by: Sathishkumar Muruganandam <murugana@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/wmi.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -5823,5 +5823,16 @@ static int ath12k_pull_reg_chan_list_ext
+ 
++	/* Preserve the firmware status before validating the rule count. */
++	reg_info->status_code = le32_to_cpu(ev->status_code);
++	reg_info->phy_id = le32_to_cpu(ev->phy_id);
++
+ 	if (!total_reg_rules) {
++		if (reg_info->status_code != REG_SET_CC_STATUS_PASS) {
++			ath12k_dbg(ab, ATH12K_DBG_REG,
++				   "ignoring empty regulatory event with status %u\n",
++				   reg_info->status_code);
++			kfree(tb);
++			return 0;
++		}
+ 		ath12k_warn(ab, "No reg rules available\n");
+ 		kfree(tb);
+ 		return -EINVAL;
+@@ -6836,6 +6847,7 @@ fallback:
+ 	 * reverted at the fw and the old SCAN_CHAN_LIST cmd needs to be sent.
+ 	 */
+ 	/* TODO: This is rare, but still should also be handled */
+-	WARN_ON(1);
++	ath12k_warn(ab,
++		   "failed to process regulatory event, retaining previous settings\n");
+ 
+ out:
+ 	/* In some error cases, even a valid pdev_idx might not be available */
+-- 
+2.43.0
