@@ -18,6 +18,7 @@ traffic falls back to CPU forwarding.
 Allow board DTS files to mark external LAN ports explicitly and keep an
 OpenWrt netdev-name fallback for already named boards.
 
+Assisted-by: Codex:gpt-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 16 ++++++++++++++++
