@@ -137,8 +137,10 @@ define Device/econet_xr1710g-ubi
 		    -kmod-pwm-airoha \
 		    airoha-en7581-mt7996-npu-firmware \
 		    apk-mbedtls ethtool-full fitblk \
+		    ip-bridge ip-full iperf3 mdio-tools phytool tcpdump \
 		    kmod-i2c-an7581 kmod-hwmon-nct7802 \
-		    kmod-mt7996-firmware kmod-phy-realtek rtl826x-firmware \
+		    kmod-mt7996-firmware kmod-phy-realtek \
+		    kmod-airoha-net-debug rtl826x-firmware \
 		    luci \
 		    luci-app-firewall luci-app-mlo \
 		    luci-app-package-manager \

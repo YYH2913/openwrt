@@ -39,3 +39,19 @@ endef
 $(eval $(call KernelPackage,pwm-airoha))
 
 
+define KernelPackage/airoha-net-debug
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=Airoha Ethernet dynamic debug support
+  DEPENDS:=@(TARGET_airoha_an7581)
+  KCONFIG:= \
+	CONFIG_DYNAMIC_DEBUG=y \
+	CONFIG_DYNAMIC_DEBUG_CORE=y
+endef
+
+define KernelPackage/airoha-net-debug/description
+ Enables runtime dynamic debug controls for Airoha Ethernet, PCS, phylink,
+ and PHY drivers. Debug messages remain disabled until explicitly enabled.
+endef
+
+$(eval $(call KernelPackage,airoha-net-debug))
+
