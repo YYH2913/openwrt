@@ -281,11 +281,17 @@ _get_ppe_entries_raw() {
 			new_flow = substr($0, RSTART+4, RLENGTH-4)
 		}
 
-		eth = ""
-		match($0, /eth=[^ ]+/)
-		if (RSTART > 0) {
-			eth = substr($0, RSTART+4, RLENGTH-4)
-		}
+			eth = ""
+			match($0, /eth=[^ ]+/)
+			if (RSTART > 0) {
+				eth = substr($0, RSTART+4, RLENGTH-4)
+			}
+
+			# Unbound entries do not have valid rewrite or Ethernet data.
+			if (state == "UNB") {
+				new_flow = ""
+				eth = ""
+			}
 
 		printf "{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s %s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\"}", \
 			index_val, state, type, subtype, orig, new_flow, eth
@@ -518,40 +524,49 @@ _get_frame_engine_raw() {
 		return
 	fi
 
-	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
+	# PSE queue status (IQ=hi16, OQ=lo16) and per-port drop/event counters.
+	# P7 is used as the NPU/WDMA handoff on this platform, so its counter is
+	# presented specially by the frontend while NPU offload is active.
 	local i reg_q reg_d pse_ports=""
 	for i in 0 1 2 3 4 5 6 7 8 9; do
 		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
 		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
 		local qval=$(($(_devmem_read $reg_q)))
 		local dval=$(($(_devmem_read $reg_d)))
-		local iq=$(( (qval >> 16) & 0xFFFF ))
-		local oq=$(( qval & 0xFFFF ))
+		local iq=$(( (qval >> 16) & 0x7FFF ))
+		local oq=$(( qval & 0x7FFF ))
 		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
 		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
 	done
 
 	# PSE shared buffer
 	local psb=$(($(_devmem_read 0x1fb50104)))
-	local pse_used=$(( (psb >> 16) & 0xFFFF ))
+	local pse_used=$(( (psb >> 16) & 0x7FFF ))
 	local pse_free=$(( psb & 0x7FFF ))
 
-	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
+	# GDM counters. The driver periodically clears these MIBs after folding
+	# them into netdev statistics, so these values represent recent activity.
 	# Read as hex to handle large 32-bit counters
 	local gdm1_tx=$(($(_devmem_read 0x1fb50604)))
-	local gdm1_txd=$(($(_devmem_read 0x1fb50608)))
+	local gdm1_txd=$(($(_devmem_read 0x1fb50618)))
 	local gdm1_rx=$(($(_devmem_read 0x1fb50648)))
-	local gdm1_rxd=$(($(_devmem_read 0x1fb5064c)))
+	local gdm1_rxd=$(( $(_devmem_read 0x1fb5064c) +
+		$(_devmem_read 0x1fb50650) + $(_devmem_read 0x1fb50654) +
+		$(_devmem_read 0x1fb50658) + $(_devmem_read 0x1fb50668) ))
 
 	local gdm2_tx=$(($(_devmem_read 0x1fb51604)))
-	local gdm2_txd=$(($(_devmem_read 0x1fb51608)))
+	local gdm2_txd=$(($(_devmem_read 0x1fb51618)))
 	local gdm2_rx=$(($(_devmem_read 0x1fb51648)))
-	local gdm2_rxd=$(($(_devmem_read 0x1fb5164c)))
+	local gdm2_rxd=$(( $(_devmem_read 0x1fb5164c) +
+		$(_devmem_read 0x1fb51650) + $(_devmem_read 0x1fb51654) +
+		$(_devmem_read 0x1fb51658) + $(_devmem_read 0x1fb51668) ))
 
 	local gdm4_tx=$(($(_devmem_read 0x1fb52604)))
-	local gdm4_txd=$(($(_devmem_read 0x1fb52608)))
+	local gdm4_txd=$(($(_devmem_read 0x1fb52618)))
 	local gdm4_rx=$(($(_devmem_read 0x1fb52648)))
-	local gdm4_rxd=$(($(_devmem_read 0x1fb5264c)))
+	local gdm4_rxd=$(( $(_devmem_read 0x1fb5264c) +
+		$(_devmem_read 0x1fb52650) + $(_devmem_read 0x1fb52654) +
+		$(_devmem_read 0x1fb52658) + $(_devmem_read 0x1fb52668) ))
 
 	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
 	local cdm1_tx=$(($(_devmem_read 0x1fb50580)))
@@ -611,9 +626,17 @@ get_frame_engine() {
 }
 
 get_vlan_offload() {
-	local val
-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null)
-	printf '{"enabled":%d}' "${val:-0}"
+	local path="/proc/sys/net/bridge/bridge-nf-filter-vlan-tagged"
+	local filter
+
+	if [ ! -r "$path" ]; then
+		echo '{"available":false,"enabled":false}'
+		return
+	fi
+
+	filter=$(cat "$path" 2>/dev/null)
+	printf '{"available":true,"enabled":%s,"bridge_filter":%d}' \
+		"$([ "${filter:-1}" -eq 0 ] && echo true || echo false)" "${filter:-1}"
 }
 
 set_vlan_offload() {
@@ -628,20 +651,31 @@ set_vlan_offload() {
 		return
 	fi
 
-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
+	# Bridge netfilter interception and the hardware fast path are inverse:
+	# disabling bridge filtering permits VLAN-tagged traffic to stay offloaded.
+	local filter=$((1 - enabled))
+	if ! echo "$filter" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
 		echo '{"error":"failed - bridge module may not be loaded"}'
 		return
 	fi
 
 	# Persist across reboots
-	echo "net.bridge.bridge-nf-filter-vlan-tagged=$enabled" > /etc/sysctl.d/14-vlan-offload.conf
+	echo "net.bridge.bridge-nf-filter-vlan-tagged=$filter" > /etc/sysctl.d/14-vlan-offload.conf
 	printf '{"result":"ok","enabled":%d}' "$enabled"
 }
 
 get_pppoe_offload() {
-	local val
-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
-	printf '{"enabled":%d}' "${val:-0}"
+	local path="/proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged"
+	local filter
+
+	if [ ! -r "$path" ]; then
+		echo '{"available":false,"enabled":false}'
+		return
+	fi
+
+	filter=$(cat "$path" 2>/dev/null)
+	printf '{"available":true,"enabled":%s,"bridge_filter":%d}' \
+		"$([ "${filter:-1}" -eq 0 ] && echo true || echo false)" "${filter:-1}"
 }
 
 set_pppoe_offload() {
@@ -656,13 +690,14 @@ set_pppoe_offload() {
 		return
 	fi
 
-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
+	local filter=$((1 - enabled))
+	if ! echo "$filter" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
 		echo '{"error":"failed - bridge module may not be loaded"}'
 		return
 	fi
 
 	# Persist across reboots
-	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$enabled" > /etc/sysctl.d/15-pppoe-offload.conf
+	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$filter" > /etc/sysctl.d/15-pppoe-offload.conf
 	printf '{"result":"ok","enabled":%d}' "$enabled"
 }
 
