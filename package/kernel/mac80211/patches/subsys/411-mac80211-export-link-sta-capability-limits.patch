@@ -1,0 +1,112 @@
+From af9eb3ac01579bfc1222099e3540144352910b5f Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Wed, 9 Oct 2024 13:50:56 +0800
+Subject: [PATCH] wifi: mac80211: export link STA capability limits
+
+Export the bandwidth and NSS capability helpers from MediaTek's operating
+mode notification support. Keep the driver-facing interface while moving
+the implementation to sta_info.c for the 7.2 bandwidth refactor.
+
+Retain the original RX OMI limit separately from the peer operating mode.
+Check link identifiers and teardown state before accessing link STA and
+channel information, and resolve AP_VLAN channel information through its
+parent BSS. Return conservative defaults if that state is unavailable.
+
+Derived from the exported helpers in MediaTek feed patch 0078,
+af9eb3ac01579bfc1222099e3540144352910b5f. The vendor flag changes from that
+patch are not part of this subset.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -8193,6 +8193,24 @@
+  */
+ void ieee80211_finalize_rx_omi_bw(struct ieee80211_link_sta *link_sta);
+ 
++/**
++ * ieee80211_link_sta_cap_bw - get a link STA's bandwidth capability
++ * @link_sta: public link STA information
++ *
++ * Return: the capability bandwidth, limited by locally advertised RX OMI,
++ * before the peer's operating-mode bandwidth restriction
++ */
++enum ieee80211_sta_rx_bandwidth
++ieee80211_link_sta_cap_bw(struct ieee80211_link_sta *link_sta);
++
++/**
++ * ieee80211_link_sta_cap_nss - get a link STA's spatial-stream capability
++ * @link_sta: public link STA information
++ *
++ * Return: the capability NSS before operating-mode restrictions
++ */
++u8 ieee80211_link_sta_cap_nss(struct ieee80211_link_sta *link_sta);
++
+ /* for older drivers - let's not document these ... */
+ int ieee80211_emulate_add_chanctx(struct ieee80211_hw *hw,
+ 				  struct ieee80211_chanctx_conf *ctx);
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -3724,6 +3724,60 @@
+ 	return IEEE80211_STA_RX_BW_80;
+ }
+ 
++enum ieee80211_sta_rx_bandwidth
++ieee80211_link_sta_cap_bw(struct ieee80211_link_sta *pub)
++{
++	struct sta_info *sta = container_of(pub->sta, struct sta_info, sta);
++	struct ieee80211_sub_if_data *sdata = sta->sdata;
++	enum ieee80211_sta_rx_bandwidth bw = IEEE80211_STA_RX_BW_20;
++	struct ieee80211_bss_conf *conf;
++	struct link_sta_info *link_sta;
++
++	if (pub->link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++		return bw;
++
++	rcu_read_lock();
++	link_sta = rcu_dereference(sta->link[pub->link_id]);
++	if (!link_sta)
++		goto out;
++
++	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
++		sdata = get_bss_sdata(sdata);
++	if (!sdata)
++		goto out;
++
++	conf = rcu_dereference(sdata->vif.link_conf[pub->link_id]);
++	if (!conf || !conf->chanreq.oper.chan)
++		goto out;
++
++	bw = min(ieee80211_sta_bw_capability(link_sta,
++					   conf->chanreq.oper.chan->band),
++		 link_sta->rx_omi_bw_rx);
++out:
++	rcu_read_unlock();
++	return bw;
++}
++EXPORT_SYMBOL(ieee80211_link_sta_cap_bw);
++
++u8 ieee80211_link_sta_cap_nss(struct ieee80211_link_sta *pub)
++{
++	struct sta_info *sta = container_of(pub->sta, struct sta_info, sta);
++	struct link_sta_info *link_sta;
++	u8 nss = 1;
++
++	if (pub->link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++		return nss;
++
++	rcu_read_lock();
++	link_sta = rcu_dereference(sta->link[pub->link_id]);
++	if (link_sta)
++		nss = link_sta->capa_nss;
++	rcu_read_unlock();
++
++	return nss;
++}
++EXPORT_SYMBOL(ieee80211_link_sta_cap_nss);
++
+ /**
+  * ieee80211_sta_usable_bw - get STA's usable bandwidth capability
+  * @link_sta: the (link) STA to get the capability for
