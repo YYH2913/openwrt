@@ -146,7 +146,7 @@ define Device/econet_xr1710g-ubi
 		    luci-app-package-manager \
 		    luci-i18n-mlo-zh-cn \
 		    luci-mod-admin-full \
-		    luci-proto-ppp luci-theme-bootstrap \
+		    luci-proto-ppp luci-theme-bootstrap luci-theme-glass \
 		    rpcd-mod-rrdns uhttpd uhttpd-mod-ubus \
 		    wpad-basic-mbedtls
   UBINIZE_OPTS := -E 5
