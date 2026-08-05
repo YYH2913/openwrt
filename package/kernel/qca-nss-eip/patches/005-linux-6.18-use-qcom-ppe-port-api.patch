@@ -1,0 +1,41 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: use the qcom_ppe physical port API
+
+Replace the downstream ppe_drv private header with the public qcom_ppe
+port lookup.  Keep the returned netdevice referenced while the decrypted
+packet is handed to the receive stack.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -15,9 +15,9 @@
+ #include <linux/slab.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <linux/soc/qcom/ppe.h>
+ #include <net/ip.h>
+ 
+-#include <ppe_drv_port.h>
+ #include "eip_priv.h"
+ 
+ /*
+@@ -244,7 +244,7 @@ static inline void eip_dma_hy_tr_deliver
+ static inline bool eip_dma_hy_deliver_linux(struct sk_buff *skb, struct eip_hw_desc *res)
+ {
+ 	uint16_t src_port = EIP_HW_RES_BYPASS_SRC_PORT(res->bypass[0]);
+-	struct net_device *dev = ppe_drv_port_num_to_dev(src_port);
++	struct net_device *dev = qcom_ppe_port_dev_get(src_port);
+ 	unsigned int ip_hdr_sz;
+ 	uint16_t proto;
+ 
+@@ -275,6 +275,7 @@ static inline bool eip_dma_hy_deliver_li
+ 
+ 	/* Inject into stack */
+ 	netif_receive_skb(skb);
++	dev_put(dev);
+ 
+ 	return true;
+ }
