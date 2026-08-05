@@ -1,0 +1,894 @@
+From: Himanshu Joshi <himajosh@qti.qualcomm.com>
+Date: Tue, 3 Mar 2026 10:39:23 +0530
+Subject: [PATCH] qca-nss-eip: restore PPE outer-inline IPsec on Linux 6.18
+
+Use the 6.18 qcom PPE API to steer inbound ESP and NAT-T flows from the
+physical ingress port through EIP-197 and return decrypted packets through
+a per-SA virtual port.  Keep host lookaside as a per-SA fallback when
+routing, PPE, EIP flow, or VP resources are unavailable.
+
+Allocate separate lookaside and hybrid contexts, direct hybrid
+decapsulation records to the EIP inline interface, and share four DMA IRQs
+between eight rings according to each ring's RX CPU.  Quiesce PPE, EIP,
+RCU, and NAPI users in teardown order before invalidating a transform
+record.
+
+Fully inline packets do not run a host completion callback.  Periodically
+consume transform-record packet and byte deltas to maintain driver and
+XFRM lifetime accounting, and take a final snapshot after stopping the
+hardware flows.  Exception punts only record the VP miss so those packets
+are not counted twice.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/169bf594df03ac4b29e0ccd3f6f87e70f0f3fb6e
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/39c0281b98922dcda04f91e30dd15bccbb0896ae
+Signed-off-by: Himanshu Joshi <himajosh@qti.qualcomm.com>
+Signed-off-by: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec.c
++++ b/clients/ipsec/eip_ipsec.c
+@@ -114,6 +114,28 @@
+ 	complete(&drv->completion);
+ }
+ 
++static void eip_ipsec_stats_sync_work(struct work_struct *work)
++{
++	struct eip_ipsec_drv *drv = container_of(to_delayed_work(work),
++						   struct eip_ipsec_drv,
++						   stats_sync_work);
++	struct eip_ipsec_sa *sa;
++	int i;
++
++	rcu_read_lock_bh();
++	for (i = 0; i < ARRAY_SIZE(drv->sa_hlist); i++) {
++		hlist_for_each_entry_rcu(sa, &drv->sa_hlist[i], hnode) {
++			if (READ_ONCE(sa->inline_offload))
++				eip_ipsec_sa_sync_hw_stats(sa);
++		}
++	}
++	rcu_read_unlock_bh();
++
++	if (READ_ONCE(drv->stats_sync_enabled))
++		schedule_delayed_work(&drv->stats_sync_work,
++				      EIP_IPSEC_STATS_SYNC_INTERVAL);
++}
++
+ /*
+  * eip_ipsec_init_module()
+  *	Module initialization
+@@ -121,7 +143,7 @@
+ static int __init eip_ipsec_init_module(void)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+-	enum eip_svc svc;
++	struct dentry *inline_dentry;
+ 	int err = 0;
+ 	int i;
+ 
+@@ -134,16 +156,12 @@
+ 	}
+ 
+ 	/*
+-	 * Assign the EIP service code.
+-	 */
+-	svc = EIP_SVC_IPSEC;
+-
+-	/*
+ 	 * Initialize the global object.
+ 	 * Dereference: eip_ipsec_exit_module()
+ 	 */
+ 	spin_lock_init(&drv->lock);
+ 	init_completion(&drv->completion);
++	INIT_DELAYED_WORK(&drv->stats_sync_work, eip_ipsec_stats_sync_work);
+ 
+ 	drv->sa_cache = kmem_cache_create("eip_ipsec_sa", sizeof(struct eip_ipsec_sa), 0, 0, NULL);
+ 	if (!drv->sa_cache) {
+@@ -166,13 +184,32 @@
+ 	/*
+ 	 * Create DMA context.
+ 	 */
+-	drv->ctx = eip_ctx_alloc(svc, &drv->dentry);
++	drv->ctx = eip_ctx_alloc(EIP_SVC_IPSEC, &drv->dentry);
+ 	if (!drv->ctx) {
+ 		pr_err("%px: Failed to create DMA context\n", drv);
+ 		err = -ENOSYS;
+ 		goto ctx_fail;
+ 	}
+ 
++	/* Keep host lookaside records separate from records whose decrypted
++	 * output is returned directly to PPE.  Inline setup is optional: an SA
++	 * falls back to the host context if any PPE/EIP resource is unavailable.
++	 */
++	if (eip_is_inline_supported()) {
++		drv->inline_ctx = eip_ctx_alloc(EIP_SVC_HYBRID_IPSEC,
++						&inline_dentry);
++		if (!drv->inline_ctx) {
++			pr_warn("%p: PPE inline context unavailable, using host IPsec\n",
++				drv);
++		} else if (!eip_feature_check(drv->inline_ctx,
++					       EIP_OFFLOAD_OUTER_FLOW)) {
++			pr_warn("%p: EIP outer-flow support disabled, using host IPsec\n",
++				drv);
++			eip_ctx_free(drv->inline_ctx);
++			drv->inline_ctx = NULL;
++		}
++	}
++
+ 	/*
+ 	 * Overide ESP protocol handler.
+ 	 */
+@@ -198,6 +235,9 @@
+ 	}
+ 
+ 	kref_init(&drv->ref);
++	WRITE_ONCE(drv->stats_sync_enabled, true);
++	schedule_delayed_work(&drv->stats_sync_work,
++			      EIP_IPSEC_STATS_SYNC_INTERVAL);
+ 	pr_info("eip ipsec module loaded\n");
+ 	return 0;
+ 
+@@ -206,6 +246,10 @@
+ fail_ppe:
+ 	eip_ipsec_proto_esp_deinit();
+ esp_init:
++	if (drv->inline_ctx) {
++		eip_ctx_free(drv->inline_ctx);
++		drv->inline_ctx = NULL;
++	}
+ 	eip_ctx_free(drv->ctx);
+ ctx_fail:
+ 	kmem_cache_destroy(drv->sa_cache);
+@@ -220,6 +264,9 @@
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 
++	WRITE_ONCE(drv->stats_sync_enabled, false);
++	cancel_delayed_work_sync(&drv->stats_sync_work);
++
+ 	/*
+ 	 * Dereference: eip_ipsec_init_module()
+ 	 */
+@@ -238,6 +285,10 @@
+ 	 */
+ 	eip_ipsec_proto_esp_deinit();
+ 
++	if (drv->inline_ctx) {
++		eip_ctx_free(drv->inline_ctx);
++		drv->inline_ctx = NULL;
++	}
+ 	eip_ctx_free(drv->ctx);
+ 	drv->ctx = NULL;
+ 	kmem_cache_destroy(drv->sa_cache);
+--- a/clients/ipsec/eip_ipsec_priv.h
++++ b/clients/ipsec/eip_ipsec_priv.h
+@@ -18,16 +18,9 @@
+ #define __EIP_IPSEC_PRIV_H
+ 
+ #include <linux/kref.h>
++#include <linux/workqueue.h>
++#include <linux/soc/qcom/ppe.h>
+ #include <eip.h>
+-#if defined(EIP_IPSEC_VP_SUPP)
+-	#include <ppe_drv.h>
+-	#include <ppe_drv_vp.h>
+-	#include <ppe_vp_public.h>
+-	#include <ppe_drv_sc.h>
+-	#include <ppe_drv_eip.h>
+-	#include <ppe_drv_iface.h>
+-	#include <ppe_vp_tx.h>
+-#endif
+ 
+ #include "../exports/eip_ipsec.h"
+ #include "eip_ipsec_sa.h"
+@@ -39,6 +32,9 @@
+ #define EIP_IPSEC_HASH_SHIFT 6U
+ #define EIP_IPSEC_HASH_SIZE (1U << EIP_IPSEC_HASH_SHIFT)
+ #define EIP_IPSEC_HASH_MASK (EIP_IPSEC_HASH_SIZE - 1)
++#define EIP_IPSEC_PPE_SRC_PORT_VP BIT(13)
++#define EIP_IPSEC_PPE_SC_EIP2PPE 8U
++#define EIP_IPSEC_STATS_SYNC_INTERVAL msecs_to_jiffies(1000)
+ 
+ /*
+  * IPsec driver object.
+@@ -53,12 +49,12 @@
+ 
+ 	struct list_head dev_head;	/* Device database */
+ 	struct kmem_cache *sa_cache;	/* Kmem cache for SA memory */
+-	struct eip_ctx *ctx;		/* DMA context to use for transformation request */
++	struct eip_ctx *ctx;		/* Host lookaside IPsec context */
++	struct eip_ctx *inline_ctx;	/* PPE inline decapsulation context */
+ 	struct dentry *dentry;		/* Driver debugfs dentry */
+ 	struct platform_device *pdev;	/* Device associated with the driver */
+-#if defined(EIP_IPSEC_VP_SUPP)
+-	struct ppe_drv_iface *iface;	/* PPE interface for inline port */
+-#endif
++	struct delayed_work stats_sync_work; /* Inline TR lifetime synchronizer */
++	bool stats_sync_enabled;	/* Allow the periodic work to requeue */
+ };
+ 
+ /*
+--- a/clients/ipsec/eip_ipsec_proto.c
++++ b/clients/ipsec/eip_ipsec_proto.c
+@@ -21,6 +21,7 @@
+ #include <linux/slab.h>
+ #include <linux/if.h>
+ #include <linux/if_ether.h>
++#include <linux/etherdevice.h>
+ #include <linux/rculist.h>
+ #include <linux/list.h>
+ #include <linux/spinlock.h>
+@@ -189,6 +190,94 @@
+ }
+ 
+ /*
++ * eip_ipsec_proto_ppe_rx()
++ *	Deliver a decrypted packet which returned through PPE but missed a
++ *	downstream hardware flow.  The source VP is unique to this SA, so no SPI
++ *	lookup is needed during rekey overlap.
++ */
++bool eip_ipsec_proto_ppe_rx(void *app_data, struct sk_buff *skb,
++			    u16 service_code)
++{
++	struct eip_ipsec_sa *sa = eip_ipsec_sa_ref_unless_zero(app_data);
++	struct eip_ipsec_dev_stats *dev_stats;
++	struct eip_ipsec_sa_stats *sa_stats;
++	unsigned int ip_hdr_sz;
++	struct sec_path *sp;
++	struct xfrm_state *x;
++
++	if (unlikely(!sa))
++		return false;
++
++	dev_stats = this_cpu_ptr(sa->eid->stats_pcpu);
++	sa_stats = this_cpu_ptr(sa->stats_pcpu);
++
++	if (unlikely(service_code != EIP_IPSEC_PPE_SC_EIP2PPE ||
++		     !pskb_may_pull(skb, ETH_HLEN)))
++		goto drop;
++
++	if (sa->xs && unlikely(!eip_ipsec_xfrm_input_state_ok(sa->xs)))
++		goto drop;
++
++	/* PPE exception frames include the fake Ethernet header selected in the
++	 * EIP transform metadata.  Strip it before restoring XFRM receive state.
++	 */
++	skb_scrub_packet(skb, false);
++	skb->dev = sa->ndev;
++	skb->skb_iif = sa->ndev->ifindex;
++	skb->protocol = eth_type_trans(skb, sa->ndev);
++	skb->pkt_type = PACKET_HOST;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb_reset_network_header(skb);
++
++	if (skb->protocol == htons(ETH_P_IP)) {
++		if (unlikely(!pskb_may_pull(skb, sizeof(struct iphdr)) ||
++			     ip_hdr(skb)->version != IPVERSION ||
++			     ip_hdr(skb)->ihl < 5))
++			goto drop;
++		ip_hdr_sz = ip_hdr(skb)->ihl * 4;
++		if (unlikely(!pskb_may_pull(skb, ip_hdr_sz)))
++			goto drop;
++	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++		if (unlikely(!pskb_may_pull(skb, sizeof(struct ipv6hdr)) ||
++			     ipv6_hdr(skb)->version != 6))
++			goto drop;
++		ip_hdr_sz = sizeof(struct ipv6hdr);
++	} else {
++		goto drop;
++	}
++
++	skb_set_transport_header(skb, ip_hdr_sz);
++	x = sa->xs;
++	if (x) {
++		sp = secpath_set(skb);
++		if (unlikely(!sp || sp->len == XFRM_MAX_DEPTH)) {
++			sa_stats->fail_sp_alloc++;
++			goto drop;
++		}
++
++		if (unlikely(!refcount_inc_not_zero(&x->refcnt)))
++			goto drop;
++
++		sp->xvec[sp->len++] = x;
++	}
++
++	/* TR hardware deltas account all inline packets.  Count only the punt
++	 * here so exception traffic is not added to lifetime and byte totals
++	 * twice.
++	 */
++	dev_stats->rx_vp++;
++	netif_receive_skb(skb);
++	eip_ipsec_sa_deref(sa);
++	return true;
++
++drop:
++	dev_stats->rx_fail++;
++	eip_ipsec_sa_deref(sa);
++	consume_skb(skb);
++	return true;
++}
++
++/*
+  * eip_ipsec_proto_esp_rx()
+  *	ESP Protocol handler for IPsec encapsulated packets.
+  */
+--- a/clients/ipsec/eip_ipsec_proto.h
++++ b/clients/ipsec/eip_ipsec_proto.h
+@@ -29,4 +29,6 @@
+ void eip_ipsec_proto_esp_deinit(void);
+ void eip_ipsec_proto_dec_done(void *app_data, eip_req_t req);
+ void eip_ipsec_proto_dec_err(void *app_data, eip_req_t req, int err);
++bool eip_ipsec_proto_ppe_rx(void *app_data, struct sk_buff *skb,
++			    u16 service_code);
+ #endif /* !__EIP_IPSEC_PROTO_H */
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -24,6 +24,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/rculist.h>
+ #include <net/addrconf.h>
++#include <net/ip6_route.h>
++#include <net/route.h>
+ #include <net/xfrm.h>
+ #include <crypto/aes.h>
+ #include "eip_ipsec_priv.h"
+@@ -32,7 +34,9 @@
+  * eip_ipsec_sa_data_to_tr_info()
+  *	Fill TR infor using SA data passed by user.
+  */
+-static void eip_ipsec_sa_data_to_tr_info(struct eip_ipsec_data *data, struct eip_ipsec_tuple *t, struct eip_tr_info *tr_info)
++static void eip_ipsec_sa_data_to_tr_info(struct eip_ipsec_data *data,
++		struct eip_ipsec_tuple *t, enum eip_svc svc,
++		struct eip_tr_info *tr_info)
+ {
+ 	struct eip_tr_info_ipsec *ipsec = &tr_info->ipsec;
+ 	struct eip_tr_base *base = &tr_info->base;
+@@ -40,7 +44,7 @@
+ 
+ 	memset(tr_info, 0, sizeof(*tr_info));
+ 
+-	base->svc = EIP_SVC_IPSEC;
++	base->svc = svc;
+ 
+ 	strscpy(base->alg_name, data->base.algo_name, CRYPTO_MAX_ALG_NAME);
+ 	base->cipher.key_data = data->base.cipher.data;
+@@ -273,6 +277,11 @@
+ 		return NULL;
+ 	}
+ 
++	/* Keep a teardown reference before the RCU database reference can be
++	 * released.  PPE VP callbacks retain a raw SA pointer until VP free has
++	 * cleared and quiesced the callback.
++	 */
++	eip_ipsec_sa_ref(sa);
+ 	list_del_rcu(&sa->node);
+ 	if (!hlist_unhashed(&sa->hnode))
+ 		eip_ipsec_sa_dettach_global(sa);
+@@ -316,24 +325,225 @@
+ 	return exist;
+ }
+ 
+-#if defined(EIP_IPSEC_VP_SUPP)
+-
+ /*
+  * eip_ipsec_ppe_mdata_set()
+  *	Set PPE meta data for TR.
+  */
+-static void eip_ipsec_ppe_mdata_set(struct eip_tr_info *tr_info, ppe_vp_num_t vp_num)
++static void eip_ipsec_ppe_mdata_set(struct eip_tr_info *tr_info, int vp_num)
+ {
+ 	struct eip_ipsec_ppe_mdata *mdata = (struct eip_ipsec_ppe_mdata *)tr_info->ipsec.ppe_mdata;
++
+ 	memset(mdata, 0, sizeof(*mdata));
+ 
+-	mdata->ppe_src_port = (0x2000 | vp_num);
+-	mdata->service_code = PPE_DRV_SC_IPSEC_EIP2PPE;
++	mdata->ppe_src_port = EIP_IPSEC_PPE_SRC_PORT_VP | vp_num;
++	mdata->service_code = EIP_IPSEC_PPE_SC_EIP2PPE;
+ 	mdata->fake_mac = true;
+ 	mdata->fake_l2_prot = true;
+ }
+ 
+-#endif
++static void eip_ipsec_sa_set_callbacks(struct eip_ipsec_sa *sa,
++				       struct eip_tr_info *tr_info,
++				       bool encap)
++{
++	tr_info->ipsec.app_data = sa;
++	if (encap) {
++		tr_info->ipsec.cb = sa->tuple.ip_version == IPVERSION ?
++			eip_ipsec_dev_enc_done_v4 : eip_ipsec_dev_enc_done_v6;
++		tr_info->ipsec.err_cb = eip_ipsec_dev_enc_err;
++		return;
++	}
++
++	tr_info->ipsec.cb = eip_ipsec_proto_dec_done;
++	tr_info->ipsec.err_cb = eip_ipsec_proto_dec_err;
++}
++
++static struct net_device *
++eip_ipsec_sa_get_ingress_dev(const struct eip_ipsec_tuple *t)
++{
++	struct net_device *dev;
++
++	if (t->ip_version == IPVERSION) {
++		struct rtable *rt;
++
++		rt = ip_route_output(&init_net, htonl(t->src_ip[0]), 0, 0, 0,
++				     RT_SCOPE_UNIVERSE);
++		if (IS_ERR(rt))
++			return NULL;
++
++		dev = rt->dst.dev;
++		dev_hold(dev);
++		ip_rt_put(rt);
++		return dev;
++	}
++
++	if (t->ip_version == 6) {
++		struct in6_addr remote = {};
++		struct in6_addr local = {};
++		struct rt6_info *rt6;
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(t->src_ip); i++) {
++			remote.s6_addr32[i] = htonl(t->src_ip[i]);
++			local.s6_addr32[i] = htonl(t->dest_ip[i]);
++		}
++
++		rt6 = rt6_lookup(&init_net, &remote, NULL, 0, 0, 0);
++		if (!rt6)
++			rt6 = rt6_lookup(&init_net, &remote, &local, 0, 0, 0);
++		if (!rt6)
++			return NULL;
++
++		dev = rt6->dst.dev;
++		dev_hold(dev);
++		ip6_rt_put(rt6);
++		return dev;
++	}
++
++	return NULL;
++}
++
++static void eip_ipsec_sa_fill_eip_flow(const struct eip_ipsec_tuple *t,
++					struct eip_flow_tuple *flow)
++{
++	int i, words = t->ip_version == IPVERSION ? 1 : 4;
++
++	memset(flow, 0, sizeof(*flow));
++	flow->ip_ver = t->ip_version;
++	flow->ip_proto = t->protocol;
++	flow->spi = htonl(t->esp_spi);
++	/* EIP's outer IPsec classifier matches SPI for both ESP and NAT-T. */
++	for (i = 0; i < words; i++) {
++		flow->src_ip[i] = htonl(t->src_ip[i]);
++		flow->dst_ip[i] = htonl(t->dest_ip[i]);
++	}
++}
++
++static void eip_ipsec_sa_fill_ppe_flow(const struct eip_ipsec_tuple *t,
++					struct qcom_ppe_eip_tuple *flow)
++{
++	int i;
++
++	memset(flow, 0, sizeof(*flow));
++	flow->protocol = t->protocol;
++	flow->ipv6 = t->ip_version == 6;
++	if (flow->protocol == IPPROTO_UDP) {
++		flow->src_port = htons(t->sport);
++		flow->dst_port = htons(t->dport);
++	}
++
++	if (!flow->ipv6) {
++		flow->src.v4 = htonl(t->src_ip[0]);
++		flow->dst.v4 = htonl(t->dest_ip[0]);
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(t->src_ip); i++) {
++		flow->src.v6.s6_addr32[i] = htonl(t->src_ip[i]);
++		flow->dst.v6.s6_addr32[i] = htonl(t->dest_ip[i]);
++	}
++}
++
++static void eip_ipsec_sa_inline_flow_stop(struct eip_ipsec_sa *sa)
++{
++	struct eip_flow_info flow_info = {};
++
++	if (sa->ppe_flow) {
++		qcom_ppe_eip_flow_put(sa->ppe_flow);
++		sa->ppe_flow = NULL;
++	}
++
++	if (sa->eip_flow_installed) {
++		flow_info.tuple = sa->eip_flow_tuple;
++		eip_flow_del(sa->inline_tun, &flow_info);
++		sa->eip_flow_installed = false;
++	}
++}
++
++static void eip_ipsec_sa_inline_rollback(struct eip_ipsec_sa *sa)
++{
++	eip_ipsec_sa_inline_flow_stop(sa);
++	if (sa->tr)
++		eip_tr_disable(sa->tr);
++	if (sa->ppe_vp >= 0) {
++		qcom_ppe_eip_vp_free(sa->ppe_vp);
++		sa->ppe_vp = -1;
++	}
++	if (sa->inline_tun) {
++		eip_tun_free(sa->inline_tun);
++		sa->inline_tun = NULL;
++	}
++	if (sa->tr) {
++		eip_tr_free(sa->tr);
++		sa->tr = NULL;
++	}
++	sa->inline_offload = false;
++}
++
++static int eip_ipsec_sa_inline_setup(struct eip_ipsec_sa *sa,
++				     struct eip_ipsec_data *data)
++{
++	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
++	struct qcom_ppe_eip_tuple ppe_tuple;
++	struct eip_flow_info flow_info = {};
++	struct net_device *ingress;
++	struct eip_tr_info tr_info;
++	int err;
++
++	if (!drv->inline_ctx)
++		return -EOPNOTSUPP;
++
++	ingress = eip_ipsec_sa_get_ingress_dev(&sa->tuple);
++	if (!ingress)
++		return -ENETUNREACH;
++
++	sa->ppe_vp = qcom_ppe_eip_vp_alloc(sa->ndev,
++					      eip_ipsec_proto_ppe_rx, sa);
++	if (sa->ppe_vp < 0) {
++		err = sa->ppe_vp;
++		goto out_dev;
++	}
++
++	eip_ipsec_sa_data_to_tr_info(data, &sa->tuple,
++					 EIP_SVC_HYBRID_IPSEC, &tr_info);
++	eip_ipsec_sa_set_callbacks(sa, &tr_info, false);
++	eip_ipsec_ppe_mdata_set(&tr_info, sa->ppe_vp);
++	sa->tr = eip_tr_alloc(drv->inline_ctx, &tr_info);
++	if (!sa->tr) {
++		err = -EINVAL;
++		goto rollback;
++	}
++
++	sa->inline_tun = eip_tun_alloc(drv->inline_ctx);
++	if (!sa->inline_tun) {
++		err = -ENOMEM;
++		goto rollback;
++	}
++
++	eip_ipsec_sa_fill_eip_flow(&sa->tuple, &sa->eip_flow_tuple);
++	flow_info.tuple = sa->eip_flow_tuple;
++	flow_info.tr = sa->tr;
++	err = eip_flow_add(sa->inline_tun, &flow_info);
++	if (err)
++		goto rollback;
++	sa->eip_flow_installed = true;
++
++	eip_ipsec_sa_fill_ppe_flow(&sa->tuple, &ppe_tuple);
++	err = qcom_ppe_eip_flow_get(ingress, &ppe_tuple, &sa->ppe_flow);
++	if (err)
++		goto rollback;
++
++	sa->inline_offload = true;
++	pr_info("%p: enabled PPE-EIP-PPE decap for SPI 0x%x on %s (VP %d)\n",
++		sa, sa->tuple.esp_spi, ingress->name, sa->ppe_vp);
++	dev_put(ingress);
++	return 0;
++
++rollback:
++	eip_ipsec_sa_inline_rollback(sa);
++out_dev:
++	dev_put(ingress);
++	return err;
++}
+ 
+ /*
+  * eip_ipsec_sa_set_mtu()
+@@ -399,6 +609,47 @@
+ 	}
+ }
+ 
++/* Fully inline packets never reach an EIP completion callback.  Consume the
++ * transform-record deltas periodically so Linux lifetime limits and the
++ * driver counters include PPE-forwarded traffic as well as exception punts.
++ */
++void eip_ipsec_sa_sync_hw_stats(struct eip_ipsec_sa *sa)
++{
++	struct eip_ipsec_dev_stats *dev_stats;
++	struct eip_ipsec_sa_stats *sa_stats;
++	struct eip_hw_stats delta = {};
++	struct xfrm_state *xs;
++
++	if (unlikely(!sa->tr))
++		return;
++
++	eip_tr_get_hw_stats(sa->tr, &delta);
++	if (!delta.pkt_cnt && !delta.byte_cnt)
++		return;
++
++	preempt_disable();
++	dev_stats = this_cpu_ptr(sa->eid->stats_pcpu);
++	sa_stats = this_cpu_ptr(sa->stats_pcpu);
++	dev_stats->rx_pkts += delta.pkt_cnt;
++	dev_stats->rx_bytes += delta.byte_cnt;
++	sa_stats->rx_pkts += delta.pkt_cnt;
++	sa_stats->rx_bytes += delta.byte_cnt;
++	preempt_enable();
++
++	xs = READ_ONCE(sa->xs);
++	if (!xs)
++		return;
++
++	spin_lock_bh(&xs->lock);
++	if (xs->km.state != XFRM_STATE_DEAD) {
++		xs->curlft.packets += delta.pkt_cnt;
++		xs->curlft.bytes += delta.byte_cnt;
++		xs->lastused = ktime_get_real_seconds();
++		xfrm_state_check_expire(xs);
++	}
++	spin_unlock_bh(&xs->lock);
++}
++
+ /*
+  * eip_ipsec_sa_read()
+  *	Read the all SA statistics in provided buffer.
+@@ -437,6 +688,9 @@
+ 
+ 		}
+ 		len += snprintf(buf + len, max_len - len, "\tActive refs: %u\n", kref_read(&sa->ref));
++		len += snprintf(buf + len, max_len - len,
++				"\tPPE inline: %s (VP %d)\n",
++				sa->inline_offload ? "yes" : "no", sa->ppe_vp);
+ 		len += snprintf(buf + len, max_len - len, "\tTx packets: %llu\n", stats.tx_pkts);
+ 		len += snprintf(buf + len, max_len - len, "\tTx bytes: %llu\n", stats.tx_bytes);
+ 		len += snprintf(buf + len, max_len - len, "\tRx packets: %llu\n", stats.rx_pkts);
+@@ -641,6 +895,8 @@
+ 	sa->head_room = EIP_IPSEC_DEV_MAX_HEADROOM; /* TODO: Calculate using SA type */
+ 	sa->tail_room = EIP_IPSEC_DEV_MAX_TAILROOM;
+ 	sa->tuple = *t;
++	sa->xs = data->xs;
++	sa->ppe_vp = -1;
+ 
+ 	/*
+ 	 * Cache part of tuple used in datapath in network order.
+@@ -657,40 +913,28 @@
+ 		sa->dst_ip[3] = htonl(t->dest_ip[3]);
+ 	}
+ 
+-	eip_ipsec_sa_data_to_tr_info(data, t, &tr_info);
+-
+-	/*
+-	 * Set completion handler.
+-	 */
+-	tr_info.ipsec.app_data = sa;
+-	if (encap) {
+-		tr_info.ipsec.cb = (t->ip_version == 4) ? eip_ipsec_dev_enc_done_v4 : eip_ipsec_dev_enc_done_v6;
+-		tr_info.ipsec.err_cb = eip_ipsec_dev_enc_err;
+-	} else {
+-		tr_info.ipsec.cb = eip_ipsec_proto_dec_done;
+-		tr_info.ipsec.err_cb = eip_ipsec_proto_dec_err;
+-	}
+-
+-	/*
+-	 * Override enc callback and fill PPE metadata for hybrid inline channel.
++	/* Inbound SAs first try the complete PPE-EIP-PPE path.  Resource or
++	 * topology failures are not fatal; retain the proven host lookaside path.
+ 	 */
+-#if defined(EIP_IPSEC_VP_SUPP)
+-	if (encap) {
+-		tr_info.ipsec.cb = eip_ipsec_dev_enc_done_hy;
++	if (!encap) {
++		err = eip_ipsec_sa_inline_setup(sa, data);
++		if (err)
++			pr_debug("%p: inline decap unavailable for SPI 0x%x (%d), using host path\n",
++				 sa, t->esp_spi, err);
+ 	}
+ 
+-	eip_ipsec_ppe_mdata_set(&tr_info, eid->vp_num);
+-#endif
+-
+-	sa->tr = eip_tr_alloc(drv->ctx, &tr_info);
+-	if (!sa->tr) {
+-		pr_warn("%px: Failed to allocate HW record\n", ndev);
+-		err = -EINVAL;
+-		goto fail_tr;
++	if (!sa->inline_offload) {
++		eip_ipsec_sa_data_to_tr_info(data, t, EIP_SVC_IPSEC,
++						 &tr_info);
++		eip_ipsec_sa_set_callbacks(sa, &tr_info, encap);
++		sa->tr = eip_tr_alloc(drv->ctx, &tr_info);
++		if (!sa->tr) {
++			pr_warn("%p: Failed to allocate HW record\n", ndev);
++			err = -EINVAL;
++			goto fail_tr;
++		}
+ 	}
+ 
+-	sa->xs = data->xs;
+-
+ 	if (!encap && udp_encap) {
+ 		if (!eip_ipsec_proto_udp_sock_override(t, &sa->udp_sock)) {
+ 			pr_warn("%p: Failed to override NAT-T socket for SPI(%u)\n",
+@@ -715,7 +959,10 @@
+ 	return 0;
+ 
+ fail_udp:
+-	eip_tr_free(sa->tr);
++	if (sa->inline_offload || sa->ppe_vp >= 0 || sa->inline_tun)
++		eip_ipsec_sa_inline_rollback(sa);
++	else
++		eip_tr_free(sa->tr);
+ fail_tr:
+ 	dev_put(ndev);
+ 	dst_cache_destroy(&sa->dst_cache);
+@@ -733,6 +980,7 @@
+ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ {
+ 	struct eip_ipsec_sa *sa;
++	bool inline_offload;
+ 
+ 	might_sleep();
+ 
+@@ -745,23 +993,45 @@
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Disable TR. This also ensure no new packet being sent by driver.
++	/* Stop the PPE outer flow before removing the EIP SPI mapping.  This is
++	 * also the ordering required by EIP TR invalidation for inline receive.
+ 	 */
+-	eip_tr_disable(sa->tr);
+-	/* Flush NAPI callbacks which may have observed the old TR callback. */
+-	synchronize_net();
++	inline_offload = sa->inline_offload;
++	if (inline_offload)
++		eip_ipsec_sa_inline_flow_stop(sa);
++
++	if (sa->ppe_vp >= 0) {
++		qcom_ppe_eip_vp_free(sa->ppe_vp);
++		sa->ppe_vp = -1;
++	}
++	if (sa->inline_tun) {
++		eip_tun_free(sa->inline_tun);
++		sa->inline_tun = NULL;
++	}
++	sa->inline_offload = false;
++
+ 	eip_ipsec_proto_udp_sock_release(sa->udp_sock);
+ 	sa->udp_sock = NULL;
++	/* Flush NAPI/VP callbacks and the stats worker before the last counter
++	 * snapshot.  TR invalidation can start as soon as eip_tr_disable() runs.
++	 */
++	synchronize_net();
++	if (inline_offload)
++		eip_ipsec_sa_sync_hw_stats(sa);
+ 
+-	/*
+-	 * Wait for all outstanding SA operation.
++	/* No hardware flow can reach this record now.  Disable it before the SA
++	 * database reference and any host packet references finish draining.
+ 	 */
+-	wait_for_completion(&sa->completion);
++	eip_tr_disable(sa->tr);
+ 
+ 	/*
+-	 * Release the TR and other SA resources
++	 * Release the explicit teardown reference and wait for the RCU database
++	 * reference plus every packet/callback reference to drain.
+ 	 */
++	eip_ipsec_sa_deref(sa);
++	wait_for_completion(&sa->completion);
++
++	/* No worker or callback can touch the SA now. */
+ 	eip_tr_free(sa->tr);
+ 	sa->xs = NULL;
+ 	dev_put(sa->ndev);
+--- a/clients/ipsec/eip_ipsec_sa.h
++++ b/clients/ipsec/eip_ipsec_sa.h
+@@ -20,6 +20,8 @@
+ #include <net/dst_cache.h>
+ 
+ struct eip_ipsec_dev;
++struct eip_tun;
++struct qcom_ppe_eip_flow;
+ struct xfrm_state;
+ 
+ /*
+@@ -61,6 +63,12 @@
+ 	struct xfrm_state *xs;          /* offloaded xfrm sate to use in SKB after decap. */
+ 	struct eip_ipsec_tuple tuple;	/* SA tuple */
+ 	struct eip_ipsec_udp_sock *udp_sock; /* NAT-T callback override */
++	struct eip_tun *inline_tun;	/* Per-SA EIP outer-flow owner */
++	struct qcom_ppe_eip_flow *ppe_flow; /* Shared PPE outer flow */
++	struct eip_flow_tuple eip_flow_tuple; /* Installed EIP SPI flow */
++	int ppe_vp;			/* Per-SA source VP for decrypted traffic */
++	bool eip_flow_installed;	/* EIP SPI flow is visible to hardware */
++	bool inline_offload;		/* PPE-EIP-PPE decapsulation is active */
+ 	struct completion completion;   /* Completion to wait for all deref */
+ 	struct rcu_head rcu;            /* delay rcu free */
+ };
+@@ -72,6 +80,7 @@
+ struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap_v6(__be32 *addr, __be32 spi);
+ struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap_v4(__be32 *addr, __be32 spi);
+ ssize_t eip_ipsec_sa_read(struct net_device *ndev, bool encap, char *buf, ssize_t max_len);
++void eip_ipsec_sa_sync_hw_stats(struct eip_ipsec_sa *sa);
+ 
+ /*
+  * Increment SA reference.
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -769,10 +769,11 @@
+ 	dma->ring_id = ring_id;
+ 	dma->irq_mask = EIP_HW_RDR_PROC_IRQ_STATUS;
+ 	dma->irq_status = base_addr + EIP_HW_HIA_RDR_STAT(ring_id);
+-	dma->irq = platform_get_irq(ep->pdev, rx_cpu);
+-	if (!dma->irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	dma->irq = platform_get_irq(ep->pdev, rx_cpu);
++	if (dma->irq < 0) {
++		pr_err("%p: failed to get IRQ index(%u) for ring_id(%u): %d\n",
++		       dma, rx_cpu, ring_id, dma->irq);
++		return dma->irq;
+ 	}
+ 
+ 	/*
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -861,13 +861,11 @@
+ 	dma->irq_mask = EIP_HW_RDR_PROC_IRQ_STATUS;
+ 	dma->irq_status = base_addr + EIP_HW_HIA_RDR_STAT(ring_id);
+ 
+-	/*
+-	 * TODO: should we rename rx_cpu to irq_num?
+-	 */
+-	dma->irq = platform_get_irq(ep->pdev, rx_cpu);
+-	if (!dma->irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	dma->irq = platform_get_irq(ep->pdev, rx_cpu);
++	if (dma->irq < 0) {
++		pr_err("%p: failed to get IRQ index(%u) for ring_id(%u): %d\n",
++		       dma, rx_cpu, ring_id, dma->irq);
++		return dma->irq;
+ 	}
+ 
+ 	/*
+--- a/driver/eip197/eip_tr_ipsec_dec.c
++++ b/driver/eip197/eip_tr_ipsec_dec.c
+@@ -160,15 +160,14 @@
+ 		tr_words[65] |= EIP_TR_IPSEC_IPV6_EN;
+ 	}
+ 
+-	/*
+-	 * Redirect packet to inline chanel after encapsulation.
+-	 * TODO: Round robin ring
++	/* A hybrid decapsulation record is used only for PPE outer-inline SAs.
++	 * Return decrypted traffic to PPE; host lookaside SAs use EIP_SVC_IPSEC
++	 * and therefore keep the submitting hybrid DMA ring as their destination.
+ 	 */
+ 	if (tr->svc == EIP_SVC_HYBRID_IPSEC) {
+-		struct eip_ctx *ctx = tr->ctx;
+ 		tr_words[65] |= EIP_TR_REDIR_EN;
+-		tr_words[65] |= EIP_TR_REDIR_IFACE(ctx->dma[1].ring_id);;
+-		pr_debug("%px: Redirection enable to ring(%u) for decap record\n", tr, ctx->dma[0].ring_id);
++		tr_words[65] |= EIP_TR_REDIR_IFACE(EIP_HW_INLINE_RING);
++		pr_debug("%p: redirect decap record to PPE inline interface\n", tr);
+ 	}
+ 
+ 	tr_words[66] = EIP_TR_IPSEC_TTL(ipsec->ip_ttl);
