@@ -144,7 +144,13 @@ define Device/econet_xr1710g-ubi
 		    luci \
 		    luci-app-firewall luci-app-mlo \
 		    luci-app-package-manager \
+		    luci-i18n-airoha-npu-zh-cn \
+		    luci-i18n-base-zh-cn \
+		    luci-i18n-firewall-zh-cn \
+		    luci-i18n-glass-zh-cn \
 		    luci-i18n-mlo-zh-cn \
+		    luci-i18n-package-manager-zh-cn \
+		    luci-i18n-w1700k-fancontrol-zh-cn \
 		    luci-mod-admin-full \
 		    luci-proto-ppp luci-theme-bootstrap luci-theme-glass \
 		    rpcd-mod-rrdns uhttpd uhttpd-mod-ubus \
