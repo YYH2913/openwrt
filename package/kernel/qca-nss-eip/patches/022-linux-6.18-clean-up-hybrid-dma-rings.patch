@@ -1,0 +1,86 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 5 Aug 2026 22:10:00 +0800
+Subject: [PATCH] qca-nss-eip: clean up hybrid DMA rings on removal
+
+The vendor hybrid-ring teardown calls an unconditional BUG_ON() instead of
+releasing the receive skbs which remain posted to the result ring.  Module
+removal consequently panics whenever inline EIP support is enabled.
+
+Walk the live result-ring interval after IRQ and NAPI shutdown and consume
+each skb still owned by hardware.  Free the original allocation rather than
+the aligned descriptor pointer, and clear IRQ affinity hints before both
+lookaside and hybrid IRQs are released.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -741,6 +741,7 @@ void eip_dma_la_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	irq_set_affinity_hint(dma->irq, NULL);
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->out.napi);
+ 	netif_napi_del(&dma->out.napi);
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -667,15 +667,29 @@ static int eip_dma_hy_napi_rx_poll(struc
+ }
+ 
+ /*
+  * eip_dma_hy_free_skb()
+- *	Refill new SKB(s) in DMA output ring.
++ *	Free SKBs which are still owned by the DMA output ring.
+  */
+ static void eip_dma_hy_free_skb(struct eip_dma *dma)
+ {
+-	/*
+-	 * TODO: Fix
+-	 */
+-	BUG_ON(1);
++	struct eip_hw_ring *ring = &dma->out;
++	uint32_t cons_idx, count;
++
++	cons_idx = atomic_read(&ring->cons_idx);
++	count = EIP_DMA_AVAIL_COUNT(atomic_read(&ring->prod_idx), cons_idx);
++
++	while (count--) {
++		struct sk_buff *skb = (struct sk_buff *)ring->meta[cons_idx];
++
++		if (skb) {
++			ring->meta[cons_idx] = 0;
++			consume_skb(skb);
++		}
++
++		cons_idx = EIP_DMA_IDX_INC(cons_idx);
++	}
++
++	atomic_set(&ring->cons_idx, cons_idx);
+ }
+ 
+ /*
+@@ -832,16 +846,17 @@ void eip_dma_hy_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	irq_set_affinity_hint(dma->irq, NULL);
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->in.napi);
+ 	napi_disable(&dma->out.napi);
+ 	netif_napi_del(&dma->in.napi);
+ 	netif_napi_del(&dma->out.napi);
+-	free_netdev(dma->in.ndev);
+-	free_netdev(dma->out.ndev);
+ 	eip_dma_hy_free_skb(dma);
+-	kfree(dma->out.desc);
+-	kfree(dma->in.desc);
++	free_netdev(dma->in.ndev);
++	free_netdev(dma->out.ndev);
++	kfree(dma->out.kaddr);
++	kfree(dma->in.kaddr);
+ 
+ 	memset(dma, 0, sizeof(*dma));
+ }
