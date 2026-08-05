@@ -1,0 +1,62 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 00:05:00 +0800
+Subject: [PATCH] wifi: ath12k: expose PPE direct-switch stats
+
+The PPE core debugfs counters show the EDMA half of direct switching but
+not the WLAN ring updates, TX buffer allocation failures, WBM completions
+or RX buffer recycling performed by ath12k.  This makes a stalled PPE2TCL
+path indistinguishable from a working path whose completion service is
+the bottleneck.
+
+Append the ath12k direct-switch counters to device_dp_stats so a before
+and after sample covers both owners of the shared rings.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1189,6 +1189,38 @@ static ssize_t ath12k_debugfs_dump_devic
+ 		len += scnprintf(buf + len, size - len, "\n");
+ 	}
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	{
++		struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++
++		len += scnprintf(buf + len, size - len,
++				 "\nPPE DIRECT-SWITCH STATS:\n");
++		len += scnprintf(buf + len, size - len,
++				 "registered: %u started: %u quiesced: %u reuse: %u\n",
++				 READ_ONCE(ppe->registered), READ_ONCE(ppe->started),
++				 READ_ONCE(ppe->quiesced),
++				 READ_ONCE(ppe->tx_desc_reuse_count));
++		len += scnprintf(buf + len, size - len,
++				 "ppe2tcl_prod: %lld ppe2tcl_cons: %lld\n",
++				 (long long)atomic64_read(&ppe->stats.ppe2tcl_prod),
++				 (long long)atomic64_read(&ppe->stats.ppe2tcl_cons));
++		len += scnprintf(buf + len, size - len,
++				 "reo2ppe_prod: %lld reo2ppe_cons: %lld\n",
++				 (long long)atomic64_read(&ppe->stats.reo2ppe_prod),
++				 (long long)atomic64_read(&ppe->stats.reo2ppe_cons));
++		len += scnprintf(buf + len, size - len,
++				 "tx_alloc: %lld tx_alloc_fail: %lld tx_complete: %lld\n",
++				 (long long)atomic64_read(&ppe->stats.tx_alloc),
++				 (long long)atomic64_read(&ppe->stats.tx_alloc_fail),
++				 (long long)atomic64_read(&ppe->stats.tx_complete));
++		len += scnprintf(buf + len, size - len,
++				 "rx_complete: %lld rx_requeue: %lld rx_drop: %lld\n",
++				 (long long)atomic64_read(&ppe->stats.rx_complete),
++				 (long long)atomic64_read(&ppe->stats.rx_requeue),
++				 (long long)atomic64_read(&ppe->stats.rx_drop));
++	}
++#endif
++
+ 	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+ 
+ 	return ret;
+-- 
+2.43.0
