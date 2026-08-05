@@ -1,0 +1,93 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 2 Aug 2026 15:25:00 +0800
+Subject: [PATCH] wifi: ath12k: report direct-switch ring indices
+
+The existing ppe2tcl_prod/cons and reo2ppe_prod/cons statistics count
+software handoff calls, not descriptors.  They can grow rapidly even when
+an index is stalled, which made the direct-switch diagnostic look healthy
+while traffic still traversed the CPU path.
+
+Label those counters as update calls and snapshot the last synchronized
+WLAN producer and consumer indices under the SRNG locks.  Report the number
+of pending descriptors for both shared rings, or explicitly report that the
+rings are unavailable while the node is stopped or quiesced.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1196,6 +1196,40 @@ static ssize_t ath12k_debugfs_dump_devic
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	{
+ 		struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++		struct hal_srng *srng;
++		u32 p2t_prod = 0, p2t_cons = 0;
++		u32 r2p_prod = 0, r2p_cons = 0;
++		bool ring_state = false;
++
++		if (READ_ONCE(ppe->started) && !READ_ONCE(ppe->quiesced)) {
++			srng = &ab->hal.srng_list[ppe->ppe2tcl_ring.ring_id];
++			spin_lock_bh(&srng->lock);
++			if (srng->initialized && srng->entry_size) {
++				p2t_prod = READ_ONCE(srng->u.src_ring.hp) /
++					srng->entry_size;
++				p2t_cons = READ_ONCE(srng->u.src_ring.cached_tp) /
++					srng->entry_size;
++				ring_state = p2t_prod < DP_PPE2TCL_RING_SIZE &&
++					     p2t_cons < DP_PPE2TCL_RING_SIZE;
++			}
++			spin_unlock_bh(&srng->lock);
++
++			if (ring_state) {
++				srng = &ab->hal.srng_list[ppe->reo2ppe_ring.ring_id];
++				spin_lock_bh(&srng->lock);
++				if (srng->initialized && srng->entry_size) {
++					r2p_prod = READ_ONCE(srng->u.dst_ring.cached_hp) /
++						srng->entry_size;
++					r2p_cons = READ_ONCE(srng->u.dst_ring.tp) /
++						srng->entry_size;
++					ring_state = r2p_prod < DP_REO2PPE_RING_SIZE &&
++						     r2p_cons < DP_REO2PPE_RING_SIZE;
++				} else {
++					ring_state = false;
++				}
++				spin_unlock_bh(&srng->lock);
++			}
++		}
+ 
+ 		len += scnprintf(buf + len, size - len,
+ 				 "\nPPE DIRECT-SWITCH STATS:\n");
+@@ -1205,13 +1239,28 @@ static ssize_t ath12k_debugfs_dump_devic
+ 				 READ_ONCE(ppe->quiesced),
+ 				 READ_ONCE(ppe->tx_desc_reuse_count));
+ 		len += scnprintf(buf + len, size - len,
+-				 "ppe2tcl_prod: %lld ppe2tcl_cons: %lld\n",
++				 "ppe2tcl_updates: prod=%lld cons=%lld\n",
+ 				 (long long)atomic64_read(&ppe->stats.ppe2tcl_prod),
+ 				 (long long)atomic64_read(&ppe->stats.ppe2tcl_cons));
+ 		len += scnprintf(buf + len, size - len,
+-				 "reo2ppe_prod: %lld reo2ppe_cons: %lld\n",
++				 "reo2ppe_updates: prod=%lld cons=%lld\n",
+ 				 (long long)atomic64_read(&ppe->stats.reo2ppe_prod),
+ 				 (long long)atomic64_read(&ppe->stats.reo2ppe_cons));
++		if (ring_state) {
++			len += scnprintf(buf + len, size - len,
++					 "ppe2tcl_index: prod=%u cons=%u pending=%u\n",
++					 p2t_prod, p2t_cons,
++					 (p2t_prod - p2t_cons) &
++					 (DP_PPE2TCL_RING_SIZE - 1));
++			len += scnprintf(buf + len, size - len,
++					 "reo2ppe_index: prod=%u cons=%u pending=%u\n",
++					 r2p_prod, r2p_cons,
++					 (r2p_prod - r2p_cons) &
++					 (DP_REO2PPE_RING_SIZE - 1));
++		} else {
++			len += scnprintf(buf + len, size - len,
++					 "ring_index: unavailable\n");
++		}
+ 		len += scnprintf(buf + len, size - len,
+ 				 "tx_alloc: %lld tx_alloc_fail: %lld tx_complete: %lld\n",
+ 				 (long long)atomic64_read(&ppe->stats.tx_alloc),
+-- 
+2.43.0
