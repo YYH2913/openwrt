@@ -1,0 +1,88 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 19:20:00 +0800
+Subject: [PATCH] wifi: mac80211: report payload data TX rate
+
+mac80211's cached station TX rate can be replaced by null-data frames,
+because ieee80211_is_data() and ieee80211_is_tx_data() include data frames
+without a payload.  Such frames are commonly sent at a conservative rate,
+which makes station_info appear to downgrade even though the peer's data
+rate and capabilities did not change.  A driver-provided reported_rate also
+bypasses the existing frame-type check and lets management frames replace
+the cache.
+
+Only update last_rate for software-encapsulated frames which carry payload.
+Hardware-encapsulated Ethernet is payload data by construction.  Apply the
+same rule to extended rate_info status when an skb is available, while
+preserving explicit aggregate status updates which do not include an skb.
+
+This only changes the visible/airtime-estimation cache.  Null-data frames
+continue through rate control and TX status processing, including ACK,
+power-save and connection-monitor accounting.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ net/mac80211/status.c | 20 ++++++++++++++++++--
+ net/mac80211/tx.c     |  6 +++---
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+--- a/net/mac80211/status.c
++++ b/net/mac80211/status.c
+@@ -967,6 +967,21 @@ static void ieee80211_tx_monitor(struct
+ 	dev_kfree_skb(skb);
+ }
+ 
++static bool
++ieee80211_tx_status_data_present(struct ieee80211_tx_status *status)
++{
++	struct ieee80211_tx_info *info;
++	struct ieee80211_hdr *hdr;
++
++	if (!status->skb)
++		return true;
++
++	info = IEEE80211_SKB_CB(status->skb);
++	hdr = (void *)status->skb->data;
++	return info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP ||
++	       ieee80211_is_data_present(hdr->frame_control);
++}
++
+ static void __ieee80211_tx_status(struct ieee80211_hw *hw,
+ 				  struct ieee80211_tx_status *status,
+ 				  int rates_idx, int retry_count)
+@@ -999,7 +1014,7 @@ static void __ieee80211_tx_status(struct
+ 				ieee80211_get_qos_ctl(hdr), sta, true, acked);
+ 
+ 		if (ieee80211_hw_check(&local->hw, HAS_RATE_CONTROL) &&
+-		    (ieee80211_is_data(hdr->frame_control)) &&
++		    ieee80211_is_data_present(hdr->frame_control) &&
+ 		    (rates_idx != -1))
+ 			sta->deflink.tx_stats.last_rate =
+ 				info->status.rates[rates_idx];
+@@ -1150,7 +1165,8 @@ void ieee80211_tx_status_ext(struct ieee
+ 	if (pubsta) {
+ 		sta = container_of(pubsta, struct sta_info, sta);
+ 
+-		if (status->n_rates)
++		if (status->n_rates &&
++		    ieee80211_tx_status_data_present(status))
+ 			sta->deflink.tx_stats.last_rate_info =
+ 				status->rates[status->n_rates - 1].rate_idx;
+ 	}
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -787,11 +787,11 @@ ieee80211_tx_h_rate_ctrl(struct ieee8021
+ 	}
+ 
+ 	if (txrc.reported_rate.idx < 0) {
+ 		txrc.reported_rate = tx->rate;
+-		if (tx->sta && ieee80211_is_tx_data(tx->skb))
+-			tx->sta->deflink.tx_stats.last_rate = txrc.reported_rate;
+-	} else if (tx->sta)
++	}
++	if (tx->sta && (encap ||
++			ieee80211_is_data_present(hdr->frame_control)))
+ 		tx->sta->deflink.tx_stats.last_rate = txrc.reported_rate;
+ 
+ 	if (ratetbl)
+ 		return TX_CONTINUE;
