@@ -1,0 +1,673 @@
+From: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Date: Tue, 29 Jul 2025 11:26:40 +0530
+Subject: [PATCH] net: qualcomm: add EIP full-inline IPsec
+
+Carry exact outbound XFRM state into hardware actions. Let Qualcomm PPE
+bind clear-text flows to an EIP provider. Program service code 42 for
+PPE-to-EIP inner-flow encapsulation, retain provider module and object
+references for each PPE row, and expose the state through debugfs.
+
+Keep virtual-port carrier and flow teardown ordered, and drain provider
+objects before stopping the exported EIP API. SoCs advertise inner-flow
+support independently through device tree.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/45345c1d377f42a3aac8dd9a486a2f1241a35c85
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/169bf594df03ac4b29e0ccd3f6f87e70f0f3fb6e
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/39c0281b98922dcda04f91e30dd15bccbb0896ae
+Signed-off-by: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Signed-off-by: Himanshu Joshi <himajosh@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -6,6 +6,8 @@
+ #include <linux/netlink.h>
+ #include <net/flow_dissector.h>
+ 
++struct xfrm_state;
++
+ struct flow_match {
+ 	struct flow_dissector	*dissector;
+ 	void			*mask;
+@@ -184,6 +186,7 @@
+ 	FLOW_ACTION_VLAN_PUSH_ETH,
+ 	FLOW_ACTION_VLAN_POP_ETH,
+ 	FLOW_ACTION_CONTINUE,
++	FLOW_ACTION_XFRM,
+ 	NUM_FLOW_ACTIONS,
+ };
+ 
+@@ -267,6 +270,7 @@
+ 		} mangle;
+ 		u32			csum_flags;	/* FLOW_ACTION_CSUM */
+ 		u32			mark;		/* FLOW_ACTION_MARK */
++		struct xfrm_state	*xfrm;		/* FLOW_ACTION_XFRM */
+ 		u16                     ptype;          /* FLOW_ACTION_PTYPE */
+ 		u16			rx_queue;	/* FLOW_ACTION_RX_QUEUE_MAPPING */
+ 		u32			priority;	/* FLOW_ACTION_PRIORITY */
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -12,6 +12,7 @@
+ #include <net/netfilter/nf_conntrack_acct.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/xfrm.h>
+ 
+ #define NF_FLOW_RULE_ACTION_MAX	24
+ 
+@@ -741,11 +742,42 @@
+ 	return 0;
+ }
+ 
++static int flow_offload_xfrm(const struct flow_offload *flow,
++			     enum flow_offload_tuple_dir dir,
++			     struct nf_flow_rule *flow_rule)
++{
++	const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++	struct flow_action_entry *entry;
++	struct dst_entry *child;
++	struct xfrm_state *x;
++
++	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM || !tuple->dst_cache)
++		return -EOPNOTSUPP;
++
++	x = dst_xfrm(tuple->dst_cache);
++	child = xfrm_dst_child(tuple->dst_cache);
++	if (!x || (child && dst_xfrm(child)))
++		return -EOPNOTSUPP;
++
++	entry = flow_action_entry_next(flow_rule);
++	if (!entry)
++		return -E2BIG;
++
++	xfrm_state_hold(x);
++	entry->id = FLOW_ACTION_XFRM;
++	entry->xfrm = x;
++
++	return 0;
++}
++
+ int nf_flow_rule_route_ipv4(struct net *net, struct flow_offload *flow,
+ 			    enum flow_offload_tuple_dir dir,
+ 			    struct nf_flow_rule *flow_rule)
+ {
+-	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
++	bool xfrm = flow->tuplehash[dir].tuple.xmit_type ==
++		    FLOW_OFFLOAD_XMIT_XFRM;
++
++	if (!xfrm && nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+ 	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
+@@ -763,6 +795,9 @@
+ 		if (flow_offload_ipv4_checksum(net, flow, flow_rule) < 0)
+ 			return -1;
+ 
++	if (xfrm)
++		return flow_offload_xfrm(flow, dir, flow_rule);
++
+ 	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+@@ -774,7 +809,10 @@
+ 			    enum flow_offload_tuple_dir dir,
+ 			    struct nf_flow_rule *flow_rule)
+ {
+-	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
++	bool xfrm = flow->tuplehash[dir].tuple.xmit_type ==
++		    FLOW_OFFLOAD_XMIT_XFRM;
++
++	if (!xfrm && nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+ 	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
+@@ -788,6 +826,9 @@
+ 			return -1;
+ 	}
+ 
++	if (xfrm)
++		return flow_offload_xfrm(flow, dir, flow_rule);
++
+ 	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+@@ -849,10 +890,16 @@
+ 
+ 	for (i = 0; i < flow_rule->rule->action.num_entries; i++) {
+ 		entry = &flow_rule->rule->action.entries[i];
+-		if (entry->id != FLOW_ACTION_REDIRECT)
+-			continue;
+-
+-		dev_put(entry->dev);
++		switch (entry->id) {
++		case FLOW_ACTION_REDIRECT:
++			dev_put(entry->dev);
++			break;
++		case FLOW_ACTION_XFRM:
++			xfrm_state_put(entry->xfrm);
++			break;
++		default:
++			break;
++		}
+ 	}
+ 	kfree(flow_rule->rule);
+ 	kfree(flow_rule);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -279,7 +279,6 @@
+ 		 * flow destruction cannot outlive its virtual port.
+ 		 */
+ 		ppe_vp_inject_disable(ppe_dev);
+-		ppe_flowtable_eip_stop(ppe_dev);
+ 		ppe_port_mac_deinit(ppe_dev);
+ 		ppe_flowtable_destroy(ppe_dev);
+ 		ppe_vp_teardown(ppe_dev);
+@@ -304,7 +303,6 @@
+ 	 * rings can be unregistered. Full VP teardown follows flow flushing.
+ 	 */
+ 	ppe_vp_inject_disable(ppe_dev);
+-	ppe_flowtable_eip_stop(ppe_dev);
+ 	ppe_port_mac_deinit(ppe_dev);
+ 
+ 	/* Netdevice teardown unbinds the flow blocks and quiesces their
+--- a/include/linux/soc/qcom/ppe.h
++++ b/include/linux/soc/qcom/ppe.h
+@@ -12,6 +12,8 @@
+ 
+ struct net_device;
+ struct sk_buff;
++struct module;
++struct xfrm_state;
+ struct qcom_ppe_eip_flow;
+ 
+ /**
+@@ -34,6 +36,54 @@
+ 	bool ipv6;
+ };
+ 
++/**
++ * struct qcom_ppe_eip_inner_tuple - clear-text flow entering IPsec
++ * @src: Inner source address in network byte order.
++ * @dst: Inner destination address in network byte order.
++ * @src_port: TCP or UDP source port in network byte order.
++ * @dst_port: TCP or UDP destination port in network byte order.
++ * @protocol: IPPROTO_TCP or IPPROTO_UDP.
++ * @ipv6: Select IPv6 rather than IPv4 addresses.
++ */
++struct qcom_ppe_eip_inner_tuple {
++	union {
++		__be32 v4;
++		struct in6_addr v6;
++	} src, dst;
++	__be16 src_port;
++	__be16 dst_port;
++	u8 protocol;
++	bool ipv6;
++};
++
++/**
++ * struct qcom_ppe_eip_binding - EIP resources bound to one PPE flow
++ * @dev: EIP IPsec netdevice retained by the provider object.
++ * @priv: Provider-owned flow handle passed back to flow_del().
++ * @vp: PPE virtual port which represents the EIP inline input.
++ * @mtu: Clear-text path MTU programmed into the PPE flow.
++ */
++struct qcom_ppe_eip_binding {
++	struct net_device *dev;
++	void *priv;
++	int vp;
++	u16 mtu;
++};
++
++/**
++ * struct qcom_ppe_eip_provider_ops - outbound full-inline IPsec provider
++ * @owner: Module which owns the callbacks.
++ * @flow_add: Bind an exact XFRM state and inner tuple to EIP hardware.
++ * @flow_del: Release a binding returned by flow_add().
++ */
++struct qcom_ppe_eip_provider_ops {
++	struct module *owner;
++	int (*flow_add)(struct xfrm_state *x,
++			const struct qcom_ppe_eip_inner_tuple *tuple,
++			struct qcom_ppe_eip_binding *binding);
++	void (*flow_del)(void *priv);
++};
++
+ typedef bool (*qcom_ppe_eip_rx_t)(void *data, struct sk_buff *skb,
+ 				   u16 service_code);
+ 
+@@ -46,6 +96,8 @@
+ 			  const struct qcom_ppe_eip_tuple *tuple,
+ 			  struct qcom_ppe_eip_flow **flow);
+ void qcom_ppe_eip_flow_put(struct qcom_ppe_eip_flow *flow);
++int qcom_ppe_eip_provider_register(const struct qcom_ppe_eip_provider_ops *ops);
++void qcom_ppe_eip_provider_unregister(const struct qcom_ppe_eip_provider_ops *ops);
+ #else
+ static inline struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
+ {
+@@ -72,6 +124,17 @@
+ static inline void qcom_ppe_eip_flow_put(struct qcom_ppe_eip_flow *flow)
+ {
+ }
++
++static inline int
++qcom_ppe_eip_provider_register(const struct qcom_ppe_eip_provider_ops *ops)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void
++qcom_ppe_eip_provider_unregister(const struct qcom_ppe_eip_provider_ops *ops)
++{
++}
+ #endif
+ 
+ #endif /* __LINUX_SOC_QCOM_PPE_H__ */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -2710,7 +2710,7 @@
+ 	sc_cfg.eip_field_update_bitmap = PPE_EIP_UPDATE_DEST_INFO |
+ 					 PPE_EIP_UPDATE_HASH_FLOW_INDEX |
+ 					 PPE_EIP_UPDATE_FAKE_L2_PROTO;
+-	sc_cfg.eip_hw_service = PPE_EIP_HW_SERVICE_IPSEC;
++	sc_cfg.eip_hw_service = PPE_EIP_HW_SERVICE_IPSEC_AIIP;
+ 	/* Zero selects the L3 offset; one selects L4. */
+ 	sc_cfg.eip_offset_sel = 0;
+ 	set_bit(PPE_SC_BYPASS_EGRESS_L3_PKT_EDIT, sc_cfg.bitmaps.egress);
+@@ -2720,6 +2720,26 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* SC42 sends a clear-text L3 packet to EIP for full-inline
++	 * encapsulation. The IIP service performs inner-flow lookup and returns
++	 * the encrypted outer packet to PPE with SC8.
++	 */
++	sc_cfg = (struct ppe_sc_cfg){};
++	sc_cfg.dest_port_valid = true;
++	sc_cfg.dest_port = PPE_EIP_PORT;
++	sc_cfg.next_service_code = PPE_EIP_SC_EIP2PPE;
++	sc_cfg.eip_field_update_bitmap = PPE_EIP_UPDATE_DEST_INFO |
++					 PPE_EIP_UPDATE_HASH_FLOW_INDEX |
++					 PPE_EIP_UPDATE_FAKE_L2_PROTO;
++	sc_cfg.eip_hw_service = PPE_EIP_HW_SERVICE_IPSEC_IIP;
++	sc_cfg.eip_offset_sel = 0;
++	set_bit(PPE_SC_BYPASS_EGRESS_L3_PKT_EDIT, sc_cfg.bitmaps.egress);
++	set_bit(PPE_SC_BYPASS_EGRESS_L2_SOURCE_SECURITY,
++		sc_cfg.bitmaps.egress);
++	ret = ppe_sc_config_set(ppe_dev, PPE_EIP_SC_PPE2EIP_ENCAP, sc_cfg);
++	if (ret)
++		return ret;
++
+ 	/* SC8 is the tag on decrypted packets returning from EIP. Preserve it
+ 	 * across ingress flow processing so exception delivery can identify the
+ 	 * inline path.
+@@ -2743,6 +2763,15 @@
+ 	for (profile = 0; profile < PPE_QUEUE_SRC_PROFILE_NUM; profile++) {
+ 		queue_dst.src_profile = profile;
+ 		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
++					       PPE_QUEUE_REDIR_PROFILE_ID);
++		if (ret)
++			return ret;
++	}
++
++	queue_dst.service_code = PPE_EIP_SC_PPE2EIP_ENCAP;
++	for (profile = 0; profile < PPE_QUEUE_SRC_PROFILE_NUM; profile++) {
++		queue_dst.src_profile = profile;
++		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
+ 					       PPE_QUEUE_REDIR_PROFILE_ID);
+ 		if (ret)
+ 			return ret;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
+@@ -28,8 +28,10 @@
+ #define PPE_EDMA_SC_SPF_BYPASS_ID		12
+ #define PPE_EIP_SC_PPE2EIP_DECAP		7
+ #define PPE_EIP_SC_EIP2PPE			8
++#define PPE_EIP_SC_PPE2EIP_ENCAP		42
+ #define PPE_EIP_PORT				7
+-#define PPE_EIP_HW_SERVICE_IPSEC		3
++#define PPE_EIP_HW_SERVICE_IPSEC_IIP		2
++#define PPE_EIP_HW_SERVICE_IPSEC_AIIP		3
+ 
+ /* FIELD_UPDATE_ACTION bits consumed by EIP-197. */
+ #define PPE_EIP_UPDATE_DEST_INFO		BIT(2)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -23,6 +23,7 @@
+ #include <linux/ip.h>
+ #include <linux/limits.h>
+ #include <linux/lockdep.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/ppp_channel.h>
+ #include <linux/rcupdate.h>
+@@ -182,6 +183,10 @@
+ 	int tunnel;
+ 	int vp;
+ 	int ivp;
++	const struct qcom_ppe_eip_provider_ops *eip_ops;
++	void *eip_priv;
++	struct net_device *eip_dev;
++	int eip_vp;
+ 	struct ppe_vp_flow vp_flow;
+ 	u8 dmac[ETH_ALEN];
+ 	u8 eport;
+@@ -310,11 +315,39 @@
+  */
+ static DEFINE_MUTEX(ppe_eip_api_lock);
+ static struct ppe_flowtable *ppe_eip_ft;
++static const struct qcom_ppe_eip_provider_ops *ppe_eip_provider;
+ /* Flow handles retired during device teardown remain protected by the API
+  * lock until their EIP owners release the final reference.
+  */
+ static LIST_HEAD(ppe_eip_retired_flows);
+ 
++static const struct qcom_ppe_eip_provider_ops *ppe_ft_eip_provider_get(void)
++{
++	const struct qcom_ppe_eip_provider_ops *ops = NULL;
++
++	mutex_lock(&ppe_eip_api_lock);
++	if (ppe_eip_provider && try_module_get(ppe_eip_provider->owner))
++		ops = ppe_eip_provider;
++	mutex_unlock(&ppe_eip_api_lock);
++
++	return ops;
++}
++
++static void ppe_ft_eip_provider_put(struct ppe_ft_flow *flow)
++{
++	const struct qcom_ppe_eip_provider_ops *ops;
++
++	if (!flow || !flow->eip_ops)
++		return;
++
++	ops = flow->eip_ops;
++	flow->eip_ops = NULL;
++	ops->flow_del(flow->eip_priv);
++	module_put(ops->owner);
++	flow->eip_priv = NULL;
++	flow->eip_dev = NULL;
++}
++
+ static const struct rhashtable_params ppe_ft_params = {
+ 	.head_offset = offsetof(struct ppe_ft_flow, node),
+ 	.key_offset = offsetof(struct ppe_ft_flow, cookie),
+@@ -2158,6 +2191,36 @@
+ }
+ EXPORT_SYMBOL_GPL(qcom_ppe_eip_flow_put);
+ 
++int qcom_ppe_eip_provider_register(const struct qcom_ppe_eip_provider_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->owner || !ops->flow_add || !ops->flow_del)
++		return -EINVAL;
++
++	mutex_lock(&ppe_eip_api_lock);
++	if (ppe_eip_provider)
++		ret = ppe_eip_provider == ops ? -EEXIST : -EBUSY;
++	else
++		ppe_eip_provider = ops;
++	mutex_unlock(&ppe_eip_api_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_provider_register);
++
++void qcom_ppe_eip_provider_unregister(const struct qcom_ppe_eip_provider_ops *ops)
++{
++	mutex_lock(&ppe_eip_api_lock);
++	if (WARN_ON_ONCE(ppe_eip_provider != ops))
++		goto out;
++
++	ppe_eip_provider = NULL;
++out:
++	mutex_unlock(&ppe_eip_api_lock);
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_provider_unregister);
++
+ int qcom_ppe_eip_vp_alloc(struct net_device *dev, qcom_ppe_eip_rx_t rx,
+ 			  void *data)
+ {
+@@ -2215,12 +2278,67 @@
+ 	list_add_tail(&flow->zombie_node, &ft->zombies);
+ }
+ 
++static int ppe_ft_eip_provider_bind(struct ppe_ft_flow *flow,
++				    struct xfrm_state *x)
++{
++	const struct qcom_ppe_eip_provider_ops *ops;
++	struct qcom_ppe_eip_inner_tuple tuple = {
++		.src_port = flow->entry.sport,
++		.dst_port = flow->entry.dport,
++		.protocol = flow->entry.proto == PPE_FLOW_PROTOCOL_TCP ?
++			    IPPROTO_TCP : IPPROTO_UDP,
++		.ipv6 = flow->entry.is_ipv6,
++	};
++	struct qcom_ppe_eip_binding binding = {};
++	int ret;
++
++	if (tuple.ipv6) {
++		tuple.src.v6 = flow->entry.sip.ip6;
++		tuple.dst.v6 = flow->entry.dip.ip6;
++	} else {
++		tuple.src.v4 = flow->entry.sip.ip4;
++		tuple.dst.v4 = flow->entry.dip.ip4;
++	}
++
++	ops = ppe_ft_eip_provider_get();
++	if (!ops)
++		return -EOPNOTSUPP;
++
++	ret = ops->flow_add(x, &tuple, &binding);
++	if (ret)
++		goto out_module;
++
++	if (!binding.dev || !binding.priv ||
++	    binding.vp < PPE_VP_PORT_BASE || binding.vp >= PPE_PORT_ID_COUNT ||
++	    binding.mtu < 68 || binding.mtu > PPE_FLOW_PMTU_MAX ||
++	    binding.dev->addr_len != ETH_ALEN ||
++	    !is_valid_ether_addr(binding.dev->dev_addr)) {
++		ret = -EINVAL;
++		ops->flow_del(binding.priv);
++		goto out_module;
++	}
++
++	flow->eip_ops = ops;
++	flow->eip_priv = binding.priv;
++	flow->eip_dev = binding.dev;
++	flow->eip_vp = binding.vp;
++	flow->entry.pmtu = binding.mtu;
++	flow->entry.service_code = PPE_EIP_SC_PPE2EIP_ENCAP;
++	flow->eport = binding.vp;
++	return 0;
++
++out_module:
++	module_put(ops->owner);
++	return ret;
++}
++
+ static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
+ 			       struct flow_cls_offload *f)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+ 	struct edma_port_priv *port_priv;
+ 	struct flow_action_entry *act;
++	struct xfrm_state *xfrm = NULL;
+ 	struct net_device *odev = NULL;
+ 	struct net_device *tdev = NULL;
+ 	struct ip6_tnl_flow_offload_info tnl_info;
+@@ -2231,6 +2349,7 @@
+ 	struct in6_addr lwt_local = {}, lwt_remote = {};
+ 	u8 lwt_hop_limit = 0;
+ 	bool tunnel_flow, tunnel_encap = false, lwt_tunnel = false;
++	bool eip_flow = false;
+ 	bool installed;
+ 	int i, nexthop, ret, redirects = 0, vlan_pushes = 0;
+ 	int pppoe_pushes = 0, csums = 0;
+@@ -2293,6 +2412,7 @@
+ 	flow->tunnel = -1;
+ 	flow->vp = -1;
+ 	flow->ivp = -1;
++	flow->eip_vp = -1;
+ 	nh.vid = -1;
+ 	data.pppoe_sid = -1;
+ 	data.ingress_vid = -1;
+@@ -2521,6 +2641,13 @@
+ 			}
+ 			break;
+ 		}
++		case FLOW_ACTION_XFRM:
++			if (xfrm) {
++				ret = -EOPNOTSUPP;
++				goto err_free;
++			}
++			xfrm = act->xfrm;
++			break;
+ 		case FLOW_ACTION_TUNNEL_ENCAP:
+ 			if (lwt_tunnel ||
+ 			    !ppe_ft_lwt_encap(act, &lwt_local, &lwt_remote,
+@@ -2546,6 +2673,20 @@
+ 		}
+ 	}
+ 
++	if (xfrm) {
++		if (redirects || vlan_pushes || vlan_pops || pppoe_pushes ||
++		    tunnel_flow || lwt_tunnel) {
++			ret = -EOPNOTSUPP;
++			goto err_free;
++		}
++
++		ret = ppe_ft_eip_provider_bind(flow, xfrm);
++		if (ret)
++			goto err_free;
++		eip_flow = true;
++		odev = flow->eip_dev;
++	}
++
+ 	if (tunnel_flow) {
+ 		if (!odev) {
+ 			ret = -EOPNOTSUPP;
+@@ -2578,24 +2719,25 @@
+ 			dev_hold(tdev);
+ 	}
+ 
+-	if (!odev || redirects != 1 ||
++	if (!odev || (!eip_flow && redirects != 1) ||
+ 	    (vlan_pops && data.ingress_vid < 0) ||
+-	    is_zero_ether_addr(data.eth.dst)) {
++	    (!eip_flow && is_zero_ether_addr(data.eth.dst))) {
+ 		ret = -EOPNOTSUPP;
+ 		goto err_tdev;
+ 	}
+-	if (!tunnel_encap && !edma_port_dev_check(odev) &&
++	if (!eip_flow && !tunnel_encap && !edma_port_dev_check(odev) &&
+ 	    (!ft->ppe_dev->variant->has_vports ||
+ 	     odev->type != ARPHRD_ETHER || !odev->ieee80211_ptr)) {
+ 		ret = -EOPNOTSUPP;
+ 		goto err_tdev;
+ 	}
+-	if (odev->mtu > PPE_FLOW_PMTU_MAX) {
++	if (!eip_flow && odev->mtu > PPE_FLOW_PMTU_MAX) {
+ 		ret = -EOPNOTSUPP;
+ 		goto err_tdev;
+ 	}
+ 
+-	flow->entry.pmtu = odev->mtu;
++	if (!eip_flow)
++		flow->entry.pmtu = odev->mtu;
+ 
+ 	/* The PPPoE L3 interface carries the session ID, so it needs
+ 	 * the source MAC rewrite of the rule to be complete.
+@@ -2645,7 +2787,12 @@
+ 		}
+ 	}
+ 
+-	if (!tunnel_encap) {
++	if (eip_flow) {
++		nh.port = flow->eip_vp;
++		nh.l3_if = ppe_flowtable_vp_l3_if(ft->ppe_dev, flow->eip_vp);
++		ether_addr_copy(flow->dmac, odev->dev_addr);
++		ether_addr_copy(nh.mac, odev->dev_addr);
++	} else if (!tunnel_encap) {
+ 		if (edma_port_dev_check(odev)) {
+ 			port_priv = netdev_priv(odev);
+ 			nh.port = port_priv->ppe_port->port_id;
+@@ -2955,6 +3102,7 @@
+ 	if (tdev)
+ 		dev_put(tdev);
+ err_free:
++	ppe_ft_eip_provider_put(flow);
+ 	kfree_rcu(flow, rcu);
+ 
+ 	return ret;
+@@ -2993,6 +3141,7 @@
+ 	}
+ 
+ 	mutex_unlock(&ft->lock);
++	ppe_ft_eip_provider_put(flow);
+ 	kfree_rcu(flow, rcu);
+ 
+ 	return 0;
+@@ -3684,11 +3833,13 @@
+ 				   &flow->entry.dip.ip4,
+ 				   be16_to_cpu(flow->entry.dport));
+ 		seq_printf(seq,
+-			   " proto:%u profile:%u index:%d valid:%u host:%u host_dst:%u nexthop:%u packets:%u bytes:%llu\n",
+-			   flow->entry.proto, flow->entry.pri_profile, flow->index,
++			   " proto:%u profile:%u service:%u index:%d valid:%u host:%u host_dst:%u nexthop:%u eip:%u eip_vp:%d packets:%u bytes:%llu\n",
++			   flow->entry.proto, flow->entry.pri_profile,
++			   flow->entry.service_code, flow->index,
+ 			   !!(w0 & PPE_FLOW_W0_VALID), flow->entry.host_index,
+ 			   !!(w0 & PPE_FLOW_W0_HOST_INDEX_TYPE), flow->nexthop,
+-			   packets, (unsigned long long)bytes);
++			   !!flow->eip_ops, flow->eip_vp, packets,
++			   (unsigned long long)bytes);
+ 	}
+ 	rhashtable_walk_stop(&iter);
+ 	rhashtable_walk_exit(&iter);
+@@ -4145,11 +4296,22 @@
+ 	if (!ft)
+ 		return;
+ 
+-	ppe_flowtable_eip_stop(ppe_dev);
+-
+ 	WARN_ON(!list_empty(&ft->block_cb_list));
+ 	ppp_unregister_channel_notifier(&ft->ppp_nb);
+ 	ppe_ft_flow_drain(ft);
++
++	/* Quarantined rows were disabled when deletion failed, but deliberately
++	 * retained their provider objects while the PPE could still reference
++	 * them. Device teardown is the final point at which those EIP resources
++	 * can be released.
++	 */
++	list_for_each_entry(flow, &ft->zombies, zombie_node)
++		ppe_ft_eip_provider_put(flow);
++
++	/* Provider callbacks and their full-inline flows are gone before the
++	 * exported EIP API drains outer flows and tears down EIP virtual ports.
++	 */
++	ppe_flowtable_eip_stop(ppe_dev);
+ 	mutex_lock(&ft->lock);
+ 	for (i = 0; i < PPE_FT_PPPOE_SESSIONS; i++) {
+ 		if (!ft->pppoe[i].ref.refcnt)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -880,6 +880,7 @@
+ 	WRITE_ONCE(slot->miss_disabled, false);
+ 	rcu_assign_pointer(slot->eip_rx, eip_rx);
+ 	eip_rx = NULL;
++	ppe_flowtable_port_carrier(ppe_dev, port, true);
+ 	ret = port;
+ 	goto out;
+ 
+@@ -921,6 +922,7 @@
+ 	/* Stop new callbacks before disabling the hardware source port. Keep the
+ 	 * callback object and slot reservation alive until every old reader exits.
+ 	 */
++	ppe_flowtable_port_carrier(ppe_dev, port, false);
+ 	rcu_assign_pointer(slot->eip_rx, NULL);
+ 	ret = ppe_vp_hw_set_queue(ppe_dev, port, false, 0, 0,
+ 				  PPE_VP_CPU_PORT);
