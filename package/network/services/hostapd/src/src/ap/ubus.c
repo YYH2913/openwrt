@@ -236,6 +236,91 @@ hostapd_parse_capab_blobmsg(struct sta_info *sta)
 	blobmsg_close_table(&b, v);
 }
 
+static unsigned int
+hostapd_rate_gi_ns(enum guard_interval gi)
+{
+	switch (gi) {
+	case GUARD_INTERVAL_0_4:
+		return 400;
+	case GUARD_INTERVAL_0_8:
+		return 800;
+	case GUARD_INTERVAL_1_6:
+		return 1600;
+	case GUARD_INTERVAL_3_2:
+		return 3200;
+	default:
+		return 0;
+	}
+}
+
+static void
+hostapd_add_rate_metadata(const struct hostap_sta_driver_data *data, bool tx)
+{
+	unsigned long flags = data->flags;
+	unsigned long rate = tx ? data->current_tx_rate : data->current_rx_rate;
+	unsigned int gi = 0, mcs = 0, nss = 0;
+	bool have_gi = false, have_mcs = false, have_nss = false;
+	const char *mode = "legacy";
+
+	if (!rate)
+		return;
+
+	if (flags & (tx ? STA_DRV_DATA_TX_EHT_MCS :
+		     STA_DRV_DATA_RX_EHT_MCS)) {
+		mode = "eht";
+		mcs = tx ? data->tx_ehtmcs : data->rx_ehtmcs;
+		have_mcs = true;
+		nss = tx ? data->tx_eht_nss : data->rx_eht_nss;
+		have_nss = flags & (tx ? STA_DRV_DATA_TX_EHT_NSS :
+				     STA_DRV_DATA_RX_EHT_NSS);
+		have_gi = flags & (tx ? STA_DRV_DATA_TX_EHT_GI :
+				    STA_DRV_DATA_RX_EHT_GI);
+	} else if (flags & (tx ? STA_DRV_DATA_TX_HE_MCS :
+			    STA_DRV_DATA_RX_HE_MCS)) {
+		mode = "he";
+		mcs = tx ? data->tx_hemcs : data->rx_hemcs;
+		have_mcs = true;
+		nss = tx ? data->tx_he_nss : data->rx_he_nss;
+		have_nss = flags & (tx ? STA_DRV_DATA_TX_HE_NSS :
+				     STA_DRV_DATA_RX_HE_NSS);
+		have_gi = flags & (tx ? STA_DRV_DATA_TX_HE_GI :
+				    STA_DRV_DATA_RX_HE_GI);
+	} else if (flags & (tx ? STA_DRV_DATA_TX_VHT_MCS :
+			    STA_DRV_DATA_RX_VHT_MCS)) {
+		mode = "vht";
+		mcs = tx ? data->tx_vhtmcs : data->rx_vhtmcs;
+		have_mcs = true;
+		nss = tx ? data->tx_vht_nss : data->rx_vht_nss;
+		have_nss = flags & (tx ? STA_DRV_DATA_TX_VHT_NSS :
+				     STA_DRV_DATA_RX_VHT_NSS);
+		have_gi = flags & (tx ? STA_DRV_DATA_TX_SHORT_GI :
+				    STA_DRV_DATA_RX_SHORT_GI);
+	} else if (flags & (tx ? STA_DRV_DATA_TX_MCS :
+			    STA_DRV_DATA_RX_MCS)) {
+		mode = "ht";
+		mcs = tx ? data->tx_mcs : data->rx_mcs;
+		have_mcs = true;
+		have_gi = flags & (tx ? STA_DRV_DATA_TX_SHORT_GI :
+				    STA_DRV_DATA_RX_SHORT_GI);
+	}
+
+	if (have_gi)
+		gi = hostapd_rate_gi_ns(tx ? data->tx_guard_interval :
+					 data->rx_guard_interval);
+
+	blobmsg_add_string(&b, tx ? "tx_mode" : "rx_mode", mode);
+	if (have_mcs)
+		blobmsg_add_u32(&b, tx ? "tx_mcs" : "rx_mcs", mcs);
+	if (have_nss)
+		blobmsg_add_u32(&b, tx ? "tx_nss" : "rx_nss", nss);
+	if (gi)
+		blobmsg_add_u32(&b, tx ? "tx_gi_ns" : "rx_gi_ns", gi);
+	if (flags & (tx ? STA_DRV_DATA_TX_RATE_MHZ :
+		     STA_DRV_DATA_RX_RATE_MHZ))
+		blobmsg_add_u32(&b, tx ? "tx_mhz" : "rx_mhz",
+				tx ? data->tx_rate_mhz : data->rx_rate_mhz);
+}
+
 static int
 hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 			struct ubus_request_data *req, const char *method,
@@ -259,6 +344,7 @@ hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 		{ "ht", WLAN_STA_HT },
 		{ "vht", WLAN_STA_VHT },
 		{ "he", WLAN_STA_HE },
+		{ "eht", WLAN_STA_EHT },
 		{ "wps", WLAN_STA_WPS },
 		{ "mfp", WLAN_STA_MFP },
 	};
@@ -316,9 +402,11 @@ hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_u32(&b, "tx", sta_driver_data.tx_packets);
 			blobmsg_close_table(&b, r);
 			r = blobmsg_open_table(&b, "rate");
-			/* Rate in kbits */
-			blobmsg_add_u32(&b, "rx", sta_driver_data.current_rx_rate * 100);
-			blobmsg_add_u32(&b, "tx", sta_driver_data.current_tx_rate * 100);
+			/* hostap_sta_driver_data stores rates in kbit/s. */
+			blobmsg_add_u32(&b, "rx", sta_driver_data.current_rx_rate);
+			blobmsg_add_u32(&b, "tx", sta_driver_data.current_tx_rate);
+			hostapd_add_rate_metadata(&sta_driver_data, false);
+			hostapd_add_rate_metadata(&sta_driver_data, true);
 			blobmsg_close_table(&b, r);
 			blobmsg_add_u32(&b, "signal", sta_driver_data.signal);
 		}
