@@ -1,0 +1,383 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 18:30:00 +0800
+Subject: [PATCH] qca-nss-eip: harden XFRM provider and NAT-T sockets
+
+Override only the ESP type in the native family AFINFO. This avoids copying
+unrelated dynamic XFRM registrations, and makes every restore outcome drop
+the saved fallback module reference. Keep only the native output callback
+needed by unsupported ESP states.
+
+Serialize NAT-T callback installation and restoration with socket options.
+When a socket already has shared EIP state, verify that its callback still
+belongs to EIP before adding another user. Restore the callback and remove
+the shared state atomically with respect to both socket options and packet
+fallback lookup.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_xfrm.c
++++ b/clients/ipsec/eip_ipsec_xfrm.c
+@@ -60,24 +60,28 @@ static struct eip_ipsec_xfrm_algo xfrm_a
+ 
+ static DEFINE_MUTEX(eip_ipsec_xfrm_state_lock);
+ 
+-static struct xfrm_state_afinfo *fallback_v4_afinfo;
+-static struct xfrm_state_afinfo *fallback_v6_afinfo;
++static int (*fallback_v4_output)(struct net *net, struct sock *sk,
++				 struct sk_buff *skb);
++static int (*fallback_v6_output)(struct net *net, struct sock *sk,
++				 struct sk_buff *skb);
+ static const struct xfrm_type *fallback_v4_type;
+ static const struct xfrm_type *fallback_v6_type;
+ 
+ static const struct xfrm_type *eip_ipsec_xfrm_fallback_type(const struct xfrm_state *xs)
+ {
+-	return xs->props.family == AF_INET ? fallback_v4_type : fallback_v6_type;
++	return xs->props.family == AF_INET ? READ_ONCE(fallback_v4_type) :
++					      READ_ONCE(fallback_v6_type);
+ }
+ 
+ static int eip_ipsec_xfrm_fallback_output(unsigned short family, struct net *net,
+ 					  struct sock *sk, struct sk_buff *skb)
+ {
+-	const struct xfrm_state_afinfo *afinfo;
++	int (*output)(struct net *net, struct sock *sk, struct sk_buff *skb);
+ 
+-	afinfo = family == AF_INET ? fallback_v4_afinfo : fallback_v6_afinfo;
+-	if (likely(afinfo && afinfo->output))
+-		return afinfo->output(net, sk, skb);
++	output = family == AF_INET ? READ_ONCE(fallback_v4_output) :
++				      READ_ONCE(fallback_v6_output);
++	if (likely(output))
++		return output(net, sk, skb);
+ 
+ 	XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+ 	kfree_skb(skb);
+@@ -883,11 +887,6 @@ static int eip_ipsec_xfrm_esp_output(str
+ }
+ 
+ /*
+- * Trapping ipv4 packets to be sent for ipsec encapsulation.
+- */
+-static struct xfrm_state_afinfo xfrm_v4_afinfo;
+-
+-/*
+  * ESP proto specific init/de-init handlers for ipv4.
+  */
+ static const struct xfrm_type xfrm_v4_type = {
+@@ -904,11 +903,6 @@ static const struct xfrm_type xfrm_v4_ty
+ };
+ 
+ /*
+- * Trapping ipv6 packets to be sent for ipsec encapsulation.
+- */
+-static struct xfrm_state_afinfo xfrm_v6_afinfo;
+-
+-/*
+  * ESP proto specific init/de-init handlers for ipv6.
+  */
+ static const struct xfrm_type xfrm_v6_type = {
+@@ -927,35 +921,22 @@ static const struct xfrm_type xfrm_v6_ty
+ #endif
+ };
+ 
+-static void eip_ipsec_xfrm_copy_dynamic_types(struct xfrm_state_afinfo *dst,
+-					      const struct xfrm_state_afinfo *src)
+-{
+-	dst->type_offload_esp = src->type_offload_esp;
+-	dst->type_ipip = src->type_ipip;
+-	dst->type_ipip6 = src->type_ipip6;
+-	dst->type_comp = src->type_comp;
+-	dst->type_ah = src->type_ah;
+-	dst->type_routing = src->type_routing;
+-	dst->type_dstopts = src->type_dstopts;
+-}
+-
+ /*
+- * Install a shallow copy of the native provider with only ESP and output
+- * replaced.  This preserves native callbacks and all non-ESP XFRM types.
++ * Replace only native ESP. Family callbacks and unrelated XFRM types stay
++ * in the original AFINFO object and therefore need no restore-time copy.
+  */
+ static int eip_ipsec_xfrm_override_afinfo(uint16_t family)
+ {
+-	struct xfrm_state_afinfo *replacement;
+ 	struct xfrm_state_afinfo *fallback;
+ 	const struct xfrm_type *fallback_type;
+ 	const struct xfrm_type *eip_type;
++	int (*fallback_output)(struct net *net, struct sock *sk,
++			       struct sk_buff *skb);
+ 	int err;
+ 
+ 	if (family == AF_INET) {
+-		replacement = &xfrm_v4_afinfo;
+ 		eip_type = &xfrm_v4_type;
+ 	} else {
+-		replacement = &xfrm_v6_afinfo;
+ 		eip_type = &xfrm_v6_type;
+ 	}
+ 
+@@ -963,79 +944,65 @@ static int eip_ipsec_xfrm_override_afinf
+ 	if (!fallback)
+ 		return -EAFNOSUPPORT;
+ 
+-	fallback_type = fallback->type_esp;
+-	if (!fallback_type || !try_module_get(fallback_type->owner)) {
++	fallback_type = READ_ONCE(fallback->type_esp);
++	fallback_output = READ_ONCE(fallback->output);
++	if (!fallback_type || !fallback_output ||
++	    !try_module_get(fallback_type->owner)) {
+ 		rcu_read_unlock();
+ 		return -EPROTONOSUPPORT;
+ 	}
+ 
+-	*replacement = *fallback;
+-	rcu_read_unlock();
+-	replacement->type_esp = eip_type;
+-
+ 	if (family == AF_INET) {
+-		fallback_v4_afinfo = fallback;
+-		fallback_v4_type = fallback_type;
++		WRITE_ONCE(fallback_v4_output, fallback_output);
++		WRITE_ONCE(fallback_v4_type, fallback_type);
+ 	} else {
+-		fallback_v6_afinfo = fallback;
+-		fallback_v6_type = fallback_type;
++		WRITE_ONCE(fallback_v6_output, fallback_output);
++		WRITE_ONCE(fallback_v6_type, fallback_type);
+ 	}
++	rcu_read_unlock();
+ 
+-	err = xfrm_state_update_afinfo(family, fallback, replacement);
++	err = xfrm_state_update_esp_type(family, fallback_type, eip_type);
+ 	if (!err)
+ 		return 0;
+ 
+ 	if (family == AF_INET) {
+-		fallback_v4_afinfo = NULL;
+-		fallback_v4_type = NULL;
++		WRITE_ONCE(fallback_v4_type, NULL);
++		WRITE_ONCE(fallback_v4_output, NULL);
+ 	} else {
+-		fallback_v6_afinfo = NULL;
+-		fallback_v6_type = NULL;
++		WRITE_ONCE(fallback_v6_type, NULL);
++		WRITE_ONCE(fallback_v6_output, NULL);
+ 	}
+ 	module_put(fallback_type->owner);
+-	memset(replacement, 0, sizeof(*replacement));
+ 	return err;
+ }
+ 
+-/*
+- * Restore the native provider and carry across non-ESP registrations which
+- * may have changed while the EIP provider was active.
+- */
+ static int eip_ipsec_xfrm_restore_afinfo(uint16_t family)
+ {
+-	struct xfrm_state_afinfo *replacement;
+-	struct xfrm_state_afinfo *fallback;
+ 	const struct xfrm_type *fallback_type;
++	const struct xfrm_type *eip_type;
+ 	int err;
+ 
+ 	if (family == AF_INET) {
+-		replacement = &xfrm_v4_afinfo;
+-		fallback = fallback_v4_afinfo;
+-		fallback_type = fallback_v4_type;
++		fallback_type = READ_ONCE(fallback_v4_type);
++		eip_type = &xfrm_v4_type;
+ 	} else {
+-		replacement = &xfrm_v6_afinfo;
+-		fallback = fallback_v6_afinfo;
+-		fallback_type = fallback_v6_type;
++		fallback_type = READ_ONCE(fallback_v6_type);
++		eip_type = &xfrm_v6_type;
+ 	}
+ 
+-	if (!fallback)
++	if (!fallback_type)
+ 		return 0;
+ 
+-	eip_ipsec_xfrm_copy_dynamic_types(fallback, replacement);
+-	err = xfrm_state_update_afinfo(family, replacement, fallback);
+-	if (err)
+-		return err;
+-
++	err = xfrm_state_update_esp_type(family, eip_type, fallback_type);
+ 	if (family == AF_INET) {
+-		fallback_v4_afinfo = NULL;
+-		fallback_v4_type = NULL;
++		WRITE_ONCE(fallback_v4_type, NULL);
++		WRITE_ONCE(fallback_v4_output, NULL);
+ 	} else {
+-		fallback_v6_afinfo = NULL;
+-		fallback_v6_type = NULL;
++		WRITE_ONCE(fallback_v6_type, NULL);
++		WRITE_ONCE(fallback_v6_output, NULL);
+ 	}
+ 	module_put(fallback_type->owner);
+-	memset(replacement, 0, sizeof(*replacement));
+-	return 0;
++	return err;
+ }
+ 
+ /*
+--- a/clients/ipsec/eip_ipsec_proto.c
++++ b/clients/ipsec/eip_ipsec_proto.c
+@@ -30,6 +30,7 @@
+ #include <net/addrconf.h>
+ #include <net/esp.h>
+ #include <net/protocol.h>
++#include <net/sock.h>
+ #include <net/xfrm.h>
+ #include <net/udp.h>
+ 
+@@ -573,14 +574,23 @@ bool eip_ipsec_proto_udp_sock_override(s
+ 	new_state->sk = sk;
+ 	new_state->users = 1;
+ 
++	/* UDP_ENCAP changes use the socket lock too. Recheck the state after
++	 * allocation so callback ownership and the shared-state list describe
++	 * one serialized socket generation.
++	 */
++	lock_sock(sk);
++	if (READ_ONCE(up->encap_type) != UDP_ENCAP_ESPINUDP)
++		goto out_sock;
++
+ 	spin_lock_bh(&eip_udp_socks_lock);
+ 	list_for_each_entry(state, &eip_udp_socks, node) {
+ 		if (state->sk == sk) {
++			if (unlikely(READ_ONCE(up->encap_rcv) !=
++				     eip_ipsec_proto_udp_rx))
++				goto out_unlock;
++
+ 			if (unlikely(state->users == UINT_MAX)) {
+-				spin_unlock_bh(&eip_udp_socks_lock);
+-				kfree(new_state);
+-				sock_put(sk);
+-				return false;
++				goto out_unlock;
+ 			}
+ 
+ 			state->users++;
+@@ -590,34 +600,32 @@ bool eip_ipsec_proto_udp_sock_override(s
+ 	}
+ 	if (!*result) {
+ 		orig_encap_rcv = READ_ONCE(up->encap_rcv);
+-		if (orig_encap_rcv == eip_ipsec_proto_udp_rx) {
+-			spin_unlock_bh(&eip_udp_socks_lock);
+-			kfree(new_state);
+-			sock_put(sk);
+-			return false;
+-		}
++		if (orig_encap_rcv == eip_ipsec_proto_udp_rx)
++			goto out_unlock;
+ 
+ 		/* Do not overwrite a callback installed after lookup. */
+ 		if (cmpxchg(&up->encap_rcv, orig_encap_rcv,
+-			    eip_ipsec_proto_udp_rx) != orig_encap_rcv) {
+-			spin_unlock_bh(&eip_udp_socks_lock);
+-			kfree(new_state);
+-			sock_put(sk);
+-			return false;
+-		}
++			    eip_ipsec_proto_udp_rx) != orig_encap_rcv)
++			goto out_unlock;
+ 		new_state->orig_encap_rcv = orig_encap_rcv;
+ 		list_add(&new_state->node, &eip_udp_socks);
+ 		*result = new_state;
+ 		installed = true;
+ 	}
+ 	users = (*result)->users;
++out_unlock:
+ 	spin_unlock_bh(&eip_udp_socks_lock);
++out_sock:
++	release_sock(sk);
+ 
+ 	if (!installed) {
+ 		kfree(new_state);
+ 		sock_put(sk);
+ 	}
+ 
++	if (!*result)
++		return false;
++
+ 	pr_debug("%p: NAT-T socket %p callback users=%u\n", drv, sk, users);
+ 	return true;
+ }
+@@ -629,9 +637,11 @@ void eip_ipsec_proto_udp_sock_release(st
+ 	if (!state)
+ 		return;
+ 
++	lock_sock(state->sk);
+ 	spin_lock_bh(&eip_udp_socks_lock);
+ 	if (WARN_ON(!state->users)) {
+ 		spin_unlock_bh(&eip_udp_socks_lock);
++		release_sock(state->sk);
+ 		return;
+ 	}
+ 	if (--state->users == 0) {
+@@ -641,6 +651,7 @@ void eip_ipsec_proto_udp_sock_release(st
+ 		free_state = true;
+ 	}
+ 	spin_unlock_bh(&eip_udp_socks_lock);
++	release_sock(state->sk);
+ 
+ 	if (free_state) {
+ 		/* Wait for callbacks which observed the old function pointer. */
+@@ -652,7 +663,7 @@ void eip_ipsec_proto_udp_sock_release(st
+ 
+ void eip_ipsec_proto_udp_sock_restore(void)
+ {
+-	struct eip_ipsec_udp_sock *state;
++	struct eip_ipsec_udp_sock *state, *candidate;
+ 	struct sock *sk;
+ 
+ 	for (;;) {
+@@ -663,16 +674,40 @@ void eip_ipsec_proto_udp_sock_restore(vo
+ 		}
+ 		state = list_first_entry(&eip_udp_socks,
+ 					 struct eip_ipsec_udp_sock, node);
++		sk = state->sk;
++		sock_hold(sk);
++		spin_unlock_bh(&eip_udp_socks_lock);
++
++		lock_sock(sk);
++		spin_lock_bh(&eip_udp_socks_lock);
++		state = NULL;
++		list_for_each_entry(candidate, &eip_udp_socks, node) {
++			if (candidate->sk == sk) {
++				state = candidate;
++				break;
++			}
++		}
++		if (!state) {
++			spin_unlock_bh(&eip_udp_socks_lock);
++			release_sock(sk);
++			sock_put(sk);
++			continue;
++		}
++
+ 		WARN_ON(state->users);
+ 		list_del(&state->node);
+-		sk = state->sk;
+ 		cmpxchg(&udp_sk(sk)->encap_rcv, eip_ipsec_proto_udp_rx,
+ 			state->orig_encap_rcv);
+ 		spin_unlock_bh(&eip_udp_socks_lock);
++		release_sock(sk);
+ 
+ 		synchronize_net();
++		/* Drop the state-owned reference while the temporary pin still keeps
++		 * the socket alive through state destruction.
++		 */
+ 		sock_put(sk);
+ 		kfree(state);
++		sock_put(sk);
+ 	}
+ }
+ 
+-- 
+2.43.0
