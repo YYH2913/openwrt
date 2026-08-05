@@ -1,0 +1,280 @@
+From: Neelansh Mittal <quic_neelansh@quicinc.com>
+Date: Wed, 23 Feb 2022 12:48:10 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add direct-switch core
+
+Add the native IPQ9574 EDMA direct-switch core and allow WLAN clients to
+bind virtual ports directly to the three reserved PPE queue/ring sets.
+Keep the PPE as a module and leave the normal EDMA ring ranges untouched.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/82d0ffed35565b7b3e2fb440ff58e0e50c7d4297
+Signed-off-by: Manish Verma <quic_maniverm@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/Makefile | 2 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe.c    | 10 ++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c | 78 ++++++++++++++++++++++---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.h |  5 +-
+ 4 files changed, 85 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/Makefile
++++ b/drivers/net/ethernet/qualcomm/ppe/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_QCOM_PPE) += qcom-ppe.o
+-qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_bridge.o ppe_flow.o ppe_flowtable.o ppe_vp.o
++qcom-ppe-objs := ppe.o ppe_config.o ppe_debugfs.o ppe_port.o ppe_api.o ppe_bridge.o ppe_flow.o ppe_flowtable.o ppe_vp.o ppe_ds.o
+ qcom-ppe-objs += ppe_tunnel.o
+ 
+ #EDMA
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -1444,6 +1444,8 @@
+ #define EDMA_REG_TXDESC_RING_SIZE(n)	(0x100c + (0x1000 * (n)))
+ #define EDMA_REG_TXDESC_CTRL(n)		(0x1010 + (0x1000 * (n)))
+ #define EDMA_REG_TXDESC_BA2(n)		(0x1014 + (0x1000 * (n)))
++#define EDMA_REG_TXDESC_BA_HIGH(n)	(0x1018 + (0x1000 * (n)))
++#define EDMA_REG_TXDESC_BA2_HIGH(n)	(0x101c + (0x1000 * (n)))
+ 
+ /* RxFill ring configuration register addresses */
+ #define EDMA_REG_RXFILL_BA(n)		(0x29000 + (0x1000 * (n)))
+@@ -1456,6 +1458,7 @@
+ #define EDMA_REG_RXFILL_RING_EN(n)	(0x2901c + (0x1000 * (n)))
+ #define EDMA_REG_RXFILL_DISABLE(n)	(0x29020 + (0x1000 * (n)))
+ #define EDMA_REG_RXFILL_DISABLE_DONE(n)	(0x29024 + (0x1000 * (n)))
++#define EDMA_REG_RXFILL_BA_HIGH(n)	(0x29028 + (0x1000 * (n)))
+ #define EDMA_REG_RXFILL_INT_STAT(n)	(0x31000 + (0x1000 * (n)))
+ #define EDMA_REG_RXFILL_INT_MASK(n)	(0x31004 + (0x1000 * (n)))
+ 
+@@ -1472,6 +1475,9 @@
+ #define EDMA_REG_RXDESC_DISABLE(n)	(0x39020 + (0x1000 * (n)))
+ #define EDMA_REG_RXDESC_DISABLE_DONE(n)	(0x39024 + (0x1000 * (n)))
+ #define EDMA_REG_RXDESC_PREHEADER_BA(n)	(0x39028 + (0x1000 * (n)))
++#define EDMA_REG_RXDESC_BA_HIGH(n)	(0x3902c + (0x1000 * (n)))
++#define EDMA_REG_RXDESC_PREHEADER_BA_HIGH(n) \
++	(0x39030 + (0x1000 * (n)))
+ #define EDMA_REG_RXDESC_INT_STAT(n)	(0x59000 + (0x1000 * (n)))
+ #define EDMA_REG_RXDESC_INT_MASK(n)	(0x59004 + (0x1000 * (n)))
+ 
+@@ -1486,6 +1492,7 @@
+ #define EDMA_REG_TXCMPL_UGT_THRE(n)	(0x79010 + (0x1000 * (n)))
+ #define EDMA_REG_TXCMPL_CTRL(n)		(0x79014 + (0x1000 * (n)))
+ #define EDMA_REG_TXCMPL_BPC(n)		(0x79018 + (0x1000 * (n)))
++#define EDMA_REG_TXCMPL_BA_HIGH(n)	(0x7901c + (0x1000 * (n)))
+ 
+ #define EDMA_REG_TX_INT_STAT(n)		(0x99000 + (0x1000 * (n)))
+ #define EDMA_REG_TX_INT_MASK(n)		(0x99004 + (0x1000 * (n)))
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -19,5 +19,6 @@
+ #include "ppe_config.h"
+ #include "ppe_debugfs.h"
++#include "ppe_ds.h"
+ #include "ppe_flow.h"
+ #include "ppe_tunnel.h"
+ #include "ppe_flowtable.h"
+@@ -262,6 +263,16 @@ static int qcom_ppe_probe(struct platfor
+ 	}
+ 
+ 	ppe_debugfs_setup(ppe_dev);
++	ret = ppe_ds_setup(ppe_dev);
++	if (ret) {
++		ppe_debugfs_teardown(ppe_dev);
++		ppe_vp_teardown(ppe_dev);
++		ppe_flowtable_destroy(ppe_dev);
++		ppe_bridge_destroy(ppe_dev);
++		ppe_port_mac_deinit(ppe_dev);
++		edma_destroy(ppe_dev);
++		return dev_err_probe(dev, ret, "PPE direct-switch setup failed\n");
++	}
+ 	platform_set_drvdata(pdev, ppe_dev);
+ 
+ 	return 0;
+@@ -273,6 +281,7 @@ static void qcom_ppe_remove(struct platf
+ 
+ 	ppe_dev = platform_get_drvdata(pdev);
+ 
++	ppe_ds_teardown(ppe_dev);
+ 	/* Stop wireless injection before its borrowed carrier netdevs and TX
+ 	 * rings can be unregistered. Full VP teardown follows flow flushing.
+ 	 */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -45,8 +45,8 @@ struct ppe_vp_flow {
+  * starting at PPE_VP_PORT_BASE, and onto the egress L3 interfaces the
+  * flowtable reserves past the physical, PPPoE and VLAN-uplink ones.
+  */
+ #define PPE_VP_PORT_BASE	64
+-#define PPE_VP_SLOTS		8
++#define PPE_VP_SLOTS		64
+ 
+ int ppe_vp_setup(struct ppe_device *ppe_dev);
+ void ppe_vp_inject_disable(struct ppe_device *ppe_dev);
+@@ -64,4 +64,7 @@ int ppe_vp_flow_add(struct ppe_device *p
+ void ppe_vp_flow_del(struct ppe_device *ppe_dev, int vp,
+ 			     struct ppe_vp_flow *flow);
+ 
++int ppe_vp_ds_attach(struct ppe_device *ppe_dev, struct net_device *dev,
++		     int queue, int node);
++void ppe_vp_ds_detach(struct ppe_device *ppe_dev, int vp, int node);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -63,6 +63,8 @@ struct ppe_vp_slot {
+ 	u64 host_mac;		/* router (bridge) MAC; zero = inject all unicast */
+ 	int vp;			/* PPE port id, read by the ingress hook */
+ 	int refcnt;
++	int ds_node;
++	bool direct;
+ 	bool hook_registered;
+ 	bool poisoned;
+ 	bool miss_disabled;
+@@ -87,10 +89,11 @@ static const struct rhashtable_params pp
+  * of a virtual port. The field set mirrors the vendor driver's
+  * ppe_drv_port_alloc() for a wireless virtual port.
+  */
+-static int ppe_vp_hw_set(struct ppe_device *ppe_dev, int vp, bool active)
++static int ppe_vp_hw_set_queue(struct ppe_device *ppe_dev, int vp,
++			       bool active, int queue)
+ {
+ 	struct ppe_queue_ucast_dest queue_dst = {};
+-	int ret, res_start, res_end;
++	int ret;
+ 	u32 tbl[4] = {};
+ 	u32 reg;
+ 
+@@ -109,17 +112,11 @@ static int ppe_vp_hw_set(struct ppe_devi
+ 			 PPE_L2_VP_PORT_W1_CONTEXT_ACTIVE;
+ 	}
+ 
+-	/* Resolve and program the queue before exposing an active VP. */
+-	ret = ppe_port_resource_get(ppe_dev, PPE_VP_CPU_PORT, PPE_RES_UCAST,
+-				    &res_start, &res_end);
+-	if (ret)
+-		return ret;
+-
+ 	queue_dst.dest_port = vp;
+ 	reg = PPE_L2_VP_PORT_TBL_ADDR + PPE_L2_VP_PORT_TBL_INC * vp;
+ 
+ 	if (active) {
+-		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, res_start,
++		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
+ 					       EDMA_CPU_PORT_PROFILE_ID);
+ 		if (ret)
+ 			return ret;
+@@ -139,6 +136,18 @@ static int ppe_vp_hw_set(struct ppe_devi
+ 						EDMA_CPU_PORT_PROFILE_ID);
+ }
+ 
++static int ppe_vp_hw_set(struct ppe_device *ppe_dev, int vp, bool active)
++{
++	int queue, end, ret;
++
++	ret = ppe_port_resource_get(ppe_dev, PPE_VP_CPU_PORT, PPE_RES_UCAST,
++				    &queue, &end);
++	if (ret)
++		return ret;
++
++	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue);
++}
++
+ /* Netfilter ingress hook on a virtual port's bound device: offload the
+  * wireless->wired uplink. It runs on the receive path before the bridge,
+  * so it sees the frame with its L2 header already pulled and, for a routed
+@@ -339,6 +348,8 @@ static void ppe_vp_slot_release(struct p
+ 				PPE_VP_PORT_BASE + i, ret);
+ 	}
+ 	rcu_assign_pointer(vp->slots[i].dev, NULL);
++	vp->slots[i].direct = false;
++	vp->slots[i].ds_node = -1;
+ }
+ 
+ /**
+@@ -424,6 +435,75 @@ int ppe_vp_get(struct ppe_device *ppe_de
+ 	return PPE_VP_PORT_BASE + free;
+ }
+ 
++int ppe_vp_ds_attach(struct ppe_device *ppe_dev, struct net_device *dev,
++		     int queue, int node)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	int free = -1, i, ret;
++
++	if (!vp || queue < 0)
++		return -EINVAL;
++
++	mutex_lock(&vp->lock);
++	if (vp->inject_disabled) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++
++	for (i = 0; i < PPE_VP_SLOTS; i++) {
++		if (rcu_access_pointer(vp->slots[i].dev) == dev) {
++			if (!vp->slots[i].direct || vp->slots[i].ds_node != node) {
++				ret = -EBUSY;
++				goto out;
++			}
++			vp->slots[i].refcnt++;
++			ret = PPE_VP_PORT_BASE + i;
++			goto out;
++		}
++		if (free < 0 && !vp->slots[i].poisoned &&
++		    !rcu_access_pointer(vp->slots[i].dev) &&
++		    !vp->slots[i].refcnt)
++			free = i;
++	}
++	if (free < 0) {
++		ret = -ENOSPC;
++		goto out;
++	}
++
++	ret = ppe_vp_hw_set_queue(ppe_dev, PPE_VP_PORT_BASE + free, true,
++				      queue);
++	if (ret)
++		goto out;
++
++	vp->slots[free].refcnt = 1;
++	vp->slots[free].direct = true;
++	vp->slots[free].ds_node = node;
++	WRITE_ONCE(vp->slots[free].miss_disabled, false);
++	rcu_assign_pointer(vp->slots[free].dev, dev);
++	ret = PPE_VP_PORT_BASE + free;
++out:
++	mutex_unlock(&vp->lock);
++	if (ret >= PPE_VP_PORT_BASE)
++		ppe_flowtable_port_carrier(ppe_dev, ret, netif_carrier_ok(dev));
++	return ret;
++}
++
++void ppe_vp_ds_detach(struct ppe_device *ppe_dev, int port, int node)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	int i = port - PPE_VP_PORT_BASE;
++
++	if (!vp || i < 0 || i >= PPE_VP_SLOTS)
++		return;
++	mutex_lock(&vp->lock);
++	if (!vp->slots[i].direct || vp->slots[i].ds_node != node) {
++		mutex_unlock(&vp->lock);
++		return;
++	}
++	mutex_unlock(&vp->lock);
++	ppe_vp_put(ppe_dev, port);
++}
++
+ /**
+  * ppe_vp_put - Release a virtual port
+  * @ppe_dev: PPE device
+@@ -638,6 +718,7 @@ int ppe_vp_setup(struct ppe_device *ppe_
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+ 		ret = rhashtable_init(&vp->slots[i].flows,
+ 				      &ppe_vp_flow_params);
++		vp->slots[i].ds_node = -1;
+ 		if (ret)
+ 			goto err_flows;
+ 	}
+-- 
+2.43.0
