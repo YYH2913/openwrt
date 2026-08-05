@@ -1,0 +1,311 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 23:55:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: configure direct vport L3 interface
+
+The WLAN firmware sends packets from a PPE-routed peer directly into the
+PPE with the VAP virtual port as their source.  The direct virtual-port
+setup currently only programs the L2 VP row, queue and MTU.  Unlike the
+vendor setup, it leaves the source port without an L3 interface or port
+MAC, so non-flow traffic such as DHCP and ARP cannot reliably take the
+PPE exception path back to the host.
+
+Expose the flowtable's reserved L3-interface layout and configure the
+direct VP's dedicated interface during attach.  Bind it to the source
+port, enable IPv4 and IPv6 routing through the common L3 helper, and set
+the VAP MAC in the L3 VP port table without touching nonexistent VP MAC
+registers.
+
+Track the hardware lifetime so attach failures, netdevice removal and
+normal teardown clear the MAC, binding and L3 rows.  Attempt every cleanup
+operation, preserve the first error and quarantine a slot whose hardware
+could not be cleared.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c |  13 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h |   1 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c        | 155 ++++++++++++++++++++-
+ 3 files changed, 159 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -902,9 +902,10 @@
+ /* The egress L3 interface a virtual port owns; its region starts
+  * where the VLAN-uplink one ends.
+  */
+-static int ppe_ft_vp_l3_if(struct ppe_flowtable *ft, int vp)
++int ppe_flowtable_vp_l3_if(struct ppe_device *ppe_dev, int vp)
+ {
+-	return ppe_ft_vlan_l3_if(ft, PPE_L3_VLAN_UPLINKS) +
++	return ppe_dev->num_ports + PPE_FT_PPPOE_SESSIONS +
++	       PPE_L3_VLAN_UPLINKS +
+ 	       (vp - PPE_VP_PORT_BASE);
+ }
+ 
+@@ -2179,7 +2180,7 @@
+ 				goto err_prelock_ivp;
+ 			flow->vp = ret;
+ 			nh.port = ret;
+-			nh.l3_if = ppe_ft_vp_l3_if(ft, ret);
++			nh.l3_if = ppe_flowtable_vp_l3_if(ft->ppe_dev, ret);
+ 		}
+ 		flow->eport = nh.port;
+ 		ether_addr_copy(flow->dmac, data.eth.dst);
+@@ -3426,7 +3427,7 @@
+ {
+ 	struct net_device *ppp_dev;
+ 	struct ppe_flowtable *ft;
+-	int ret;
++	int vp_l3_end, ret;
+ 
+ 	ft = kzalloc(sizeof(*ft), GFP_KERNEL);
+ 	if (!ft)
+@@ -3438,8 +3439,8 @@
+ 	 * a runtime base (the port count); refuse a layout that would
+ 	 * overrun the interface tables.
+ 	 */
+-	if (WARN_ON(ppe_ft_vp_l3_if(ft, PPE_VP_PORT_BASE + PPE_VP_SLOTS) >
+-		    PPE_IN_L3_IF_TBL_ENTRIES)) {
++	vp_l3_end = ppe_flowtable_vp_l3_if(ppe_dev, PPE_VP_PORT_BASE + PPE_VP_SLOTS);
++	if (WARN_ON(vp_l3_end > PPE_IN_L3_IF_TBL_ENTRIES)) {
+ 		kfree(ft);
+ 		return -ERANGE;
+ 	}
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -15,6 +15,7 @@
+ void ppe_flowtable_destroy(struct ppe_device *ppe_dev);
+ int ppe_flowtable_setup_tc(struct net_device *dev, void *type_data);
+ void ppe_flowtable_debugfs_init(struct ppe_device *ppe_dev);
++int ppe_flowtable_vp_l3_if(struct ppe_device *ppe_dev, int vp);
+ void ppe_flowtable_port_carrier(struct ppe_device *ppe_dev, int port, bool up);
+ void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
+ 				      u8 profile, bool up, bool invalidate);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -49,6 +49,7 @@
+ #include "edma_tx.h"
+ #include "ppe.h"
+ #include "ppe_config.h"
++#include "ppe_flow.h"
+ #include "ppe_flowtable.h"
+ #include "ppe_regs.h"
+ #include "ppe_vp.h"
+@@ -83,6 +84,7 @@
+ 	bool hook_registered;
+ 	bool poisoned;
+ 	bool miss_disabled;
++	bool l3_configured;
+ };
+ 
+ struct ppe_vp {
+@@ -245,6 +247,112 @@
+ 				 ARRAY_SIZE(tbl));
+ }
+ 
++static int ppe_vp_hw_set_mac(struct ppe_device *ppe_dev, int vp,
++			     const u8 *addr, bool valid)
++{
++	u32 reg, port_cfg[4];
++	int ret;
++
++	reg = PPE_L3_VP_PORT_TBL_ADDR + PPE_L3_VP_PORT_TBL_INC * vp;
++	ret = regmap_bulk_read(ppe_dev->regmap, reg, port_cfg,
++			       ARRAY_SIZE(port_cfg));
++	if (ret)
++		return ret;
++
++	port_cfg[1] &= ~(PPE_L3_VP_PORT_W1_MAC_VALID |
++			 PPE_L3_VP_PORT_W1_MAC_DA_0);
++	port_cfg[2] = 0;
++	port_cfg[3] &= ~PPE_L3_VP_PORT_W3_MAC_DA_2;
++	if (valid) {
++		port_cfg[1] |= PPE_L3_VP_PORT_W1_MAC_VALID |
++			 FIELD_PREP(PPE_L3_VP_PORT_W1_MAC_DA_0,
++				    (addr[4] & 0x7f) << 8 | addr[5]);
++		port_cfg[2] = (u32)(addr[0] & 0x7f) << 25 |
++			      (u32)addr[1] << 17 | (u32)addr[2] << 9 |
++			      (u32)addr[3] << 1 | addr[4] >> 7;
++		port_cfg[3] |= FIELD_PREP(PPE_L3_VP_PORT_W3_MAC_DA_2,
++					  addr[0] >> 7);
++	}
++
++	return regmap_bulk_write(ppe_dev->regmap, reg, port_cfg,
++				 ARRAY_SIZE(port_cfg));
++}
++
++static int ppe_vp_l3_cleanup(struct ppe_device *ppe_dev,
++			     struct ppe_vp_slot *slot, int vp)
++{
++	int l3_if, ret = 0, err;
++
++	if (!slot->l3_configured)
++		return 0;
++
++	l3_if = ppe_flowtable_vp_l3_if(ppe_dev, vp);
++	err = ppe_vp_hw_set_mac(ppe_dev, vp, NULL, false);
++	if (!ret)
++		ret = err;
++	err = ppe_port_l3_if_set(ppe_dev, vp, -1);
++	if (!ret)
++		ret = err;
++	err = ppe_l3_if_clear(ppe_dev, l3_if);
++	if (!ret)
++		ret = err;
++
++	if (ret)
++		slot->poisoned = true;
++	else
++		slot->l3_configured = false;
++
++	return ret;
++}
++
++static int ppe_vp_l3_configure(struct ppe_device *ppe_dev,
++			       struct ppe_vp_slot *slot,
++			       struct net_device *dev, int vp)
++{
++	int l3_if = ppe_flowtable_vp_l3_if(ppe_dev, vp);
++	int ret, err;
++
++	/* Mark cleanup necessary before the first multi-register operation. */
++	slot->l3_configured = true;
++	ret = ppe_l3_if_set(ppe_dev, l3_if, dev->dev_addr, dev->mtu, -1);
++	if (ret)
++		goto rollback;
++
++	ret = ppe_port_l3_if_set(ppe_dev, vp, l3_if);
++	if (ret)
++		goto rollback;
++
++	ret = ppe_vp_hw_set_mac(ppe_dev, vp, dev->dev_addr, true);
++	if (!ret)
++		return 0;
++
++rollback:
++	err = ppe_vp_l3_cleanup(ppe_dev, slot, vp);
++	if (err)
++		dev_err(ppe_dev->dev,
++			"failed to roll back VP %d L3 interface, quarantining slot: %d\n",
++			vp, err);
++	return ret;
++}
++
++static int ppe_vp_l3_update(struct ppe_device *ppe_dev,
++			    struct ppe_vp_slot *slot,
++			    struct net_device *dev, int vp)
++{
++	int ret;
++
++	if (!slot->l3_configured)
++		return 0;
++
++	ret = ppe_l3_if_set(ppe_dev,
++			    ppe_flowtable_vp_l3_if(ppe_dev, vp),
++			    dev->dev_addr, dev->mtu, -1);
++	if (ret)
++		return ret;
++
++	return ppe_vp_hw_set_mac(ppe_dev, vp, dev->dev_addr, true);
++}
++
+ static void ppe_vp_hw_rollback(struct ppe_device *ppe_dev,
+ 			       struct ppe_vp_slot *slot, int vp)
+ {
+@@ -451,6 +559,12 @@
+ 			"failed to disable VP %d, quarantining slot: %d\n",
+ 			PPE_VP_PORT_BASE + i, ret);
+ 	}
++	ret = ppe_vp_l3_cleanup(ppe_dev, &vp->slots[i],
++				PPE_VP_PORT_BASE + i);
++	if (ret)
++		dev_err(ppe_dev->dev,
++			"failed to clean VP %d L3 interface, quarantining slot: %d\n",
++			PPE_VP_PORT_BASE + i, ret);
+ 	ppe_vp_ds_peers_purge(vp, PPE_VP_PORT_BASE + i,
+ 			      PPE_VP_DS_NODE_NONE);
+ 	rcu_assign_pointer(vp->slots[i].dev, NULL);
+@@ -623,6 +737,13 @@
+ 				   PPE_VP_PORT_BASE + free);
+ 		goto out;
+ 	}
++	ret = ppe_vp_l3_configure(ppe_dev, &vp->slots[free], dev,
++				  PPE_VP_PORT_BASE + free);
++	if (ret) {
++		ppe_vp_hw_rollback(ppe_dev, &vp->slots[free],
++				   PPE_VP_PORT_BASE + free);
++		goto out;
++	}
+ 
+ 	vp->slots[free].refcnt = 1;
+ 	vp->slots[free].direct = true;
+@@ -936,6 +1057,7 @@
+ {
+ 	struct ppe_vp *vpt = ppe_dev->vp;
+ 	int i = vp - PPE_VP_PORT_BASE;
++	int ret;
+ 
+ 	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
+ 		return;
+@@ -952,9 +1074,14 @@
+ 		return;
+ 	}
+ 
+-	if (rcu_access_pointer(vpt->slots[i].dev))
++	if (rcu_access_pointer(vpt->slots[i].dev)) {
+ 		ppe_vp_slot_release(ppe_dev, vpt, i);
+-	else {
++	} else {
++		ret = ppe_vp_l3_cleanup(ppe_dev, &vpt->slots[i], vp);
++		if (ret)
++			dev_err(ppe_dev->dev,
++				"failed to clean VP %d L3 interface, quarantining slot: %d\n",
++				vp, ret);
+ 		memset(vpt->slots[i].ds_node_refs, 0,
+ 		       sizeof(vpt->slots[i].ds_node_refs));
+ 		vpt->slots[i].direct = false;
+@@ -1115,6 +1242,17 @@
+ 			cleared = true;
+ 			carrier = PPE_VP_PORT_BASE + i;
+ 		} else {
++			if ((event == NETDEV_CHANGEMTU ||
++			     event == NETDEV_CHANGEADDR) &&
++			    vp->slots[i].l3_configured) {
++				ret = ppe_vp_l3_update(vp->ppe_dev,
++						       &vp->slots[i], dev,
++						       PPE_VP_PORT_BASE + i);
++				if (ret)
++					netdev_warn(dev,
++						    "failed to update PPE VP L3 interface: %d\n",
++						    ret);
++			}
+ 			if (event == NETDEV_CHANGEMTU) {
+ 				ret = ppe_vp_hw_set_mtu(vp->ppe_dev,
+ 						    PPE_VP_PORT_BASE + i, dev->mtu);
+@@ -1222,11 +1360,20 @@
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+ 		struct net_device *dev = rcu_access_pointer(vp->slots[i].dev);
+ 
+-		if (dev)
++		if (dev) {
+ 			ppe_vp_slot_release(ppe_dev, vp, i);
+-		else
++		} else {
++			int ret;
++
++			ret = ppe_vp_l3_cleanup(ppe_dev, &vp->slots[i],
++						PPE_VP_PORT_BASE + i);
++			if (ret)
++				dev_err(ppe_dev->dev,
++					"failed to clean VP %d L3 interface during teardown: %d\n",
++					PPE_VP_PORT_BASE + i, ret);
+ 			ppe_vp_ds_peers_purge(vp, PPE_VP_PORT_BASE + i,
+ 					      PPE_VP_DS_NODE_NONE);
++		}
+ 	}
+ 	mutex_unlock(&vp->lock);
+ 
+-- 
+2.43.0
