@@ -1,0 +1,406 @@
+From: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Date: Thu, 12 Jun 2025 00:29:11 -0700
+Subject: [PATCH] wifi: ath12k: harden PPE direct-switch lifecycle
+
+Use a wildcard PMAC and a bank with vdev-id checking disabled when a
+split-PHY virtual interface shares a PPE VP.  Keep the bank reference in
+the VP profile, restore PPE routing registers after UMAC reset, and
+reprogram existing VP entries as vdevs restart.  Only the associated STA
+link owns the shared AST search entry.
+
+Based-on: cc51c4d638df1d1ab4d1e90c957f4c588e57d577
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0348-QSDK-DP-wifi-ath12k-Enable-UMAC-reset-support-for-DS-mode.patch
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/b75a2535c456c487835fd924d088082d1e74d596
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Signed-off-by: Ramya Gnanasekar <quic_rgnanase@qti.qualcomm.com>
+Signed-off-by: Balamurugan S <quic_bselvara@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: syed touqeer pasha <spasha@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 36 ++++++-
+ drivers/net/wireless/ath/ath12k/dp.h    |  1 +
+ drivers/net/wireless/ath/ath12k/dp_tx.h |  5 ++
+ drivers/net/wireless/ath/ath12k/ppe.c   | 153 ++++++++++++++++++++++++++++---
+ 4 files changed, 173 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -402,18 +402,14 @@ static u32 ath12k_dp_tx_get_vdev_bank_co
+ 	return bank_config;
+ }
+ 
+-static int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab,
+-					 struct ath12k_link_vif *arvif,
+-					 struct ath12k_dp *dp)
++static int ath12k_dp_tx_get_bank_profile_config(struct ath12k_base *ab,
++						 struct ath12k_dp *dp,
++						 u32 bank_config)
+ {
+ 	int bank_id = DP_INVALID_BANK_ID;
+ 	int i;
+-	u32 bank_config;
+ 	bool configure_register = false;
+ 
+-	/* convert vdev params into hal_tx_bank_config */
+-	bank_config = ath12k_dp_tx_get_vdev_bank_config(ab, arvif);
+-
+ 	spin_lock_bh(&dp->tx_bank_lock);
+ 	/* TODO: implement using idr kernel framework*/
+ 	for (i = 0; i < dp->num_bank_profiles; i++) {
+@@ -453,10 +449,34 @@ inc_ref_and_return:
+ 	return bank_id;
+ }
+ 
++static int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab,
++					 struct ath12k_link_vif *arvif,
++					 struct ath12k_dp *dp)
++{
++	return ath12k_dp_tx_get_bank_profile_config(ab, dp,
++			ath12k_dp_tx_get_vdev_bank_config(ab, arvif));
++}
++
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++int ath12k_dp_tx_get_ppe_ds_bank_profile(struct ath12k_base *ab,
++					  struct ath12k_link_vif *arvif,
++					  struct ath12k_dp *dp)
++{
++	u32 bank_config;
++
++	bank_config = ath12k_dp_tx_get_vdev_bank_config(ab, arvif);
++	bank_config &= ~HAL_TX_BANK_CONFIG_VDEV_ID_CHECK_EN;
++
++	return ath12k_dp_tx_get_bank_profile_config(ab, dp, bank_config);
++}
++#endif
++
+ void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id)
+ {
+ 	spin_lock_bh(&dp->tx_bank_lock);
+-	dp->bank_profiles[bank_id].num_users--;
++	if (bank_id < dp->num_bank_profiles &&
++	    dp->bank_profiles[bank_id].num_users)
++		dp->bank_profiles[bank_id].num_users--;
+ 	spin_unlock_bh(&dp->tx_bank_lock);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -373,6 +373,7 @@ struct ath12k_ppe_ds_vp_profile {
+ struct ath12k_ppe_ds_vp_profile {
+ 	int vp;
+ 	int search_idx;
++	int bank_id;
+ 	u32 refcount;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -33,6 +33,11 @@ int ath12k_dp_tx_htt_rx_filter_setup(str
+ 				     int rx_buf_size,
+ 				     struct htt_rx_ring_tlv_filter *tlv_filter);
+ void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++int ath12k_dp_tx_get_ppe_ds_bank_profile(struct ath12k_base *ab,
++					  struct ath12k_link_vif *arvif,
++					  struct ath12k_dp *dp);
++#endif
+ int ath12k_dp_tx_htt_tx_filter_setup(struct ath12k_base *ab, u32 ring_id,
+ 				     int mac_id, enum hal_ring_type ring_type,
+ 				     int tx_buf_size,
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -7,6 +7,7 @@
+ 
+ #include "core.h"
+ #include "debug.h"
++#include "dp_tx.h"
+ #include "hal.h"
+ #include "hal_rx.h"
+ #include "hif.h"
+@@ -23,6 +24,7 @@
+ #define ATH12K_PPE_VP_BANK_ID		GENMASK(15, 10)
+ #define ATH12K_PPE_VP_VDEV_ID		GENMASK(23, 16)
+ #define ATH12K_PPE_VP_SEARCH_IDX	GENMASK(26, 24)
++#define ATH12K_PPE_VP_WILDCARD_PMAC_ID	3
+ 
+ #define ATH12K_PPE_SEARCH_TABLE_SIZE	8
+ #define ATH12K_PPE_SEARCH_TABLE_BASE	(HAL_SEQ_WCSS_UMAC_TCL_REG + 0x214)
+@@ -134,6 +136,11 @@ static int ath12k_ppe_ds_tx_desc_init(st
+ 	INIT_LIST_HEAD(&ppe->tx_desc_free_list);
+ 	spin_lock_init(&ppe->tx_desc_lock);
+ 	spin_lock_init(&ppe->vp_lock);
++	for (i = 0; i < ATH12K_PPE_DS_VP_PROFILES; i++) {
++		ppe->vp_profiles[i].vp = -1;
++		ppe->vp_profiles[i].search_idx = -1;
++		ppe->vp_profiles[i].bank_id = DP_INVALID_BANK_ID;
++	}
+ 
+ 	ppe->tx_desc_pages = kcalloc(DP_PPE_DS_TX_SPT_PAGES,
+ 				     sizeof(*ppe->tx_desc_pages), GFP_KERNEL);
+@@ -511,6 +518,7 @@ int ath12k_ppe_ds_start(struct ath12k_ba
+ 	if (!ppe->registered || ppe->started)
+ 		return 0;
+ 
++	ath12k_ppe_ds_hw_config(ab);
+ 	WRITE_ONCE(ppe->quiesced, false);
+ 	ret = qcom_ppe_ds_start(ppe->node);
+ 	if (ret) {
+@@ -657,7 +665,8 @@ static void ath12k_ppe_ds_vp_write(struc
+ 
+ static int
+ ath12k_ppe_ds_vp_profile_alloc(struct ath12k_ppe_ds *ppe, int vp,
+-			       enum nl80211_iftype type, int *search_idx)
++			       enum nl80211_iftype type, int *search_idx,
++			       u32 *refcount)
+ {
+ 	struct ath12k_ppe_ds_vp_profile *profile;
+ 	int i, idx;
+@@ -669,6 +678,7 @@ ath12k_ppe_ds_vp_profile_alloc(struct at
+ 		if (profile->vp != vp)
+ 			continue;
+ 		profile->refcount++;
++		*refcount = profile->refcount;
+ 		*search_idx = max(profile->search_idx, 0);
+ 		spin_unlock_bh(&ppe->vp_lock);
+ 		return i;
+@@ -696,14 +706,55 @@ ath12k_ppe_ds_vp_profile_alloc(struct at
+ 	profile = &ppe->vp_profiles[idx];
+ 	profile->vp = vp;
+ 	profile->search_idx = type == NL80211_IFTYPE_STATION ? *search_idx : -1;
++	profile->bank_id = DP_INVALID_BANK_ID;
+ 	profile->refcount = 1;
++	*refcount = 1;
+ 	spin_unlock_bh(&ppe->vp_lock);
+ 	return idx;
+ }
+ 
++static int
++ath12k_ppe_ds_vp_shared_bank(struct ath12k_link_vif *arvif, int idx)
++{
++	struct ath12k_base *ab = arvif->ar->ab;
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	struct ath12k_ppe_ds_vp_profile *profile;
++	int allocated, bank_id, vp;
++
++	spin_lock_bh(&ppe->vp_lock);
++	profile = &ppe->vp_profiles[idx];
++	vp = profile->vp;
++	bank_id = profile->bank_id;
++	spin_unlock_bh(&ppe->vp_lock);
++	if (vp != arvif->ppe_vp)
++		return -ENOENT;
++	if (bank_id != DP_INVALID_BANK_ID)
++		return bank_id;
++
++	allocated = ath12k_dp_tx_get_ppe_ds_bank_profile(ab, arvif, &ab->dp);
++	if (allocated == DP_INVALID_BANK_ID)
++		return allocated;
++
++	spin_lock_bh(&ppe->vp_lock);
++	if (!test_bit(idx, &ppe->vp_profile_map) || profile->vp != vp) {
++		bank_id = DP_INVALID_BANK_ID;
++	} else if (profile->bank_id == DP_INVALID_BANK_ID) {
++		profile->bank_id = allocated;
++		bank_id = allocated;
++		allocated = DP_INVALID_BANK_ID;
++	} else {
++		bank_id = profile->bank_id;
++	}
++	spin_unlock_bh(&ppe->vp_lock);
++
++	if (allocated != DP_INVALID_BANK_ID)
++		ath12k_dp_tx_put_bank_profile(&ab->dp, allocated);
++	return bank_id;
++}
++
+ static bool
+ ath12k_ppe_ds_vp_profile_put(struct ath12k_ppe_ds *ppe, int idx,
+-			     int *search_idx)
++			     int *search_idx, int *bank_id)
+ {
+ 	struct ath12k_ppe_ds_vp_profile *profile;
+ 	bool last = false;
+@@ -716,30 +767,78 @@ ath12k_ppe_ds_vp_profile_put(struct ath1
+ 		goto out;
+ 
+ 	profile = &ppe->vp_profiles[idx];
++	if (!profile->refcount)
++		goto out;
+ 	if (--profile->refcount)
+ 		goto out;
+ 
+ 	*search_idx = profile->search_idx;
++	*bank_id = profile->bank_id;
+ 	if (*search_idx >= 0 && *search_idx < ATH12K_PPE_SEARCH_TABLE_SIZE)
+ 		__clear_bit(*search_idx, &ppe->search_idx_map);
+ 	__clear_bit(idx, &ppe->vp_profile_map);
+ 	profile->vp = -1;
+ 	profile->search_idx = -1;
++	profile->bank_id = DP_INVALID_BANK_ID;
+ 	last = true;
+ out:
+ 	spin_unlock_bh(&ppe->vp_lock);
+ 	return last;
+ }
+ 
++static int ath12k_ppe_ds_vif_program(struct ath12k_link_vif *arvif)
++{
++	struct ath12k_base *ab = arvif->ar->ab;
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	struct ath12k_ppe_ds_vp_profile *profile;
++	u32 config, refcount;
++	int bank_id;
++	u8 pmac_id;
++
++	if (arvif->ppe_vp_profile < 0 ||
++	    arvif->ppe_vp_profile >= ATH12K_PPE_DS_VP_PROFILES)
++		return -EINVAL;
++
++	spin_lock_bh(&ppe->vp_lock);
++	if (!test_bit(arvif->ppe_vp_profile, &ppe->vp_profile_map)) {
++		spin_unlock_bh(&ppe->vp_lock);
++		return -ENOENT;
++	}
++	profile = &ppe->vp_profiles[arvif->ppe_vp_profile];
++	refcount = profile->refcount;
++	bank_id = profile->bank_id;
++	spin_unlock_bh(&ppe->vp_lock);
++
++	pmac_id = arvif->ar->lmac_id;
++	if (refcount > 1) {
++		if (bank_id == DP_INVALID_BANK_ID)
++			return -EINVAL;
++		pmac_id = ATH12K_PPE_VP_WILDCARD_PMAC_ID;
++	} else {
++		bank_id = arvif->bank_id;
++	}
++
++	config = u32_encode_bits(arvif->ppe_vp, ATH12K_PPE_VP_NUM) |
++		 u32_encode_bits(pmac_id, ATH12K_PPE_VP_PMAC_ID) |
++		 u32_encode_bits(bank_id, ATH12K_PPE_VP_BANK_ID) |
++		 u32_encode_bits(arvif->vdev_id, ATH12K_PPE_VP_VDEV_ID) |
++		 u32_encode_bits(arvif->ppe_search_idx,
++				 ATH12K_PPE_VP_SEARCH_IDX);
++	ath12k_ppe_ds_vp_write(arvif, arvif->ppe_vp_profile, config);
++	return 0;
++}
++
+ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+ {
+ 	struct ath12k_base *ab = arvif->ar->ab;
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
+ 	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
+-	u32 config = 0;
++	u32 refcount;
++	int bank_id = DP_INVALID_BANK_ID;
++	int released_search = -1, released_bank = DP_INVALID_BANK_ID;
+ 	int profile, search_idx;
+-	int vp;
++	int ret, vp;
+ 
+ 	if (!ppe->started || !wdev || !wdev->netdev)
+ 		return 0;
+@@ -747,14 +846,14 @@ int ath12k_ppe_ds_vif_attach(struct ath1
+ 	    vif->type != NL80211_IFTYPE_STATION)
+ 		return 0;
+ 	if (arvif->ppe_vp >= 64)
+-		return 0;
++		return ath12k_ppe_ds_vif_program(arvif);
+ 
+ 	vp = qcom_ppe_ds_vp_alloc(ppe->node, wdev->netdev);
+ 	if (vp < 0)
+ 		return vp;
+ 
+ 	profile = ath12k_ppe_ds_vp_profile_alloc(ppe, vp, vif->type,
+-						 &search_idx);
++						 &search_idx, &refcount);
+ 	if (profile < 0) {
+ 		qcom_ppe_ds_vp_free(ppe->node, vp);
+ 		return profile;
+@@ -763,13 +862,34 @@ int ath12k_ppe_ds_vif_attach(struct ath1
+ 	arvif->ppe_vp = vp;
+ 	arvif->ppe_vp_profile = profile;
+ 	arvif->ppe_search_idx = search_idx;
+-	config |= u32_encode_bits(vp, ATH12K_PPE_VP_NUM) |
+-		  u32_encode_bits(arvif->ar->lmac_id, ATH12K_PPE_VP_PMAC_ID) |
+-		  u32_encode_bits(arvif->bank_id, ATH12K_PPE_VP_BANK_ID) |
+-		  u32_encode_bits(arvif->vdev_id, ATH12K_PPE_VP_VDEV_ID) |
+-		  u32_encode_bits(search_idx, ATH12K_PPE_VP_SEARCH_IDX);
+-	ath12k_ppe_ds_vp_write(arvif, profile, config);
++	if (refcount > 1) {
++		bank_id = ath12k_ppe_ds_vp_shared_bank(arvif, profile);
++		if (bank_id == DP_INVALID_BANK_ID) {
++			ret = -ENOSPC;
++			goto err_profile;
++		}
++	}
++
++	ret = ath12k_ppe_ds_vif_program(arvif);
++	if (ret)
++		goto err_profile;
++
++	ath12k_info(ab,
++		    "PPE direct-switch vdev %u attached: netdev=%s vp=%d profile=%d bank=%d refs=%u\n",
++		    arvif->vdev_id, wdev->netdev->name, vp, profile,
++		    refcount > 1 ? bank_id : arvif->bank_id, refcount);
+ 	return 0;
++
++err_profile:
++	ath12k_ppe_ds_vp_profile_put(ppe, profile, &released_search,
++				     &released_bank);
++	if (released_bank != DP_INVALID_BANK_ID)
++		ath12k_dp_tx_put_bank_profile(&ab->dp, released_bank);
++	qcom_ppe_ds_vp_free(ppe->node, vp);
++	arvif->ppe_vp = -1;
++	arvif->ppe_vp_profile = -1;
++	arvif->ppe_search_idx = -1;
++	return ret;
+ }
+ 
+ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
+@@ -778,6 +898,7 @@ void ath12k_ppe_ds_vif_detach(struct ath
+ 	struct ath12k_ppe_ds *ppe;
+ 	struct ieee80211_vif *vif;
+ 	int search_idx = -1;
++	int bank_id = DP_INVALID_BANK_ID;
+ 	bool last;
+ 
+ 	if (!arvif || !arvif->ar || arvif->ppe_vp < 64)
+@@ -788,13 +909,15 @@ void ath12k_ppe_ds_vif_detach(struct ath
+ 
+ 	qcom_ppe_ds_vp_free(ppe->node, arvif->ppe_vp);
+ 	last = ath12k_ppe_ds_vp_profile_put(ppe, arvif->ppe_vp_profile,
+-					 &search_idx);
++					 &search_idx, &bank_id);
+ 	if (last)
+ 		ath12k_ppe_ds_vp_write(arvif, arvif->ppe_vp_profile, 0);
+ 	if (last && vif->type == NL80211_IFTYPE_STATION) {
+ 		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
+ 				   search_idx * 4, 0);
+ 	}
++	if (last && bank_id != DP_INVALID_BANK_ID)
++		ath12k_dp_tx_put_bank_profile(&ab->dp, bank_id);
+ 	arvif->ppe_vp = -1;
+ 	arvif->ppe_vp_profile = -1;
+ 	arvif->ppe_search_idx = -1;
+@@ -806,12 +929,14 @@ void ath12k_ppe_ds_peer_route(struct ath
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
++	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
+ 	u32 map = 0;
+ 
+ 	if (!ab->dp.ppe_ds.started || arvif->ppe_vp < 64)
+ 		return;
+ 
+-	if (vif->type == NL80211_IFTYPE_STATION) {
++	if (vif->type == NL80211_IFTYPE_STATION &&
++	    (!sta->mlo || arsta->is_assoc_link)) {
+ 		if (enable)
+ 			map = u32_encode_bits(arvif->ast_idx,
+ 					      ATH12K_PPE_SEARCH_AST_IDX) |
+-- 
+2.43.0
