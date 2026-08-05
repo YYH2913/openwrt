@@ -1,0 +1,255 @@
+#!/bin/sh
+
+usage()
+{
+	printf 'Usage: %s [duration-seconds [interval-seconds [station-mac]]]\n' "$0" >&2
+	exit 2
+}
+
+is_uint()
+{
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+show_file()
+{
+	local label="$1"
+	local file="$2"
+
+	printf '\n-- %s --\n' "$label"
+	if [ -r "$file" ]; then
+		cat "$file" 2>&1
+	else
+		printf 'unavailable: %s\n' "$file"
+	fi
+}
+
+show_iw()
+{
+	local dev iw_output
+
+	if ! command -v iw >/dev/null 2>&1; then
+		printf '\nunavailable: iw\n'
+		return
+	fi
+
+	iw_output=$(iw dev 2>&1)
+	printf '\n-- iw dev --\n%s\n' "$iw_output"
+	printf '%s\n' "$iw_output" | awk '$1 == "Interface" { print $2 }' |
+	while read -r dev; do
+		[ -n "$dev" ] || continue
+		printf '\n-- iw %s station --\n' "$dev"
+		if [ -n "$station_mac" ]; then
+			iw dev "$dev" station get "$station_mac" 2>&1
+		else
+			iw dev "$dev" station dump 2>&1
+		fi
+	done
+}
+
+show_hostapd()
+{
+	local object
+
+	command -v ubus >/dev/null 2>&1 || return
+	for object in $(ubus -S list 'hostapd.*' 2>/dev/null); do
+		case "$object" in
+		hostapd.*)
+			printf '\n-- %s get_clients --\n' "$object"
+			ubus -S call "$object" get_clients 2>&1
+			;;
+		esac
+	done
+}
+
+show_opmode_events()
+{
+	printf '\n-- hostapd station opmode events --\n'
+	if ! command -v logread >/dev/null 2>&1; then
+		printf 'unavailable: logread\n'
+		return
+	fi
+
+	if [ -n "$station_mac" ]; then
+		logread 2>&1 | grep 'STA-OPMODE-' |
+			grep -i "$station_mac" | tail -100
+	else
+		logread 2>&1 | grep 'STA-OPMODE-' | tail -100
+	fi
+}
+
+show_link_state()
+{
+	local path station
+
+	for path in /sys/kernel/debug/ieee80211/*/netdev:*/stations/*; do
+		[ -d "$path" ] || continue
+		station=${path##*/}
+		if [ -n "$station_mac" ] && [ "$station" != "$station_mac" ]; then
+			continue
+		fi
+		show_file "mac80211 $station link_state" "$path/link_state"
+		if [ "$sample" -eq 1 ]; then
+			show_file "mac80211 $station eht_capa" "$path/eht_capa"
+		fi
+	done
+}
+
+show_htt_nss_delta()
+{
+	local before="$1"
+	local after="$2"
+
+	[ -r "$before" ] && [ -r "$after" ] || return
+
+	awk '
+	function sample(wanted,    i, field) {
+		for (i = 3; i <= NF; i++) {
+			split($i, field, ":")
+			if (field[1] == wanted)
+				return field[2] + 0
+		}
+		return 0
+	}
+	function result(name, tried, failed) {
+		printf "%-10s tried=%u failed=%u", name, tried, failed
+		if (tried)
+			printf " failure_pct=%.2f\n", failed * 100 / tried
+		else
+			printf " failure_pct=n/a\n"
+	}
+	FNR == 1 { file++ }
+	$1 == "ppdus_tried_su" || $1 == "ppdus_ack_failed_su" ||
+	$1 == "mpdus_tried_su" || $1 == "mpdus_failed_su" {
+		seen[file, $1]++
+		# Type 40 prints bandwidth, NSS and MCS sections in that order.
+		if (seen[file, $1] == 2) {
+			value[file, $1, 1] = sample(1)
+			value[file, $1, 2] = sample(2)
+		}
+	}
+	END {
+		p1t = value[2, "ppdus_tried_su", 1] - value[1, "ppdus_tried_su", 1]
+		p1f = value[2, "ppdus_ack_failed_su", 1] - value[1, "ppdus_ack_failed_su", 1]
+		p2t = value[2, "ppdus_tried_su", 2] - value[1, "ppdus_tried_su", 2]
+		p2f = value[2, "ppdus_ack_failed_su", 2] - value[1, "ppdus_ack_failed_su", 2]
+		m1t = value[2, "mpdus_tried_su", 1] - value[1, "mpdus_tried_su", 1]
+		m1f = value[2, "mpdus_failed_su", 1] - value[1, "mpdus_failed_su", 1]
+		m2t = value[2, "mpdus_tried_su", 2] - value[1, "mpdus_tried_su", 2]
+		m2f = value[2, "mpdus_failed_su", 2] - value[1, "mpdus_failed_su", 2]
+
+		if (p1t < 0 || p1f < 0 || p2t < 0 || p2f < 0 ||
+		    m1t < 0 || m1f < 0 || m2t < 0 || m2f < 0) {
+			print "unavailable: firmware counters reset during capture"
+			exit
+		}
+
+		result("PPDU-1SS", p1t, p1f)
+		result("PPDU-2SS", p2t, p2f)
+		result("MPDU-1SS", m1t, m1f)
+		result("MPDU-2SS", m2t, m2f)
+	}' "$before" "$after"
+}
+
+show_ath12k_htt_stats()
+{
+	local phase="$1"
+	local path type old_type output radio=0
+
+	for path in /sys/kernel/debug/ath12k/*/mac*; do
+		[ -r "$path/htt_stats" ] && [ -w "$path/htt_stats_type" ] || continue
+		radio=$((radio + 1))
+		old_type=$(cat "$path/htt_stats_type" 2>/dev/null)
+
+		for type in 9 31 40; do
+			output="$htt_tmp.$radio.$type.$phase"
+			if ! printf '%s\n' "$type" >"$path/htt_stats_type" 2>/dev/null ||
+			   ! cat "$path/htt_stats" >"$output" 2>&1; then
+				printf '\n-- ath12k %s type %s (%s) --\nunavailable\n' \
+					"${path#/sys/kernel/debug/ath12k/}" "$type" "$phase"
+				continue
+			fi
+
+			printf '\n-- ath12k %s type %s (%s) --\n' \
+				"${path#/sys/kernel/debug/ath12k/}" "$type" "$phase"
+			case "$type" in
+			9)
+				grep -E '^(HTT_TX_PDEV_RATE_STATS_TLV:|tx_(mcs|nss|bw) =)' \
+					"$output"
+				;;
+			31)
+				grep -E '^(HTT_STATS_PDEV_TX_RATE_TXBF_STATS:|tx_txbf_(mcs|nss|bw) =)' \
+					"$output"
+				;;
+			40)
+				grep -E '^(HTT_TX_PER_STATS:|ppdus_(tried|ack_failed)_su =|mpdus_(tried|failed)_su =)' \
+					"$output"
+				if [ "$phase" = after ]; then
+					printf '\n-- ath12k %s NSS delta --\n' \
+						"${path#/sys/kernel/debug/ath12k/}"
+					show_htt_nss_delta "$htt_tmp.$radio.$type.before" "$output"
+				fi
+				;;
+			esac
+		done
+
+		case "$old_type" in
+		''|*[!0-9]*) ;;
+		*) printf '%s\n' "$old_type" >"$path/htt_stats_type" 2>/dev/null ;;
+		esac
+	done
+}
+
+duration=${1:-30}
+interval=${2:-1}
+station_mac=${3:-}
+
+is_uint "$duration" || usage
+is_uint "$interval" || usage
+[ "$duration" -gt 0 ] || usage
+[ "$interval" -gt 0 ] || usage
+[ "$#" -le 3 ] || usage
+
+if ! grep -qs ' /sys/kernel/debug debugfs ' /proc/mounts; then
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+fi
+
+htt_tmp="/tmp/wifi-rate-diag.$$"
+trap 'rm -f "$htt_tmp".*' EXIT INT TERM
+
+start=$(date +%s)
+end=$((start + duration))
+sample=0
+
+printf 'wifi-rate-diag duration=%s interval=%s station=%s\n' \
+	"$duration" "$interval" "${station_mac:-all}"
+
+while :; do
+	now=$(date +%s)
+	sample=$((sample + 1))
+	printf '\n=== SAMPLE %u epoch=%s elapsed=%s ===\n' \
+		"$sample" "$now" "$((now - start))"
+
+	show_iw
+	show_hostapd
+	show_link_state
+	if [ "$sample" -eq 1 ] || [ "$now" -ge "$end" ]; then
+		show_opmode_events
+		if [ "$sample" -eq 1 ]; then
+			show_ath12k_htt_stats before
+		else
+			show_ath12k_htt_stats after
+		fi
+	fi
+	show_file ppe_direct_switch /sys/kernel/debug/ppe/direct_switch
+	show_file ppe_virtual_ports /sys/kernel/debug/ppe/virtual_ports
+	show_file ppe_flows /sys/kernel/debug/ppe/flows
+	show_file proc_stat /proc/stat
+	show_file softirqs /proc/softirqs
+
+	[ "$now" -ge "$end" ] && break
+	sleep "$interval"
+done
