@@ -1,0 +1,39 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: ath12k: clean up PPE TX descriptors on init failure
+
+The PPE descriptor pool is allocated one page at a time.  If a later page
+allocation fails, the partially initialized pool was returned to the caller
+without releasing the earlier pages.  Recovery and repeated probe attempts
+could therefore leak the pool until the device ran out of memory.
+
+Use the normal descriptor cleanup path for the partial allocation and keep
+the failure path idempotent for the caller's subsequent cleanup.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -182,6 +182,8 @@ static void ath12k_ppe_ds_tx_desc_comple
+ 	spin_unlock_bh(&ppe->tx_desc_lock);
+ }
+ 
++static void ath12k_ppe_ds_tx_desc_cleanup(struct ath12k_base *ab);
++
+ static int ath12k_ppe_ds_tx_desc_init(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+@@ -211,7 +213,9 @@ static int ath12k_ppe_ds_tx_desc_init(st
+ 	for (i = 0; i < DP_PPE_DS_TX_SPT_PAGES; i++) {
+ 		descs = kcalloc(ATH12K_MAX_SPT_ENTRIES, sizeof(*descs),
+ 				GFP_KERNEL);
+-		if (!descs)
++		if (!descs) {
++			ath12k_ppe_ds_tx_desc_cleanup(ab);
+ 			return -ENOMEM;
++		}
+ 
+ 		ppe->tx_desc_pages[i] = descs;
