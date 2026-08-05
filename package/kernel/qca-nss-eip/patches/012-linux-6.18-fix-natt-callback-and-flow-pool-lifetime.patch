@@ -1,0 +1,114 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 15:10:00 +0800
+Subject: [PATCH] qca-nss-eip: fix NAT-T callback and flow pool lifetime
+
+The NAT-T callback was sampled before taking the socket-state lock.  A
+concurrent final SA release could restore the socket between that sample
+and the list lookup, leaving the callback and saved state from different
+generations.  Serialize the callback sample with the state list, reject an
+orphaned EIP callback, and prevent the shared-state user count from
+wrapping.
+
+The EIP197 flow table allocates the primary and collision tables as one
+coherent DMA region, but deinitialization only passed the primary table
+size to dma_free_coherent().  Record the complete allocation size, as the
+newer EIP197 v2 implementation already does, and use it for allocation,
+initialization, and release.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_proto.c
++++ b/clients/ipsec/eip_ipsec_proto.c
+@@ -562,7 +562,6 @@ bool eip_ipsec_proto_udp_sock_override(s
+ 		       up, up->encap_type);
+ 		return false;
+ 	}
+-	orig_encap_rcv = READ_ONCE(up->encap_rcv);
+ 	rcu_read_unlock();
+ 
+ 	new_state = kzalloc(sizeof(*new_state), GFP_KERNEL);
+@@ -572,18 +571,32 @@ bool eip_ipsec_proto_udp_sock_override(s
+ 	}
+ 	INIT_LIST_HEAD(&new_state->node);
+ 	new_state->sk = sk;
+-	new_state->orig_encap_rcv = orig_encap_rcv;
+ 	new_state->users = 1;
+ 
+ 	spin_lock_bh(&eip_udp_socks_lock);
+ 	list_for_each_entry(state, &eip_udp_socks, node) {
+ 		if (state->sk == sk) {
++			if (unlikely(state->users == UINT_MAX)) {
++				spin_unlock_bh(&eip_udp_socks_lock);
++				kfree(new_state);
++				sock_put(sk);
++				return false;
++			}
++
+ 			state->users++;
+ 			*result = state;
+ 			break;
+ 		}
+ 	}
+ 	if (!*result) {
++		orig_encap_rcv = READ_ONCE(up->encap_rcv);
++		if (orig_encap_rcv == eip_ipsec_proto_udp_rx) {
++			spin_unlock_bh(&eip_udp_socks_lock);
++			kfree(new_state);
++			sock_put(sk);
++			return false;
++		}
++
+ 		/* Do not overwrite a callback installed after lookup. */
+ 		if (cmpxchg(&up->encap_rcv, orig_encap_rcv,
+ 			    eip_ipsec_proto_udp_rx) != orig_encap_rcv) {
+@@ -592,6 +605,7 @@ bool eip_ipsec_proto_udp_sock_override(s
+ 			sock_put(sk);
+ 			return false;
+ 		}
++		new_state->orig_encap_rcv = orig_encap_rcv;
+ 		list_add(&new_state->node, &eip_udp_socks);
+ 		*result = new_state;
+ 		installed = true;
+--- a/driver/eip197/eip_flow.h
++++ b/driver/eip197/eip_flow.h
+@@ -62,6 +62,7 @@ struct eip_flow {
+ struct eip_flow_tbl {
+ 	struct hlist_head sw_head[EIP_FLOW_MAX];        /* Pointer to SW flow object in the flow table */
+ 	struct eip_flow_hw *hw_head;                    /* Pointer to HW flow in the flow table */
++	size_t pool_sz;					/* HW flow pool size */
+ 	dma_addr_t hw_head_paddr;                       /* Physical address of the flow table */
+ 	struct eip_flow_tbl_stats {
+ 		uint64_t alloc;                         /* Counter for number of flows allocated */
+--- a/driver/eip197/eip_flow.c
++++ b/driver/eip197/eip_flow.c
+@@ -669,17 +669,18 @@ bool eip_flow_table_init(struct platform
+ 	tbl = &ep->flow_table;
+ 	tbl_sz = EIP_FLOW_MAX * sizeof(struct eip_flow_hw);
+ 	collision_sz = EIP_FLOW_MAX_COLLISION * sizeof(struct eip_flow_hw);
++	tbl->pool_sz = tbl_sz + collision_sz;
+ 
+ 	/*
+ 	 * Allocate contiguous memory for hash table and collision list
+ 	 */
+-	addr = dma_alloc_coherent(&pdev->dev, (tbl_sz + collision_sz), &paddr, GFP_DMA);
++	addr = dma_alloc_coherent(&pdev->dev, tbl->pool_sz, &paddr, GFP_DMA);
+ 	if (!addr) {
+ 		pr_err("%px: Failed to allocate entries\n",pdev);
+ 		goto fail_dma;
+ 	}
+ 
+-	memset(addr, 0, (tbl_sz + collision_sz));
++	memset(addr, 0, tbl->pool_sz);
+ 	tbl->hw_head = addr;
+ 	tbl->hw_head_paddr = paddr;
+ 	ep->flow_hwcache = addr + tbl_sz;
+@@ -723,5 +724,6 @@ void eip_flow_table_deinit(struct platfo
+ 	eip_flow_dump_deinit(tbl);
+ 	iowrite32(0x0, base_addr + EIP_HW_FLUE_HASHBASE_LO(0));
+ 	kmem_cache_destroy(ep->flow_swcache);
+-	dma_free_coherent(&pdev->dev, EIP_FLOW_MAX * sizeof(struct eip_flow_hw), tbl->hw_head, tbl->hw_head_paddr);
++	dma_free_coherent(&pdev->dev, tbl->pool_sz, tbl->hw_head,
++			  tbl->hw_head_paddr);
+ }
