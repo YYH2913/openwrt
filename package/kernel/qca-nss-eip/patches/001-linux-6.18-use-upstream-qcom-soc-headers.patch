@@ -1,0 +1,32 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: use upstream Qualcomm SoC headers
+
+The downstream soc/qcom/socinfo.h compatibility header is not part of
+upstream Linux.  Kernels newer than 6.1 use qcom_smem_get_soc_id(), whose
+declaration is provided by linux/soc/qcom/smem.h, so the downstream include
+is both unused and invalid.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/exports/eip.h
++++ b/driver/exports/eip.h
+@@ -21,7 +21,6 @@
+ #include <crypto/aead.h>
+ #include <crypto/skcipher.h>
+ #include <crypto/hash.h>
+-#include <soc/qcom/socinfo.h>
+ #if (LINUX_VERSION_CODE > KERNEL_VERSION(6, 1, 0))
+ #include <dt-bindings/arm/qcom,ids.h>
+ #include <linux/soc/qcom/smem.h>
+--- a/clients/crypto/eip_crypto.c
++++ b/clients/crypto/eip_crypto.c
+@@ -19,7 +19,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/crypto.h>
+-#include <soc/qcom/socinfo.h>
+ 
+ #include "eip_crypto.h"
+ 
