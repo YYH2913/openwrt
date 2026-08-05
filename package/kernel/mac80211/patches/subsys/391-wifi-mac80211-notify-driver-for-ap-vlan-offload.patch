@@ -1,0 +1,266 @@
+From: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+Date: Mon, 26 May 2025 18:29:55 -0700
+Subject: [PATCH] wifi: mac80211: notify drivers about AP VLAN data offload
+
+AP_VLAN interfaces normally have no firmware object, so mac80211 hides
+their lifecycle and translates station callbacks to the parent AP.  A
+driver which gives each AP_VLAN a hardware datapath object needs the
+original interface for allocation and 4-address peer routing.
+
+Add an opt-in hardware flag for that contract.  Notify capable drivers
+when an AP_VLAN is opened, closed and restored, and preserve the AP_VLAN
+for the 4-address callback and the authorization transition.  Restore
+parent-first ordering during reconfiguration so a VLAN callback can safely
+refer to its master.
+
+When a station moves away from a 4-address VLAN, notify the old interface
+before changing sta->sdata.  This prevents a hardware peer route from
+remaining attached to the old VLAN while a new route is installed.
+
+Based-on: ba31901cc92e3aa4aa2799876745af447b8a8bae
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-10-QSDK-DP-wifi-Enable-DS-support-for-WDS-AP_VLAN-inter.patch
+Signed-off-by: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ include/net/mac80211.h    | 19 +++++++++++++++++++
+ net/mac80211/cfg.c        | 10 +++++++++-
+ net/mac80211/debugfs.c    |  1 +
+ net/mac80211/driver-ops.c | 10 ++++++++--
+ net/mac80211/driver-ops.h |  3 ++-
+ net/mac80211/iface.c      | 12 +++++++++++-
+ net/mac80211/util.c       | 39 ++++++++++++++++++++++++++++++++++-----
+ 7 files changed, 84 insertions(+), 10 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2154,6 +2154,22 @@ static inline bool ieee80211_vif_is_mesh
+  */
+ struct ieee80211_vif *wdev_to_ieee80211_vif(struct wireless_dev *wdev);
+ 
++/**
++ * wdev_to_ieee80211_vif_vlan - return the driver-visible vif for a wdev
++ * @wdev: the wdev to resolve
++ *
++ * For an AP_VLAN interface, return its parent AP vif.  Unlike
++ * wdev_to_ieee80211_vif(), the AP_VLAN itself need not be running yet;
++ * this permits use from a driver's add_interface callback.  The parent
++ * must already have been added to the driver.
++ *
++ * For other interface types this has the same semantics as
++ * wdev_to_ieee80211_vif().
++ *
++ * Return: the driver-visible vif, or %NULL
++ */
++struct ieee80211_vif *wdev_to_ieee80211_vif_vlan(struct wireless_dev *wdev);
++
+ /**
+  * ieee80211_vif_to_wdev - return a wdev struct from a vif
+  * @vif: the vif to get the wdev for
+@@ -2892,6 +2907,9 @@ struct ieee80211_txq {
+  *	implements MLO, so operation can continue on other links when one
+  *	link is switching.
+  *
++ * @IEEE80211_HW_SUPPORTS_VLAN_DATA_OFFLOAD: The driver gives AP_VLAN
++ *	interfaces distinct data-path objects and needs their lifecycle and
++ *	4-address station callbacks instead of callbacks translated to the AP.
+  * @IEEE80211_HW_STRICT: strictly enforce certain things mandated by the spec
+  *	but otherwise ignored/worked around for interoperability. This is a
+  *	HW flag so drivers can opt in according to their own control, e.g. in
+@@ -2953,6 +2971,7 @@ enum ieee80211_hw_flags {
+ 	IEEE80211_HW_DISALLOW_PUNCTURING,
+ 	IEEE80211_HW_HANDLES_QUIET_CSA,
+ 	IEEE80211_HW_STRICT,
++	IEEE80211_HW_SUPPORTS_VLAN_DATA_OFFLOAD,
+ 
+ 	/* keep last, obviously */
+ 	NUM_IEEE80211_HW_FLAGS
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -503,6 +503,7 @@ static const char *hw_flag_names[] = {
+ 	FLAG(DISALLOW_PUNCTURING),
+ 	FLAG(HANDLES_QUIET_CSA),
+ 	FLAG(STRICT),
++	FLAG(SUPPORTS_VLAN_DATA_OFFLOAD),
+ #undef FLAG
+ };
+ 
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -52,7 +52,9 @@ int drv_add_interface(struct ieee80211_l
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+-	if (WARN_ON(sdata->vif.type == NL80211_IFTYPE_AP_VLAN ||
++	if (WARN_ON((sdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
++		     !ieee80211_hw_check(&local->hw,
++					    SUPPORTS_VLAN_DATA_OFFLOAD)) ||
+ 		    (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
+ 		     !ieee80211_hw_check(&local->hw, WANT_MONITOR_VIF) &&
+ 		     !ieee80211_hw_check(&local->hw, NO_VIRTUAL_MONITOR) &&
+@@ -69,6 +71,9 @@ int drv_add_interface(struct ieee80211_l
+ 	if (!(sdata->flags & IEEE80211_SDATA_IN_DRIVER)) {
+ 		sdata->flags |= IEEE80211_SDATA_IN_DRIVER;
+ 
++		if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
++			return 0;
++
+ 		drv_vif_add_debugfs(local, sdata);
+ 		/* initially vif is not MLD */
+ 		ieee80211_link_debugfs_drv_add(&sdata->deflink);
+@@ -135,7 +140,9 @@ int drv_sta_state(struct ieee80211_local
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+-	sdata = get_bss_sdata(sdata);
++	if (!ieee80211_hw_check(&local->hw, SUPPORTS_VLAN_DATA_OFFLOAD) ||
++	    old_state != IEEE80211_STA_ASSOC || new_state != IEEE80211_STA_AUTHORIZED)
++		sdata = get_bss_sdata(sdata);
+ 	if (!check_sdata_in_driver(sdata))
+ 		return -EIO;
+ 
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1601,7 +1601,8 @@ static inline void drv_sta_set_4addr(str
+ 				     struct ieee80211_sub_if_data *sdata,
+ 				     struct ieee80211_sta *sta, bool enabled)
+ {
+-	sdata = get_bss_sdata(sdata);
++	if (!ieee80211_hw_check(&local->hw, SUPPORTS_VLAN_DATA_OFFLOAD))
++		sdata = get_bss_sdata(sdata);
+ 
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -2459,15 +2459,24 @@ static int ieee80211_change_station(stru
+ 		return err;
+ 
+ 	if (params->vlan && params->vlan != sta->sdata->dev) {
++		struct ieee80211_sub_if_data *old_sdata = sta->sdata;
++
+ 		vlansdata = IEEE80211_DEV_TO_SUB_IF(params->vlan);
+ 
+ 		if (params->vlan->ieee80211_ptr->use_4addr) {
+ 			if (vlansdata->u.vlan.sta)
+ 				return -EBUSY;
++		}
+ 
++		if (ieee80211_hw_check(&local->hw, SUPPORTS_VLAN_DATA_OFFLOAD) &&
++		    old_sdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
++		    old_sdata->wdev.use_4addr)
++			drv_sta_set_4addr(local, old_sdata, &sta->sta, false);
++
++		if (params->vlan->ieee80211_ptr->use_4addr) {
+ 			rcu_assign_pointer(vlansdata->u.vlan.sta, sta);
+ 			__ieee80211_check_fast_rx_iface(vlansdata);
+-			drv_sta_set_4addr(local, sta->sdata, &sta->sta, true);
++			drv_sta_set_4addr(local, vlansdata, &sta->sta, true);
+ 		}
+ 
+ 		if (sta->sdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -706,6 +706,12 @@ static void ieee80211_do_stop(struct iee
+ 
+ 	switch (sdata->vif.type) {
+ 	case NL80211_IFTYPE_AP_VLAN:
++		if (going_down &&
++		    ieee80211_hw_check(&local->hw, SUPPORTS_VLAN_DATA_OFFLOAD)) {
++			drv_remove_interface(local, sdata);
++			memset(sdata->vif.drv_priv, 0,
++			       local->hw.vif_data_size);
++		}
+ 		break;
+ 	case NL80211_IFTYPE_MONITOR:
+ 		if (local->virt_monitors == 0)
+@@ -1379,7 +1385,13 @@ int ieee80211_do_open(struct wireless_de
+ 	sdata->vif.addr_valid = sdata->vif.type != NL80211_IFTYPE_MONITOR ||
+ 				(sdata->u.mntr.flags & MONITOR_FLAG_ACTIVE);
+ 	switch (sdata->vif.type) {
+-	case NL80211_IFTYPE_AP_VLAN:
++	case NL80211_IFTYPE_AP_VLAN:
++		if (coming_up && ieee80211_hw_check(&local->hw,
++						    SUPPORTS_VLAN_DATA_OFFLOAD)) {
++			res = drv_add_interface(local, sdata);
++			if (res)
++				goto err_stop;
++		}
+ 		/* no need to tell driver, but set carrier and chanctx */
+ 		if (sdata->bss->active) {
+ 			struct ieee80211_link_data *link;
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -915,6 +915,25 @@ struct ieee80211_vif *wdev_to_ieee80211
+ }
+ EXPORT_SYMBOL_GPL(wdev_to_ieee80211_vif);
+ 
++struct ieee80211_vif *wdev_to_ieee80211_vif_vlan(struct wireless_dev *wdev)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_WDEV_TO_SUB_IF(wdev);
++	struct ieee80211_sub_if_data *master;
++
++	if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN)
++		return wdev_to_ieee80211_vif(wdev);
++
++	if (!sdata->bss)
++		return NULL;
++
++	master = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
++	if (!(master->flags & IEEE80211_SDATA_IN_DRIVER))
++		return NULL;
++
++	return &master->vif;
++}
++EXPORT_SYMBOL_GPL(wdev_to_ieee80211_vif_vlan);
++
+ struct wireless_dev *ieee80211_vif_to_wdev(struct ieee80211_vif *vif)
+ {
+ 	if (!vif)
+@@ -1924,29 +1946,39 @@ int ieee80211_reconfig(struct ieee80211_
+ 		}
+ 	}
+ 
++	/* Parent interfaces must be restored before their AP_VLAN children. */
+ 	list_for_each_entry(sdata, &local->interfaces, list) {
+ 		if (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
+ 		    !ieee80211_hw_check(&local->hw, NO_VIRTUAL_MONITOR))
+ 			continue;
+ 		if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN &&
+ 		    ieee80211_sdata_running(sdata)) {
+ 			res = drv_add_interface(local, sdata);
+ 			if (WARN_ON(res))
+ 				break;
+ 		}
+ 	}
++	if (!res && ieee80211_hw_check(&local->hw,
++				       SUPPORTS_VLAN_DATA_OFFLOAD)) {
++		list_for_each_entry(sdata, &local->interfaces, list) {
++			if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN ||
++			    !ieee80211_sdata_running(sdata))
++				continue;
++			res = drv_add_interface(local, sdata);
++			if (WARN_ON(res))
++				break;
++		}
++	}
+ 
+ 	/* If adding any of the interfaces failed above, roll back and
+ 	 * report failure.
+ 	 */
+ 	if (res) {
+-		list_for_each_entry_continue_reverse(sdata, &local->interfaces,
+-						     list) {
++		list_for_each_entry_reverse(sdata, &local->interfaces, list) {
+ 			if (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
+ 			    !ieee80211_hw_check(&local->hw, NO_VIRTUAL_MONITOR))
+ 				continue;
+-			if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN &&
+-			    ieee80211_sdata_running(sdata))
++			if (ieee80211_sdata_running(sdata))
+ 				drv_remove_interface(local, sdata);
+ 		}
+ 		ieee80211_handle_reconfig_failure(local);
+-- 
+2.43.0
