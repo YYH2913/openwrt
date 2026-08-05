@@ -1,0 +1,130 @@
+From: KRITHI D SHETTY <quic_kdshetty@quicinc.com>
+Date: Thu, 22 Feb 2024 20:45:55 +0530
+Subject: [PATCH] qca-nss-eip: wait for inline TR invalidation before VP reuse
+
+eip_tr_free() drops the software reference and schedules the final hardware
+invalidation asynchronously. Full-inline and outer-inline callers must not
+release a PPE VP or EIP tunnel while invalidation is pending. A late
+descriptor could observe a recycled VP slot. Expose a sleepable variant
+which completes after the final invalidation and use it only on paths that
+release inline resources.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/463b65bb69c3e3a03bba6f2fe36f5e1459682418
+Signed-off-by: Hardik S. Panchal <quic_hpanchal@quicinc.com>
+Signed-off-by: Pritam Jha <quic_pritamku@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_tr.h
++++ b/driver/eip197/eip_tr.h
+@@ -176,6 +176,7 @@ struct eip_tr {
+ 	enum eip_svc svc;			/* Service number */
+ 	uint32_t inval_dummy_buf;		/* Dummy 4 byte buffer for Invalidation. */
+ 	struct delayed_work inval_work;		/* Workqueue for Invalidation schedule */
++	struct completion *free_done;		/* Optional completion after final invalidation */
+ 	struct eip_hw_stats tr_stats;		/* Last readed TR stats */
+ 
+ 	uint32_t hw_words[] __attribute__((aligned (L1_CACHE_BYTES)));
+--- a/driver/eip197/eip_tr.c
++++ b/driver/eip197/eip_tr.c
+@@ -7,6 +7,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/kref.h>
++#include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/crypto.h>
+ #include <linux/cache.h>
+@@ -109,9 +110,11 @@ static void eip_tr_inval_n_free(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+ 	struct eip_pdev *ep;
+ 	struct eip_ctx *ctx;
++	struct completion *free_done;
+ 
+ 	ctx = tr->ctx;
+ 	ep = ctx->ep;
++	free_done = READ_ONCE(tr->free_done);
+ 
+ 	/*
+ 	 * free the memory associated with the operation.
+@@ -129,4 +132,6 @@ static void eip_tr_inval_n_free(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ 	free_percpu(tr->stats_pcpu);
+ 	kmem_cache_free(ep->tr_cache, tr);
++	if (free_done)
++		complete(free_done);
+ 	pr_debug("TR freed successfully\n");
+ }
+@@ -474,6 +479,28 @@ void eip_tr_free(struct eip_tr *tr)
+ }
+ EXPORT_SYMBOL(eip_tr_free);
+ 
++/*
++ * eip_tr_free_sync()
++ *	Free a transform record and wait for the hardware invalidation to finish.
++ *
++ * The normal eip_tr_free() API deliberately returns before the delayed final
++ * invalidation. Inline callers must wait before releasing PPE metadata that
++ * can be referenced by an in-flight descriptor.
++ */
++void eip_tr_free_sync(struct eip_tr *tr)
++{
++	DECLARE_COMPLETION_ONSTACK(free_done);
++
++	might_sleep();
++	if (WARN_ON_ONCE(READ_ONCE(tr->free_done)))
++		return;
++
++	WRITE_ONCE(tr->free_done, &free_done);
++	eip_tr_free(tr);
++	wait_for_completion(&free_done);
++}
++EXPORT_SYMBOL(eip_tr_free_sync);
++
+ /*
+  * eip_tr_classify_err()
+  *     API to classify hw errors to linux errors.
+--- a/driver/exports/eip.h
++++ b/driver/exports/eip.h
+@@ -466,6 +466,9 @@ void eip_tr_free(struct eip_tr *tr);
+  */
+ void eip_tr_free(struct eip_tr *tr);
+ 
++/* Free a transform record and wait for final hardware invalidation. */
++void eip_tr_free_sync(struct eip_tr *tr);
++
+ /*
+  * eip_tr_get_hw_stats
+  *	Get delta of TR packet count and byte counts processed by TR
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -462,7 +462,7 @@ static void eip_ipsec_sa_inline_rollback(struct eip_ipsec_sa *sa)
+ 	eip_ipsec_sa_inline_flow_stop(sa);
+ 	if (sa->tr) {
+ 		eip_tr_disable(sa->tr);
+-		eip_tr_free(sa->tr);
++		eip_tr_free_sync(sa->tr);
+ 		sa->tr = NULL;
+ 	}
+ 	if (sa->ppe_vp >= 0) {
+@@ -1064,7 +1064,7 @@
+ 
+ fail_udp:
+ 	if (sa->inner_offload) {
+-		eip_tr_free(sa->tr);
++		eip_tr_free_sync(sa->tr);
+ 		sa->tr = NULL;
+ 		sa->inline_offload = false;
+ 		eip_ipsec_flow_sa_put(sa);
+@@ -1131,7 +1131,10 @@ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ 	wait_for_completion(&sa->completion);
+ 
+ 	/* No worker or callback can touch the SA now. */
+-	eip_tr_free(sa->tr);
++	if (inline_offload || sa->inner_offload)
++		eip_tr_free_sync(sa->tr);
++	else
++		eip_tr_free(sa->tr);
+ 	sa->tr = NULL;
+ 
+ 	if (sa->ppe_vp >= 0) {
