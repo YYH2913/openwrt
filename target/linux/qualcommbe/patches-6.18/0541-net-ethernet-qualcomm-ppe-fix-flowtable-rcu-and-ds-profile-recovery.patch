@@ -1,0 +1,101 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: fix flowtable RCU and DS profile recovery
+
+The duplicate-cookie check in the flow replace path reads the flow
+rhashtable without an RCU read-side section.  A concurrent destroy can
+remove and defer free the matching object while the lookup is still
+traversing the table.
+
+Direct-switch VPs can move to another WLAN node while one node is stopped.
+Only re-enable a node's profiles after that node has actually become the
+VP's active queue.  Re-enabling an old profile while the VP is active on
+another node sends packets to a stale queue; when a move succeeds, the new
+node's profiles must be restored at the same transition.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -1826,7 +1826,8 @@ static int ppe_ft_flow_replace(struct pp
+ 	int vlan_pops = 0;
+ 	struct in6_addr lwt_local = {}, lwt_remote = {};
+ 	u8 lwt_hop_limit = 0;
+-	bool tunnel_flow, tunnel_encap = false, lwt_tunnel = false;
++	bool tunnel_flow, tunnel_encap = false, lwt_tunnel = false;
++	bool installed;
+ 	int i, nexthop, ret, redirects = 0, vlan_pushes = 0;
+ 	int pppoe_pushes = 0, csums = 0;
+ 	int iport = -1, imtu = 0;
+@@ -1838,6 +1838,10 @@ static int ppe_ft_flow_replace(struct pp
+ 	 * of resources.
+ 	 */
+-	if (rhashtable_lookup_fast(&ft->flows, &f->cookie, ppe_ft_params))
++	rcu_read_lock();
++	installed = rhashtable_lookup_fast(&ft->flows, &f->cookie,
++					   ppe_ft_params);
++	rcu_read_unlock();
++	if (installed)
+ 		return 0;
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -999,7 +999,8 @@
+ void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up)
+ {
+ 	struct ppe_vp *vp = ppe_dev->vp;
+-	u64 carrier_down = 0, carrier_up = 0, profile_ports = 0;
++	u64 carrier_down = 0, carrier_up = 0, profile_down = 0;
++	u64 profile_up[PPE_VP_DS_NODES] = {};
+ 	int i, next, port, ret;
+ 
+ 	if (!vp || node < 0 || node >= PPE_VP_DS_NODES)
+@@ -1014,7 +1015,8 @@
+ 		if (!slot->direct || !dev || !slot->ds_node_refs[node])
+ 			continue;
+ 		port = PPE_VP_PORT_BASE + i;
+-		profile_ports |= BIT_ULL(i);
++		if (!up)
++			profile_down |= BIT_ULL(i);
+ 
+ 		if (up) {
+ 			if (slot->ds_node != PPE_VP_DS_NODE_NONE)
+@@ -1028,6 +1030,7 @@
+ 				continue;
+ 			}
+ 			slot->ds_node = node;
++			profile_up[node] |= BIT_ULL(i);
+ 			if (netif_carrier_ok(dev))
+ 				carrier_up |= BIT_ULL(i);
+ 			else
+@@ -1045,6 +1048,7 @@
+ 						     slot->ds_queues[next]);
+ 			if (!ret) {
+ 				slot->ds_node = next;
++				profile_up[next] |= BIT_ULL(i);
+ 				continue;
+ 			}
+ 			dev_err(ppe_dev->dev,
+@@ -1058,10 +1062,17 @@
+ 	mutex_unlock(&vp->lock);
+ 
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+-		if (profile_ports & BIT_ULL(i))
++		if (profile_down & BIT_ULL(i))
+ 			ppe_flowtable_port_profile_state(ppe_dev,
+-							 PPE_VP_PORT_BASE + i,
+-					PPE_VP_DS_PRI_PROFILE(node), up, false);
++								 PPE_VP_PORT_BASE + i,
++								PPE_VP_DS_PRI_PROFILE(node),
++								false, false);
++		for (next = 0; next < PPE_VP_DS_NODES; next++)
++			if (profile_up[next] & BIT_ULL(i))
++				ppe_flowtable_port_profile_state(ppe_dev,
++								 PPE_VP_PORT_BASE + i,
++								PPE_VP_DS_PRI_PROFILE(next),
++								true, false);
+ 		if (carrier_down & BIT_ULL(i))
+ 			ppe_flowtable_port_carrier(ppe_dev, PPE_VP_PORT_BASE + i, false);
+ 		else if (carrier_up & BIT_ULL(i))
