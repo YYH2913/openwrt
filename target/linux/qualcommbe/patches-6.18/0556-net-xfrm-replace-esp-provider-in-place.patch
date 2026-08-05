@@ -1,0 +1,94 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 18:20:00 +0800
+Subject: [PATCH] net: xfrm: replace the ESP provider in place
+
+The EIP client only needs to override the ESP type. Replacing the entire
+family AFINFO object also duplicates independently registered AH, IPComp,
+tunnel and offload types. A registration racing provider restore can then
+be copied back incompletely, and a displaced provider can retain its saved
+fallback module reference forever.
+
+Replace only type_esp under the AFINFO table lock and wait for readers that
+may have observed the previous type. Family callbacks and every unrelated
+dynamic type remain in their original AFINFO object. Use single-copy access
+for the ESP lookup because the pointer can now change while AFINFO remains
+published.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -434,9 +434,9 @@ struct xfrm_state_afinfo {
+ int xfrm_state_register_afinfo(struct xfrm_state_afinfo *afinfo);
+ int xfrm_state_unregister_afinfo(struct xfrm_state_afinfo *afinfo);
+ struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family);
+-int xfrm_state_update_afinfo(unsigned int family,
+-			     struct xfrm_state_afinfo *expected,
+-			     struct xfrm_state_afinfo *new);
++int xfrm_state_update_esp_type(unsigned int family,
++			       const struct xfrm_type *expected,
++			       const struct xfrm_type *new_type);
+ struct xfrm_state_afinfo *xfrm_state_afinfo_get_rcu(unsigned int family);
+ 
+ struct xfrm_input_afinfo {
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -341,7 +341,7 @@ static const struct xfrm_type *xfrm_get_
+ 		type = afinfo->type_ah;
+ 		break;
+ 	case IPPROTO_ESP:
+-		type = afinfo->type_esp;
++		type = READ_ONCE(afinfo->type_esp);
+ 		break;
+ 	case IPPROTO_IPIP:
+ 		type = afinfo->type_ipip;
+@@ -3099,24 +3099,27 @@ struct xfrm_state_afinfo *xfrm_state_get
+ }
+ EXPORT_SYMBOL_GPL(xfrm_state_get_afinfo);
+ 
+-int xfrm_state_update_afinfo(unsigned int family,
+-			     struct xfrm_state_afinfo *expected,
+-			     struct xfrm_state_afinfo *new)
++int xfrm_state_update_esp_type(unsigned int family,
++			       const struct xfrm_type *expected,
++			       const struct xfrm_type *new_type)
+ {
+-	struct xfrm_state_afinfo *old_afinfo;
++	struct xfrm_state_afinfo *afinfo;
+ 	int err = 0;
+ 
+-	if (WARN_ON(family >= NPROTO || !expected || !new ||
+-		    expected->family != family || new->family != family))
++	if (WARN_ON(family >= NPROTO || !expected || !new_type ||
++		    expected->proto != IPPROTO_ESP ||
++		    new_type->proto != IPPROTO_ESP))
+ 		return -EINVAL;
+ 
+ 	spin_lock_bh(&xfrm_state_afinfo_lock);
+-	old_afinfo = rcu_dereference_protected(xfrm_state_afinfo[family],
+-					       lockdep_is_held(&xfrm_state_afinfo_lock));
+-	if (old_afinfo != expected)
++	afinfo = rcu_dereference_protected(xfrm_state_afinfo[family],
++					   lockdep_is_held(&xfrm_state_afinfo_lock));
++	if (!afinfo)
++		err = -EAFNOSUPPORT;
++	else if (READ_ONCE(afinfo->type_esp) != expected)
+ 		err = -ESTALE;
+ 	else
+-		rcu_assign_pointer(xfrm_state_afinfo[family], new);
++		WRITE_ONCE(afinfo->type_esp, new_type);
+ 	spin_unlock_bh(&xfrm_state_afinfo_lock);
+ 
+ 	if (!err)
+@@ -3124,7 +3127,7 @@ int xfrm_state_update_afinfo(unsigned int
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(xfrm_state_update_afinfo);
++EXPORT_SYMBOL_GPL(xfrm_state_update_esp_type);
+ 
+ void xfrm_flush_gc(void)
+ {
+-- 
+2.43.0
