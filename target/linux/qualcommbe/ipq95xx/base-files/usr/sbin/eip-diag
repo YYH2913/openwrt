@@ -1,0 +1,241 @@
+#!/bin/sh
+
+DEBUG_ROOT=/sys/kernel/debug/qca-nss-eip/eip197
+
+section()
+{
+	printf '\n=== %s ===\n' "$1"
+}
+
+show_file()
+{
+	if [ -r "$1" ]; then
+		printf '\n-- %s --\n' "$1"
+		cat "$1" 2>&1 || printf 'read failed: %s\n' "$1"
+	else
+		printf 'unavailable: %s\n' "$1"
+	fi
+}
+
+find_eip_node()
+{
+	local node compatible
+
+	for node in /sys/firmware/devicetree/base/soc@0/*@39800000 \
+		    /proc/device-tree/soc@0/*@39800000; do
+		[ -r "$node/compatible" ] || continue
+		compatible=$(tr '\000' '\n' < "$node/compatible")
+		printf '%s\n' "$compatible" | grep -qx 'qcom,eip' || continue
+		printf '%s\n' "$node"
+		return
+	done
+}
+
+show_dt()
+{
+	local node status property
+
+	node=$(find_eip_node)
+	if [ -z "$node" ]; then
+		printf 'eip_node=missing\n'
+		return
+	fi
+
+	status=$(tr -d '\000' < "$node/status" 2>/dev/null)
+	[ -n "$status" ] || status=okay
+	printf 'node=%s status=%s\n' "$node" "$status"
+	for property in qcom,inline-enabled qcom,outer-offload qcom,inner-offload; do
+		if [ -e "$node/$property" ]; then
+			printf '%s=yes\n' "$property"
+		else
+			printf '%s=no\n' "$property"
+		fi
+	done
+}
+
+show_firmware()
+{
+	local file
+
+	for file in ifpp.bin ipue.bin ofpp.bin opue.bin; do
+		if [ -r "/lib/firmware/$file" ]; then
+			printf '%s=present size=%s\n' "$file" \
+				"$(wc -c < "/lib/firmware/$file")"
+		else
+			printf '%s=missing\n' "$file"
+		fi
+	done
+}
+
+show_modules()
+{
+	if command -v lsmod >/dev/null 2>&1; then
+		lsmod | grep -E '(^| )(qca_nss_eip|qcom_ppe)( |$)' || true
+	else
+		printf 'unavailable: lsmod\n'
+	fi
+
+	for module in qca_nss_eip qca_nss_eip_crypto qca_nss_eip_ipsec qcom_ppe; do
+		if [ -d "/sys/module/$module" ]; then
+			printf '%s=loaded\n' "$module"
+		else
+			printf '%s=missing\n' "$module"
+		fi
+	done
+}
+
+show_crypto()
+{
+	if [ ! -r /proc/crypto ]; then
+		printf 'unavailable: /proc/crypto\n'
+		return
+	fi
+
+	awk '
+		/^name[[:space:]]*:/ { name = $0 }
+		/^driver[[:space:]]*:[[:space:]]*eip-/ {
+			print name
+			print
+			count++
+		}
+		END { printf "eip_algorithms=%u\n", count + 0 }
+	' /proc/crypto
+}
+
+show_xfrm()
+{
+	if ip -s xfrm state >/dev/null 2>&1; then
+		ip -s xfrm state 2>&1
+		printf '\n-- policies --\n'
+		ip -s xfrm policy 2>&1
+	else
+		printf 'unavailable: ip xfrm\n'
+	fi
+}
+
+show_irqs()
+{
+	grep -Ei 'eip.*ring|ring.*eip' /proc/interrupts 2>/dev/null || \
+		printf 'unavailable: EIP ring interrupts\n'
+}
+
+show_stats()
+{
+	local found=0 path
+
+	for path in "$DEBUG_ROOT"/ring_* \
+		    "$DEBUG_ROOT"/eip_ipsec_ctx@* \
+		    "$DEBUG_ROOT"/eip_hy_ipsec_ctx@* \
+		    "$DEBUG_ROOT"/ipsectun* \
+		    "$DEBUG_ROOT"/aead/stats \
+		    "$DEBUG_ROOT"/skcipher/stats \
+		    "$DEBUG_ROOT"/ahash/stats; do
+		[ -r "$path" ] || continue
+		found=1
+		show_file "$path"
+	done
+
+	[ "$found" = 1 ] || printf 'unavailable: %s statistics\n' "$DEBUG_ROOT"
+}
+
+show_flows()
+{
+	local flows=/sys/kernel/debug/ppe/flows
+
+	if [ -r "$flows" ]; then
+		printf '\n-- PPE EIP bindings --\n'
+		awk '
+			NR == 1 { print }
+			/eip:1|service:42/ { print; eip++ }
+			END { printf "ppe_eip_rows=%u\n", eip + 0 }
+		' "$flows"
+	else
+		printf 'unavailable: %s\n' "$flows"
+	fi
+
+	show_file /sys/kernel/debug/ppe/eip_outer_flows
+	show_file "$DEBUG_ROOT/eip_flow_table"
+}
+
+show_log()
+{
+	if command -v logread >/dev/null 2>&1; then
+		logread 2>&1 | grep -Ei \
+			'qca-nss-eip|eip ipsec|eip197|ifpp\.bin|ipue\.bin|ofpp\.bin|opue\.bin|full-inline|qcom_ppe.*eip' | \
+			tail -n 300
+	else
+		dmesg | grep -Ei \
+			'qca-nss-eip|eip ipsec|eip197|ifpp\.bin|ipue\.bin|ofpp\.bin|opue\.bin|full-inline|qcom_ppe.*eip' | \
+			tail -n 300
+	fi
+}
+
+usage()
+{
+	printf 'Usage: eip-diag [summary|stats|flows|xfrm|all]\n'
+}
+
+if ! grep -qs ' /sys/kernel/debug debugfs ' /proc/mounts; then
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+fi
+
+case "${1:-summary}" in
+summary)
+	section SYSTEM
+	ubus call system board 2>/dev/null || true
+	uname -a
+	section DEVICE_TREE
+	show_dt
+	section FIRMWARE
+	show_firmware
+	section MODULES
+	show_modules
+	section CRYPTO_API
+	show_crypto
+	section INTERRUPTS
+	show_irqs
+	section LOG
+	show_log
+	;;
+stats)
+	section EIP_STATS
+	show_stats
+	section INTERRUPTS
+	show_irqs
+	;;
+flows)
+	section EIP_FLOWS
+	show_flows
+	;;
+xfrm)
+	section XFRM
+	show_xfrm
+	;;
+all)
+	section SYSTEM
+	ubus call system board 2>/dev/null || true
+	uname -a
+	section DEVICE_TREE
+	show_dt
+	section FIRMWARE
+	show_firmware
+	section MODULES
+	show_modules
+	section CRYPTO_API
+	show_crypto
+	section XFRM
+	show_xfrm
+	section EIP_STATS
+	show_stats
+	section EIP_FLOWS
+	show_flows
+	section INTERRUPTS
+	show_irqs
+	section LOG
+	show_log
+	;;
+*)
+	usage >&2
+	exit 1
+	;;
+esac

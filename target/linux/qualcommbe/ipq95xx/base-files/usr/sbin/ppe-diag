@@ -8,7 +8,9 @@ section()
 show_file()
 {
 	if [ -r "$1" ]; then
-		cat "$1"
+		if ! cat "$1" 2>&1; then
+			printf 'read failed: %s\n' "$1"
+		fi
 	else
 		printf 'unavailable: %s\n' "$1"
 	fi
@@ -22,12 +24,140 @@ show_named_file()
 
 show_ppe_counters()
 {
+	show_named_file qm /sys/kernel/debug/ppe/qm
 	show_named_file cpu_code /sys/kernel/debug/ppe/cpu_code
 	show_named_file port_rx /sys/kernel/debug/ppe/port_rx
 	show_named_file port_tx /sys/kernel/debug/ppe/port_tx
 	show_named_file edma_err_stats /sys/kernel/debug/ppe/edma/stats/err_stats
 	show_named_file edma_rx_ring_stats /sys/kernel/debug/ppe/edma/stats/rx_ring_stats
 	show_named_file edma_tx_ring_stats /sys/kernel/debug/ppe/edma/stats/tx_ring_stats
+}
+
+show_cpu()
+{
+	show_named_file proc_stat /proc/stat
+	show_named_file softirqs /proc/softirqs
+	show_named_file softnet_stat /proc/net/softnet_stat
+	show_named_file interrupts /proc/interrupts
+	if command -v top >/dev/null 2>&1; then
+		printf '\n-- top --\n'
+		top -b -n 1 2>&1 | head -n 30
+	else
+		printf 'unavailable: top\n'
+	fi
+}
+
+show_netdev_stats()
+{
+	for path in /sys/class/net/*; do
+		[ -d "$path/statistics" ] || continue
+		dev=${path##*/}
+		printf '%s' "$dev"
+		for counter in rx_packets rx_bytes rx_dropped rx_errors \
+				tx_packets tx_bytes tx_dropped tx_errors; do
+			value=$(cat "$path/statistics/$counter" 2>/dev/null) || \
+				value=unknown
+			printf ' %s=%s' "$counter" "$value"
+		done
+		printf '\n'
+	done
+}
+
+show_wireless_stations()
+{
+	local iw_output
+
+	if ! command -v iw >/dev/null 2>&1; then
+		printf 'unavailable: iw\n'
+		return
+	fi
+
+	iw_output=$(iw dev 2>&1)
+	printf '%s\n' "$iw_output"
+	printf '%s\n' "$iw_output" | awk '$1 == "Interface" { print $2 }' |
+	while read -r dev; do
+		[ -n "$dev" ] || continue
+		printf '\n-- %s station dump --\n' "$dev"
+		iw dev "$dev" station dump 2>&1
+	done
+}
+
+show_hostapd_clients()
+{
+	local found=0 object
+
+	if ! command -v ubus >/dev/null 2>&1; then
+		printf 'unavailable: ubus\n'
+		return
+	fi
+
+	for object in $(ubus -S list 'hostapd.*' 2>/dev/null); do
+		case "$object" in
+		hostapd.*)
+			found=1
+			printf '\n-- %s get_clients --\n' "$object"
+			ubus -S call "$object" get_clients 2>&1
+			;;
+		esac
+	done
+	[ "$found" = 1 ] || printf 'unavailable: hostapd ubus objects\n'
+}
+
+show_mac80211_station_state()
+{
+	local found=0 path station
+
+	for path in /sys/kernel/debug/ieee80211/*/netdev:*/stations/*; do
+		[ -d "$path" ] || continue
+		found=1
+		station=${path#/sys/kernel/debug/ieee80211/}
+		show_named_file "$station/link_state" "$path/link_state"
+		show_named_file "$station/eht_capa" "$path/eht_capa"
+	done
+	[ "$found" = 1 ] || printf 'unavailable: mac80211 station debugfs\n'
+}
+
+show_ath12k_ppe_stats()
+{
+	local found=0 path
+
+	for path in /sys/kernel/debug/ath12k/*/device_dp_stats; do
+		[ -r "$path" ] || continue
+		found=1
+		show_named_file "${path%/device_dp_stats}" "$path"
+	done
+	[ "$found" = 1 ] || printf 'unavailable: ath12k device_dp_stats\n'
+}
+
+show_eip_state()
+{
+	local found=0 path
+
+	if [ -r /sys/kernel/debug/ppe/flows ]; then
+		printf '\n-- PPE SC42 bindings --\n'
+		awk '
+			/eip:1/ { eip++ }
+			/service:42/ { sc42++; print }
+			END { printf "eip_bindings=%u sc42_bindings=%u\n", eip + 0, sc42 + 0 }
+		' /sys/kernel/debug/ppe/flows
+	else
+		printf 'unavailable: /sys/kernel/debug/ppe/flows\n'
+	fi
+
+	show_named_file ppe_eip_outer_flows /sys/kernel/debug/ppe/eip_outer_flows
+	show_named_file eip_flow_table /sys/kernel/debug/qca-nss-eip/eip197/eip_flow_table
+
+	for path in /sys/kernel/debug/qca-nss-eip/eip197/ipsectun*; do
+		[ -r "$path" ] || continue
+		found=1
+		show_named_file "${path##*/}" "$path"
+	done
+	[ "$found" = 1 ] || printf 'unavailable: active EIP IPsec devices\n'
+
+	for path in /sys/kernel/debug/qca-nss-eip/eip197/eip_hy_ipsec_ctx@*; do
+		[ -r "$path" ] || continue
+		show_named_file "${path##*/}" "$path"
+	done
 }
 
 section SYSTEM
@@ -40,7 +170,7 @@ printf 'flow_offloading_hw=%s\n' "$(uci -q get firewall.@defaults[0].flow_offloa
 
 section MODULES
 if command -v lsmod >/dev/null 2>&1; then
-	lsmod | grep -E '(^| )qcom_ppe|nf_flow_table|nft_flow_offload|nft_flow_table' || true
+	lsmod | grep -E '(^| )(qcom_ppe|qca_nss_eip)|nf_flow_table|nft_flow_offload|nft_flow_table' || true
 else
 	printf 'unavailable: lsmod\n'
 fi
@@ -61,6 +191,12 @@ if [ -r /proc/kallsyms ]; then
 		printf 'legacy_qcom_ppe_ds_queue_start=present\n'
 	else
 		printf 'legacy_qcom_ppe_ds_queue_start=absent\n'
+	fi
+	if grep -qw qcom_ppe_eip_provider_register /proc/kallsyms &&
+	   grep -qw qcom_ppe_eip_provider_unregister /proc/kallsyms; then
+		printf 'qcom_ppe_eip_provider_abi=present\n'
+	else
+		printf 'qcom_ppe_eip_provider_abi=missing\n'
 	fi
 else
 	printf 'unavailable: /proc/kallsyms\n'
@@ -138,7 +274,7 @@ for path in /sys/class/net/*/speed; do
 	printf '\n-- %s --\n' "$dev"
 	if [ -r "/sys/class/net/$dev/carrier" ]; then
 		printf 'carrier=%s speed=%s duplex=%s\n' \
-			"$(cat "/sys/class/net/$dev/carrier")" \
+			"$(cat "/sys/class/net/$dev/carrier" 2>/dev/null || printf unknown)" \
 			"$(cat "/sys/class/net/$dev/speed" 2>/dev/null || printf unknown)" \
 			"$(cat "/sys/class/net/$dev/duplex" 2>/dev/null || printf unknown)"
 	fi
@@ -165,8 +301,29 @@ show_file /sys/kernel/debug/ppe/flows
 section PPE_COUNTERS_BEFORE
 show_ppe_counters
 
-section SOFTIRQS_BEFORE
-grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null || true
+section REASONS_BEFORE
+show_file /sys/kernel/debug/ppe/reason_counters
+
+section NETDEV_STATS_BEFORE
+show_netdev_stats
+
+section WIRELESS_STATIONS_BEFORE
+show_wireless_stations
+
+section HOSTAPD_CLIENTS_BEFORE
+show_hostapd_clients
+
+section MAC80211_STATIONS_BEFORE
+show_mac80211_station_state
+
+section ATH12K_PPE_BEFORE
+show_ath12k_ppe_stats
+
+section EIP_BEFORE
+show_eip_state
+
+section CPU_BEFORE
+show_cpu
 
 sleep 5
 
@@ -182,17 +339,35 @@ show_file /sys/kernel/debug/ppe/flows
 section PPE_COUNTERS_AFTER
 show_ppe_counters
 
-section SOFTIRQS_AFTER
-grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null || true
+section REASONS_AFTER
+show_file /sys/kernel/debug/ppe/reason_counters
+
+section NETDEV_STATS_AFTER
+show_netdev_stats
+
+section WIRELESS_STATIONS_AFTER
+show_wireless_stations
+
+section HOSTAPD_CLIENTS_AFTER
+show_hostapd_clients
+
+section MAC80211_STATIONS_AFTER
+show_mac80211_station_state
+
+section ATH12K_PPE_AFTER
+show_ath12k_ppe_stats
+
+section EIP_AFTER
+show_eip_state
+
+section CPU_AFTER
+show_cpu
 
 section FLOW_ROWS
 show_file /sys/kernel/debug/ppe/flow_rows
 
 section PIPELINE
 show_file /sys/kernel/debug/ppe/pipeline_state
-
-section REASONS
-show_file /sys/kernel/debug/ppe/reason_counters
 
 section CONNTRACK
 if [ -r /proc/net/nf_conntrack ]; then
@@ -216,7 +391,7 @@ uci -q show wireless 2>&1 || true
 
 section LOG
 if command -v logread >/dev/null 2>&1; then
-	logread 2>&1 | grep -Ei 'dhcp|dnsmasq|hostapd|sta-|associated|authorized|qcom_ppe|ppe-flowtable|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 500
+	logread 2>&1 | grep -Ei 'dhcp|dnsmasq|hostapd|sta-|associated|authorized|qcom_ppe|qca-nss-eip|eip ipsec|full-inline|ppe-flowtable|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 500
 else
-	dmesg | grep -Ei 'qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
+	dmesg | grep -Ei 'qcom_ppe|qca-nss-eip|eip ipsec|full-inline|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
 fi
