@@ -1,0 +1,162 @@
+From: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Date: Mon, 4 Aug 2025 19:18:12 +0530
+Subject: [PATCH] wifi: ath12k: optimize PPE direct-switch TX completions
+
+Use the vendor driver's 128-entry NAPI weight for interrupt groups carrying
+PPE direct-switch rings.  The default 64-entry weight is especially costly
+for the WBM completion ring under multi-gigabit downlink traffic.
+
+Detach completed descriptors under one descriptor-lock critical section
+and free their DMA buffers after releasing the SRNG lock.  This removes two
+lock operations per packet from the completion loop and keeps slow DMA
+teardown out of the ring critical section.  Also ignore firmware MEC
+notifications; they do not own a PPE TX descriptor and treating their
+overlaid fields as a cookie can release an unrelated buffer.
+
+Based-on: 41c027804556a6adc68fa0d79400fb96655a909e
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0486-QSDK-DP-wifi-ath12k-Fixes-to-improve-DS-DL-performan.patch
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/pci.c | 13 +++++++++++--
+ drivers/net/wireless/ath/ath12k/ppe.c | 46 +++++++++++++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/ppe.h |  2 ++
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -603,6 +603,7 @@ static int ath12k_pci_ext_irq_config(str
+ 	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+ 		irq_grp = &ab->ext_irq_grp[i];
+ 		u32 num_irq = 0;
++		u32 napi_weight = NAPI_POLL_WEIGHT;
+ 
+ 		irq_grp->ab = ab;
+ 		irq_grp->grp_id = i;
+@@ -612,8 +613,16 @@ static int ath12k_pci_ext_irq_config(str
+ 			goto fail_allocate;
+ 		}
+ 
+-		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
+-			       ath12k_pci_ext_grp_napi_poll);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++		if (ab->hw_params->ring_mask->ppe2tcl[i] ||
++		    ab->hw_params->ring_mask->reo2ppe[i] ||
++		    ab->hw_params->ring_mask->ppeds_tx_cmpl[i])
++			napi_weight = ATH12K_PPE_DS_NAPI_WEIGHT;
++#endif
++		netif_napi_add_weight(irq_grp->napi_ndev,
++				      &irq_grp->napi,
++				      ath12k_pci_ext_grp_napi_poll,
++				      napi_weight);
+ 
+ 		if (ab->hw_params->ring_mask->tx[i] ||
+ 		    ab->hw_params->ring_mask->rx[i] ||
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -126,6 +126,35 @@ static void ath12k_ppe_ds_tx_desc_releas
+ 	spin_unlock_bh(&ppe->tx_desc_lock);
+ }
+ 
++static void
++ath12k_ppe_ds_tx_desc_complete(struct ath12k_base *ab,
++			       struct list_head *completed)
++{
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	struct ath12k_ppe_ds_tx_desc *desc;
++	struct sk_buff *skb;
++
++	if (list_empty(completed))
++		return;
++
++	list_for_each_entry(desc, completed, list) {
++		skb = desc->skb;
++		if (skb) {
++			dma_unmap_single(ab->dev, desc->paddr, desc->dma_len,
++					 DMA_BIDIRECTIONAL);
++			dev_kfree_skb_any(skb);
++		}
++
++		desc->skb = NULL;
++		desc->paddr = 0;
++		desc->dma_len = 0;
++	}
++
++	spin_lock_bh(&ppe->tx_desc_lock);
++	list_splice_tail_init(completed, &ppe->tx_desc_free_list);
++	spin_unlock_bh(&ppe->tx_desc_lock);
++}
++
+ static int ath12k_ppe_ds_tx_desc_init(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+@@ -711,40 +740,53 @@ int ath12k_ppe_ds_service_tx_completion(
+ {
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ath12k_ppe_ds_tx_desc *tx_desc;
++	LIST_HEAD(completed);
+ 	struct hal_wbm_completion_ring_tx *desc;
+ 	struct hal_srng *srng;
+ 	u64 addr;
+ 	u32 cookie;
+ 	int done = 0;
+ 
+ 	if (!ppe->registered)
+ 		return 0;
+ 
+ 	srng = &ab->hal.srng_list[ppe->txcmpl_ring.ring_id];
+ 	spin_lock_bh(&srng->lock);
+ 	ath12k_hal_srng_access_begin(ab, srng);
++	spin_lock_bh(&ppe->tx_desc_lock);
+ 	while (done < budget &&
+ 	       (desc = ath12k_hal_srng_dst_get_next_entry(ab, srng))) {
++		if (le32_get_bits(desc->info0,
++				  HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE) ==
++					  HAL_WBM_REL_SRC_MODULE_FW &&
++		    le32_get_bits(desc->info0, HTT_TX_WBM_COMP_INFO0_STATUS) ==
++					  HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY)
++			goto next;
+ 		if (le32_get_bits(desc->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+ 			addr = le32_to_cpu(desc->buf_va_lo) |
+ 			       (u64)le32_to_cpu(desc->buf_va_hi) << 32;
+ 			tx_desc = (void *)(uintptr_t)addr;
+ 			if (!ath12k_ppe_ds_tx_desc_valid(ab, tx_desc))
+ 				tx_desc = NULL;
+ 		} else {
+ 			cookie = le32_get_bits(desc->info0,
+ 					       HAL_WBM_COMPL_TX_INFO0_SW_COOKIE_LO) |
+ 				 le32_get_bits(desc->info3,
+ 					       HAL_WBM_COMPL_TX_INFO3_SW_COOKIE_HI) << 12;
+ 			tx_desc = ath12k_ppe_ds_tx_desc_get(ab, cookie);
+ 		}
+-		if (tx_desc)
+-			ath12k_ppe_ds_tx_desc_release(ab, tx_desc);
++		if (tx_desc && tx_desc->in_use) {
++			tx_desc->in_use = false;
++			list_add_tail(&tx_desc->list, &completed);
++		}
++next:
+ 		done++;
+ 	}
++	spin_unlock_bh(&ppe->tx_desc_lock);
+ 	ath12k_hal_srng_access_end(ab, srng);
+ 	spin_unlock_bh(&srng->lock);
+ 
++	ath12k_ppe_ds_tx_desc_complete(ab, &completed);
+ 	atomic64_add(done, &ppe->stats.tx_complete);
+ 	return done;
+ }
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -7,6 +7,8 @@ struct ath12k_link_sta;
+ struct ath12k_link_vif;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++#define ATH12K_PPE_DS_NAPI_WEIGHT 128
++
+ bool ath12k_ppe_ds_enabled(struct ath12k_base *ab);
+ int ath12k_ppe_ds_attach(struct ath12k_base *ab);
+ void ath12k_ppe_ds_detach(struct ath12k_base *ab);
+-- 
+2.43.0
