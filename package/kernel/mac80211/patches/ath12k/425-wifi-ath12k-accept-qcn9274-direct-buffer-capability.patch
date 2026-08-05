@@ -1,0 +1,34 @@
+From: Rajat Soni <quic_rajson@quicinc.com>
+Date: Fri, 10 Feb 2023 17:06:43 +0530
+Subject: [PATCH] wifi: ath12k: accept QCN9274 direct-buffer capability
+
+QCN9274 firmware advertises the CV upload direct-buffer module during the
+service-ready event.  The upstream enum stopped at spectral and CFR, causing
+the capability parser to reject the whole TLV with "Invalid module id 2".
+Accept the firmware-defined module IDs so WMI initialization continues with
+the advertised capabilities intact.
+
+Based-on: 1838228b17c223ca6ae3f8ce2932329825f258eb
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0226-ath12k-11be-spectral-scan-support.patch
+Based-on: 75420b29865d30ff1abfbb41d2f45ba1ce94667b
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0342-QSDK-CP-add-WMI_CONFIG_MODULE_WIFI_RADAR-to-enum-wmi.patch
+Signed-off-by: Rajat Soni <quic_rajson@quicinc.com>
+Signed-off-by: Harish Rachakonda <rachakon@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/wmi.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2330,5 +2330,7 @@ enum wmi_direct_buffer_module {
+ 	WMI_DIRECT_BUF_SPECTRAL = 0,
+ 	WMI_DIRECT_BUF_CFR = 1,
++	WMI_CONFIG_MODULE_CV_UPLOAD = 2,
++	WMI_CONFIG_MODULE_WIFI_RADAR = 3,
+ 
+ 	/* keep it last */
+ 	WMI_DIRECT_BUF_MAX
+-- 
+2.43.0
