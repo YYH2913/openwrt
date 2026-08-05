@@ -1,0 +1,43 @@
+From: Manish Verma <quic_maniverm@quicinc.com>
+Date: Wed, 5 Apr 2023 15:57:43 +0530
+Subject: [PATCH] wifi: ath12k: align PPE RX fill ring size
+
+Keep the EDMA RX fill ring independent from the WLAN PPE2TCL ring.  The
+IPQ95xx QSDK profile uses 2048 fill descriptors with a 256-entry low
+threshold even when PPE2TCL is enlarged to 8192 entries for high-rate
+downlink traffic.
+
+Using the PPE2TCL size for both rings retains 6144 unnecessary 2 KiB
+buffers per radio without increasing the number of WLAN descriptors that
+can be in flight.  Match the vendor profile while keeping the larger WLAN
+ring and the existing refill budget.
+
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/30c5fe84ec4636f91eed86750c28903f64ff9433
+Signed-off-by: Manish Verma <quic_maniverm@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -17,6 +17,7 @@
+ 
+ #define ATH12K_PPE_DS_BUFFER_SIZE	2048
+ #define ATH12K_PPE_DS_HEADROOM		130
++#define ATH12K_PPE_DS_RXFILL_SIZE	2048
+ #define ATH12K_PPE_DS_RXFILL_THRESHOLD	256
+ #define ATH12K_PPE_DS_RXFILL_BUDGET	128
+ #define ATH12K_PPE_DS_TXCMPL_BUDGET	1024
+@@ -649,7 +650,7 @@ int ath12k_ppe_ds_attach(struct ath12k_b
+ 	reg.reo2ppe_dma = ppe->reo2ppe_ring.paddr;
+ 	reg.ppe2tcl_count = DP_PPE2TCL_RING_SIZE;
+ 	reg.reo2ppe_count = DP_REO2PPE_RING_SIZE;
+-	reg.rxfill_count = DP_PPE2TCL_RING_SIZE;
++	reg.rxfill_count = ATH12K_PPE_DS_RXFILL_SIZE;
+ 	reg.txcmpl_count = DP_REO2PPE_RING_SIZE;
+ 	reg.buffer_size = ATH12K_PPE_DS_BUFFER_SIZE;
+ 	reg.headroom = ATH12K_PPE_DS_HEADROOM;
+-- 
+2.43.0
