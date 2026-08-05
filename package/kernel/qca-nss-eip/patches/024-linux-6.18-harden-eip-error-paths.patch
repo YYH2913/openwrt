@@ -1,0 +1,325 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 5 Aug 2026 23:30:00 +0800
+Subject: [PATCH] qca-nss-eip: harden recoverable error paths
+
+Several vendor error paths turn recoverable hardware or lifecycle faults into
+kernel crashes.  In particular, an HMAC key-digest error panics while leaving
+the synchronous caller blocked, IPsec lookaside requests install a NULL error
+callback, and defensive flow and device checks use BUG_ON().
+
+Complete failed digest requests and propagate the failure to transform-record
+initialization.  Give IPsec lookaside requests a real error completion, reject
+invalid hybrid services without invoking the wrong callback union, and fail
+corrupt flow/device lifecycle operations without taking down the system.
+Clear consumed command-ring metadata so a stale completion cannot reuse an
+old software descriptor after the ring wraps.
+
+The CodeLinaro nss-eip branches retain the crashing behavior and no external
+correction for these faults could be identified.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_tr_ahash.c
++++ b/driver/eip197/eip_tr_ahash.c
+@@ -197,6 +197,11 @@ static const struct eip_svc_entry ahash_
+ 
+ };
+ 
++struct eip_tr_ahash_digest_result {
++	struct completion *completion;
++	bool success;
++};
++
+ /*
+  * eip_tr_ahash_tx_complete()
+  *	Free Resources held during transmit.
+@@ -224,11 +229,14 @@ static inline void eip_tr_ahash_tx_compl
+  */
+ static void eip_tr_ahash_digest_err(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
+ {
++	struct eip_tr_ahash_digest_result *result = sw->req;
++
+ 	/*
+ 	 * Digest computation must not fail unless there is any programming error.
+ 	 */
+ 	pr_err("%px: Digest completed with cle_err(%u) tr_err(%u)\n", tr, cle_err, tr_err);
+-	BUG_ON(1);
++	eip_tr_ahash_tx_complete(tr, sw);
++	complete(result->completion);
+ }
+ 
+ /*
+@@ -237,15 +246,16 @@ static void eip_tr_ahash_digest_err(stru
+  */
+ static void eip_tr_ahash_digest_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+-	struct completion *completion = sw->req;
++	struct eip_tr_ahash_digest_result *result = sw->req;
+ 
+ 	/*
+ 	 * Free transmit resources.
+ 	 */
++	result->success = true;
+ 	eip_tr_ahash_tx_complete(tr, sw);
+ 
+ 	pr_debug("%px: Digest completed\n", tr);
+-	complete(completion);
++	complete(result->completion);
+ }
+ 
+ /*
+@@ -365,8 +375,12 @@ bool eip_tr_ahash_key2digest(struct eip_
+ 	void *key_data;
+ 	uint32_t data_len;
+ 	uint32_t tk_words;
++	struct eip_tr_ahash_digest_result result = {
++		.success = false,
++	};
+ 
+ 	DECLARE_COMPLETION_ONSTACK(completion);
++	result.completion = &completion;
+ 
+ 	/*
+ 	 * Sanity check.
+@@ -436,7 +450,7 @@ bool eip_tr_ahash_key2digest(struct eip_
+ 	sw->tr_addr_type = tr->tr_addr_type;
+ 	sw->tk_words = tk_words;
+ 	sw->hw_svc = EIP_HW_CMD_HWSERVICE_LAC;
+-	sw->req = &completion;
++	sw->req = &result;
+ 
+ 	/*
+ 	 * Schedule the transformation.
+@@ -463,7 +477,7 @@ retry:
+ 	pr_debug("%px: Waiting for Digest completion\n", tr);
+ 	wait_for_completion(&completion);
+ 	kfree(key_data);
+-	return true;
++	return result.success;
+ 
+ fail_alloc_desc:
+ 	kmem_cache_free(ctx->tk_cache, tk);
+--- a/driver/eip197/eip_tr_ipsec.h
++++ b/driver/eip197/eip_tr_ipsec.h
+@@ -25,6 +25,8 @@
+ void eip_tr_ipsec_dec_cmn_init(struct eip_tr *tr, struct eip_tr_info *info, const struct eip_svc_entry *algo);
+ void eip_tr_ipsec_enc_cmn_init(struct eip_tr *tr, struct eip_tr_info *info, const struct eip_svc_entry *algo);
+ void eip_tr_ipsec_tx_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw);
++void eip_tr_ipsec_tx_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++		struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err);
+ uint8_t eip_tr_ipsec_get_ohdr(uint32_t sa_flags);
+ 
+ #endif /* __EIP_TR_IPSEC_H */
+--- a/driver/eip197/eip_tr_ipsec.c
++++ b/driver/eip197/eip_tr_ipsec.c
+@@ -538,6 +538,37 @@ void eip_tr_ipsec_tx_done(struct eip_tr
+ 	eip_tr_deref(tr);
+ }
+ 
++/*
++ * eip_tr_ipsec_tx_err()
++ *	Hardware error callback for host-submitted inline packets.
++ */
++void eip_tr_ipsec_tx_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++		struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
++{
++	eip_tr_err_callback_t cb = tr->ipsec.ops.err_cb;
++	struct sk_buff *skb = eip_req2skb(sw->req);
++	void *app_data = tr->ipsec.app_data;
++	struct eip_ctx *ctx = tr->ctx;
++	int err;
++
++	err = eip_tr_classify_err(cle_err, tr_err);
++	if (skb->len >= sizeof(struct ethhdr))
++		skb_pull(skb, sizeof(struct ethhdr));
++
++	kmem_cache_free(ctx->sw_cache, sw);
++
++	if (likely(cb)) {
++		cb(app_data, skb, err);
++	} else {
++		pr_warn_ratelimited("IPsec request failed without an error callback: %d\n",
++				    err);
++		consume_skb(skb);
++	}
++
++	/* Keep the TR, and therefore its SA callback data, alive through cb(). */
++	eip_tr_deref(tr);
++}
++
+ /*
+  * eip_tr_ipsec_get_svc()
+  *	Get algo database for ipsec.
+--- a/driver/eip197/eip_tr_ipsec_enc.c
++++ b/driver/eip197/eip_tr_ipsec_enc.c
+@@ -229,7 +229,7 @@ int eip_tr_ipsec_enc(struct eip_tr *tr,
+ 	skb_push(skb, sizeof(struct ethhdr));
+ 	sw->tk_hdr |= skb->len;
+ 	sw->comp = &eip_tr_ipsec_tx_done;
+-	sw->err_comp = NULL; /* There is no error in Transmit completion */
++	sw->err_comp = &eip_tr_ipsec_tx_err;
+ 
+ 	dma = &ctx->dma[smp_processor_id()];
+ 
+--- a/driver/eip197/eip_tr_ipsec_dec.c
++++ b/driver/eip197/eip_tr_ipsec_dec.c
+@@ -253,7 +253,7 @@ int eip_tr_ipsec_dec(struct eip_tr *tr,
+ 	skb_push(skb, sizeof(struct ethhdr));
+ 	sw->tk_hdr |= skb->len;
+ 	sw->comp = &eip_tr_ipsec_tx_done;
+-	sw->err_comp = NULL; /* There is no error in Transmit completion */
++	sw->err_comp = &eip_tr_ipsec_tx_err;
+ 
+ 	dma = &ctx->dma[smp_processor_id()];
+ 
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -202,11 +202,17 @@ static inline struct eip_tr *eip_dma_hy_
+  */
+ static inline void eip_dma_hy_tr_deliver(struct eip_tr *tr, struct sk_buff *skb, uint32_t nsegs)
+ {
+-	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
++	struct eip_tr_stats *tr_stats;
+ 
+-	BUG_ON(tr->svc != EIP_SVC_IPSEC &&
+-	       tr->svc != EIP_SVC_HYBRID_IPSEC);
++	if (unlikely((tr->svc != EIP_SVC_IPSEC &&
++		      tr->svc != EIP_SVC_HYBRID_IPSEC) ||
++		     !tr->ipsec.ops.cb)) {
++		pr_warn_ratelimited("%px: invalid hybrid completion service %u\n", tr, tr->svc);
++		consume_skb(skb);
++		return;
++	}
+ 
++	tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 	tr_stats->rx_frags += nsegs;
+ 	tr_stats->rx_pkts++;
+ 	tr_stats->rx_bytes += skb->len;
+@@ -223,11 +229,17 @@ static inline void eip_dma_hy_tr_deliver
+  */
+ static inline void eip_dma_hy_tr_deliver_err(struct eip_tr *tr, struct sk_buff *skb, uint32_t nsegs, uint16_t tr_err)
+ {
+-	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
++	struct eip_tr_stats *tr_stats;
+ 
+-	BUG_ON(tr->svc != EIP_SVC_IPSEC &&
+-	       tr->svc != EIP_SVC_HYBRID_IPSEC);
++	if (unlikely((tr->svc != EIP_SVC_IPSEC &&
++		      tr->svc != EIP_SVC_HYBRID_IPSEC) ||
++		     !tr->ipsec.ops.err_cb)) {
++		pr_warn_ratelimited("%px: invalid hybrid error service %u\n", tr, tr->svc);
++		consume_skb(skb);
++		return;
++	}
+ 
++	tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 	tr_stats->rx_frags += nsegs;
+ 	tr_stats->rx_pkts++;
+ 	tr_stats->rx_bytes += skb->len;
+@@ -632,6 +642,7 @@ int eip_dma_hy_tx_comp(struct eip_dma *d
+ 		struct eip_sw_desc *sw;
+ 
+ 		sw = (struct eip_sw_desc *)dma->in.meta[in_cidx];
++		dma->in.meta[in_cidx] = 0;
+ 		in_cidx = EIP_DMA_IDX_INC(in_cidx);
+ 
+ 		if (!sw)
+--- a/driver/eip197/eip_flow.c
++++ b/driver/eip197/eip_flow.c
+@@ -518,7 +518,13 @@ int eip_flow_add(struct eip_tun *tun, st
+ 	 * Obtain the tail of the current chain. Here, atleast one node will be already present,hence tail can't be null.
+ 	 */
+ 	tail_flow = eip_flow_get_tail(flow_head);
+-	BUG_ON(tail_flow == NULL);
++	if (WARN_ON_ONCE(!tail_flow)) {
++		tbl->stats.fail_collision++;
++		eip_flow_free(flow, ep);
++		spin_unlock_bh(&ep->lock);
++		pr_err("%px: Missing collision-chain head at index %u\n", tun, idx);
++		return -EIO;
++	}
+ 
+ 	pr_debug("%px: Physical address of hardware head: %pad\n", tr, &tbl->hw_head_paddr);
+ 	tail_flow->hflow->next_flow_offset = (flow->hflow_paddr - tbl->hw_head_paddr) | EIP_FLOW_VALID_BIT;
+--- a/clients/ipsec/eip_ipsec_dev.c
++++ b/clients/ipsec/eip_ipsec_dev.c
+@@ -862,10 +862,13 @@ void eip_ipsec_dev_unlink_id(struct net_
+ 	 * devid should be >=0 prior to
+ 	 * entering this API.
+ 	 */
+-	BUG_ON(eid->devid < 0);
+-
+ 	spin_lock_bh(&drv->lock);
+-	list_del(&eid->node);
++	if (WARN_ON_ONCE(eid->devid < 0 || eid->devid != devid)) {
++		spin_unlock_bh(&drv->lock);
++		return;
++	}
++
++	list_del_init(&eid->node);
+ 	dev_put(ndev);
+ 	eid->devid = -1;
+ 	spin_unlock_bh(&drv->lock);
+@@ -884,9 +887,12 @@ void eip_ipsec_dev_link_id(struct net_dev
+ 	 * devid should be -1 prior to
+ 	 * entering this API.
+ 	 */
+-	BUG_ON(eid->devid >= 0);
+-
+ 	spin_lock_bh(&drv->lock);
++	if (WARN_ON_ONCE(eid->devid >= 0 || devid < 0 || !list_empty(&eid->node))) {
++		spin_unlock_bh(&drv->lock);
++		return;
++	}
++
+ 	eid->devid = devid;
+ 	list_add(&eid->node, &drv->dev_head);
+ 	dev_hold(ndev);
+@@ -920,18 +926,17 @@ void eip_ipsec_dev_del(struct net_device
+ {
+ 	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+ 
+-	/*
+-	 * the given net_device should be unlinked from the db
+-	 * before deletion.
+-	 */
+-	BUG_ON(eid->devid >= 0);
+-
+ 	/*
+-	 * User is require to remove SA first.
+-	 * TODO: Can we flush all?
++	 * The device must be unlinked and all SAs removed before deletion.
++	 * Refuse an unsafe teardown instead of corrupting the database or
++	 * releasing storage which is still reachable by packet processing.
+ 	 */
+-	if (!list_empty(&eid->enc_sa) || !list_empty(&eid->dec_sa)) {
+-		pr_warn("%px: Device is being deleted with active SA\n", ndev);
++	if (WARN_ON_ONCE(eid->devid >= 0 ||
++			 !list_empty(&eid->enc_sa) ||
++			 !list_empty(&eid->dec_sa))) {
++		pr_warn("%px: Refusing to delete a linked or active IPsec device\n",
++			ndev);
++		return;
+ 	}
+ 
+ 	eip_ipsec_flow_dev_cleanup(eid);
+@@ -984,6 +990,7 @@ struct net_device *eip_ipsec_dev_add(void
+ 	eid->ndev = ndev;
+ 	eid->devid = -1;
+ 
++	INIT_LIST_HEAD(&eid->node);
+ 	INIT_LIST_HEAD(&eid->enc_sa);
+ 	INIT_LIST_HEAD(&eid->dec_sa);
+ 	INIT_LIST_HEAD(&eid->inner_flows);
+--- a/clients/ipsec/eip_ipsec_xfrm.c
++++ b/clients/ipsec/eip_ipsec_xfrm.c
+@@ -672,7 +672,6 @@ static int __eip_ipsec_xfrm_state_add(st
+ 	 */
+ 	if (eip_ipsec_xfrm_check_state(xs)) {
+ 		pr_warn("%p: xfrm_state is already offloaded\n", xs);
+-		WARN_ON(1);
+ 		return -EEXIST;
+ 	}
+ 
