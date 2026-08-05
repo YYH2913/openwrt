@@ -1,0 +1,206 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 6 Aug 2026 04:09:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: let EIP update flow PMTU
+
+An EIP binding currently returns one MTU snapshot from its shared reqid
+netdevice.  That snapshot cannot identify the SA which owns a full-inline
+flow, and it cannot be refreshed when rekey changes the transform
+overhead.
+
+Give the EIP provider a PPE-owned handle and PMTU update callback.  Cache
+updates which arrive before the row is installed, update a live row
+under the flowtable lock, and revoke the callback under the same lock
+before releasing the provider object.  The revocation handshake prevents
+a concurrent rekey from writing an index after its hardware row has been
+deleted or reused.
+
+The CodeLinaro nss-ppe branches retain the snapshot-only binding, and no
+external correction for this ownership fault could be identified.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -151,11 +151,14 @@ struct ppe_ft_vlan {
+ 
+ static_assert(offsetof(struct ppe_ft_vlan, ref) == 0);
+ 
++struct ppe_flowtable;
++
+ /**
+  * struct ppe_ft_flow - An offloaded flow.
+  * @node: Hash table node, keyed by the flow cookie.
+  * @zombie_node: Quarantine list node for an undeletable hardware flow.
+  * @rcu: RCU callback used to release a removed flow.
++ * @ft: Flowtable which owns this flow while its EIP callback is usable.
+  * @cookie: Flow cookie of the rule.
+  * @index: Hardware flow table index.
+  * @entry: The flow, kept for the delete command.
+@@ -182,6 +185,7 @@ struct ppe_ft_flow {
+ 	struct rhash_head node;
+ 	struct list_head zombie_node;
+ 	struct rcu_head rcu;
++	struct ppe_flowtable *ft;
+ 	unsigned long cookie;
+ 	int index;
+ 	struct ppe_flow_entry entry;
+@@ -205,8 +209,6 @@ struct ppe_ft_flow {
+ 	u64 bytes;
+ };
+ 
+-struct ppe_flowtable;
+-
+ /* One PPE outer tuple can be shared by several inbound SAs during rekey;
+  * EIP still keeps a distinct SPI flow and VP for every SA.
+  */
+@@ -362,10 +364,25 @@ static const struct qcom_ppe_eip_provider_ops *ppe_ft_eip_provider_get(void)
+ static void ppe_ft_eip_provider_put(struct ppe_ft_flow *flow)
+ {
+ 	const struct qcom_ppe_eip_provider_ops *ops;
++	struct ppe_flowtable *ft;
+ 
+ 	if (!flow || !flow->eip_ops)
+ 		return;
+ 
++	/* Stop new PMTU updates and wait for one which already acquired the
++	 * flowtable pointer.  flow_del() then removes the provider object from its
++	 * rekey-visible list before this PPE object can be freed.
++	 */
++	ft = READ_ONCE(flow->ft);
++	if (ft) {
++		mutex_lock(&ft->lock);
++		if (READ_ONCE(flow->ft) == ft) {
++			WRITE_ONCE(flow->ft, NULL);
++			flow->index = -1;
++		}
++		mutex_unlock(&ft->lock);
++	}
++
+ 	ops = flow->eip_ops;
+ 	flow->eip_ops = NULL;
+ 	ops->flow_del(flow->eip_priv);
+@@ -2304,6 +2321,43 @@ static void ppe_ft_flow_quarantine(struct ppe_flowtable *ft,
+ 	list_add_tail(&flow->zombie_node, &ft->zombies);
+ }
+ 
++static int ppe_ft_eip_flow_mtu_set(void *priv, u16 mtu)
++{
++	struct ppe_ft_flow *flow = priv;
++	struct ppe_flowtable *ft;
++	int ret = 0;
++
++	if (!flow || mtu < 68 || mtu > PPE_FLOW_PMTU_MAX)
++		return -ERANGE;
++
++	ft = READ_ONCE(flow->ft);
++	if (!ft)
++		return -ESHUTDOWN;
++
++	mutex_lock(&ft->lock);
++	if (READ_ONCE(flow->ft) != ft) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++
++	/* The provider becomes visible before the PPE row is installed.  Cache an
++	 * early rekey's MTU now; once index is valid, update the live row while it
++	 * is disabled so hardware never observes split PMTU fields.
++	 */
++	if (flow->index >= 0) {
++		ret = ppe_flow_entry_pmtu_set(ft->ppe_dev, flow->index,
++					      flow->entry.is_ipv6,
++					      flow->entry.is_3tuple, mtu);
++		if (ret)
++			goto out;
++	}
++
++	WRITE_ONCE(flow->entry.pmtu, mtu);
++out:
++	mutex_unlock(&ft->lock);
++	return ret;
++}
++
+ static int ppe_ft_eip_provider_bind(struct ppe_ft_flow *flow,
+ 				    struct xfrm_state *x)
+ {
+@@ -2315,7 +2369,10 @@ static int ppe_ft_eip_provider_bind(struct ppe_ft_flow *flow,
+ 			    IPPROTO_TCP : IPPROTO_UDP,
+ 		.ipv6 = flow->entry.is_ipv6,
+ 	};
+-	struct qcom_ppe_eip_binding binding = {};
++	struct qcom_ppe_eip_binding binding = {
++		.ppe_priv = flow,
++		.mtu_set = ppe_ft_eip_flow_mtu_set,
++	};
+ 	int ret;
+ 
+ 	if (tuple.ipv6) {
+@@ -2336,7 +2393,8 @@ static int ppe_ft_eip_provider_bind(struct ppe_ft_flow *flow,
+ 
+ 	if (!binding.dev || !binding.priv ||
+ 	    binding.vp < PPE_VP_PORT_BASE || binding.vp >= PPE_PORT_ID_COUNT ||
+-	    binding.mtu < 68 || binding.mtu > PPE_FLOW_PMTU_MAX ||
++	    READ_ONCE(flow->entry.pmtu) < 68 ||
++	    READ_ONCE(flow->entry.pmtu) > PPE_FLOW_PMTU_MAX ||
+ 	    binding.dev->addr_len != ETH_ALEN ||
+ 	    !is_valid_ether_addr(binding.dev->dev_addr)) {
+ 		ret = -EINVAL;
+@@ -2348,7 +2406,6 @@ static int ppe_ft_eip_provider_bind(struct ppe_ft_flow *flow,
+ 	flow->eip_priv = binding.priv;
+ 	flow->eip_dev = binding.dev;
+ 	flow->eip_vp = binding.vp;
+-	flow->entry.pmtu = binding.mtu;
+ 	flow->entry.service_code = PPE_EIP_SC_PPE2EIP_ENCAP;
+ 	flow->eport = binding.vp;
+ 	return 0;
+@@ -2429,7 +2486,9 @@ static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
+ 	if (!flow)
+ 		return -ENOMEM;
+ 
++	flow->ft = ft;
+ 	flow->cookie = f->cookie;
++	flow->index = -1;
+ 	flow->my_mac = -1;
+ 	flow->my_mac_l3_if = -1;
+ 	flow->pub_ip = -1;
+@@ -3098,6 +3157,8 @@ err_hw_flow:
+ 		flow = NULL;
+ 		goto err_unlock;
+ 	}
++	WRITE_ONCE(flow->ft, NULL);
++	flow->index = -1;
+ 	ppe_ft_host_put(ft, &flow->entry);
+ 	goto err_my_mac;
+ err_host:
+@@ -3151,6 +3212,8 @@ static int ppe_ft_flow_destroy(struct ppe_flowtable *ft,
+ 	ppe_vp_flow_del(ft->ppe_dev, flow->ivp, &flow->vp_flow);
+ 
+ 	if (ppe_ft_flow_hw_del(ft, flow)) {
++		WRITE_ONCE(flow->ft, NULL);
++		flow->index = -1;
+ 		ppe_ft_host_put(ft, &flow->entry);
+ 		clear_bit(flow->nexthop, ft->nexthop_used);
+ 		ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if,
+--- a/include/linux/soc/qcom/ppe.h
++++ b/include/linux/soc/qcom/ppe.h
+@@ -60,14 +60,16 @@ struct qcom_ppe_eip_inner_tuple {
+  * struct qcom_ppe_eip_binding - EIP resources bound to one PPE flow
+  * @dev: EIP IPsec netdevice retained by the provider object.
+  * @priv: Provider-owned flow handle passed back to flow_del().
++ * @ppe_priv: PPE-owned flow handle valid until flow_del() returns.
++ * @mtu_set: Update the clear-text PMTU cached or programmed by PPE.
+  * @vp: PPE virtual port which represents the EIP inline input.
+- * @mtu: Clear-text path MTU programmed into the PPE flow.
+  */
+ struct qcom_ppe_eip_binding {
+ 	struct net_device *dev;
+ 	void *priv;
++	void *ppe_priv;
++	int (*mtu_set)(void *priv, u16 mtu);
+ 	int vp;
+-	u16 mtu;
+ };
+ 
+ /**

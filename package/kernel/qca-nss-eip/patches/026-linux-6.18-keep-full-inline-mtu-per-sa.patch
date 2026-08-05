@@ -1,0 +1,335 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 6 Aug 2026 04:10:00 +0800
+Subject: [PATCH] qca-nss-eip: keep full-inline MTU per SA
+
+A reqid netdevice is shared by old and new outbound SAs during rekey.
+The last SA added currently overwrites that device's MTU, full-inline
+PPE flows copy the shared value once, and replacing the EIP transform
+does not refresh their hardware PMTU.  Different algorithms or outer
+paths can consequently leave retained flows with the wrong limit.
+
+Store the clear-text MTU on each SA and keep the shared netdevice at the
+minimum of its active outbound SAs.  Use the exact SA value on the IPv6
+host path and expose it in debugfs.
+
+For full-inline flows, program the owning SA's PMTU through the PPE
+binding callback.  During rekey, update every live PPE row before
+switching the EIP transform and restore the old PMTU if migration fails.
+Treat a revoked PPE handle as a concurrent flow deletion, since its row
+can no longer forward through the transform being migrated.
+
+The CodeLinaro nss-eip branches retain the shared-device MTU ownership,
+and no external correction for this case could be identified.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_dev.c
++++ b/clients/ipsec/eip_ipsec_dev.c
+@@ -107,7 +107,7 @@ static ssize_t eip_ipsec_dev_read(struct file *fp, char __user *ubuf, size_t sz,
+ 	max_len += EIP_IPSEC_MAX_STR_LEN; /* Encap heading */
+ 	max_len += EIP_IPSEC_MAX_STR_LEN; /* Decap heading */
+ 	max_len += EIP_IPSEC_MAX_STR_LEN * 2; /* Full-inline status */
+-	max_len += (EIP_IPSEC_MAX_STR_LEN * sa_count); /* SA header */
++	max_len += (EIP_IPSEC_MAX_STR_LEN * 4 * sa_count); /* SA metadata */
+ 	max_len += ((sizeof(struct eip_ipsec_sa_stats) / sizeof(uint64_t)) * EIP_IPSEC_MAX_STR_LEN * sa_count) ; /* SA Members */
+ 
+ 	buf = vzalloc(max_len);
+@@ -994,6 +994,7 @@ struct net_device *eip_ipsec_dev_add(void)
+ 	INIT_LIST_HEAD(&eid->enc_sa);
+ 	INIT_LIST_HEAD(&eid->dec_sa);
+ 	INIT_LIST_HEAD(&eid->inner_flows);
++	mutex_init(&eid->mtu_lock);
+ 	mutex_init(&eid->inner_lock);
+ 	eid->inner_vp = -1;
+ 
+--- a/clients/ipsec/eip_ipsec_dev.h
++++ b/clients/ipsec/eip_ipsec_dev.h
+@@ -63,6 +63,7 @@ struct eip_ipsec_dev {
+ 	struct list_head dec_sa;	/* Decap SA list protected by RCU read lock and spinlock for modification */
+ 	struct eip_ipsec_dev_stats __percpu *stats_pcpu;	/* Device statistics */
+ 	struct dentry *dentry;		/* Driver debugfs dentry */
++	struct mutex mtu_lock;		/* Serializes SA lists with shared MTU updates */
+ 	struct mutex inner_lock;	/* Serializes full-inline flows and resources */
+ 	struct list_head inner_flows;	/* PPE provider flows using inner_tun */
+ 	struct eip_tun *inner_tun;	/* Shared outbound EIP flow context */
+--- a/clients/ipsec/eip_ipsec_flow.c
++++ b/clients/ipsec/eip_ipsec_flow.c
+@@ -25,6 +25,8 @@ struct eip_ipsec_flow {
+ 	struct eip_ipsec_sa *sa;
+ 	struct xfrm_state *xs;
+ 	struct net_device *dev;
++	void *ppe_priv;
++	int (*ppe_mtu_set)(void *priv, u16 mtu);
+ 	struct eip_flow_tuple tuple;
+ 	bool installed;
+ };
+@@ -358,7 +360,8 @@ eip_ipsec_flow_add(struct xfrm_state *xs,
+ 	struct eip_flow_info info = {};
+ 	int ret;
+ 
+-	if (!xs || !tuple || !binding ||
++	if (!xs || !tuple || !binding || !binding->ppe_priv ||
++	    !binding->mtu_set ||
+ 	    (tuple->protocol != IPPROTO_TCP && tuple->protocol != IPPROTO_UDP) ||
+ 	    !(xs->xflags & XFRM_STATE_OFFLOAD_EIP) ||
+ 	    xs->dir != XFRM_SA_DIR_OUT)
+@@ -388,6 +391,8 @@ eip_ipsec_flow_add(struct xfrm_state *xs,
+ 	flow->sa = sa;
+ 	flow->xs = xs;
+ 	flow->dev = dev;
++	flow->ppe_priv = binding->ppe_priv;
++	flow->ppe_mtu_set = binding->mtu_set;
+ 	eip_ipsec_flow_tuple_set(&flow->tuple, tuple);
+ 	xfrm_state_hold(xs);
+ 	dev_hold(dev);
+@@ -407,12 +412,17 @@ eip_ipsec_flow_add(struct xfrm_state *xs,
+ 		goto out_unlock;
+ 
+ 	flow->installed = true;
++	ret = flow->ppe_mtu_set(flow->ppe_priv, READ_ONCE(sa->mtu));
++	if (ret) {
++		eip_flow_del(eid->inner_tun, &info);
++		flow->installed = false;
++		goto out_unlock;
++	}
+ 	list_add_tail(&flow->node, &eid->inner_flows);
+ 	eid->inner_flow_count++;
+ 	binding->dev = dev;
+ 	binding->priv = flow;
+ 	binding->vp = eid->inner_vp;
+-	binding->mtu = READ_ONCE(dev->mtu);
+ 	mutex_unlock(&eid->inner_lock);
+ 	return 0;
+ 
+@@ -480,6 +490,7 @@ void eip_ipsec_flow_rekey(struct eip_ipsec_sa *new_sa)
+ 	};
+ 	struct xfrm_state *old_xs;
+ 	unsigned int migrated = 0;
++	bool pmtu_changed;
+ 	bool found = false;
+ 	int ret;
+ 
+@@ -516,14 +527,31 @@ void eip_ipsec_flow_rekey(struct eip_ipsec_sa *new_sa)
+ 	if (!migrated)
+ 		goto out_unlock;
+ 
++	pmtu_changed = READ_ONCE(old_sa->mtu) != READ_ONCE(new_sa->mtu);
++	if (pmtu_changed) {
++		list_for_each_entry(flow, &eid->inner_flows, node) {
++			if (flow->sa != old_sa || flow->xs != old_xs)
++				continue;
++
++			ret = flow->ppe_mtu_set(flow->ppe_priv,
++						     READ_ONCE(new_sa->mtu));
++			if (ret == -ESHUTDOWN)
++				continue;
++			if (ret) {
++				pr_warn("%p: failed to update PPE flow PMTU during rekey: %d\n",
++					new_sa, ret);
++				goto rollback_pmtu;
++			}
++		}
++	}
++
+ 	update.tr = old_sa->tr;
+ 	update.new_tr = new_sa->tr;
+ 	ret = eip_tun_update(eid->inner_tun, &update);
+ 	if (ret) {
+ 		pr_warn("%p: failed to migrate %u EIP flows during rekey: %d\n",
+ 			new_sa, migrated, ret);
+-		migrated = 0;
+-		goto out_unlock;
++		goto rollback_pmtu;
+ 	}
+ 
+ 	list_for_each_entry(flow, &eid->inner_flows, node) {
+@@ -534,6 +562,24 @@ void eip_ipsec_flow_rekey(struct eip_ipsec_sa *new_sa)
+ 		flow->sa = new_sa;
+ 		flow->xs = new_sa->xs;
+ 	}
++	goto out_unlock;
++
++rollback_pmtu:
++	if (pmtu_changed) {
++		list_for_each_entry(flow, &eid->inner_flows, node) {
++			int mtu_ret;
++
++			if (flow->sa != old_sa || flow->xs != old_xs)
++				continue;
++
++			mtu_ret = flow->ppe_mtu_set(flow->ppe_priv,
++						     READ_ONCE(old_sa->mtu));
++			if (mtu_ret && mtu_ret != -ESHUTDOWN)
++				pr_warn("%p: failed to roll back PPE flow PMTU: %d\n",
++					old_sa, mtu_ret);
++		}
++	}
++	migrated = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&eid->inner_lock);
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -206,6 +206,7 @@ static void eip_ipsec_sa_attach(struct net_device *ndev, struct eip_ipsec_sa *sa
+ 	struct list_head *sa_head = &eid->enc_sa;
+ 	struct eip_ipsec_dev_stats *dev_stats;
+ 
++	lockdep_assert_held(&eid->mtu_lock);
+ 	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+ 
+ 	/* Attach every SA globally.  Inbound host receive and outbound SC8
+@@ -266,6 +267,7 @@ static struct eip_ipsec_sa *eip_ipsec_sa_dettach(struct net_device *ndev, struct
+ 	struct eip_ipsec_dev_stats *dev_stats;
+ 	struct eip_ipsec_sa *sa;
+ 
++	lockdep_assert_held(&eid->mtu_lock);
+ 	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+ 	spin_lock_bh(&drv->lock);
+ 
+@@ -544,12 +546,11 @@ out_dev:
+ 
+ /*
+  * eip_ipsec_sa_set_mtu()
+- *      Set IPsec device MTU.
++ *      Set the clear-text MTU owned by this SA.
+  */
+ static void eip_ipsec_sa_set_mtu(struct eip_ipsec_sa *sa, struct eip_ipsec_data *sa_data)
+ {
+ 	struct eip_ipsec_base *base = &sa_data->base;
+-	struct net_device *ndev = sa->ndev;
+ 	struct eip_tr_algo_info algo = {0};
+ 	struct eip_tr *tr = sa->tr;
+ 	u32 header_len = sizeof(struct ip_esp_hdr);
+@@ -573,10 +574,30 @@ static void eip_ipsec_sa_set_mtu(struct eip_ipsec_sa *sa, struct eip_ipsec_data
+ 		sa->xs->props.trailer_len = trailer_len;
+ 	}
+ 
++	WRITE_ONCE(sa->mtu, sa_data->mtu > mtu_overhead ?
++			    sa_data->mtu - mtu_overhead : 1);
++}
++
++static void eip_ipsec_sa_update_dev_mtu(struct eip_ipsec_dev *eid)
++{
++	struct eip_ipsec_sa *sa;
++	u16 mtu = U16_MAX;
++	int ret;
++
++	lockdep_assert_held(&eid->mtu_lock);
++
++	list_for_each_entry(sa, &eid->enc_sa, node)
++		mtu = min_t(u16, mtu, READ_ONCE(sa->mtu));
++
++	if (mtu == U16_MAX)
++		mtu = ETH_DATA_LEN - EIP_IPSEC_DEV_MAX_HDR_LEN;
++
+ 	rtnl_lock();
+-	dev_set_mtu(ndev, sa_data->mtu > mtu_overhead ?
+-			  sa_data->mtu - mtu_overhead : 1);
++	ret = dev_set_mtu(eid->ndev, mtu);
+ 	rtnl_unlock();
++	if (ret)
++		pr_warn("%p: failed to update shared IPsec MTU to %u: %d\n",
++			eid, mtu, ret);
+ }
+ 
+ /*
+@@ -732,6 +753,10 @@ ssize_t eip_ipsec_sa_read(struct net_device *ndev, bool encap, char *buf, ssize_
+ 		else
+ 			len += snprintf(buf + len, max_len - len,
+ 					"\tPPE inline: no (host lookaside)\n");
++		if (encap)
++			len += snprintf(buf + len, max_len - len,
++					"\tClear-text MTU: %u\n",
++					READ_ONCE(sa->mtu));
+ 		len += snprintf(buf + len, max_len - len, "\tTx packets: %llu\n", stats.tx_pkts);
+ 		len += snprintf(buf + len, max_len - len, "\tTx bytes: %llu\n", stats.tx_bytes);
+ 		len += snprintf(buf + len, max_len - len, "\tRx packets: %llu\n", stats.rx_pkts);
+@@ -1085,7 +1110,11 @@ int eip_ipsec_sa_add(struct net_device *ndev, struct eip_ipsec_data *data, struc
+ 	/*
+ 	 * TODO: Do we need to handle multiple sa_add() on multiple core.
+ 	 */
++	mutex_lock(&eid->mtu_lock);
+ 	eip_ipsec_sa_attach(ndev, sa, encap);
++	if (encap)
++		eip_ipsec_sa_update_dev_mtu(eid);
++	mutex_unlock(&eid->mtu_lock);
+ 	if (encap && sa->inner_offload)
+ 		eip_ipsec_flow_rekey(sa);
+ 
+@@ -1119,6 +1148,7 @@ fail_pcpu:
+  */
+ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ {
++	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+ 	struct eip_ipsec_sa *sa;
+ 	bool inline_offload;
+ 
+@@ -1127,11 +1157,16 @@ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ 	/*
+ 	 * Dettach and deref the SA. This also ensure no new packet gets reference.
+ 	 */
++	mutex_lock(&eid->mtu_lock);
+ 	sa = eip_ipsec_sa_dettach(ndev, t);
+ 	if (!sa) {
++		mutex_unlock(&eid->mtu_lock);
+ 		pr_warn("%px: SA not found\n", ndev);
+ 		return;
+ 	}
++	if (sa->flags & EIP_IPSEC_FLAG_ENC)
++		eip_ipsec_sa_update_dev_mtu(eid);
++	mutex_unlock(&eid->mtu_lock);
+ 
+ 	/* Stop the PPE outer flow before removing the EIP SPI mapping.  This is
+ 	 * also the ordering required by EIP TR invalidation for inline receive.
+--- a/clients/ipsec/eip_ipsec_sa.h
++++ b/clients/ipsec/eip_ipsec_sa.h
+@@ -59,6 +59,7 @@ struct eip_ipsec_sa {
+ 	u8 ip_ver;			/* IP version */
+ 	uint16_t head_room;		/* Headroom required for encapsulation */
+ 	uint16_t tail_room;		/* Tailroom required for encapsulation */
++	u16 mtu;			/* Clear-text path MTU for this SA */
+ 	struct eip_tr *tr;		/* Transform record allocated by HW */
+ 	struct eip_ipsec_sa_stats __percpu *stats_pcpu;	/* SA statistics */
+ 	struct xfrm_state *xs;          /* offloaded xfrm sate to use in SKB after decap. */
+--- a/clients/ipsec/eip_ipsec_xfrm.c
++++ b/clients/ipsec/eip_ipsec_xfrm.c
+@@ -281,6 +281,7 @@ static int eip_ipsec_xfrm_v6_output(struct net *net, struct sock *sk, struct sk_
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct xfrm_state *xs = dst ? dst->xfrm : NULL;
++	struct eip_ipsec_sa *sa;
+ 	struct net_device *dev;
+ 	int mtu;
+ 
+@@ -294,16 +295,24 @@ static int eip_ipsec_xfrm_v6_output(struct net *net, struct sock *sk, struct sk_
+ 	}
+ 
+ 	skb->dev = dev;
++	sa = eip_ipsec_sa_ref_get_encap_xs(dev, xs);
++	if (unlikely(!sa)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
++		goto drop;
++	}
++	mtu = READ_ONCE(sa->mtu);
++	eip_ipsec_sa_deref(sa);
+ 
+ 	/*
+-         * Reject the packets if greater than MTU.
+-         */
+-        mtu = READ_ONCE(dev->mtu);
++	 * Reject packets which exceed the exact SA's clear-text path MTU.  A
++	 * reqid device can carry old and new SAs concurrently during rekey.
++	 */
+ 	if (unlikely(!skb_is_gso(skb) && !skb->ignore_df && skb->len > mtu)) {
+-		pr_debug("%px: V6 inner packet size(%d) greater than MTU(%d\n)", skb, skb->len, mtu);
++		pr_debug("%p: V6 inner packet size(%d) greater than MTU(%d)\n",
++			 skb, skb->len, mtu);
+ 		icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
+ 		goto drop;
+-        }
++	}
+ 
+ 	return eip_ipsec_xfrm_xmit(net, sk, skb);
+ 
