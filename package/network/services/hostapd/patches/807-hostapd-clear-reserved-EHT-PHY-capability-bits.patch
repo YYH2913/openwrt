@@ -1,0 +1,27 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 28 Jul 2026 01:47:00 +0800
+Subject: [PATCH] hostapd: clear reserved EHT PHY capability bits
+
+The last octet of the EHT PHY Capabilities Information field only defines
+bits 0 and 1. Clear the remaining reserved bits before advertising the
+capability. Some stations reject the complete EHT capability when a driver
+leaves a reserved bit set and fall back to HE operation.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ src/ap/ieee802_11_eht.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -140,6 +140,9 @@ u8 * hostapd_eid_eht_capab(struct hostap
+ 	cap->mac_cap = host_to_le16(eht_cap->mac_cap);
+ 	os_memcpy(cap->phy_cap, eht_cap->phy_cap, EHT_PHY_CAPAB_LEN);
+ 
++	/* Bits 2-7 of the last EHT PHY capability octet are reserved. */
++	cap->phy_cap[EHT_PHY_CAPAB_LEN - 1] &= BIT(0) | BIT(1);
++
+ 	if (!is_6ghz_op_class(hapd->iconf->op_class))
+ 		cap->phy_cap[EHT_PHYCAP_320MHZ_IN_6GHZ_SUPPORT_IDX] &=
+ 			~EHT_PHYCAP_320MHZ_IN_6GHZ_SUPPORT_MASK;
