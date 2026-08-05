@@ -1,0 +1,106 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 5 Aug 2026 23:50:00 +0800
+Subject: [PATCH] qca-nss-eip: quiesce DMA interrupts during teardown
+
+The vendor initializes command and result ring interrupt sources before
+all software resources are allocated, but error unwinding frees their
+descriptor memory without masking the sources. Normal removal similarly
+unregisters the shared IRQ while NAPI can re-enable a ring threshold,
+leaving a pending source on the shared interrupt line.
+
+Mask each initialized ring and acknowledge pending status on probe failures.
+During removal, quiesce the rings both before unregistering the handler and
+after NAPI is disabled so an already-running poll cannot leave the threshold
+re-enabled.
+
+The CodeLinaro nss-eip branches retain the original teardown ordering and no
+external correction for these faults could be identified.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -732,6 +732,12 @@ int eip_dma_res_init(struct eip_dma *dma
+ 	return 0;
+ }
+ 
++static void eip_dma_la_irq_disable(struct eip_dma *dma)
++{
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->out.proc_thresh);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
++}
++
+ /*
+  * eip_dma_la_deinit()
+  *	De-Initialize the DMA HW ring.
+@@ -743,9 +749,11 @@ void eip_dma_la_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	eip_dma_la_irq_disable(dma);
+ 	irq_set_affinity_hint(dma->irq, NULL);
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->out.napi);
++	eip_dma_la_irq_disable(dma);
+ 	netif_napi_del(&dma->out.napi);
+ 	free_netdev(dma->out.ndev);
+ 	kfree(dma->out.kaddr);
+@@ -831,8 +839,10 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	return 0;
+ 
+ fail_netdev:
++	eip_dma_la_irq_disable(dma);
+ 	free_irq(dma->irq, dma);
+ fail_irq:
++	eip_dma_la_irq_disable(dma);
+ 	kfree(dma->out.kaddr);
+ fail_res:
+ 	kfree(dma->in.kaddr);
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -907,6 +907,14 @@ int eip_dma_hy_tx_nonlinear_skb(struct e
+ 	return 0;
+ }
+ 
++static void eip_dma_hy_irq_disable(struct eip_dma *dma)
++{
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->in.proc_thresh);
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->out.proc_thresh);
++	iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, dma->in.proc_status);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
++}
++
+ /*
+  * eip_dma_hy_deinit()
+  *	De-Initialize the DMA HW ring.
+@@ -918,10 +926,12 @@ void eip_dma_hy_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	eip_dma_hy_irq_disable(dma);
+ 	irq_set_affinity_hint(dma->irq, NULL);
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->in.napi);
+ 	napi_disable(&dma->out.napi);
++	eip_dma_hy_irq_disable(dma);
+ 	netif_napi_del(&dma->in.napi);
+ 	netif_napi_del(&dma->out.napi);
+ 	eip_dma_hy_free_skb(dma);
+@@ -1033,11 +1043,15 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ fail_netdev_out:
+ 	free_netdev(dma->in.ndev);
+ fail_netdev_in:
++	eip_dma_hy_irq_disable(dma);
+ 	free_irq(dma->irq, dma);
+ 
+ fail_irq:
++	eip_dma_hy_irq_disable(dma);
+ 	kfree(dma->out.kaddr);
+ fail_res:
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->in.proc_thresh);
++	iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, dma->in.proc_status);
+ 	kfree(dma->in.kaddr);
+ 	return status;
+ }
