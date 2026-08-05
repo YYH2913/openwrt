@@ -1,0 +1,401 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 5 Aug 2026 22:40:00 +0800
+Subject: [PATCH] qca-nss-eip: harden hybrid result-ring processing
+
+The vendor hybrid receive loop keeps the scatter-gather head and fragment
+queue as function-wide state while publishing the consumer index only at a
+LAST descriptor.  A partial chain at a NAPI boundary can consequently lose
+its software assembly state, reread already-mutated skbs, and corrupt or
+double-free the packet on the next poll.
+
+Pre-scan hardware-completed descriptors for a full chain and consume only
+whole packets.  Keep chain state local, clear shadow metadata as descriptors
+are consumed, and preserve complete chains across NAPI budget boundaries.
+Use the posted skb rather than a hardware-provided physical address for
+cache invalidation.
+
+Reject missing skbs, zero or oversized fragments, invalid FIRST/LAST
+sequences, bad PPE header offsets, unsupported IP versions and inconsistent
+hardware packet lengths without panicking.  Acknowledge the hardware before
+publishing the software consumer index so refill cannot reuse descriptors
+which the result ring still owns.
+
+The CodeLinaro nss-eip branches retain the original receive algorithm and no
+external correction for these faults could be identified.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -200,7 +200,7 @@
+  * eip_dma_hy_tr_deliver()
+  *	Send SKB to registered client's handler.
+  */
+-static inline void eip_dma_hy_tr_deliver(struct eip_tr *tr, struct sk_buff *skb, uint8_t nsegs)
++static inline void eip_dma_hy_tr_deliver(struct eip_tr *tr, struct sk_buff *skb, uint32_t nsegs)
+ {
+ 	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 
+@@ -221,7 +221,7 @@
+  * eip_dma_hy_tr_deliver_err()
+  *	Send SKB to registered client's error handler.
+  */
+-static inline void eip_dma_hy_tr_deliver_err(struct eip_tr *tr, struct sk_buff *skb, uint8_t nsegs, uint16_t tr_err)
++static inline void eip_dma_hy_tr_deliver_err(struct eip_tr *tr, struct sk_buff *skb, uint32_t nsegs, uint16_t tr_err)
+ {
+ 	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 
+@@ -246,9 +246,32 @@
+ static inline bool eip_dma_hy_deliver_linux(struct sk_buff *skb, struct eip_hw_desc *res)
+ {
+ 	uint16_t src_port = EIP_HW_RES_BYPASS_SRC_PORT(res->bypass[0]);
+-	struct net_device *dev = qcom_ppe_port_dev_get(src_port);
++	struct net_device *dev;
+ 	unsigned int ip_hdr_sz;
+ 	uint16_t proto;
++	uint8_t version;
++
++	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
++		return false;
++
++	version = ((struct iphdr *)skb->data)->version;
++	if (version == IPVERSION) {
++		ip_hdr_sz = ((struct iphdr *)skb->data)->ihl * sizeof(uint32_t);
++		if (ip_hdr_sz < sizeof(struct iphdr) || !pskb_may_pull(skb, ip_hdr_sz))
++			return false;
++
++		proto = htons(ETH_P_IP);
++	} else if (version == 6) {
++		if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
++			return false;
++
++		proto = htons(ETH_P_IPV6);
++		ip_hdr_sz = sizeof(struct ipv6hdr);
++	} else {
++		return false;
++	}
++
++	dev = qcom_ppe_port_dev_get(src_port);
+ 
+ 	if (!dev) {
+ 		return false;
+@@ -263,15 +286,6 @@
+ 	skb->skb_iif = dev->ifindex;
+ 	skb->ip_summed = CHECKSUM_NONE;
+ 
+-	/* Detect IPv4 / IPv6 */
+-	if (ip_hdr(skb)->version == IPVERSION) {
+-		proto = htons(ETH_P_IP);
+-		ip_hdr_sz = sizeof(struct iphdr);
+-	} else {
+-		proto = htons(ETH_P_IPV6);
+-		ip_hdr_sz = sizeof(struct ipv6hdr);
+-	}
+-
+ 	skb->protocol = proto;
+ 	skb_set_transport_header(skb, ip_hdr_sz);
+ 
+@@ -314,6 +328,12 @@
+ 			 * Pull the fake mac added by PPE.
+ 			 * token[3] contains offset to start of network header.
+ 			 */
++			if (!pskb_may_pull(skb, EIP_HW_RES_OFFST(res->token[3]))) {
++				consume_skb(skb);
++				dma_stats->rx_dropped++;
++				return true;
++			}
++
+ 			skb_pull(skb, EIP_HW_RES_OFFST(res->token[3]));
+ 			if (!eip_dma_hy_deliver_linux(skb, res)) {
+ 				consume_skb(skb);
+@@ -360,15 +380,12 @@
+ int eip_dma_hy_rx(struct eip_dma *dma, int budget)
+ {
+ 	uint32_t hw_pidx, out_cidx;
+-	uint32_t avail, processed;
+-	struct sk_buff_head list;
+-	uint32_t true_len = 0;
+-	uint32_t list_len = 0;
++	uint32_t avail, processed, work_done = 0;
+ 	uint32_t prod_words;
+ 	uint32_t old_cidx;
+ 
+-
+-	__skb_queue_head_init(&list);
++	if (unlikely(budget <= 0))
++		return 0;
+ 
+ 	/*
+ 	 * Calculate Descriptor produced by HW.
+@@ -382,7 +399,6 @@
+ 		return 0;
+ 	}
+ 
+-	avail = avail > budget ? budget : avail;
+ 	old_cidx = out_cidx;
+ 
+ 	/*
+@@ -396,108 +412,147 @@
+ 		eip_dmac_inv_range(dma->out.desc, dma->out.desc + hw_pidx);
+ 	}
+ 
+-	while (avail--) {
++	while (avail) {
+ 		struct eip_dma_stats *dma_stats = &dma->stats;
++		struct sk_buff *head_skb = NULL;
++		struct sk_buff_head list;
+ 		uint16_t cle_err, tr_err;
+-		struct sk_buff *head_skb;
+-		struct eip_hw_desc *res;
++		struct eip_hw_desc *res = NULL;
+ 		struct sk_buff *skb;
+ 		struct eip_tr *tr;
++		uint32_t true_len = 0;
++		uint32_t list_len = 0;
++		uint32_t pkt_idx = out_cidx;
++		uint32_t pkt_descs = 0;
++		uint32_t frag_idx;
++		uint16_t data_len;
+ 		uint16_t frag_len;
+-		uint8_t nsegs;
+-		void *data;
++		bool complete = false;
++		bool malformed = false;
+ 		bool err;
+ 
+-		res = &dma->out.desc[out_cidx];
+-		skb = (struct sk_buff *)dma->out.meta[out_cidx];
+-		out_cidx = EIP_DMA_IDX_INC(out_cidx);
+-
+ 		/*
+-		 * Fragment data needs to be invalidated for non zero fragment.
+-		 * This is needed as there may be speculative prefetch before completion.
++		 * Do not consume a partial scatter-gather chain.  The next poll will
++		 * start from the same consumer index after hardware posts the tail.
+ 		 */
+-		frag_len = EIP_HW_RES_FRAG_LEN(res->frag[0]);
+-		BUG_ON(!frag_len);
+-		data = phys_to_virt(res->frag[2]);
+-		eip_dmac_inv_range(data, data + frag_len);
++		while (pkt_descs < avail) {
++			res = &dma->out.desc[pkt_idx];
++			pkt_descs++;
++			pkt_idx = EIP_DMA_IDX_INC(pkt_idx);
++
++			if (res->frag[0] & EIP_HW_RES_FLAGS_LAST) {
++				complete = true;
++				break;
++			}
++		}
+ 
+-		/*
+-		 * Trim the linear SKB frag to length produced by hardware.
+-		 */
+-		skb_trim(skb, frag_len);
++		if (!complete)
++			break;
+ 
+ 		/*
+-		 * Linear data. Both First & Last flags are set.
++		 * Keep descriptor chains intact at the NAPI boundary.  Leave the next
++		 * chain for another poll when this poll already made progress.  A
++		 * single chain larger than the budget must still be consumed to avoid
++		 * permanently stalling the ring.
+ 		 */
+-		if (likely((EIP_HW_RES_FLAGS_MASK & res->frag[0]) == EIP_HW_RES_FLAGS_LINEAR)) {
+-			head_skb = skb;
+-			nsegs = 1;
+-			goto deliver;
++		if (work_done && pkt_descs > budget - work_done) {
++			work_done = budget;
++			break;
+ 		}
+ 
+-		/*
+-		 * Non-linear data. Set our head to descriptor with first flag.
+-		 * This condition will be always true for first descritor in chain. Hence, head_skb will be always assigned.
+-		 */
+-		if (EIP_HW_RES_FLAGS_FIRST & res->frag[0]) {
+-			head_skb = skb;
+-			continue;
+-		}
++		__skb_queue_head_init(&list);
++		pkt_idx = out_cidx;
+ 
+ 		/*
+-		 * Append SKB to head SKB frag list.
+-		 */
+-		list_len += skb->len;
+-		true_len += skb->truesize;
+-		__skb_queue_tail(&list, skb);
+-		skb = NULL;
++		 * Consume and assemble the complete chain.  Use the software-owned
++		 * skb address for cache maintenance so a corrupt result descriptor
++		 * cannot make the CPU invalidate an arbitrary physical range.
++		 */
++		for (frag_idx = 0; frag_idx < pkt_descs; frag_idx++) {
++			uint32_t flags;
++
++			res = &dma->out.desc[pkt_idx];
++			skb = (struct sk_buff *)dma->out.meta[pkt_idx];
++			dma->out.meta[pkt_idx] = 0;
++			pkt_idx = EIP_DMA_IDX_INC(pkt_idx);
++
++			flags = res->frag[0] & EIP_HW_RES_FLAGS_MASK;
++			frag_len = EIP_HW_RES_FRAG_LEN(res->frag[0]);
++			if (unlikely(!skb || !frag_len || frag_len > skb->len ||
++				     (!frag_idx && !(flags & EIP_HW_RES_FLAGS_FIRST)) ||
++				     (frag_idx && (flags & EIP_HW_RES_FLAGS_FIRST)))) {
++				malformed = true;
++				if (skb)
++					consume_skb(skb);
++				continue;
++			}
+ 
+-		/*
+-		 * Continue to next descriptor if not last.
+-		 * We dont update consumer index if full chain is not received.
+-		 * So, will read the descriptor again if last is not received
+-		 * during this execution.
+-		 */
+-		if (!(EIP_HW_RES_FLAGS_LAST & res->frag[0])) {
+-			continue;
++			eip_dmac_inv_range(skb->data, skb->data + frag_len);
++			skb_trim(skb, frag_len);
++
++			if (!frag_idx) {
++				head_skb = skb;
++				continue;
++			}
++
++			list_len += skb->len;
++			true_len += skb->truesize;
++			__skb_queue_tail(&list, skb);
+ 		}
+ 
+-		/*
+-		 * All fragments are received;
+-		 * Link the Head SKB with the list.
+-		 */
+-		skb_shinfo(head_skb)->frag_list = __skb_peek(&list);
+-		skb_shinfo(head_skb)->frag_list->prev = NULL;
+-		skb_peek_tail(&list)->next = NULL;
+-		head_skb->len += list_len;
+-		head_skb->data_len = list_len;
+-		head_skb->truesize += true_len;
+-		nsegs = skb_queue_len(&list) + 1;
++		/* Keep the consumer private until hardware has acknowledged the batch. */
++		out_cidx = pkt_idx;
++		avail -= pkt_descs;
++		work_done = min_t(uint32_t, work_done + pkt_descs, budget);
++
++		if (unlikely(malformed || !head_skb)) {
++			if (head_skb)
++				consume_skb(head_skb);
++			skb_queue_purge(&list);
++			dma_stats->rx_frags += pkt_descs;
++			dma_stats->rx_pkts++;
++			dma_stats->rx_error++;
++			dma_stats->rx_dropped++;
++			pr_warn_ratelimited("%px: malformed hybrid result chain (%u descriptors)\n",
++					    dma, pkt_descs);
++			goto next;
++		}
+ 
+-		/*
+-		 * Reset the list.
+-		 */
+-		list_len = 0;
+-		true_len = 0;
+-		__skb_queue_head_init(&list);
++		if (!skb_queue_empty(&list)) {
++			skb_shinfo(head_skb)->frag_list = __skb_peek(&list);
++			skb_shinfo(head_skb)->frag_list->prev = NULL;
++			skb_peek_tail(&list)->next = NULL;
++			head_skb->len += list_len;
++			head_skb->data_len = list_len;
++			head_skb->truesize += true_len;
++			__skb_queue_head_init(&list);
++		}
+ 
+-deliver:
+ 		/*
+ 		 * Fetch error from result descriptor.
+ 		 */
+ 		tr_err = EIP_HW_RES_ERROR(res->token[0]);
+ 		cle_err = EIP_HW_RES_ERROR_CLE(res->token[1]);
+ 		err = cle_err || tr_err;
+-		WARN_ON(head_skb->len != EIP_HW_RES_DATA_LEN(res->token[0]));
++		data_len = EIP_HW_RES_DATA_LEN(res->token[0]);
+ 
+ 		/*
+ 		 * Update DMA Rx stats.
+ 		 * We have not used atomic operation as there is no write contention for stats.
+ 		 */
+-		dma_stats->rx_frags += nsegs;
++		dma_stats->rx_frags += pkt_descs;
+ 		dma_stats->rx_pkts++;
+ 		dma_stats->rx_bytes += head_skb->len;
+ 
++		if (unlikely(head_skb->len != data_len)) {
++			pr_warn_ratelimited("%px: result length mismatch: skb=%u hw=%u\n",
++					    dma, head_skb->len, data_len);
++			dma_stats->rx_error++;
++			dma_stats->rx_dropped++;
++			consume_skb(head_skb);
++			goto next;
++		}
++
+ 		if (err && eip_dma_hy_classify_err(dma, head_skb, res)) {
+ 			goto next;
+ 		}
+@@ -513,22 +568,27 @@
+ 		 * Pull the fake mac added by PPE.
+                  * token[3] contains offset to start of network header.
+ 		 */
++		if (!pskb_may_pull(head_skb, EIP_HW_RES_OFFST(res->token[3]))) {
++			dma_stats->rx_error++;
++			dma_stats->rx_dropped++;
++			consume_skb(head_skb);
++			goto next;
++		}
++
+ 		skb_pull(head_skb, EIP_HW_RES_OFFST(res->token[3]));
+ 
+ 		/*
+ 		 * Send packet to the client's handler.
+ 		 */
+ 		if (err) {
+-			eip_dma_hy_tr_deliver_err(tr, head_skb, nsegs, tr_err);
++			eip_dma_hy_tr_deliver_err(tr, head_skb, pkt_descs, tr_err);
+ 			goto next;
+ 		}
+ 
+-		eip_dma_hy_tr_deliver(tr, head_skb, nsegs);
++		eip_dma_hy_tr_deliver(tr, head_skb, pkt_descs);
+ next:
+-		/*
+-		 * Update output consumer indexes in dma object.
+-		 */
+-		atomic_set(&dma->out.cons_idx, out_cidx);
++		if (work_done == budget)
++			break;
+ 	}
+ 
+ 	/*
+@@ -536,10 +596,11 @@
+ 	 * We may have not processed last few descriptor due to incomplete SG.
+ 	 * Hence, find actual processed count using diff of old consumer index and new consumer index.
+ 	 */
+-	processed = EIP_DMA_AVAIL_COUNT(atomic_read(&dma->out.cons_idx), old_cidx);
++	processed = EIP_DMA_AVAIL_COUNT(out_cidx, old_cidx);
+ 	iowrite32(EIP_HW_PROC_CNT_DESC_SZ(EIP_HW_DESC_WORDS * processed), dma->out.proc_cnt);
++	atomic_set(&dma->out.cons_idx, out_cidx);
+ 
+-	return processed;
++	return work_done;
+ }
+ 
+ /*
