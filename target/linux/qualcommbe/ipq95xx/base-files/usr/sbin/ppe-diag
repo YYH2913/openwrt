@@ -32,9 +32,51 @@ fi
 section INTERFACES
 ip address show 2>&1
 
-section LINKS
-for dev in lan1 wan; do
+section NETDEV_STATE
+for path in /sys/class/net/*; do
+	[ -e "$path" ] || continue
+	dev=${path##*/}
+	master=$(readlink "$path/master" 2>/dev/null)
+	master=${master##*/}
+	[ -n "$master" ] || master=none
 	printf '\n-- %s --\n' "$dev"
+	printf 'address=%s carrier=%s operstate=%s mtu=%s master=%s\n' \
+		"$(cat "$path/address" 2>/dev/null || printf unknown)" \
+		"$(cat "$path/carrier" 2>/dev/null || printf unknown)" \
+		"$(cat "$path/operstate" 2>/dev/null || printf unknown)" \
+		"$(cat "$path/mtu" 2>/dev/null || printf unknown)" \
+		"$master"
+done
+
+section BRIDGE
+if command -v bridge >/dev/null 2>&1; then
+	bridge link show 2>&1
+	bridge fdb show 2>&1
+else
+	printf 'unavailable: bridge\n'
+	for path in /sys/class/net/*/brport; do
+		[ -d "$path" ] || continue
+		dev=${path%/brport}
+		dev=${dev##*/}
+		printf '%s state=%s hairpin=%s isolated=%s\n' "$dev" \
+			"$(cat "$path/state" 2>/dev/null || printf unknown)" \
+			"$(cat "$path/hairpin_mode" 2>/dev/null || printf unknown)" \
+			"$(cat "$path/isolated" 2>/dev/null || printf unknown)"
+	done
+fi
+
+section LINKS
+for path in /sys/class/net/*/speed; do
+	[ -r "$path" ] || continue
+	dev=${path%/speed}
+	dev=${dev##*/}
+	printf '\n-- %s --\n' "$dev"
+	if [ -r "/sys/class/net/$dev/carrier" ]; then
+		printf 'carrier=%s speed=%s duplex=%s\n' \
+			"$(cat "/sys/class/net/$dev/carrier")" \
+			"$(cat "/sys/class/net/$dev/speed" 2>/dev/null || printf unknown)" \
+			"$(cat "/sys/class/net/$dev/duplex" 2>/dev/null || printf unknown)"
+	fi
 	if command -v ethtool >/dev/null 2>&1; then
 		ethtool "$dev" 2>&1
 	else
@@ -46,10 +88,24 @@ if ! grep -qs ' /sys/kernel/debug debugfs ' /proc/mounts; then
 	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
 fi
 
-section DIRECT_SWITCH
+section DIRECT_SWITCH_BEFORE
 show_file /sys/kernel/debug/ppe/direct_switch
 
-section FLOWS
+section VIRTUAL_PORTS_BEFORE
+show_file /sys/kernel/debug/ppe/virtual_ports
+
+section FLOWS_BEFORE
+show_file /sys/kernel/debug/ppe/flows
+
+sleep 5
+
+section DIRECT_SWITCH_AFTER
+show_file /sys/kernel/debug/ppe/direct_switch
+
+section VIRTUAL_PORTS_AFTER
+show_file /sys/kernel/debug/ppe/virtual_ports
+
+section FLOWS_AFTER
 show_file /sys/kernel/debug/ppe/flows
 
 section FLOW_ROWS
@@ -72,5 +128,18 @@ fi
 section INTERRUPTS
 grep -Ei 'ppe|edma|reo2ppe|ppe2tcl|rxfill|txcmpl' /proc/interrupts 2>/dev/null || true
 
+section PROCESSES
+ps w 2>&1 | grep -E '[d]nsmasq|[h]ostapd|[n]etifd|[o]dhdcpd' || true
+
+section DHCP_CONFIG
+uci -q show dhcp 2>&1 || true
+
+section WIRELESS_CONFIG
+uci -q show wireless 2>&1 || true
+
 section LOG
-dmesg | grep -Ei 'qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
+if command -v logread >/dev/null 2>&1; then
+	logread 2>&1 | grep -Ei 'dhcp|dnsmasq|hostapd|sta-|associated|authorized|qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 500
+else
+	dmesg | grep -Ei 'qcom_ppe|ppe direct|ppe-ds|ath12k.*ppe|reo2ppe|ppe2tcl|rxfill|txcmpl|usxgmii|10gbase|link is' | tail -n 300
+fi
