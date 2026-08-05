@@ -1,0 +1,76 @@
+From bf68417eec8d399e824db99782c977724c1d5664 Mon Sep 17 00:00:00 2001
+From: Govindaraj Saminathan <govindaraj.saminathan@oss.qualcomm.com>
+Date: Fri, 10 Jul 2026 11:38:24 +0530
+Subject: [PATCH] nl80211: Prevent stale event from matching active command
+ reply sequence
+
+When an event handler called from nl80211_deliver_pending_events() issues a
+driver command, nested commands can append new events to pending_events.
+Do not requeue the event currently being delivered behind those newer
+events. Besides reversing event order, sustained command sequences can
+otherwise accumulate stale events until a sequence number matches an active
+command reply and corrupts the reply handler state.
+
+Fixes: f5790e97cd64 ("nl80211: Delay event processing during command handling")
+Signed-off-by: Govindaraj Saminathan <govindaraj.saminathan@oss.qualcomm.com>
+---
+ src/drivers/driver_nl80211.c | 19 +++++++++++++++++--
+ src/drivers/driver_nl80211.h |  2 ++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -539,6 +539,8 @@ static void nl80211_deliver_pending_even
+ 	if (dl_list_empty(&global->pending_events))
+ 		return;
+ 
++	global->delivering_pending_events = true;
++
+ 	dl_list_init(&pending_events);
+ 
+ 	global->pending_events.next->prev = &pending_events;
+@@ -555,6 +557,8 @@ static void nl80211_deliver_pending_even
+ 		event->handler(event->msg, event->data);
+ 		nl80211_remove_pending_event(event);
+ 	}
++
++	global->delivering_pending_events = false;
+ }
+ 
+ 
+@@ -575,9 +579,20 @@ int nl80211_reply_hook(struct nl80211_gl
+ 		 * to read the socket again (it should usually, but it may not
+ 		 * if multiple timeouts have expired). As such, check here if
+ 		 * there are already pending events, and if there are, queue
+-		 * this one.
++		 * this one to preserve delivery order.
++		 *
++		 * However, if we are already inside
++		 * nl80211_deliver_pending_events(), do not re-queue events
++		 * triggered by event handlers. Re-queuing during delivery
++		 * causes events to accumulate across command cycles. When the
++		 * accumulated event count is large enough, a re-queued event's
++		 * sequence number eventually matches the reply_seq of a
++		 * concurrent send_and_recv_glb() call, causing the reply
++		 * handler to fire with the wrong message and corrupt the
++		 * caller's stack.
+ 		 */
+-		if (!dl_list_empty(&global->pending_events))
++		if (!dl_list_empty(&global->pending_events) &&
++		    !global->delivering_pending_events)
+ 			goto queue_event;
+ 
+ 		return NL_OK;
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -48,6 +48,8 @@ struct nl80211_global {
+ 
+ 	/* pending events that happened while waiting for a sync reply */
+ 	struct dl_list pending_events;
++	/* set while nl80211_deliver_pending_events() is running */
++	bool delivering_pending_events;
+ #ifdef CONFIG_NAN
+ 	/* Dedicated socket for NAN interface creation and events */
+ 	struct nl_sock *nl_nan;
+-- 
+2.43.0
