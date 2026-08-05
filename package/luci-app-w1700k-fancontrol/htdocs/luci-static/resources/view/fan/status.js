@@ -9,6 +9,25 @@ var callFanStatus = rpc.declare({
 	method: 'getStatus'
 });
 
+function fanModeLabel(mode) {
+	switch (Number(mode)) {
+	case 0: return _('Full Speed');
+	case 1: return _('Manual');
+	case 2: return _('Automatic');
+	case 3: return _('Automatic (Closed Loop)');
+	default: return _('Unknown');
+	}
+}
+
+function fanPresetLabel(preset) {
+	switch (preset) {
+	case 'quiet': return _('Quiet');
+	case 'performance': return _('Performance');
+	case 'custom': return _('Custom');
+	default: return _('Balanced');
+	}
+}
+
 function tempColor(temp) {
 	if (temp <= 40) return '#28a745';      // Green - cool
 	if (temp <= 55) return '#ffc107';      // Yellow - warm
@@ -88,7 +107,7 @@ return view.extend({
 		status = status || {};
 
 		var modeClass = status.fan_mode === 2 ? 'label-success' : 'label-warning';
-		var modeText = status.fan_mode_desc || 'Unknown';
+		var modeText = fanModeLabel(status.fan_mode);
 
 		var viewEl = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('Fan Control - Status')),
@@ -109,8 +128,7 @@ return view.extend({
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('span', { 'id': 'fan-preset' },
 								status.uci_mode === 'manual' ? _('Manual Override') :
-								(status.uci_preset || 'balanced').charAt(0).toUpperCase() +
-								(status.uci_preset || 'balanced').slice(1))
+								fanPresetLabel(status.uci_preset))
 						])
 					])
 				])
@@ -164,7 +182,7 @@ return view.extend({
 				// Update mode display
 				var modeEl = document.getElementById('fan-mode');
 				if (modeEl) {
-					modeEl.textContent = status.fan_mode_desc || 'Unknown';
+					modeEl.textContent = fanModeLabel(status.fan_mode);
 					modeEl.className = status.fan_mode === 2 ? 'label-success' : 'label-warning';
 				}
 
@@ -172,8 +190,7 @@ return view.extend({
 				var presetEl = document.getElementById('fan-preset');
 				if (presetEl) {
 					presetEl.textContent = status.uci_mode === 'manual' ? _('Manual Override') :
-						(status.uci_preset || 'balanced').charAt(0).toUpperCase() +
-						(status.uci_preset || 'balanced').slice(1);
+						fanPresetLabel(status.uci_preset);
 				}
 			}, this));
 		}, this), 3);
