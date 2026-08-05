@@ -1,0 +1,62 @@
+From: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Date: Fri, 30 May 2025 22:20:41 -0700
+Subject: [PATCH] wifi: ath12k: map REO destination to the PPE ring
+
+RxOLE marks direct-switch frames with REO destination index 6, but the
+QCN9274 REO destination map must also translate that index to hardware
+ring 11.  The QSDK driver installs this mapping from its REO setup path.
+Without it, an authorized peer is redirected away from the normal host
+ring without reliably reaching REO2PPE, which also loses DHCP traffic.
+
+Install the missing mapping when the direct-switch rings are configured.
+Read the register back both to flush the write and to make the effective
+configuration visible in the node registration log.
+
+Based-on: 4590caf67ab7de99e7a1ea2bc70d2429b5f855e1
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-01-QSDK-DP-wifi-Add-support-for-PPE-DS-Direct-switch-fe.patch
+Signed-off-by: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Signed-off-by: Ganesh Kariganuru Mahabalesh <gkarigan@qti.qualcomm.com>
+Signed-off-by: Nithyanantham Paramasivam <nithp@qti.qualcomm.com>
+Signed-off-by: Nandha Kishore Easwaran <nandhaki@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Signed-off-by: Neha Bisht <nbisht@qti.qualcomm.com>
+Signed-off-by: Aloka Dixit <alokad@qti.qualcomm.com>
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -39,6 +39,9 @@
+ 
+ #define ATH12K_PPE_REO_DEST_REG		(HAL_SEQ_WCSS_UMAC_REO_REG + 0xcf0)
+ #define ATH12K_PPE_REO_DEST_VALUE	0x2000
++#define ATH12K_PPE_REO_RING_MAP_REG	(HAL_SEQ_WCSS_UMAC_REO_REG + 0x4)
++#define ATH12K_PPE_REO_RING6_MAP	GENMASK(27, 24)
++#define ATH12K_PPE_REO2PPE_RING_MAP	11
+ #define ATH12K_PPE_TCL_RBM_MAP_REG	(HAL_SEQ_WCSS_UMAC_TCL_REG + 0x88)
+ #define ATH12K_PPE_TCL_RBM_SHIFT	(7 * 4)
+ #define ATH12K_PPE_TCL_RBM_MASK		GENMASK(31, 28)
+@@ -600,8 +603,15 @@ static void ath12k_ppe_ds_hw_config(stru
+ 
+ 	ath12k_hif_write32(ab, ATH12K_PPE_REO_DEST_REG,
+ 			   ATH12K_PPE_REO_DEST_VALUE);
++	val = ath12k_hif_read32(ab, ATH12K_PPE_REO_RING_MAP_REG);
++	val &= ~ATH12K_PPE_REO_RING6_MAP;
++	val |= u32_encode_bits(ATH12K_PPE_REO2PPE_RING_MAP,
++			       ATH12K_PPE_REO_RING6_MAP);
++	ath12k_hif_write32(ab, ATH12K_PPE_REO_RING_MAP_REG, val);
++	val = ath12k_hif_read32(ab, ATH12K_PPE_REO_RING_MAP_REG);
++	ath12k_info(ab, "PPE REO ring map configured: 0x%x\n", val);
+ 	val = ath12k_hif_read32(ab, ATH12K_PPE_TCL_RBM_MAP_REG);
+ 	val &= ~ATH12K_PPE_TCL_RBM_MASK;
+ 	val |= HAL_WBM2SW_PPEDS_TX_CMPL_MAP_ID << ATH12K_PPE_TCL_RBM_SHIFT;
+ 	ath12k_hif_write32(ab, ATH12K_PPE_TCL_RBM_MAP_REG, val);
+ }
+-- 
+2.43.0
