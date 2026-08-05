@@ -2,8 +2,8 @@
 
 # Keep PPE flowtable defaults present across sysupgrades.  UCI defaults
 # scripts are removed after first boot and may be hidden by an overlay
-# whiteout, while this target requires hardware offload before firewall
-# starts.
+# whiteout. This target requires the hardware-offload defaults to be set
+# before firewall starts.
 START=11
 
 boot()
