@@ -1,0 +1,143 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 28 Jul 2026 03:00:00 +0800
+Subject: [PATCH] wifi: ath12k: handle positive monitor RSSI as SNR
+
+QCN9274 firmware can advertise HW dB-to-dBm conversion while monitor TLVs
+still contain a positive SNR.  The service bit alone then makes
+station_info report physically impossible positive dBm values.
+
+Treat non-negative samples as SNR even when the service bit is set and add
+the current pdev noise floor.  Preserve already converted negative dBm
+samples.  Apply the same validation to instantaneous, average and per-chain
+station signal values, including MLO link statistics.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 55 +++++++++++++++++++----------
+ 1 file changed, 36 insertions(+), 19 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12633,8 +12633,21 @@ static int ath12k_mac_op_get_survey(stru
+ 	return 0;
+ }
+ 
++static s8 ath12k_mac_signal_to_dbm(s8 signal, s8 noise_floor, bool db2dbm)
++{
++	/* Some firmware advertises HW dB-to-dBm conversion but still reports
++	 * monitor RSSI as a non-negative SNR. Such a value cannot be a useful
++	 * received signal level, so convert it using the current noise floor.
++	 */
++	if (!db2dbm || signal >= 0)
++		return signal + noise_floor;
++
++	return signal;
++}
++
+ static void ath12k_mac_put_chain_rssi(struct station_info *sinfo,
+-				      struct ath12k_link_sta *arsta)
++				      struct ath12k_link_sta *arsta,
++				      s8 noise_floor, bool db2dbm)
+ {
+ 	s8 rssi;
+ 	int i;
+@@ -12647,7 +12660,8 @@ static void ath12k_mac_put_chain_rssi(st
+ 		    rssi != ATH12K_INVALID_RSSI_FULL &&
+ 		    rssi != ATH12K_INVALID_RSSI_EMPTY &&
+ 		    rssi != 0) {
+-			sinfo->chain_signal[i] = rssi;
++			sinfo->chain_signal[i] =
++				ath12k_mac_signal_to_dbm(rssi, noise_floor, db2dbm);
+ 			sinfo->chains |= BIT(i);
+ 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL);
+ 		}
+@@ -12662,7 +12676,7 @@ static void ath12k_mac_op_sta_statistics
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	struct ath12k_fw_stats_req_params params = {};
+ 	struct ath12k_link_sta *arsta;
+-	s8 signal, noise_floor;
++	s8 signal, signal_avg, noise_floor;
+ 	struct ath12k *ar;
+ 	bool db2dbm;
+ 
+@@ -12676,6 +12690,10 @@ static void ath12k_mac_op_sta_statistics
+ 	db2dbm = test_bit(WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT,
+ 			  ar->ab->wmi_ab.svc_map);
+ 
++	spin_lock_bh(&ar->data_lock);
++	noise_floor = ath12k_pdev_get_noise_floor(ar);
++	spin_unlock_bh(&ar->data_lock);
++
+ 	sinfo->rx_duration = arsta->rx_duration;
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_DURATION);
+ 
+@@ -12715,21 +12733,17 @@ static void ath12k_mac_op_sta_statistics
+ 	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL)) &&
+ 	    ahsta->ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
+ 	    !(ath12k_mac_get_fw_stats(ar, &params)))
+-		ath12k_mac_put_chain_rssi(sinfo, arsta);
+-
+-	spin_lock_bh(&ar->data_lock);
+-	noise_floor = ath12k_pdev_get_noise_floor(ar);
+-	spin_unlock_bh(&ar->data_lock);
++		ath12k_mac_put_chain_rssi(sinfo, arsta, noise_floor, db2dbm);
+ 
+ 	if (signal) {
+-		sinfo->signal = db2dbm ? signal : signal + noise_floor;
++		sinfo->signal =
++			ath12k_mac_signal_to_dbm(signal, noise_floor, db2dbm);
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+ 	}
+ 
+-	sinfo->signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi);
+-
+-	if (!db2dbm)
+-		sinfo->signal_avg += noise_floor;
++	signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi);
++	sinfo->signal_avg =
++		ath12k_mac_signal_to_dbm(signal_avg, noise_floor, db2dbm);
+ 
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+ 
+@@ -12748,7 +12762,7 @@ static void ath12k_mac_op_link_sta_stati
+ 	struct ath12k_fw_stats_req_params params = {};
+ 	struct ath12k_link_sta *arsta;
+ 	struct ath12k *ar;
+-	s8 signal;
++	s8 signal, signal_avg, noise_floor;
+ 	bool db2dbm;
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+@@ -12765,6 +12779,10 @@ static void ath12k_mac_op_link_sta_stati
+ 	db2dbm = test_bit(WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT,
+ 			  ar->ab->wmi_ab.svc_map);
+ 
++	spin_lock_bh(&ar->data_lock);
++	noise_floor = ath12k_pdev_get_noise_floor(ar);
++	spin_unlock_bh(&ar->data_lock);
++
+ 	link_sinfo->rx_duration = arsta->rx_duration;
+ 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_DURATION);
+ 
+@@ -12804,14 +12822,13 @@ static void ath12k_mac_op_link_sta_stati
+ 
+ 	if (signal) {
+ 		link_sinfo->signal =
+-			db2dbm ? signal : signal + ATH12K_DEFAULT_NOISE_FLOOR;
++			ath12k_mac_signal_to_dbm(signal, noise_floor, db2dbm);
+ 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+ 	}
+ 
+-	link_sinfo->signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi);
+-
+-	if (!db2dbm)
+-		link_sinfo->signal_avg += ATH12K_DEFAULT_NOISE_FLOOR;
++	signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi);
++	link_sinfo->signal_avg =
++		ath12k_mac_signal_to_dbm(signal_avg, noise_floor, db2dbm);
+ 
+ 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+ 
+-- 
+2.43.0
