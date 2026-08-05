@@ -1,0 +1,161 @@
+From: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Date: Tue, 16 Jun 2026 10:49:48 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: trap fragmented flow hits
+
+APPE uses 3-tuple entries for ESP, so an outer IPv4 fragment can match an
+EIP redirect flow even when it does not contain an ESP header.  EIP cannot
+select an SA from a non-initial fragment.  The vendor driver avoids this by
+enabling the IPv4 and IPv6 fragment exceptions for L3 flow hits; QSDK 14 r9
+also restricts its legacy ESP UDF ACL to non-fragmented IPv4 packets.
+
+The native driver resets PPE during probe but did not restore those
+exception controls.  Program the vendor flow-hit policy before enabling the
+flow engine: redirect fragments to the CPU and mark the hardware flow for
+deacceleration.  This lets the kernel reassemble the packet instead of
+feeding an incomplete ESP packet to EIP.  Name both CPU codes in the
+diagnostic counters as well.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/59edc9a35baf3b6daa96a6bdb357a98419d0800f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/f8012dc2d129412e4d1dbf665516967600c0f30c
+Signed-off-by: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c      | 34 +++++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c | 35 ++++++++++++++++++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h      | 13 +++++++++
+ 3 files changed, 81 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -735,6 +735,36 @@ int ppe_flow_nexthop_set(struct ppe_devi
+ 	return regmap_bulk_write(ppe_dev->regmap, reg, val, ARRAY_SIZE(val));
+ }
+ 
++static int ppe_flow_fragment_exceptions_init(struct ppe_device *ppe_dev)
++{
++	static const u8 exceptions[] = {
++		PPE_L3_EXCEPTION_IPV4_FRAGMENT,
++		PPE_L3_EXCEPTION_IPV6_FRAGMENT,
++	};
++	u32 reg, val;
++	int i, ret;
++
++	val = FIELD_PREP(PPE_L3_EXCEPTION_CMD_ACTION,
++			 PPE_ACTION_REDIRECT_TO_CPU) |
++	      PPE_L3_EXCEPTION_CMD_DEACCEL;
++	for (i = 0; i < ARRAY_SIZE(exceptions); i++) {
++		reg = PPE_L3_EXCEPTION_CMD_ADDR +
++		      exceptions[i] * PPE_L3_EXCEPTION_CTRL_INC;
++		ret = regmap_write(ppe_dev->regmap, reg, val);
++		if (ret)
++			return ret;
++
++		reg = PPE_L3_FLOW_HIT_EXP_CTRL_ADDR +
++		      exceptions[i] * PPE_L3_EXCEPTION_CTRL_INC;
++		ret = regmap_write(ppe_dev->regmap, reg,
++				   PPE_L3_FLOW_HIT_EXP_CTRL_ENABLE);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /**
+  * ppe_flow_hw_init - Initialize the PPE L3 flow engine
+  * @ppe_dev: PPE device
+@@ -783,6 +813,10 @@ int ppe_flow_hw_init(struct ppe_device *
+ 	if (ret)
+ 		return ret;
+ 
++	ret = ppe_flow_fragment_exceptions_init(ppe_dev);
++	if (ret)
++		return ret;
++
+ 	ret = regmap_update_bits(ppe_dev->regmap, PPE_FLOW_CTRL0_ADDR,
+ 				 PPE_FLOW_CTRL0_FLOW_EN |
+ 				 PPE_FLOW_CTRL0_AGE_TIMER,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -3285,5 +3285,9 @@ static const char *ppe_ft_reason_name(bo
+ 	if (cpu) {
+ 		switch (code) {
++		case 11:
++			return "IPv4 fragment";
++		case 31:
++			return "IPv6 fragment";
+ 		case 93:
+ 			return "L3 flow MTU fail";
+ 		case 94:
+@@ -3387,10 +3391,17 @@
+  */
+ static int ppe_ft_pipeline_state_show(struct seq_file *seq, void *data)
+ {
++	static const struct {
++		u8 code;
++		const char *name;
++	} fragment_exceptions[] = {
++		{ PPE_L3_EXCEPTION_IPV4_FRAGMENT, "IPv4 fragment" },
++		{ PPE_L3_EXCEPTION_IPV6_FRAGMENT, "IPv6 fragment" },
++	};
+ 	struct ppe_flowtable *ft = seq->private;
+ 	u32 route = 0, route_ext = 0, ctrl0 = 0, ctrl1 = 0;
+ 	int route_err, route_ext_err, ctrl0_err, ctrl1_err;
+-	int port;
++	int i, port;
+ 
+ 	route_err = regmap_read(ft->ppe_dev->regmap,
+ 				PPE_L3_ROUTE_CTRL_ADDR, &route);
+@@ -3412,6 +3423,28 @@
+ 		   FIELD_GET(PPE_L3_ROUTE_CTRL_EXT_HOST_HASH_MODE_1,
+ 			     route_ext));
+ 
++	for (i = 0; i < ARRAY_SIZE(fragment_exceptions); i++) {
++		u32 cmd = 0, hit = 0;
++		u8 code = fragment_exceptions[i].code;
++		int cmd_err, hit_err;
++
++		cmd_err = regmap_read(ft->ppe_dev->regmap,
++				      PPE_L3_EXCEPTION_CMD_ADDR +
++				      code * PPE_L3_EXCEPTION_CTRL_INC, &cmd);
++		hit_err = regmap_read(ft->ppe_dev->regmap,
++				      PPE_L3_FLOW_HIT_EXP_CTRL_ADDR +
++				      code * PPE_L3_EXCEPTION_CTRL_INC, &hit);
++		seq_printf(seq,
++			   "exception code:%u name:%s action:%lu deaccel:%u",
++			   code, fragment_exceptions[i].name,
++			   FIELD_GET(PPE_L3_EXCEPTION_CMD_ACTION, cmd),
++			   !!(cmd & PPE_L3_EXCEPTION_CMD_DEACCEL));
++		seq_printf(seq,
++			   " l3_flow_hit:%u read:%d/%d raw:%08x/%08x\n",
++			   !!(hit & PPE_L3_FLOW_HIT_EXP_CTRL_ENABLE),
++			   cmd_err, hit_err, cmd, hit);
++	}
++
+ 	mutex_lock(&ft->lock);
+ 	for (port = 0; port < ft->ppe_dev->num_ports; port++) {
+ 		u32 port_row[4] = {}, in_l3[3] = {}, eg_l3[3] = {};
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -612,6 +612,19 @@
+ #define PPE_CPU_CODE_CNT_ENTRIES			256
+ #define PPE_DROP_CODE_PORTS			8
+ 
++/* L3 parser exceptions and the APPE flow-hit enable table. */
++#define PPE_L3_EXCEPTION_CMD_ADDR		0x20081c
++#define PPE_L3_EXCEPTION_CTRL_INC		0x4
++#define PPE_L3_EXCEPTION_CMD_ACTION		GENMASK(1, 0)
++#define PPE_L3_EXCEPTION_CMD_DEACCEL		BIT(2)
++
++#define PPE_L3_FLOW_HIT_EXP_CTRL_ADDR		0x201678
++#define PPE_L3_FLOW_HIT_EXP_CTRL_ENABLE	BIT(0)
++
++/* Parser exception numbers are also reported as EDMA CPU codes. */
++#define PPE_L3_EXCEPTION_IPV4_FRAGMENT		11
++#define PPE_L3_EXCEPTION_IPV6_FRAGMENT		31
++
+ /* Global L3 failure policy. */
+ #define PPE_L3_ROUTE_CTRL_ADDR			0x200480
+ #define PPE_L3_ROUTE_CTRL_IP_MRU_FAIL		GENMASK(1, 0)
