@@ -1,0 +1,126 @@
+From: Amit Gupta <quic_amitgupt@quicinc.com>
+Date: Tue, 1 Mar 2022 11:55:08 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: configure port QoS precedence
+
+APPE resolves the flow priority profile together with the other QoS
+classification results before selecting an enqueue mapping.  Physical and
+virtual ports currently leave every resolution precedence at its reset
+value of zero.  Consequently, a destination flow can contain the correct
+direct-switch priority profile while its packets still resolve to the
+normal VP queue and return through an EDMA CPU ring.
+
+Program the precedence order used by the Qualcomm PPE driver for every
+physical ingress port and for normal and direct-switch virtual ports.  Give
+the flow result precedence six so its profile selects the FLOW enqueue map
+and PPE2TCL queue.  Preserve unrelated MRU/MTU fields and handle the inner
+pre-ACL field which spans two words.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/88dacc661d4edf6a634c3d2c1a80e7f82b2d168a
+Signed-off-by: Amit Gupta <quic_amitgupt@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_config.c |  9 +++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h   | 41 ++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c     |  9 +++++
+ 3 files changed, 59 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -2720,6 +2720,15 @@ static int ppe_port_config_init(struct p
+ 		 */
+ 		PPE_MRU_MTU_CTRL_SET_MRU_CMD(mru_mtu_val, PPE_ACTION_REDIRECT_TO_CPU);
+ 		PPE_MRU_MTU_CTRL_SET_MTU_CMD(mru_mtu_val, PPE_ACTION_DROP);
++		PPE_MRU_MTU_CTRL_SET_PREHEADER_PREC(mru_mtu_val, PPE_QOS_PREC_PREHEADER);
++		PPE_MRU_MTU_CTRL_SET_PCP_PREC(mru_mtu_val, PPE_QOS_PREC_PCP);
++		PPE_MRU_MTU_CTRL_SET_DSCP_PREC(mru_mtu_val, PPE_QOS_PREC_DSCP);
++		PPE_MRU_MTU_CTRL_SET_FLOW_PREC(mru_mtu_val, PPE_QOS_PREC_FLOW);
++		PPE_MRU_MTU_CTRL_SET_PRE_ACL_PREC(mru_mtu_val, PPE_QOS_PREC_ACL);
++		PPE_MRU_MTU_CTRL_SET_POST_ACL_PREC(mru_mtu_val, PPE_QOS_PREC_ACL);
++		PPE_MRU_MTU_CTRL_SET_PRE_ACL_OUTER_PREC(mru_mtu_val, PPE_QOS_PREC_PRE_ACL);
++		PPE_MRU_MTU_CTRL_SET_INNER_PREC_LOW(mru_mtu_val, PPE_QOS_PREC_PRE_ACL & 1);
++		PPE_MRU_MTU_CTRL_SET_INNER_PREC_HIGH(mru_mtu_val, PPE_QOS_PREC_PRE_ACL >> 1);
+ 		ret = regmap_bulk_write(ppe_dev->regmap, reg,
+ 					mru_mtu_val, ARRAY_SIZE(mru_mtu_val));
+ 		if (ret)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -397,9 +397,23 @@
+ #define PPE_MRU_MTU_CTRL_W1_RX_CNT_EN		BIT(0)
+ #define PPE_MRU_MTU_CTRL_W1_TX_CNT_EN		BIT(1)
+ #define PPE_MRU_MTU_CTRL_W1_SRC_PROFILE		GENMASK(3, 2)
++#define PPE_MRU_MTU_CTRL_W1_PREHEADER_PREC	GENMASK(10, 8)
++#define PPE_MRU_MTU_CTRL_W1_PCP_PREC		GENMASK(13, 11)
++#define PPE_MRU_MTU_CTRL_W1_DSCP_PREC		GENMASK(16, 14)
++#define PPE_MRU_MTU_CTRL_W1_FLOW_PREC		GENMASK(19, 17)
++#define PPE_MRU_MTU_CTRL_W1_PRE_ACL_PREC		GENMASK(22, 20)
++#define PPE_MRU_MTU_CTRL_W1_POST_ACL_PREC	GENMASK(25, 23)
++#define PPE_MRU_MTU_CTRL_W1_PRE_ACL_OUTER_PREC	GENMASK(30, 28)
+ #define PPE_MRU_MTU_CTRL_W1_INNER_PREC_LOW	BIT(31)
+ #define PPE_MRU_MTU_CTRL_W2_INNER_PREC_HIGH	GENMASK(1, 0)
+ 
++#define PPE_QOS_PREC_PREHEADER			1
++#define PPE_QOS_PREC_PCP			2
++#define PPE_QOS_PREC_DSCP			3
++#define PPE_QOS_PREC_PRE_ACL			4
++#define PPE_QOS_PREC_ACL			5
++#define PPE_QOS_PREC_FLOW			6
++
+ #define PPE_MRU_MTU_CTRL_SET_MRU(tbl_cfg, value)	\
+ 	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W0_MRU, tbl_cfg, value)
+ #define PPE_MRU_MTU_CTRL_SET_MRU_CMD(tbl_cfg, value)	\
+@@ -412,6 +426,33 @@
+ 	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_RX_CNT_EN, (tbl_cfg) + 0x1, value)
+ #define PPE_MRU_MTU_CTRL_SET_TX_CNT_EN(tbl_cfg, value)	\
+ 	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_TX_CNT_EN, (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_PREHEADER_PREC(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_PREHEADER_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_PCP_PREC(tbl_cfg, value)		\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_PCP_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_DSCP_PREC(tbl_cfg, value)		\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_DSCP_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_FLOW_PREC(tbl_cfg, value)		\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_FLOW_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_PRE_ACL_PREC(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_PRE_ACL_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_POST_ACL_PREC(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_POST_ACL_PREC,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_PRE_ACL_OUTER_PREC(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_PRE_ACL_OUTER_PREC,	\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_INNER_PREC_LOW(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W1_INNER_PREC_LOW,		\
++		     (tbl_cfg) + 0x1, value)
++#define PPE_MRU_MTU_CTRL_SET_INNER_PREC_HIGH(tbl_cfg, value)	\
++	FIELD_MODIFY(PPE_MRU_MTU_CTRL_W2_INNER_PREC_HIGH,		\
++		     (tbl_cfg) + 0x2, value)
+ 
+ /* PPE service code configuration for destination port and counter. */
+ #define PPE_IN_L2_SERVICE_TBL_ADDR		0x66000
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -345,6 +345,15 @@ static int ppe_vp_hw_set_mtu(struct ppe_
+ 	PPE_MRU_MTU_CTRL_SET_MTU_CMD(tbl, PPE_ACTION_REDIRECT_TO_CPU);
+ 	PPE_MRU_MTU_CTRL_SET_RX_CNT_EN(tbl, true);
+ 	PPE_MRU_MTU_CTRL_SET_TX_CNT_EN(tbl, true);
++	PPE_MRU_MTU_CTRL_SET_PREHEADER_PREC(tbl, PPE_QOS_PREC_PREHEADER);
++	PPE_MRU_MTU_CTRL_SET_PCP_PREC(tbl, PPE_QOS_PREC_PCP);
++	PPE_MRU_MTU_CTRL_SET_DSCP_PREC(tbl, PPE_QOS_PREC_DSCP);
++	PPE_MRU_MTU_CTRL_SET_FLOW_PREC(tbl, PPE_QOS_PREC_FLOW);
++	PPE_MRU_MTU_CTRL_SET_PRE_ACL_PREC(tbl, PPE_QOS_PREC_ACL);
++	PPE_MRU_MTU_CTRL_SET_POST_ACL_PREC(tbl, PPE_QOS_PREC_ACL);
++	PPE_MRU_MTU_CTRL_SET_PRE_ACL_OUTER_PREC(tbl, PPE_QOS_PREC_PRE_ACL);
++	PPE_MRU_MTU_CTRL_SET_INNER_PREC_LOW(tbl, PPE_QOS_PREC_PRE_ACL & 1);
++	PPE_MRU_MTU_CTRL_SET_INNER_PREC_HIGH(tbl, PPE_QOS_PREC_PRE_ACL >> 1);
+ 
+ 	return regmap_bulk_write(ppe_dev->regmap, reg, tbl,
+ 				 ARRAY_SIZE(tbl));
+-- 
+2.43.0
