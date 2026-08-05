@@ -36,7 +36,8 @@ define Device/askey_sbe1v1k
 		ds-lite map kmod-sched-core ip-full ip-bridge tc-tiny \
 		luci-ssl luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
 		luci-i18n-package-manager-zh-cn curl nano htop tcpdump ethtool-full \
-		iperf3 bind-dig pciutils usbutils
+		iperf3 bind-dig pciutils usbutils qca-nss-fw-eip \
+		kmod-qca-nss-eip kmod-qca-nss-eip-crypto kmod-qca-nss-eip-ipsec
 	IMAGE/recovery.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-rootfs | \
 		pad-rootfs | check-size $$$$(IMAGE_SIZE) | append-metadata
 endef
