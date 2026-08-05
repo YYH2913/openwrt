@@ -7,8 +7,10 @@ destinations and to reclassify SOE-decrypted packets whose secpath
 remains attached. This lets the Airoha PPE bind flows that pass through
 SOE ESP encapsulation or decapsulation.
 
-Assisted-by: Codex:gpt-5.5
+Assisted-by: Codex:gpt-5.5 <codex@openai.invalid>
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
 index 0b7bdfd..731545a 100644
@@ -64,18 +66,18 @@ index 0b7bdfd..731545a 100644
  		return 0;
  
  	if (!nf_flow_dst_check(&tuplehash->tuple)) {
-diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
---- a/net/netfilter/nft_flow_offload.c
-+++ b/net/netfilter/nft_flow_offload.c
-@@ -12,6 +12,7 @@
- #include <net/dsfield.h>
+diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -10,6 +10,7 @@
+ #include <net/flow_dissector.h>
  #include <net/ip.h>
- #include <net/flow.h>
+ #include <net/inet_dscp.h>
 +#include <net/xfrm.h>
  #include <net/netfilter/nf_tables.h>
  #include <net/netfilter/nf_tables_core.h>
  #include <net/netfilter/nf_conntrack_core.h>
-@@ -31,6 +32,21 @@
+@@ -25,6 +26,21 @@
  	return FLOW_OFFLOAD_XMIT_NEIGH;
  }
  
@@ -97,7 +99,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  static void nft_default_forward_path(struct nf_flow_route *route,
  				     struct dst_entry *dst_cache,
  				     enum ip_conntrack_dir dir)
-@@ -382,7 +398,8 @@
+@@ -375,7 +391,8 @@
  		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
  		route->tuple[dir].out.ifindex = info.outdev->ifindex;
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
@@ -107,7 +109,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  	}
  
  	return 0;
-@@ -396,6 +413,9 @@
+@@ -389,6 +406,9 @@
  {
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
@@ -117,7 +119,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  	struct flowi fl;
  
  	memset(&fl, 0, sizeof(fl));
-@@ -420,7 +440,57 @@
+@@ -413,7 +433,53 @@
  		break;
  	}
  
@@ -147,20 +149,16 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 +			cur_fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;
 +			break;
 +		case NFPROTO_IPV6:
-+			cur_fl.u.ip6.daddr =
-+				ct->tuplehash[dir].tuple.dst.u3.in6;
-+			cur_fl.u.ip6.saddr =
-+				ct->tuplehash[dir].tuple.src.u3.in6;
++			cur_fl.u.ip6.daddr = ct->tuplehash[dir].tuple.dst.u3.in6;
++			cur_fl.u.ip6.saddr = ct->tuplehash[dir].tuple.src.u3.in6;
 +			cur_fl.u.ip6.flowi6_iif = nft_in(pkt)->ifindex;
-+			cur_fl.u.ip6.flowlabel =
-+				ip6_flowinfo(ipv6_hdr(pkt->skb));
++			cur_fl.u.ip6.flowlabel = ip6_flowinfo(ipv6_hdr(pkt->skb));
 +			cur_fl.u.ip6.flowi6_mark = pkt->skb->mark;
 +			cur_fl.u.ip6.flowi6_flags = FLOWI_FLAG_ANYSRC;
 +			break;
 +		}
 +
-+		nf_route(nft_net(pkt), &relookup_dst, &cur_fl, false,
-+			 nft_pf(pkt));
++		nf_route(nft_net(pkt), &relookup_dst, &cur_fl, false, nft_pf(pkt));
 +		if (relookup_dst) {
 +			this_dst = relookup_dst;
 +			this_dst_relooked = true;
@@ -176,7 +174,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  		return -ENOENT;
  
  	nf_route(nft_net(pkt), &other_dst, &fl, false, nft_pf(pkt));
-@@ -428,18 +498,32 @@
+@@ -421,18 +487,32 @@
  		dst_release(this_dst);
  		return -ENOENT;
  	}
@@ -213,8 +211,19 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 +	return -ENOENT;
  }
  
- static int
-@@ -540,9 +624,24 @@
+ static int nft_flow_route_dir(const struct nft_pktinfo *pkt,
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -11,6 +11,7 @@
+ #include <net/dsfield.h>
+ #include <net/ip.h>
+ #include <net/flow.h>
++#include <net/xfrm.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -44,9 +45,24 @@
  
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {
@@ -241,7 +250,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  	if (family == NFPROTO_IPV4) {
  		const struct ip_options *opt;
  
-@@ -574,6 +673,7 @@
+@@ -78,6 +94,7 @@
  	struct nf_flow_route route = {};
  	enum ip_conntrack_info ctinfo;
  	struct flow_offload *flow;
@@ -249,7 +258,7 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
  	int ret;
-@@ -589,9 +689,14 @@
+@@ -93,9 +110,14 @@
  	case IPPROTO_TCP:
  		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
  					  sizeof(_tcph), &_tcph);
@@ -266,9 +275,9 @@ diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
  		break;
  	case IPPROTO_UDP:
  		break;
-@@ -631,6 +736,16 @@
- 			goto err_flow_route;
- 	}
+@@ -130,6 +152,16 @@
+ 	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
+ 		goto err_flow_route;
  
 +	/* XFRM packet offload can hide part of the plaintext TCP handshake from
 +	 * conntrack. Once routing proves that either direction is an XFRM
