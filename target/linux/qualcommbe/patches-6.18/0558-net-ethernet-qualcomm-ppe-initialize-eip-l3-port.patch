@@ -1,0 +1,71 @@
+From: Sourav Poddar <quic_souravp@quicinc.com>
+Date: Thu, 19 May 2022 14:49:08 +0530
+Subject: [PATCH] net: qualcomm: initialize the EIP L3 port
+
+The downstream PPE driver allocates an L3 interface and attaches it to the
+reserved EIP-197 physical port before enabling inline IPsec. The upstream
+port configured the EIP service codes and queues, but left port 7 without a
+valid ingress L3 interface. Packets returning from EIP therefore could not
+enter the routed PPE pipeline reliably.
+
+Provision the matching reserved L3 interface and bind it to port 7. Use the
+hardware maximum MTU because this internal interface carries both outer and
+decrypted packets and has no netdevice MTU of its own.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/4f90a2dc99e9f842a4efe2c2f49c3deaa14492e6
+Signed-off-by: Sourav Poddar <quic_souravp@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -13,6 +13,7 @@
+ 
+ #include "ppe.h"
+ #include "ppe_config.h"
++#include "ppe_flow.h"
+ #include "ppe_regs.h"
+ 
+ #define PPE_QUEUE_SCH_PRI_NUM		8
+@@ -2780,6 +2781,27 @@ static int ppe_servcode_init(struct ppe_
+ 	return 0;
+ }
+ 
++/* EIP-197 returns inline packets through reserved physical port 7. Give the
++ * port the same dedicated L3 interface that the downstream ppe_drv_eip_init()
++ * transaction allocates before any EIP client can publish a flow.
++ */
++static int ppe_eip_port_init(struct ppe_device *ppe_dev)
++{
++	static const u8 zero_addr[ETH_ALEN];
++	int ret;
++
++	ret = ppe_l3_if_set(ppe_dev, PPE_EIP_PORT, zero_addr,
++			    PPE_FLOW_PMTU_MAX, -1);
++	if (ret)
++		return ret;
++
++	ret = ppe_port_l3_if_set(ppe_dev, PPE_EIP_PORT, PPE_EIP_PORT);
++	if (ret)
++		ppe_l3_if_clear(ppe_dev, PPE_EIP_PORT);
++
++	return ret;
++}
++
+ /* Initialize PPE port configurations. */
+ static int ppe_port_config_init(struct ppe_device *ppe_dev)
+ {
+@@ -3030,6 +3052,10 @@ int ppe_hw_config(struct ppe_device *ppe
+ 	if (ret)
+ 		return ret;
+ 
++	ret = ppe_eip_port_init(ppe_dev);
++	if (ret)
++		return ret;
++
+ 	ret = ppe_rss_hash_init(ppe_dev);
+ 	if (ret)
+ 		return ret;
+-- 
+2.43.0
