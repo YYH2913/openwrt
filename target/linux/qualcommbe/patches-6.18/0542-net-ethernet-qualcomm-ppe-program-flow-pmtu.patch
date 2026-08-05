@@ -1,0 +1,194 @@
+From: Amit Gupta <quic_amitgupt@quicinc.com>
+Date: Wed, 8 Dec 2021 22:28:52 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: program flow PMTU
+
+The APPE flow table has a mandatory 14-bit path-MTU field.  The native
+driver left it at its reset value of zero, so every packet which matched
+an installed flow failed the per-flow MTU check.  DF packets were punted
+with CPU code 94 and other packets with code 93, leaving both wired and
+wireless traffic on the software forwarding path.
+
+Follow the vendor PPE driver: select the L3-length PMTU check and program
+the output netdevice MTU in every IPv4 and IPv6 5-tuple.  The fields occupy
+different words for the two entry formats, despite the common tuple header.
+Expose the programmed value and name the two exception codes in debugfs so
+this failure is visible without decoding raw rows.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/c1518e56cae724c59df30cd0001772da66c21e60
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/1ba5937f12b03f58e32d6afce29f33c1a01c5d35
+Signed-off-by: Amit Gupta <quic_amitgupt@quicinc.com>
+Signed-off-by: Sourav Poddar <quic_souravp@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c      | 11 +++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.h      |  3 +++
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c | 28 ++++++++++++++++++++----
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h      |  7 +++++++
+ 4 files changed, 45 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -159,4 +159,10 @@ static void ppe_flow_entry_pack(const st
+ 	if (flow->is_ipv6) {
+ 		u32 dip[4];
+ 
++		val[2] |= PPE_FLOW_V6_W2_PMTU_CHECK_L3;
++		val[2] |= FIELD_PREP(PPE_FLOW_V6_W2_PMTU_LO,
++					     flow->pmtu & GENMASK(10, 0));
++		val[3] |= FIELD_PREP(PPE_FLOW_V6_W3_PMTU_HI,
++					     flow->pmtu >> 11);
++
+ 		ppe_flow_ip6_words(&flow->dip.ip6, dip);
+@@ -171,6 +177,11 @@ static void ppe_flow_entry_pack(const st
+ 		val[2] |= FIELD_PREP(PPE_FLOW_W2_IP_ADDR_LO,
+ 				     ip & GENMASK(19, 0));
+ 		val[3] |= FIELD_PREP(PPE_FLOW_W3_IP_ADDR_HI, ip >> 20);
++		val[4] |= PPE_FLOW_V4_W4_PMTU_CHECK_L3;
++		val[4] |= FIELD_PREP(PPE_FLOW_V4_W4_PMTU_LO,
++				     flow->pmtu & GENMASK(10, 0));
++		val[5] = FIELD_PREP(PPE_FLOW_V4_W5_PMTU_HI,
++				    flow->pmtu >> 11);
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -47,5 +47,7 @@ struct ppe_flow_nexthop {
+  * flows are never translated, only routed.
+  * @pri_profile: Egress queue priority profile.
++ * @pmtu: Path MTU of the output netdevice.  APPE compares this against the
++ * L3 packet length before forwarding a matched flow.
+  * @nexthop: Next hop entry index of the flow.
+  * @host_index: Source host-table index returned by hardware.
+  * @nat_port: Translated source port of SNAT flows, translated
+@@ -64,6 +66,7 @@ struct ppe_flow_entry {
+ 	u8 proto;
+ 	u8 fwd_type;
+ 	u8 pri_profile;
++	u16 pmtu;
+ 	u16 nexthop;
+ 	u16 host_index;
+ 	__be16 nat_port;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -2167,6 +2167,12 @@ static int ppe_ft_flow_replace(struct pp
+ 		ret = -EOPNOTSUPP;
+ 		goto err_tdev;
+ 	}
++	if (odev->mtu > PPE_FLOW_PMTU_MAX) {
++		ret = -EOPNOTSUPP;
++		goto err_tdev;
++	}
++
++	flow->entry.pmtu = odev->mtu;
+ 
+ 	/* The PPPoE L3 interface carries the session ID, so it needs
+ 	 * the source MAC rewrite of the rule to be complete.
+@@ -2725,5 +2731,9 @@ static const char *ppe_ft_reason_name(bo
+ 	if (cpu) {
+ 		switch (code) {
++		case 93:
++			return "L3 flow MTU fail";
++		case 94:
++			return "L3 flow MTU DF fail";
+ 		case 148:
+ 			return "L3 route host mismatch action";
+ 		case 162:
+@@ -3019,16 +3029,17 @@ static int ppe_ft_flow_rows_show(struct
+ 		u32 reg;
+ 		u16 hw_host, hw_nh, sport, dport;
++		u16 hw_pmtu;
+ 		u64 bytes = 0;
+ 		union {
+ 			__be32 ip4;
+ 			struct in6_addr ip6;
+ 		} host_ip = {}, inline_ip = {};
+ 		__be32 dnat_ip, pub_ip_addr;
+ 		u8 dmac[ETH_ALEN], hw_profile;
+ 		int flow_err, host_err, nh_err, in_err, eg_err;
+ 		int my_mac_err = 0, pub_ip_err = 0;
+ 		int flow_words, host_words;
+-		bool key_match, source_match;
++		bool hw_pmtu_l3, key_match, source_match;
+ 		u8 l3_if;
+ 
+ 		if (IS_ERR(flow)) {
+@@ -3072,8 +3083,11 @@ static int ppe_ft_flow_rows_show(struct
+ 			source_match = ipv6_addr_equal(&host_ip.ip6,
+ 						       &flow->entry.sip.ip6);
+ 			key_match = source_match &&
+ 				ipv6_addr_equal(&inline_ip.ip6,
+ 						&flow->entry.dip.ip6);
++			hw_pmtu = FIELD_GET(PPE_FLOW_V6_W2_PMTU_LO, f[2]) |
++				  FIELD_GET(PPE_FLOW_V6_W3_PMTU_HI, f[3]) << 11;
++			hw_pmtu_l3 = !!(f[2] & PPE_FLOW_V6_W2_PMTU_CHECK_L3);
+ 		} else {
+ 			host_ip.ip4 = cpu_to_be32(h[1]);
+ 			inline_ip.ip4 = cpu_to_be32
+@@ -3082,6 +3096,9 @@ static int ppe_ft_flow_rows_show(struct
+ 			source_match = host_ip.ip4 == flow->entry.sip.ip4;
+ 			key_match = source_match &&
+ 				inline_ip.ip4 == flow->entry.dip.ip4;
++			hw_pmtu = FIELD_GET(PPE_FLOW_V4_W4_PMTU_LO, f[4]) |
++				  FIELD_GET(PPE_FLOW_V4_W5_PMTU_HI, f[5]) << 11;
++			hw_pmtu_l3 = !!(f[4] & PPE_FLOW_V4_W4_PMTU_CHECK_L3);
+ 		}
+ 		sport = FIELD_GET(PPE_FLOW_W3_L4_SPORT, f[3]);
+ 		dport = FIELD_GET(PPE_FLOW_W3_L4_DPORT_LO, f[3]) |
+@@ -3095,7 +3112,8 @@ static int ppe_ft_flow_rows_show(struct
+ 			sport == be16_to_cpu(flow->entry.sport) &&
+ 			dport == be16_to_cpu(flow->entry.dport) &&
+ 			FIELD_GET(PPE_FLOW_W0_PROTOCOL_TYPE, f[0]) ==
+-				flow->entry.proto;
++				flow->entry.proto &&
++			hw_pmtu_l3 && hw_pmtu == flow->entry.pmtu;
+ 		dmac[0] = nh[2] >> 24;
+ 		dmac[1] = nh[2] >> 16;
+ 		dmac[2] = nh[2] >> 8;
+@@ -3121,9 +3139,10 @@ static int ppe_ft_flow_rows_show(struct
+ 				   &flow->entry.dip.ip4,
+ 				   be16_to_cpu(flow->entry.dport));
+ 		seq_printf(seq,
+-			   " proto:%u fwd:%u profile:%u index:%d host:%u nexthop:%u my_mac:%d pub_ip:%d packets:%u bytes:%llu\n",
++			   " proto:%u fwd:%u profile:%u pmtu:%u index:%d host:%u nexthop:%u my_mac:%d pub_ip:%d packets:%u bytes:%llu\n",
+ 			   flow->entry.proto, flow->entry.fwd_type,
+-			   flow->entry.pri_profile, flow->index,
++			   flow->entry.pri_profile, flow->entry.pmtu,
++			   flow->index,
+ 			   flow->entry.host_index, flow->nexthop,
+ 			   flow->my_mac, flow->pub_ip, packets,
+ 			   (unsigned long long)bytes);
+@@ -3143,6 +3162,7 @@ static int ppe_ft_flow_rows_show(struct
+ 			   FIELD_GET(PPE_FLOW_W1_L4_PORT, f[1]),
+ 			   hw_profile,
+ 			   FIELD_GET(PPE_FLOW_W2_SERVICE_CODE, f[2]));
++		seq_printf(seq, " pmtu:%u pmtu_l3:%u", hw_pmtu, hw_pmtu_l3);
+ 		if (flow->entry.is_ipv6)
+ 			seq_printf(seq, " inline:%pI6c", &inline_ip.ip6);
+ 		else
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -694,12 +694,19 @@
+ #define PPE_FLOW_W3_L4_SPORT			GENMASK(27, 12)
+ #define PPE_FLOW_W3_L4_DPORT_LO			GENMASK(31, 28)
+ #define PPE_FLOW_W4_L4_DPORT_HI			GENMASK(11, 0)
++#define PPE_FLOW_PMTU_MAX			GENMASK(13, 0)
++#define PPE_FLOW_V4_W4_PMTU_CHECK_L3		BIT(20)
++#define PPE_FLOW_V4_W4_PMTU_LO			GENMASK(31, 21)
++#define PPE_FLOW_V4_W5_PMTU_HI			GENMASK(2, 0)
+ 
+ /* An IPv6 flow entry (entry type 1) spans two flow table entries: 9
+  * words. Words 0 and 1 match the IPv4 layout and the L4 ports sit at
+  * the IPv4 positions of words 3 and 4; the 128-bit address is stored
+  * from bit 12 of word 4 upwards as a little-endian wide integer.
+  */
++#define PPE_FLOW_V6_W2_PMTU_CHECK_L3		BIT(20)
++#define PPE_FLOW_V6_W2_PMTU_LO			GENMASK(31, 21)
++#define PPE_FLOW_V6_W3_PMTU_HI			GENMASK(2, 0)
+ #define PPE_FLOW_V6_W4_IP_ADDR_0		GENMASK(31, 12)
+ #define PPE_FLOW_V6_W8_IP_ADDR_4		GENMASK(11, 0)
+ 
+-- 
+2.43.0
