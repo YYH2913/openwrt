@@ -1,0 +1,164 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 15:10:00 +0800
+Subject: [PATCH] wifi: mt76: report data frame TX rate
+
+The station_info TX bitrate is backed by wcid->rate, which is currently
+replaced by every per-SKB TX status.  Management, control and null-data
+frames use basic or otherwise conservative rates, so one such completion
+can make a HE or EHT station appear to have renegotiated to an older mode.
+
+Only cache rates from frames which carry data.  Hardware-encapsulated
+Ethernet frames and WED PPDU status are data by construction; for software
+802.11 encapsulation use ieee80211_is_data_present() so null-data frames do
+not overwrite the visible rate either.  Keep the existing WED packet-ID
+classification and generic no-SKB semantics intact, since older mt76x02
+drivers encode per-packet rate information into the latter.  Continue
+accounting the rate histogram for all TX status records.
+
+Apply the same rule to the common connac path, the mt7925 EHT path and the
+mt7996 EHT/AP path so station_info has consistent semantics across mt76
+devices.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ mt76.h            |  9 +++++++++
+ mt76_connac.h     | 2 +-
+ mt76_connac_mac.c | 8 +++++---
+ mt7915/mac.c      | 2 +-
+ mt7925/mac.c      | 3 ++-
+ mt7996/mac.c      | 5 ++++-
+ tx.c              | 4 +---
+ 7 files changed, 23 insertions(+), 10 deletions(-)
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -1454,6 +1454,15 @@ static inline struct mt76_tx_cb *mt76_tx
+ 	return ((void *)IEEE80211_SKB_CB(skb)->status.status_driver_data);
+ }
+ 
++static inline bool mt76_tx_status_is_data(struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_hdr *hdr = (void *)skb->data;
++
++	return info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP ||
++	       ieee80211_is_data_present(hdr->frame_control);
++}
++
+ static inline void *mt76_skb_get_hdr(struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status mstat;
+--- a/tx.c
++++ b/tx.c
+@@ -122,7 +122,6 @@ int
+ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 		       struct sk_buff *skb)
+ {
+-	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
+ 	int pid;
+@@ -138,8 +137,7 @@ mt76_tx_status_skb_add(struct mt76_dev *
+ 	if (!(info->flags & (IEEE80211_TX_CTL_REQ_TX_STATUS |
+ 			     IEEE80211_TX_CTL_RATE_CTRL_PROBE))) {
+ 		if (mtk_wed_device_active(&dev->mmio.wed) &&
+-		    ((info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) ||
+-		     ieee80211_is_data(hdr->frame_control)))
++		    mt76_tx_status_is_data(skb))
+ 			return MT_PACKET_ID_WED;
+ 
+ 		return MT_PACKET_ID_NO_SKB;
+--- a/mt76_connac.h
++++ b/mt76_connac.h
+@@ -522,7 +522,7 @@ u16 mt76_connac2_mac_tx_rate_val(struct
+ 				 struct ieee80211_bss_conf *conf,
+ 				 bool beacon, bool mcast);
+ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+-			       __le32 *txs_data);
++			       __le32 *txs_data, bool update_rate);
+ bool mt76_connac2_mac_add_txs_skb(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 				  int pid, __le32 *txs_data);
+ void mt76_connac2_mac_decode_he_radiotap(struct mt76_dev *dev,
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -622,7 +622,7 @@ void mt76_connac2_mac_write_txwi(struct
+ EXPORT_SYMBOL_GPL(mt76_connac2_mac_write_txwi);
+ 
+ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+-			       __le32 *txs_data)
++			       __le32 *txs_data, bool update_rate)
+ {
+ 	struct mt76_sta_stats *stats = &wcid->stats;
+ 	struct ieee80211_supported_band *sband;
+@@ -740,7 +740,8 @@ bool mt76_connac2_mac_fill_txs(struct mt
+ 		stats->tx_bw[0]++;
+ 		break;
+ 	}
+-	wcid->rate = rate;
++	if (update_rate)
++		wcid->rate = rate;
+ 
+ 	return true;
+ }
+@@ -768,7 +769,8 @@ bool mt76_connac2_mac_add_txs_skb(struct
+ 			!!(info->flags & IEEE80211_TX_STAT_ACK);
+ 		info->status.rates[0].idx = -1;
+ 
+-		mt76_connac2_mac_fill_txs(dev, wcid, txs_data);
++		mt76_connac2_mac_fill_txs(dev, wcid, txs_data,
++					    mt76_tx_status_is_data(skb));
+ 		mt76_tx_status_skb_done(dev, skb, &list);
+ 	}
+ 	mt76_tx_status_unlock(dev, &list);
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1006,7 +1006,7 @@ static void mt7915_mac_add_txs(struct mt
+ 	msta = container_of(wcid, struct mt7915_sta, wcid);
+ 
+ 	if (pid == MT_PACKET_ID_WED)
+-		mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs_data);
++		mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs_data, true);
+ 	else
+ 		mt76_connac2_mac_add_txs_skb(&dev->mt76, wcid, pid, txs_data);
+ 
+--- a/mt7925/mac.c
++++ b/mt7925/mac.c
+@@ -1022,7 +1022,8 @@ mt7925_mac_add_txs_skb(struct mt792x_dev
+ 		stats->tx_bw[0]++;
+ 		break;
+ 	}
+-	wcid->rate = rate;
++	if (mt76_tx_status_is_data(skb))
++		wcid->rate = rate;
+ 
+ out:
+ 	mt76_tx_status_skb_done(mdev, skb, &list);
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1419,6 +1419,7 @@ mt7996_mac_add_txs_skb(struct mt7996_dev
+ 	struct sk_buff_head list;
+ 	struct rate_info rate = {};
+ 	struct sk_buff *skb = NULL;
++	bool update_rate = pid == MT_PACKET_ID_WED;
+ 	bool cck = false;
+ 	u32 txrate, txs, mode, stbc;
+ 
+@@ -1431,6 +1432,7 @@ mt7996_mac_add_txs_skb(struct mt7996_dev
+ 		skb = mt76_tx_status_skb_get(mdev, wcid, pid, &list);
+ 		if (skb) {
+ 			info = IEEE80211_SKB_CB(skb);
++			update_rate = mt76_tx_status_is_data(skb);
+ 			if (!(txs & MT_TXS0_ACK_ERROR_MASK))
+ 				info->flags |= IEEE80211_TX_STAT_ACK;
+ 
+@@ -1548,7 +1550,8 @@ mt7996_mac_add_txs_skb(struct mt7996_dev
+ 		stats->tx_bw[0]++;
+ 		break;
+ 	}
+-	wcid->rate = rate;
++	if (update_rate)
++		wcid->rate = rate;
+ 
+ out:
+ 	if (skb)
