@@ -1,0 +1,103 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: manage clock and node lifetimes
+
+The EIP probe enables every clock with clk_prepare_enable(), but never
+balances the enable count on probe failure or driver removal.  Register a
+managed cleanup action after each successful enable so that the clocks stay
+on while remove tears down DMA, and are then disabled by devres.
+
+Validate that clock-frequency describes every named clock.  Do not rely on
+BUG_ON() or index past a short property.  Also stop taking the OF node
+reference held by the outer probe routine.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip.c
++++ b/driver/eip197/eip.c
+@@ -55,7 +55,7 @@ uint32_t ring_sz = 256;
+  */
+ static int eip_device_probe(struct platform_device *pdev)
+ {
+-	struct device_node *np = of_node_get(pdev->dev.of_node);
++	struct device_node *np = pdev->dev.of_node;
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	struct resource res = {0};
+ 	struct eip_pdev *ep;
+--- a/driver/eip197/eip_hw.c
++++ b/driver/eip197/eip_hw.c
+@@ -601,6 +601,15 @@ static void eip_hw_setup(void __iomem *b
+ }
+ 
+ /*
++ * eip_hw_clock_disable()
++ *	Disable a clock acquired for the lifetime of the platform device.
++ */
++static void eip_hw_clock_disable(void *data)
++{
++	clk_disable_unprepare(data);
++}
++
++/*
+  * eip_hw_clock_init()
+  *	Initialise EIP197 clock
+  */
+@@ -632,8 +641,17 @@ static int eip_hw_clock_init(struct devi
+ 		return 0;
+ 	}
+ 
+-	BUG_ON(len < sizeof(*clk_rate));
++	if (len <= 0 || len % sizeof(*clk_rate)) {
++		dev_err(dev, "invalid clock-frequency property length: %d\n", len);
++		return -EINVAL;
++	}
++
+ 	clk_entries = len / sizeof(*clk_rate);
++	if (clk_entries != (size_t)count) {
++		dev_err(dev, "clock-frequency has %zu entries, expected %d\n",
++			clk_entries, count);
++		return -EINVAL;
++	}
+ 
+ 	clk_rate = kzalloc(len, GFP_KERNEL);
+ 	if (!clk_rate)
+@@ -652,20 +670,30 @@ static int eip_hw_clock_init(struct devi
+ 
+ 		clk = devm_clk_get(dev, clk_string);
+ 		if (IS_ERR(clk)) {
+-			pr_err("%px: cannot get crypto clock: %s\n", dev, clk_string);
+-			status = -ENOENT;
++			status = PTR_ERR(clk);
++			dev_err(dev, "cannot get crypto clock %s: %d\n",
++				clk_string, status);
+ 			goto free;
+ 		}
+ 
+-		if (clk_set_rate(clk, clk_rate[i])) {
+-			pr_err("%px: cannot set %llx freq for %s\n", dev, clk_rate[i], clk_string);
+-			status = -EINVAL;
++		status = clk_set_rate(clk, clk_rate[i]);
++		if (status) {
++			dev_err(dev, "cannot set %llu Hz for %s: %d\n",
++				clk_rate[i], clk_string, status);
+ 			goto free;
+ 		}
+ 
+-		if (clk_prepare_enable(clk)) {
+-			pr_err("%px: cannot enable clock: %s\n", dev, clk_string);
+-			status = -EFAULT;
++		status = clk_prepare_enable(clk);
++		if (status) {
++			dev_err(dev, "cannot enable clock %s: %d\n",
++				clk_string, status);
++			goto free;
++		}
++
++		status = devm_add_action_or_reset(dev, eip_hw_clock_disable, clk);
++		if (status) {
++			dev_err(dev, "cannot manage clock %s: %d\n",
++				clk_string, status);
+ 			goto free;
+ 		}
+ 	}
