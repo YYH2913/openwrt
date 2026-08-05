@@ -1,0 +1,31 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 28 Jul 2026 02:25:00 +0800
+Subject: [PATCH] hostapd: do not advertise unsupported EHT MAC capabilities
+
+The driver capabilities include EPCS priority access and Restricted TWT,
+but hostapd does not currently implement either feature for an AP. In
+particular, the EPCS action frame handling is still explicitly left as a
+TODO in ap_drv_ops.c.
+
+Do not copy these hardware capabilities into management frames until the
+corresponding hostapd functionality is available. Advertising unsupported
+EHT MAC features can make strict stations reject the complete EHT
+Capabilities element and associate as HE instead.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ src/ap/ieee802_11_eht.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -138,5 +138,8 @@ u8 * hostapd_eid_eht_capab(struct hostap
+ 	os_memset(cap, 0, sizeof(*cap));
+ 	cap->mac_cap = host_to_le16(eht_cap->mac_cap);
++	cap->mac_cap &= host_to_le16(~(EHT_MACCAP_EPCS_PRIO |
++					 EHT_MACCAP_RESTRICTED_TWT));
++
+ 	os_memcpy(cap->phy_cap, eht_cap->phy_cap, EHT_PHY_CAPAB_LEN);
+ 
+ 	/* Bits 2-7 of the last EHT PHY capability octet are reserved. */
