@@ -69,6 +69,7 @@ config-$(call config_package,ath11k) += ATH11K
 config-$(call config_package,ath11k-ahb) += ATH11K_AHB
 config-$(call config_package,ath11k-pci) += ATH11K_PCI
 config-$(call config_package,ath12k) += ATH12K
+config-$(CONFIG_TARGET_qualcommbe_ipq95xx) += ATH12K_PPE_DS_SUPPORT
 
 config-$(call config_package,ath5k) += ATH5K ATH5K_PCI
 
@@ -371,6 +372,7 @@ define KernelPackage/ath12k
   DEPENDS+= @PCI_SUPPORT +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
   +kmod-crypto-michael-mic +kmod-qrtr-mhi \
   +kmod-qcom-qmi-helpers +@DRIVER_11BE_SUPPORT \
+  +(TARGET_qualcommbe_ipq95xx):kmod-qcom-ppe \
   +ATH12K_THERMAL:kmod-hwmon-core +ATH12K_THERMAL:kmod-thermal
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ath12k.ko
   AUTOLOAD:=$(call AutoProbe,ath12k)
