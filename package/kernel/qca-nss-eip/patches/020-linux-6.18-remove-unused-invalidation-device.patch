@@ -1,0 +1,25 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: remove unused invalidation device pointer
+
+The synchronous transform-record invalidation changes left an eip_pdev
+pointer in eip_tr_inval_done() after its last user was removed.  Drop the
+dead declaration and assignment so the driver builds cleanly with W=1.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_tr.c
++++ b/driver/eip197/eip_tr.c
+@@ -88,11 +88,9 @@ static void eip_tr_dummy_err(void *app_d
+  */
+ static void eip_tr_inval_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+-	struct eip_pdev *ep;
+ 	struct eip_ctx *ctx;
+ 
+ 	ctx = tr->ctx;
+-	ep = ctx->ep;
+ 
+ 	/*
+ 	 * free the memory associated with the operation.
