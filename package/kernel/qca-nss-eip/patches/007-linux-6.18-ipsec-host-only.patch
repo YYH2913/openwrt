@@ -1,0 +1,3136 @@
+From: Hardik S. Panchal <quic_hpanchal@quicinc.com>
+Date: Sun, 23 Jan 2022 15:21:29 +0530
+Subject: [PATCH] qca-nss-eip: port IPsec client to Linux 6.18 host mode
+
+The QSDK IPsec client combines a look-aside EIP-197 path with legacy ECM,
+PPE inline-flow and packet-steering interfaces which are not available in
+the Linux 6.18 qualcommbe tree. Keep the supported host look-aside path and
+remove those unavailable inline dependencies.
+
+Integrate the client with the upstream XFRM protocol multiplexers and the
+EIP state-provider hooks. Preserve native ESP for unsupported states and
+non-EIP packets, safely override shared NAT-T sockets, and serialize SA and
+netdevice lifetimes so rekey and module teardown cannot race the data path.
+
+Validate namespaces, marks, xfrm interfaces, offload devices, algorithms,
+replay windows and migrated sequence state before claiming an SA. Add ESN,
+RFC4106 salt, GSO, partial-checksum, MTU, lifetime, sequence and exact rekey
+SA handling while keeping EIP hardware records and Linux XFRM accounting in
+step. Use the host EIP_SVC_IPSEC service throughout the core driver.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/d75526582ace2d06ce0d9d5b40c41a541ffb4bcb
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/b4ee72bf8a8f36512f74afb855be7da7ca451eab
+Signed-off-by: Hardik S. Panchal <quic_hpanchal@quicinc.com>
+Signed-off-by: Pavithra R <quic_pavir@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/Makefile
++++ b/clients/ipsec/Makefile
+@@ -14,11 +14,9 @@ $(EIP_IPSEC_MOD_NAME)-objs += eip_ipsec_
+ $(EIP_IPSEC_MOD_NAME)-objs += eip_ipsec_sa.o
+ $(EIP_IPSEC_MOD_NAME)-objs += eip_ipsec_proto.o
+ $(EIP_IPSEC_MOD_NAME)-objs += eip_ipsec_xfrm.o
+-$(EIP_IPSEC_MOD_NAME)-objs += eip_ipsec_flow.o
+ 
+ obj ?= .
+ EIP_IPSEC_INCLUDE = -I$(obj)/../../driver/exports
+ 
+ ccflags-y += $(EIP_IPSEC_INCLUDE)
+ ccflags-y += -Wall -Werror
+-ccflags-y += -DEIP_IPSEC_VP_SUPP
+--- a/clients/ipsec/eip_ipsec.c
++++ b/clients/ipsec/eip_ipsec.c
+@@ -17,13 +17,8 @@
+ #include <linux/platform_device.h>
+ #include <linux/of_address.h>
+ #include <linux/debugfs.h>
+-#include <linux/inetdevice.h>
+-#include <eip.h>
+-
+ #include "eip_ipsec_priv.h"
+ 
+-#define EIP_IPSEC_MAX_CORE_MASK ((1 << NR_CPUS) - 1)	/* Max value of core mask */
+-
+ /*
+  * global ipsec instance.
+  */
+@@ -40,14 +35,6 @@ bool disable_v4_offload = false;
+ module_param(disable_v4_offload, bool, S_IRUSR | S_IWUSR | S_IRGRP);
+ MODULE_PARM_DESC(disable_v4_offload, "Disable ipv4 acceleration");
+ 
+-int eip_pkt_steer_qlen = EIP_IPSEC_PKT_STEER_FIFO_LEN;
+-module_param(eip_pkt_steer_qlen, int, S_IRUSR | S_IWUSR | S_IRGRP);
+-MODULE_PARM_DESC(eip_pkt_steer_qlen, "FIFO length required for packet steer queues");
+-
+-ulong eip_rps_core_mask = 0x0;	/* Should be enabled as required */
+-module_param(eip_rps_core_mask, ulong, S_IRUSR | S_IWUSR | S_IRGRP);
+-MODULE_PARM_DESC(eip_rps_core_mask, "IPsec RPS core mask");
+-
+ /*
+  * eip_ipsec_ppe_init()
+  *	Initialize PPE port if enabled.
+@@ -131,7 +118,7 @@ void eip_ipsec_drv_final(struct kref *kr
+  * eip_ipsec_init_module()
+  *	Module initialization
+  */
+-int __init eip_ipsec_init_module(void)
++static int __init eip_ipsec_init_module(void)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	enum eip_svc svc;
+@@ -149,16 +136,7 @@ int __init eip_ipsec_init_module(void)
+ 	/*
+ 	 * Assign the EIP service code.
+ 	 */
+-	svc = eip_is_inline_supported() ? EIP_SVC_HYBRID_IPSEC : EIP_SVC_IPSEC;
+-
+-	/*
+-	 * Validate module param.
+-	 */
+-	if ((eip_ipsec_core_id >= NR_CPUS) || (eip_rps_core_mask > EIP_IPSEC_MAX_CORE_MASK)) {
+-		pr_err("Invalid module param - ipsec_core_id: %d, rps_core_mask: %lu\n",
+-				(int)eip_ipsec_core_id, eip_rps_core_mask);
+-		return -1;
+-	}
++	svc = EIP_SVC_IPSEC;
+ 
+ 	/*
+ 	 * Initialize the global object.
+@@ -211,17 +189,6 @@ int __init eip_ipsec_init_module(void)
+ 	}
+ 
+ 	/*
+-	 * Enable transmit steer when ppe-eip inline channel is not available.
+-	 * With inline channel hardware supports multi-core receive.
+-	 */
+-	drv->tx_steer_en = !eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW);
+-
+-	/*
+-	 * Enable receive packet steer when it is configured by user.
+-	 */
+-	drv->rx_steer_en = eip_rps_core_mask ? true : false;
+-
+-	/*
+ 	 * XFRM offload initialization.
+ 	 */
+ 	err = eip_ipsec_xfrm_init();
+@@ -230,21 +197,10 @@ int __init eip_ipsec_init_module(void)
+ 		goto fail_xfrm;
+ 	}
+ 
+-	/*
+-	 * Initialize flow
+-	 */
+-	err = eip_ipsec_flow_init();
+-	if (err < 0) {
+-		pr_err("%px: Failed to initialize flow module, error(%d)\n", drv, err);
+-		goto fail_flow;
+-	}
+-
+ 	kref_init(&drv->ref);
+ 	pr_info("eip ipsec module loaded\n");
+ 	return 0;
+ 
+-fail_flow:
+-	eip_ipsec_xfrm_exit();
+ fail_xfrm:
+ 	eip_ipsec_ppe_deinit();
+ fail_ppe:
+@@ -260,16 +216,11 @@ ctx_fail:
+  * eip_ipsec_exit_module()
+  *	Module exit cleanup
+  */
+-void __exit eip_ipsec_exit_module(void)
++static void __exit eip_ipsec_exit_module(void)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 
+ 	/*
+-	 * Deinitialize flow
+-	 */
+-	eip_ipsec_flow_deinit();
+-
+-	/*
+ 	 * Dereference: eip_ipsec_init_module()
+ 	 */
+ 	eip_ipsec_drv_deref(drv);
+--- a/clients/ipsec/eip_ipsec_dev.c
++++ b/clients/ipsec/eip_ipsec_dev.c
+@@ -24,55 +24,15 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/debugfs.h>
++#include <linux/vmalloc.h>
+ #include <net/addrconf.h>
+ #include <net/dst_cache.h>
+ #include <net/route.h>
+ #include <net/ip.h>
+ #include <net/ip6_route.h>
+ #include <net/esp.h>
+-#include <net/xfrm.h>
+-#include <linux/inetdevice.h>
+-
+ #include "eip_ipsec_priv.h"
+ 
+-/*
+- * eip_ipsec_stats_sync_cb()
+- *	sync stats function.
+- */
+-static void eip_ipsec_stats_sync(struct eip_ipsec_dev *eid)
+-{
+-	struct net_device *ndev = eid->ndev;
+-	struct eip_ipsec_sa *sa;
+-
+-	dev_hold(ndev);
+-
+-	/*
+-	 * Collect Encap stats
+-	 */
+-	rcu_read_lock_bh();
+-	list_for_each_entry_rcu(sa, &eid->enc_sa, node) {
+-		/*
+-		 * Sync SA stats stats
+-		 */
+-		eip_ipsec_sa_stats_sync(ndev, sa);
+-	}
+-	rcu_read_unlock_bh();
+-
+-	/*
+-	 * Collect Decap stats.
+-	 */
+-	rcu_read_lock_bh();
+-	list_for_each_entry_rcu(sa, &eid->dec_sa, node) {
+-		/*
+-		 * Sync SA stats stats
+-		 */
+-		eip_ipsec_sa_stats_sync(ndev, sa);
+-	}
+-
+-	rcu_read_unlock_bh();
+-	dev_put(ndev);
+-}
+-
+ #if defined(EIP_IPSEC_VP_SUPP)
+ 
+ /*
+@@ -100,7 +60,6 @@ static bool eip_ipsec_dev_vp_stats_cb(st
+ static void eip_ipsec_dev_get_summary_stats(struct eip_ipsec_dev *eid,
+ 		struct eip_ipsec_dev_stats *stats)
+ {
+-	struct eip_ctx *ctx = eip_ipsec_drv_g.ctx;
+ 	int words;
+ 	int cpu;
+ 	int i;
+@@ -108,9 +67,6 @@ static void eip_ipsec_dev_get_summary_st
+ 	words = (sizeof(*stats) / sizeof(uint64_t));
+ 	memset(stats, 0, sizeof(*stats));
+ 
+-	if (eip_feature_check(ctx, EIP_OFFLOAD_OUTER_FLOW) &&
+-			eip_feature_check(ctx, EIP_OFFLOAD_INNER_FLOW))
+-		eip_ipsec_stats_sync(eid);
+ 	/*
+ 	 * All statistics are 64bit. So we can just iterate by words.
+ 	 */
+@@ -169,8 +125,6 @@ static ssize_t eip_ipsec_dev_read(struct
+ 	len += snprintf(buf + len, max_len - len, "\tTx Error: %llu\n", stats.tx_fail);
+ 	len += snprintf(buf + len, max_len - len, "\tTx Fail SA: %llu\n", stats.tx_fail_sa);
+ 	len += snprintf(buf + len, max_len - len, "\tTx Fail SA (VP Exception): %llu\n", stats.tx_fail_vp_sa);
+-	len += snprintf(buf + len, max_len - len, "\tTPS bypass: %llu\n", stats.bypass_tps);
+-	len += snprintf(buf + len, max_len - len, "\tTPS fail: %llu\n", stats.fail_tps);
+ 
+ 	len += snprintf(buf + len, max_len - len, "Device Decapsulation Statistics:\n");
+ 	len += snprintf(buf + len, max_len - len, "\tRx packets: %llu\n", stats.rx_pkts);
+@@ -179,8 +133,6 @@ static ssize_t eip_ipsec_dev_read(struct
+ 	len += snprintf(buf + len, max_len - len, "\tRx vp: %llu\n", stats.rx_vp);
+ 	len += snprintf(buf + len, max_len - len, "\tRx Error: %llu\n", stats.rx_fail);
+ 	len += snprintf(buf + len, max_len - len, "\tRx Fail SA: %llu\n", stats.rx_fail_sa);
+-	len += snprintf(buf + len, max_len - len, "\tRPS bypass: %llu\n", stats.bypass_rps);
+-	len += snprintf(buf + len, max_len - len, "\tRPS fail: %llu\n", stats.fail_rps);
+ 
+ 	/*
+ 	 * Encap SA stats read.
+@@ -204,34 +156,8 @@ static ssize_t eip_ipsec_dev_read(struct
+  */
+ static int eip_ipsec_dev_open(struct net_device *ndev)
+ {
+-	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+-
+-	/*
+-	 * Enable tx and rx pkt steering.
+-	 */
+-	if (drv->tx_steer_en && !netfn_pkt_steer_enable(&eid->tx_steer)) {
+-		pr_warn("%px: Unable to enable tx packet steering.\n", eid);
+-		goto fail_tx_steer;
+-	}
+-
+-	if (drv->rx_steer_en && !netfn_pkt_steer_enable(&eid->rx_steer)) {
+-		pr_warn("%px: Unable to enable rx data pkt steering.\n", eid);
+-		goto fail_rx_steer;
+-	}
+-
+ 	netif_start_queue(ndev);
+ 	return 0;
+-
+-fail_rx_steer:
+-	if (drv->tx_steer_en) {
+-		netfn_pkt_steer_disable(&eid->tx_steer);
+-		drv->tx_steer_en = false;
+-	}
+-
+-fail_tx_steer:
+-	drv->rx_steer_en = false;
+-	return -ENOMEM;
+ }
+ 
+ /*
+@@ -240,22 +166,7 @@ fail_tx_steer:
+  */
+ static int eip_ipsec_dev_stop(struct net_device *ndev)
+ {
+-	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+-
+ 	netif_stop_queue(ndev);
+-
+-	/*
+-	 * Disable the tx and rx steer.
+-	 */
+-	if (drv->tx_steer_en) {
+-		netfn_pkt_steer_disable(&eid->tx_steer);
+-	}
+-
+-	if (drv->rx_steer_en) {
+-		netfn_pkt_steer_disable(&eid->rx_steer);
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -309,7 +220,8 @@ static struct dst_entry *eip_ipsec_dev_g
+ 	if (iph->version == IPVERSION) {
+ 		struct rtable *rt;
+ 
+-		rt = ip_route_output(&init_net, iph->daddr, iph->saddr, 0, 0);
++		rt = ip_route_output(&init_net, iph->daddr, iph->saddr, 0, 0,
++				     RT_SCOPE_UNIVERSE);
+ 		if (IS_ERR(rt)) {
+ 			sa_stats->fail_route++;
+ 			return NULL;
+@@ -757,6 +669,7 @@ static netdev_tx_t eip_ipsec_dev_tx(stru
+ 	struct eip_ipsec_dev_stats *dev_stats;
+ 	struct eip_ipsec_sa_stats *sa_stats;
+ 	struct eip_ipsec_sa *sa;
++	struct xfrm_state *xs = skb_dst(skb) ? skb_dst(skb)->xfrm : NULL;
+ 	unsigned int len;
+ 	bool expand_skb;
+ 	int error;
+@@ -778,7 +691,7 @@ static netdev_tx_t eip_ipsec_dev_tx(stru
+ 	/*
+ 	 * First SA in the device encapsulation head is always selected.
+ 	 */
+-	sa = eip_ipsec_sa_ref_get_encap(ndev);
++	sa = eip_ipsec_sa_ref_get_encap_xs(ndev, xs);
+ 	if (!sa) {
+ 		pr_debug("%px: Failed to find a valid SA for encapsulation\n", ndev);
+ 		dev_stats->tx_fail_sa++;
+@@ -822,57 +735,6 @@ sa_fail:
+ }
+ 
+ /*
+- * eip_ipsec_dev_tx_steer_cb()
+- *	Tx packet steering callback
+- */
+-static void eip_ipsec_dev_tx_steer_cb(struct netfn_pkt_steer *tx_steer, struct sk_buff_head *q_head)
+-{
+-	struct eip_ipsec_dev *eid = container_of(tx_steer, struct eip_ipsec_dev, tx_steer);
+-	struct net_device *ndev = eid->ndev;
+-	struct sk_buff *skb, *nskb;
+-
+-	skb_queue_walk_safe(q_head, skb, nskb) {
+-		__skb_unlink(skb, q_head);
+-		eip_ipsec_dev_tx(skb, ndev);
+-	}
+-}
+-
+-/*
+- * eip_ipsec_dev_tx_steer()
+- *	Steer plaintext packet to desired core.
+- */
+-static netdev_tx_t eip_ipsec_dev_tx_steer(struct sk_buff *skb, struct net_device *ndev)
+-{
+-	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+-	struct eip_ipsec_dev_stats *dev_stats;
+-
+-	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+-
+-	/*
+-	 * Do not steer flows coming on IPsec core.
+-	 */
+-	if (smp_processor_id() == eip_ipsec_core_id) {
+-		dev_stats->bypass_tps++;
+-		return eip_ipsec_dev_tx(skb, ndev);
+-	}
+-
+-	/*
+-	 * Map the packet to desired core.
+-	 */
+-	if (!netfn_pkt_steer_send(&eid->tx_steer, skb, eip_ipsec_core_id)) {
+-                dev_stats->fail_tps++;
+-                goto steer_fail;
+-        }
+-
+-	return NETDEV_TX_OK;
+-
+-steer_fail:
+-	dev_stats->tx_fail++;
+-	consume_skb(skb);
+-	return NETDEV_TX_OK;
+-}
+-
+-/*
+  * eip_ipsec_dev_free()
+  *	Free netdevice memory.
+  */
+@@ -892,51 +754,15 @@ static void eip_ipsec_dev_free(struct ne
+ 		free_percpu(eid->stats_pcpu);
+ 	}
+ 
+-	/*
+-	 * Remove tunnel associated with dev
+-	 */
+-	eip_tun_free(eid->tun);
+-
+-	/*
+-	 * Deinit pkt steer objects.
+-	 */
+-	if (drv->tx_steer_en) {
+-		netfn_pkt_steer_deinit(&eid->tx_steer);
+-	}
+-
+-	netfn_pkt_steer_deinit(&eid->rx_steer);
+ 	free_netdev(ndev);
+ 	eip_ipsec_drv_deref(drv);
+ 	pr_info("%px: IPsec device freed\n", ndev);
+ }
+ 
+ /*
+- * eip_ipsec_dev_set_rps2cpu()
+- *	Set the CPU map for Receive packet steering.
+- */
+-static void eip_ipsec_dev_set_rps2cpu(struct eip_ipsec_dev *eid)
+-{
+-	int cpu, idx = 0;
+-
+-	/*
+-	 * Initialize the memory.
+-	 */
+-	memset(eid->rps_map, 0, sizeof(eid->rps_map));
+-
+-	/*
+-	 * Set the RPS cpu map if RPS mask is configured.
+-	 */
+-	eid->rps_num_cores = bitmap_weight(&eip_rps_core_mask, NR_CPUS);
+-	for_each_set_bit(cpu, &eip_rps_core_mask, NR_CPUS) {
+-		eid->rps_map[idx] = cpu;
+-		idx++;
+-	}
+-}
+-
+-/*
+  * IPsec device callbacks.
+  */
+-static struct net_device_ops ipsec_dev_ops = {
++static const struct net_device_ops ipsec_dev_ops = {
+ 	.ndo_open = eip_ipsec_dev_open,
+ 	.ndo_stop = eip_ipsec_dev_stop,
+ 	.ndo_start_xmit = eip_ipsec_dev_tx,
+@@ -959,8 +785,6 @@ const struct file_operations eip_ipsec_d
+  */
+ static void eip_ipsec_dev_setup(struct net_device *ndev)
+ {
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+-
+ 	ndev->addr_len = ETH_ALEN;
+ 	ndev->mtu = ETH_DATA_LEN - EIP_IPSEC_DEV_MAX_HDR_LEN;
+ 
+@@ -971,13 +795,6 @@ static void eip_ipsec_dev_setup(struct n
+ 	ndev->ethtool_ops = NULL; /* TODO:  Can we use ethtool interface for device statistics */
+ 	ndev->header_ops = NULL;
+ 
+-	/*
+-	 * Override ndo_start_xmit handler when tx packet steering is enabled.
+-	 */
+-	if (drv->tx_steer_en) {
+-		ipsec_dev_ops.ndo_start_xmit = eip_ipsec_dev_tx_steer;
+-	}
+-
+ 	ndev->netdev_ops = &ipsec_dev_ops;
+ 	ndev->priv_destructor = eip_ipsec_dev_free;
+ 
+@@ -1125,7 +942,6 @@ EXPORT_SYMBOL(eip_ipsec_dev_del);
+ struct net_device *eip_ipsec_dev_add(void)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+-	struct netfn_pkt_steer_info info = {0};
+ 	struct eip_ipsec_dev *eid;
+ 	struct net_device *ndev;
+ 	int status;
+@@ -1146,11 +962,6 @@ struct net_device *eip_ipsec_dev_add(voi
+ 	eid->ndev = ndev;
+ 	eid->devid = -1;
+ 
+-	/*
+-	 * Map RPS core as per the configured CPU mask.
+-	 */
+-	eip_ipsec_dev_set_rps2cpu(eid);
+-
+ 	INIT_LIST_HEAD(&eid->enc_sa);
+ 	INIT_LIST_HEAD(&eid->dec_sa);
+ 
+@@ -1178,46 +989,6 @@ struct net_device *eip_ipsec_dev_add(voi
+ 		return NULL;
+ 	}
+ 
+-	/*
+-	 * Allocate tx data pkt steering object.
+-	 */
+-	if (drv->tx_steer_en) {
+-		info.dev = ndev;
+-		info.weight = 1;
+-		info.fifo_len = eip_pkt_steer_qlen;
+-		info.cb = eip_ipsec_dev_tx_steer_cb;
+-		info.budget = EIP_IPSEC_TX_STEER_BUDGET;
+-		cpumask_copy(&info.sender_mask, cpu_online_mask);
+-		cpumask_set_cpu(eip_ipsec_core_id, &info.receiver_mask);
+-		netfn_pkt_steer_init(&eid->tx_steer, &info);
+-	}
+-
+-	/*
+-	 * Allocate rx data pkt steering object.
+-	 */
+-	if (drv->rx_steer_en) {
+-		info.dev = ndev;
+-		info.weight = 1;
+-		info.fifo_len = eip_pkt_steer_qlen;
+-		info.cb = eip_ipsec_proto_rx_steer_cb;
+-		info.budget = EIP_IPSEC_RX_STEER_BUDGET;
+-		cpumask_set_cpu(eip_ipsec_core_id, &info.sender_mask);
+-		info.receiver_mask = *(to_cpumask(&eip_rps_core_mask));
+-		netfn_pkt_steer_init(&eid->rx_steer, &info);
+-	}
+-
+-	/*
+-	 * Allocate tunnel for new connection
+-	 */
+-	eid->tun = eip_tun_alloc(drv->ctx);
+-	if (!eid->tun) {
+-		pr_err("%px: Unable to allocate tunnel object\n", ndev);
+-		unregister_netdevice(ndev);
+-		rtnl_unlock();
+-
+-		return NULL;
+-	}
+-
+ 	/*
+ 	 * Set netdevice to UP state.
+ 	 */
+--- a/clients/ipsec/eip_ipsec_dev.h
++++ b/clients/ipsec/eip_ipsec_dev.h
+@@ -17,8 +17,6 @@
+ #ifndef __EIP_IPSEC_DEV_H
+ #define __EIP_IPSEC_DEV_H
+ 
+-#include <netfn_pkt_steer.h>
+-
+ #define EIP_IPSEC_DEV_MAX_HDR_LEN 96U
+ #define EIP_IPSEC_DEV_MAX_HEADROOM 128U		/* Size of the buffer headroom. */
+ #define EIP_IPSEC_DEV_MAX_TAILROOM 192U		/* Size of the buffer tailroom. */
+@@ -42,8 +40,6 @@ struct eip_ipsec_dev_stats {
+ 	uint64_t tx_fail;		/* Encapsulation failure */
+ 	uint64_t tx_fail_sa;		/* sa not found failure */
+ 	uint64_t tx_fail_vp_sa;		/* sa not found failure during VP exception */
+-	uint64_t bypass_tps;		/* Tx packet steering not required */
+-	uint64_t fail_tps;		/* Tx Packet Steering error */
+ 
+ 	/*
+ 	 * Rx is for decapsulation packets.
+@@ -54,8 +50,6 @@ struct eip_ipsec_dev_stats {
+ 	uint64_t rx_bytes;		/* Decap Bytes received */
+ 	uint64_t rx_fail;		/* Decapsulation failure */
+ 	uint64_t rx_fail_sa;		/* sa not found failure */
+-	uint64_t bypass_rps;		/* Rx packet steering not required */
+-	uint64_t fail_rps;		/* Rx Packet Steering error */
+ };
+ 
+ /*
+@@ -64,16 +58,11 @@ struct eip_ipsec_dev_stats {
+ struct eip_ipsec_dev {
+ 	struct list_head node;		/* Node in Global device list */
+ 	struct net_device *ndev;	/* Linux netdevice representation for this device */
+-	struct eip_tun *tun;		/* Tunnel associated with the dev */
+ 	int64_t devid;			/* Device ID */
+-	uint8_t rps_num_cores;		/* Number of cores for Receive Packet Steering */
+ 	struct list_head enc_sa;	/* Encap SA list protected by RCU read lock and spinlock for modification */
+ 	struct list_head dec_sa;	/* Decap SA list protected by RCU read lock and spinlock for modification */
+ 	struct eip_ipsec_dev_stats __percpu *stats_pcpu;	/* Device statistics */
+ 	struct dentry *dentry;		/* Driver debugfs dentry */
+-	uint8_t rps_map[NR_CPUS];	/* Mapping for Receive Packet Steering */
+-	struct netfn_pkt_steer tx_steer;	/* Tx data packet steering handle. */
+-	struct netfn_pkt_steer rx_steer;	/* Rx data packet steering handle. */
+ #if defined(EIP_IPSEC_VP_SUPP)
+ 	ppe_vp_num_t vp_num;		/* VP number associated with this netdevice. */
+ #endif
+--- a/clients/ipsec/eip_ipsec_priv.h
++++ b/clients/ipsec/eip_ipsec_priv.h
+@@ -36,18 +36,10 @@
+ #include "eip_ipsec_xfrm.h"
+ 
+ #define EIP_IPSEC_MAX_STR_LEN 64U	/* Maximum print lenght */
+-#define EIP_IPSEC_TAG_MAX 128U		/* Maximum tag length for debug prints */
+ #define EIP_IPSEC_HASH_SHIFT 6U
+ #define EIP_IPSEC_HASH_SIZE (1U << EIP_IPSEC_HASH_SHIFT)
+ #define EIP_IPSEC_HASH_MASK (EIP_IPSEC_HASH_SIZE - 1)
+ 
+-#define EIP_IPSEC_RX_STEER_BUDGET 128U		/* RPS napi poll budget */
+-#define EIP_IPSEC_TX_STEER_BUDGET 128U		/* TPS napi poll budget */
+-#define EIP_IPSEC_PKT_STEER_FIFO_LEN 8192U	/* Packet steer FIFO length */
+-
+-
+-#define EIP_IPSEC_NATT_PORT 4500U	/* IPsec NAT-T Port number */
+-
+ /*
+  * IPsec driver object.
+  */
+@@ -64,8 +56,6 @@ struct eip_ipsec_drv {
+ 	struct eip_ctx *ctx;		/* DMA context to use for transformation request */
+ 	struct dentry *dentry;		/* Driver debugfs dentry */
+ 	struct platform_device *pdev;	/* Device associated with the driver */
+-	bool tx_steer_en;		/* Tx packet steer is enabled */
+-	bool rx_steer_en;		/* Rx packet steer is enabled */
+ #if defined(EIP_IPSEC_VP_SUPP)
+ 	struct ppe_drv_iface *iface;	/* PPE interface for inline port */
+ #endif
+@@ -92,8 +82,6 @@ struct eip_ipsec_ppe_mdata {
+ 
+ extern struct eip_ipsec_drv eip_ipsec_drv_g;	/* Global Driver object */
+ extern uint8_t eip_ipsec_core_id;		/* Global ipsec core id */
+-extern int eip_pkt_steer_qlen;			/* Global queue length for packet steer */
+-extern ulong eip_rps_core_mask;			/* Global core mask for IPsec RPS */
+ extern void eip_ipsec_drv_final(struct kref *kref);
+ extern bool disable_v4_offload;
+ 
+@@ -114,13 +102,4 @@ static inline void eip_ipsec_drv_deref(s
+ 	kref_put(&drv->ref, eip_ipsec_drv_final);
+ }
+ 
+-/*
+- * Flow functions
+- */
+-int eip_ipsec_flow_init(void);
+-void eip_ipsec_flow_deinit(void);
+-void eip_ipsec_flow_del(struct net_device *ndev, struct eip_ipsec_tuple *flow_tuple, bool is_encap);
+-int eip_ipsec_flow_add(struct net_device *ndev, struct eip_ipsec_tuple *flow_tuple, struct eip_ipsec_sa *sa);
+-s16 eip_ipsec_flow_match_spi(__le32 spi, struct net_device *dev, u32 sa_flags);
+-
+ #endif /* !__EIP_IPSEC_PRIV_H */
+--- a/clients/ipsec/eip_ipsec_proto.c
++++ b/clients/ipsec/eip_ipsec_proto.c
+@@ -20,7 +20,10 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/if.h>
++#include <linux/if_ether.h>
+ #include <linux/rculist.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
+ #include <linux/netdevice.h>
+ #include <linux/ip.h>
+ #include <net/addrconf.h>
+@@ -31,56 +34,46 @@
+ 
+ #include "eip_ipsec_priv.h"
+ 
+-/*
+- * Original ESP ptotocol handlers
+- */
+-static const struct net_protocol *linux_esp_handler;
+-static const struct inet6_protocol *linux_esp6_handler;
++static bool esp4_registered;
++static bool esp6_registered;
+ 
+ /*
+- * eip_ipsec_rps_hash_get()
+- *	Compute Hash from the 5-tuple.
++ * NAT-T sockets are owned by the XFRM/UDP code.  Keep a reference while an
++ * EIP decapsulation SA uses the socket and restore the callback before that
++ * reference is dropped.  One socket can be shared by several SAs.
+  */
+-static uint32_t eip_ipsec_rps_hash_get(struct sk_buff *skb, uint8_t rps_num_cores, bool is_v6)
+-{
+-	uint32_t hash = 0;
+-	uint8_t proto;
+-
+-	if (!is_v6) {
+-		struct iphdr *iph = ip_hdr(skb);
+-
+-		proto = iph->protocol;
+-		hash = ntohl(iph->saddr ^ iph->daddr);
+-	} else {
+-		struct ipv6hdr *ip6h = ipv6_hdr(skb);
+-		__be32 *saddr;
+-		__be32 *daddr;
++struct eip_ipsec_udp_sock {
++	struct list_head node;
++	struct sock *sk;
++	int (*orig_encap_rcv)(struct sock *sk, struct sk_buff *skb);
++	unsigned int users;
++};
+ 
+-		proto = ip6h->nexthdr;
+-		saddr = ip6h->saddr.s6_addr32;
+-		daddr = ip6h->daddr.s6_addr32;
++static LIST_HEAD(eip_udp_socks);
++static DEFINE_SPINLOCK(eip_udp_socks_lock);
+ 
+-		hash ^= saddr[0] ^ daddr[0];
+-		hash ^= saddr[1] ^ daddr[1];
+-		hash ^= saddr[2] ^ daddr[2];
+-		hash ^= saddr[3] ^ daddr[3];
++static int eip_ipsec_proto_udp_rx(struct sock *sk, struct sk_buff *skb);
++static int eip_ipsec_proto_esp4_rx(struct sk_buff *skb);
++static int eip_ipsec_proto_esp6_rx(struct sk_buff *skb);
++
++static int eip_ipsec_proto_udp_fallback(struct sock *sk, struct sk_buff *skb)
++{
++	struct eip_ipsec_udp_sock *state;
++	int (*fallback)(struct sock *sk, struct sk_buff *skb) = NULL;
++
++	spin_lock_bh(&eip_udp_socks_lock);
++	list_for_each_entry(state, &eip_udp_socks, node) {
++		if (state->sk == sk) {
++			fallback = state->orig_encap_rcv;
++			break;
++		}
+ 	}
++	spin_unlock_bh(&eip_udp_socks_lock);
+ 
+-	switch (proto) {
+-	case IPPROTO_UDP:
+-	case IPPROTO_TCP:
+-		__le16 *sport = (__le16 *)skb_transport_header(skb);
+-		__le16 *dport = (__le16 *)(skb_transport_header(skb) + sizeof(__le16));
++	if (fallback && fallback != eip_ipsec_proto_udp_rx)
++		return fallback(sk, skb);
+ 
+-		hash ^= ntohs (*sport ^ *dport);
+-		break;
+-
+-	default:
+-		break;
+-	}
+-
+-	hash ^= proto;
+-	return (hash % rps_num_cores);
++	return 1;
+ }
+ 
+ /*
+@@ -118,164 +111,18 @@ void eip_ipsec_proto_dec_err(void *app_d
+ }
+ 
+ /*
+- * eip_ipsec_proto_forward()
+- *	Forwards decapsulated packet through SFE/Linux.
+- */
+-static void eip_ipsec_proto_forward(struct eip_ipsec_dev *eid, uint32_t spi, struct sk_buff *skb)
+-{
+-	struct eip_ipsec_dev_stats *dev_stats;
+-	int (*fast_recv)(struct sk_buff *skb);
+-	struct eip_ipsec_sa_stats *sa_stats;
+-	struct eip_ipsec_sa *sa;
+-
+-	/*
+-	 * Try to send packet via SFE
+-	 */
+-	rcu_read_lock_bh();
+-
+-	fast_recv = rcu_dereference(athrs_fast_nat_recv);
+-	if (likely(fast_recv) && likely(fast_recv(skb))) {
+-		rcu_read_unlock_bh();
+-		return;
+-	}
+-
+-	/*
+-	 * Forwarding with SFE failed, possibly connection does not exist yet.
+-	 * We should not come here very often, update and send packet to Linux stack.
+-	 * Linux requires sp in SKB when xfrm is enabled.
+-	 */
+-	sa = eip_ipsec_sa_match_spi(&eid->dec_sa, htonl(spi));
+-	if (!sa) {
+-		pr_debug("%px: Failed to find a valid Decap SA pointer\n", sa);
+-		goto fail;
+-	}
+-
+-	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+-	sa_stats = this_cpu_ptr(sa->stats_pcpu);
+-	sa_stats->fast_recv_miss++;
+-
+-	if (sa->xs) {
+-		struct xfrm_state *x = sa->xs;
+-		struct sec_path *sp;
+-
+-		sp = secpath_set(skb);
+-		if(!sp) {
+-			sa_stats->fail_sp_alloc++;
+-			goto fail;
+-		}
+-
+-		/*
+-		 * TODO: Add API in linux xfrm_state_try_hold() ?
+-		 * This is needed to solve race condition with final ref_put() by Linux.
+-		 */
+-		if (unlikely(!refcount_inc_not_zero(&x->refcnt))) {
+-			goto fail;
+-		}
+-
+-		sp->xvec[sp->len++] = x;
+-	}
+-
+-	netif_receive_skb(skb);
+-	rcu_read_unlock_bh();
+-	return;
+-
+-fail:
+-	rcu_read_unlock_bh();
+-	dev_stats->rx_fail++;
+-	consume_skb(skb);
+-	return;
+-}
+-
+-/*
+- * eip_ipsec_proto_except()
+- *	Handle plain text(post decapsulation) packet.
+- */
+-void eip_ipsec_proto_except(struct eip_ipsec_dev *eid, struct sk_buff *skb)
+-{
+-	struct net_device *ndev;
+-	struct eip_ipsec_sa *sa;
+-	unsigned int ip_hdr_sz;
+-	uint16_t proto;
+-	__be32 spi;
+-
+-	/* Reset General SKB fields for further processing */
+-	ndev = eid->ndev;
+-	skb_scrub_packet(skb, false);
+-	skb_reset_mac_header(skb);
+-	skb_reset_network_header(skb);
+-
+-	skb->dev = ndev;
+-	skb->skb_iif = ndev->ifindex;
+-	skb->ip_summed = CHECKSUM_NONE;
+-
+-	/* Detect IPv4 / IPv6 */
+-	if (ip_hdr(skb)->version == IPVERSION) {
+-		proto = htons(ETH_P_IP);
+-		ip_hdr_sz = sizeof(struct iphdr);
+-	} else {
+-		proto = htons(ETH_P_IPV6);
+-		ip_hdr_sz = sizeof(struct ipv6hdr);
+-	}
+-
+-	skb->protocol = proto;
+-	skb_set_transport_header(skb, ip_hdr_sz);
+-
+-	/*
+-	 * We will pick whatever head SA available as
+-	 * we don't know which exact decap SA has been used by EIP for ESP decapsulation.
+-	 * (If SA has not been rekeyed during exception then this SA would be the correct one).
+-	 */
+-	sa = eip_ipsec_sa_ref_get_decap(ndev);
+-	if (!sa) {
+-		pr_debug("%px: Failed to get decap SA\n", skb);
+-		kfree_skb(skb);
+-		return;
+-	}
+-
+-	spi = htonl(sa->spi);
+-	eip_ipsec_proto_forward(eid, spi, skb);
+-	eip_ipsec_sa_deref(sa);
+-}
+-
+-/*
+- * eip_ipsec_proto_rx_steer_cb()
+- *	Rx data packet steering callback
+- */
+-void eip_ipsec_proto_rx_steer_cb(struct netfn_pkt_steer *rx_steer, struct sk_buff_head *q_head)
+-{
+-	struct eip_ipsec_dev *eid = container_of(rx_steer, struct eip_ipsec_dev, rx_steer);
+-	struct sk_buff *skb, *nskb;
+-	uint32_t spi;
+-
+-	skb_queue_walk_safe(q_head, skb, nskb) {
+-		/*
+-		 * Retrieve the spi.
+-		 */
+-		spi = EIP_IPSEC_PROTO_SPI_SKB_CB(skb)->spi;
+-		EIP_IPSEC_PROTO_SPI_SKB_CB(skb)->spi = 0;
+-
+-		__skb_unlink(skb, q_head);
+-		eip_ipsec_proto_forward(eid, spi, skb);
+-	}
+-}
+-
+-/*
+  * eip_ipsec_proto_dec_done()
+  *	Decapsulation completion callback.
+  */
+ void eip_ipsec_proto_dec_done(void *app_data, eip_req_t req)
+ {
+ 	struct eip_ipsec_sa *sa = eip_ipsec_sa_ref_unless_zero((struct eip_ipsec_sa *)app_data);
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	struct sk_buff *skb = eip_req2skb(req);
+ 	struct eip_ipsec_dev_stats *dev_stats;
+ 	int ip_hdr_sz = sizeof(struct iphdr);
+ 	struct eip_ipsec_sa_stats *sa_stats;
+ 	uint16_t proto = htons(ETH_P_IP);
+ 	struct eip_ipsec_dev *eid;
+-	uint32_t hash = 0;
+-	bool is_v6 = false;
+-	int cpu;
+ 
+ 	if (unlikely(!sa)) {
+ 		pr_debug("%px: Failed to take reference on SA\n", sa);
+@@ -308,48 +155,29 @@ void eip_ipsec_proto_dec_done(void *app_
+ 	if (unlikely(ip_hdr(skb)->version != IPVERSION)) {
+ 		ip_hdr_sz = sizeof(struct ipv6hdr);
+ 		proto = htons(ETH_P_IPV6);
+-		is_v6 = true;
+ 	}
+ 
+ 	skb->protocol = proto;
+ 	skb_set_transport_header(skb, ip_hdr_sz);
+ 
+-	/*
+-	 * Do not steer flows if RPS is disabled.
+-	 */
+-	if (likely(!drv->rx_steer_en)) {
+-		dev_stats->bypass_rps++;
+-		eip_ipsec_proto_forward(eid, sa->tuple.esp_spi, skb);
+-		goto done;
+-	}
++	if (sa->xs) {
++		struct xfrm_state *x = sa->xs;
++		struct sec_path *sp;
+ 
+-	/*
+-	 * Fetch the hash for RPS mapping.
+-	 */
+-	if (likely(eid->rps_num_cores > 1)) {
+-		hash = eip_ipsec_rps_hash_get(skb, eid->rps_num_cores, is_v6);
+-	}
++		sp = secpath_set(skb);
++		if (!sp || sp->len == XFRM_MAX_DEPTH) {
++			sa_stats->fail_sp_alloc++;
++			goto drop;
++		}
+ 
+-	/*
+-	 * Do not steer flows if its already on any of the RPS CPU.
+-	 */
+-	cpu = eid->rps_map[hash];
+-	if (cpu == smp_processor_id()) {
+-		dev_stats->bypass_rps++;
+-		eip_ipsec_proto_forward(eid, sa->tuple.esp_spi, skb);
+-		goto done;
+-	}
++		if (unlikely(!refcount_inc_not_zero(&x->refcnt)))
++			goto drop;
+ 
+-	/*
+-	 * Map the packet to desired core.
+-	 */
+-	EIP_IPSEC_PROTO_SPI_SKB_CB(skb)->spi = sa->tuple.esp_spi;
+-	if (unlikely(!netfn_pkt_steer_send(&eid->rx_steer, skb, cpu))) {
+-		dev_stats->fail_rps++;
+-		goto drop;
++		sp->xvec[sp->len++] = x;
++		eip_ipsec_xfrm_input_done(x, skb->len);
+ 	}
+ 
+-done:
++	netif_receive_skb(skb);
+ 	eip_ipsec_sa_deref(sa);
+ 	return;
+ 
+@@ -377,6 +205,9 @@ static inline void eip_ipsec_proto_esp_r
+ 	dev_stats->rx_host++;
+ 	len = skb->len;
+ 
++	if (sa->xs && unlikely(!eip_ipsec_xfrm_input_state_ok(sa->xs)))
++		goto fail;
++
+ 	/*
+ 	 * skb->data points to ESP or UDP header. So, We need to push ip header.
+ 	 */
+@@ -412,6 +243,9 @@ static int eip_ipsec_proto_esp4_rx(struc
+ {
+ 	struct eip_ipsec_sa *sa;
+ 
++	if (unlikely(!pskb_may_pull(skb, sizeof(struct ip_esp_hdr))))
++		return -EINVAL;
++
+ 	/*
+ 	 * Lookup SA using <ESP SPI, IP Destination address>.
+ 	 * We can't use skb->dev because ECM is only pushing rule for 3 tuple (Single rule for multiple decap SAs).
+@@ -419,16 +253,13 @@ static int eip_ipsec_proto_esp4_rx(struc
+ 	sa = eip_ipsec_sa_ref_get_decap_v4(&ip_hdr(skb)->daddr, ip_esp_hdr(skb)->spi);
+ 	if (!sa) {
+ 		pr_debug("IPv4 SA not found %pI4n SPI is: %x\n", &(ip_hdr(skb)->daddr), ip_esp_hdr(skb)->spi);
+-		goto drop;
++		return -EINVAL;
+ 	}
+ 
+ 	eip_ipsec_proto_esp_rx(sa, skb);
+ 	eip_ipsec_sa_deref(sa);
+ 	return 0;
+ 
+-drop:
+-	consume_skb(skb);
+-	return 0;
+ }
+ 
+ /*
+@@ -439,6 +270,9 @@ static int eip_ipsec_proto_esp6_rx(struc
+ {
+ 	struct eip_ipsec_sa *sa;
+ 
++	if (unlikely(!pskb_may_pull(skb, sizeof(struct ip_esp_hdr))))
++		return -EINVAL;
++
+ 	/*
+ 	 * Lookup SA using <ESP SPI, IP Destination address>.
+ 	 * We can't use skb->dev because ECM is only pushing rule for 3 tuple (Single rule for multiple decap SAs).
+@@ -446,16 +280,13 @@ static int eip_ipsec_proto_esp6_rx(struc
+ 	sa = eip_ipsec_sa_ref_get_decap_v6(ipv6_hdr(skb)->daddr.s6_addr32, ip_esp_hdr(skb)->spi);
+ 	if (!sa) {
+ 		pr_debug("IPv6 SA not found %pI6 %x\n", ipv6_hdr(skb)->daddr.s6_addr32, ip_esp_hdr(skb)->spi);
+-		goto drop;
++		return -EINVAL;
+ 	}
+ 
+ 	eip_ipsec_proto_esp_rx(sa, skb);
+ 	eip_ipsec_sa_deref(sa);
+ 	return 0;
+ 
+-drop:
+-	consume_skb(skb);
+-	return 0;
+ }
+ 
+ /*
+@@ -471,118 +302,87 @@ static int eip_ipsec_proto_udp_rx(struct
+ {
+ 	size_t hdr_len = sizeof(struct udphdr) +  sizeof(struct ip_esp_hdr);
+ 	struct ip_esp_hdr *esph;
++	struct eip_ipsec_sa *sa;
++	bool ipv6 = skb->protocol == htons(ETH_P_IPV6);
+ 
+ 	/*
+ 	 * NAT-keepalive packet has udphdr & one byte payload (rfc3948).
+ 	 */
+ 	if (skb->len < hdr_len) {
+-		return 1;
++		return eip_ipsec_proto_udp_fallback(sk, skb);
+ 	}
+ 
+-	/*
+-	 * In case of non-linear SKB we would like to ensure that
+-	 * all the required headers are present in the first segment
+-	 */
+-	if (skb_is_nonlinear(skb) && (skb_headlen(skb) < hdr_len)) {
+-		if (skb_linearize(skb)) {
+-			dev_kfree_skb_any(skb);
+-			return 0;
+-		}
+-
+-		/*
+-		 * skb_linearize may change header. So, reload all required pointer.
+-		 */
+-		skb_reset_transport_header(skb);
+-		skb_set_network_header(skb, -(int)sizeof(struct iphdr));
+-	}
++	/* Pull only the UDP and ESP headers; preserve IPv4/IPv6 header offsets. */
++	if (!pskb_may_pull(skb, hdr_len))
++		return eip_ipsec_proto_udp_fallback(sk, skb);
+ 
+ 	/*
+ 	 * Check if packet has non-ESP marker (rfc3948)
+ 	 */
+ 	esph = (struct ip_esp_hdr *)(skb_transport_header(skb) + sizeof(struct udphdr));
+ 	if (ntohl(esph->spi) == EIP_IPSEC_PROTO_NON_ESP_MARKER) {
+-		return 1;
++		return eip_ipsec_proto_udp_fallback(sk, skb);
+ 	}
+ 
++	/* Keep the original UDP layout for packets which are not owned by EIP. */
++	if (ipv6)
++		sa = eip_ipsec_sa_ref_get_decap_v6(ipv6_hdr(skb)->daddr.s6_addr32,
++						   esph->spi);
++	else
++		sa = eip_ipsec_sa_ref_get_decap_v4(&ip_hdr(skb)->daddr, esph->spi);
++	if (!sa)
++		return eip_ipsec_proto_udp_fallback(sk, skb);
++
+ 	/*
+ 	 * ESPinUDP, Make transport header to point ESP.
+ 	 */
+ 	skb_set_transport_header(skb, sizeof(struct udphdr));
+-	return eip_ipsec_proto_esp4_rx(skb);
++	eip_ipsec_proto_esp_rx(sa, skb);
++	eip_ipsec_sa_deref(sa);
++	return 0;
+ }
+ 
+ /*
+- * eip_ipsec_proto_vp_rx()
+- * 	VP callback after PPE lookup.
++ * These callbacks deliberately pass encapsulated and error paths down to the
++ * native ESP handler.  EIP only consumes raw packets for SAs in its own DB.
+  */
+-bool eip_ipsec_proto_vp_rx(struct ppe_vp_cb_info *info, void *cb_data)
++static int eip_ipsec_proto_input(struct sk_buff *skb, int nexthdr,
++				 __be32 spi, int encap_type)
+ {
+-	struct sk_buff *skb = info->skb;
+-	struct eip_ipsec_dev *eid = cb_data;
+-	struct eip_ipsec_dev_stats *dev_stats;
+-	struct iphdr *iph;
+-
+-	skb_reset_network_header(skb);
+-	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+-	iph = ip_hdr(skb);
+-
+-	/*
+-	 * Update device stats
+-	 */
+-	dev_stats->rx_vp++;
+-
+-	/*
+-	 * We need to pull ip header to point to ESP or UDP header and then
+-	 * send packet to the ESP packet handler
+-	 */
+-	if (iph->version != IPVERSION) {
+-		skb_pull(skb, sizeof(struct ipv6hdr));
+-		skb_reset_transport_header(skb);
+-		eip_ipsec_proto_esp6_rx(skb);
+-		return true;
+-	}
+-
+-	skb_pull(skb, sizeof(struct iphdr));
+-	skb_reset_transport_header(skb);
+-
+-	if (iph->protocol == IPPROTO_UDP) {
+-		int ret;
+-
+-		ret = eip_ipsec_proto_udp_rx(NULL, skb);
++	return -EINVAL;
++}
+ 
+-		/*
+-		 * Send the NONESP packet to Linux
+-		 */
+-		if (unlikely(ret)) {
+-			skb_push(skb, sizeof(struct iphdr));
+-			skb->ip_summed = CHECKSUM_NONE;
+-			netif_receive_skb(skb);
+-		}
++static int eip_ipsec_proto_cb(struct sk_buff *skb, int err)
++{
++	return 1;
++}
+ 
+-		return true;
+-	}
++static int eip_ipsec_proto_esp4_err(struct sk_buff *skb, u32 info)
++{
++	return 1;
++}
+ 
+-	eip_ipsec_proto_esp4_rx(skb);
+-	return true;
++static int eip_ipsec_proto_esp6_err(struct sk_buff *skb,
++				    struct inet6_skb_parm *opt, u8 type,
++				    u8 code, int offset, __be32 info)
++{
++	return 1;
+ }
+ 
+-/*
+- * IPv4 ESP handler
+- */
+-static struct net_protocol esp_protocol = {
++static struct xfrm4_protocol esp_protocol = {
+ 	.handler = eip_ipsec_proto_esp4_rx,
+-	.no_policy = 1,
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	.netns_ok  = 1,
+-#endif
++	.input_handler = eip_ipsec_proto_input,
++	.cb_handler = eip_ipsec_proto_cb,
++	.err_handler = eip_ipsec_proto_esp4_err,
++	.priority = 1,
+ };
+ 
+-/*
+- * IPv6 ESP handler
+- */
+-static struct inet6_protocol esp6_protocol = {
++static struct xfrm6_protocol esp6_protocol = {
+ 	.handler = eip_ipsec_proto_esp6_rx,
+-	.flags = INET6_PROTO_NOPOLICY,
++	.input_handler = eip_ipsec_proto_input,
++	.cb_handler = eip_ipsec_proto_cb,
++	.err_handler = eip_ipsec_proto_esp6_err,
++	.priority = 1,
+ };
+ 
+ /*
+@@ -591,26 +391,23 @@ static struct inet6_protocol esp6_protoc
+  */
+ bool eip_ipsec_proto_esp_init(void)
+ {
+-	const struct net_protocol *ip_prot = &esp_protocol;
+-
+-	if (!disable_v4_offload && inet_update_protocol(&esp_protocol, IPPROTO_ESP, &linux_esp_handler) < 0) {
+-		pr_err("Failed to update ESP protocol handler for IPv4\n");
+-		return false;
+-	}
+-
+-	if (inet6_update_protocol(&esp6_protocol, IPPROTO_ESP, &linux_esp6_handler) < 0) {
+-		pr_err("Failed to update ESP protocol handler for IPv4\n");
+-		/*
+-		 * Revert v4 ESP handler to original handler.
+-		 */
+-		xchg(&linux_esp6_handler, NULL);
+-		if (disable_v4_offload)
++	if (!disable_v4_offload) {
++		if (xfrm4_protocol_register(&esp_protocol, IPPROTO_ESP)) {
++			pr_err("Failed to register EIP ESP handler for IPv4\n");
+ 			return false;
++		}
++		esp4_registered = true;
++	}
+ 
+-		inet_update_protocol(linux_esp_handler, IPPROTO_ESP, &ip_prot);
+-		xchg(&linux_esp_handler, NULL);
++	if (xfrm6_protocol_register(&esp6_protocol, IPPROTO_ESP)) {
++		pr_err("Failed to register EIP ESP handler for IPv6\n");
++		if (esp4_registered) {
++			xfrm4_protocol_deregister(&esp_protocol, IPPROTO_ESP);
++			esp4_registered = false;
++		}
+ 		return false;
+ 	}
++	esp6_registered = true;
+ 
+ 	return true;
+ }
+@@ -618,56 +415,179 @@ bool eip_ipsec_proto_esp_init(void)
+ /*
+  * eip_ipsec_proto_udp_sock_override()
+  */
+-bool eip_ipsec_proto_udp_sock_override(struct eip_ipsec_tuple *sa_tuple)
++bool eip_ipsec_proto_udp_sock_override(struct eip_ipsec_tuple *sa_tuple,
++				       struct eip_ipsec_udp_sock **result)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
++	struct eip_ipsec_udp_sock *state, *new_state;
+ 	struct udp_sock *up;
+ 	struct sock *sk;
++	int (*orig_encap_rcv)(struct sock *sk, struct sk_buff *skb);
++	struct in6_addr src6, dst6;
++	bool ipv6 = sa_tuple->ip_version == 6;
++	bool installed = false;
++	unsigned int users;
++	int i;
+ 
+-	rcu_read_lock();
++	if (!result)
++		return false;
++	*result = NULL;
+ 
+-	sk = __udp4_lib_lookup(&init_net, htonl(sa_tuple->src_ip[0]),  htons(sa_tuple->sport),
+-			htonl(sa_tuple->dest_ip[0]), htons(sa_tuple->dport), 0, 0, &udp_table, NULL);
++	rcu_read_lock();
++	if (ipv6) {
++		for (i = 0; i < ARRAY_SIZE(sa_tuple->src_ip); i++) {
++			src6.s6_addr32[i] = htonl(sa_tuple->src_ip[i]);
++			dst6.s6_addr32[i] = htonl(sa_tuple->dest_ip[i]);
++		}
++		sk = __udp6_lib_lookup(&init_net, &src6, htons(sa_tuple->sport),
++				       &dst6, htons(sa_tuple->dport), 0, 0,
++				       init_net.ipv4.udp_table, NULL);
++	} else {
++		sk = __udp4_lib_lookup(&init_net, htonl(sa_tuple->src_ip[0]),
++				       htons(sa_tuple->sport),
++				       htonl(sa_tuple->dest_ip[0]),
++				       htons(sa_tuple->dport), 0, 0,
++				       init_net.ipv4.udp_table, NULL);
++	}
+ 	if (!sk) {
+ 		rcu_read_unlock();
+-		pr_err("%px: Failed to lookup UDP socket dst(%pI4h) dport(0x%X)\n", drv, sa_tuple->dest_ip, sa_tuple->dport);
++		if (ipv6)
++			pr_err("%p: Failed to lookup UDP socket dst(%pI6) dport(%u)\n",
++			       drv, &dst6, sa_tuple->dport);
++		else
++			pr_err("%p: Failed to lookup UDP socket dst(%pI4h) dport(%u)\n",
++			       drv, sa_tuple->dest_ip, sa_tuple->dport);
++		return false;
++	}
++
++	if (!refcount_inc_not_zero(&sk->sk_refcnt)) {
++		rcu_read_unlock();
+ 		return false;
+ 	}
+ 
+ 	up = udp_sk(sk);
+-	if (up->encap_type != UDP_ENCAP_ESPINUDP) {
++	if (READ_ONCE(up->encap_type) != UDP_ENCAP_ESPINUDP) {
+ 		rcu_read_unlock();
+-		pr_err("%px: Socket type is not UDP_ENCAP_ESPINUDP (%u)\n", up, up->encap_type);
++		sock_put(sk);
++		pr_err("%p: Socket type is not UDP_ENCAP_ESPINUDP (%u)\n",
++		       up, up->encap_type);
+ 		return false;
+ 	}
++	orig_encap_rcv = READ_ONCE(up->encap_rcv);
++	rcu_read_unlock();
+ 
+-	if (READ_ONCE(up->encap_rcv) != eip_ipsec_proto_udp_rx) {
+-		xchg(&up->encap_rcv, eip_ipsec_proto_udp_rx);
+-		pr_debug("%px: Overriden socket encap handler\n", up);
++	new_state = kzalloc(sizeof(*new_state), GFP_KERNEL);
++	if (!new_state) {
++		sock_put(sk);
++		return false;
++	}
++	INIT_LIST_HEAD(&new_state->node);
++	new_state->sk = sk;
++	new_state->orig_encap_rcv = orig_encap_rcv;
++	new_state->users = 1;
++
++	spin_lock_bh(&eip_udp_socks_lock);
++	list_for_each_entry(state, &eip_udp_socks, node) {
++		if (state->sk == sk) {
++			state->users++;
++			*result = state;
++			break;
++		}
+ 	}
++	if (!*result) {
++		/* Do not overwrite a callback installed after lookup. */
++		if (cmpxchg(&up->encap_rcv, orig_encap_rcv,
++			    eip_ipsec_proto_udp_rx) != orig_encap_rcv) {
++			spin_unlock_bh(&eip_udp_socks_lock);
++			kfree(new_state);
++			sock_put(sk);
++			return false;
++		}
++		list_add(&new_state->node, &eip_udp_socks);
++		*result = new_state;
++		installed = true;
++	}
++	users = (*result)->users;
++	spin_unlock_bh(&eip_udp_socks_lock);
+ 
+-	rcu_read_unlock();
++	if (!installed) {
++		kfree(new_state);
++		sock_put(sk);
++	}
+ 
++	pr_debug("%p: NAT-T socket %p callback users=%u\n", drv, sk, users);
+ 	return true;
+ }
+ 
++void eip_ipsec_proto_udp_sock_release(struct eip_ipsec_udp_sock *state)
++{
++	bool free_state = false;
++
++	if (!state)
++		return;
++
++	spin_lock_bh(&eip_udp_socks_lock);
++	if (WARN_ON(!state->users)) {
++		spin_unlock_bh(&eip_udp_socks_lock);
++		return;
++	}
++	if (--state->users == 0) {
++		list_del(&state->node);
++		cmpxchg(&udp_sk(state->sk)->encap_rcv, eip_ipsec_proto_udp_rx,
++			state->orig_encap_rcv);
++		free_state = true;
++	}
++	spin_unlock_bh(&eip_udp_socks_lock);
++
++	if (free_state) {
++		/* Wait for callbacks which observed the old function pointer. */
++		synchronize_net();
++		sock_put(state->sk);
++		kfree(state);
++	}
++}
++
++void eip_ipsec_proto_udp_sock_restore(void)
++{
++	struct eip_ipsec_udp_sock *state;
++	struct sock *sk;
++
++	for (;;) {
++		spin_lock_bh(&eip_udp_socks_lock);
++		if (list_empty(&eip_udp_socks)) {
++			spin_unlock_bh(&eip_udp_socks_lock);
++			break;
++		}
++		state = list_first_entry(&eip_udp_socks,
++					 struct eip_ipsec_udp_sock, node);
++		WARN_ON(state->users);
++		list_del(&state->node);
++		sk = state->sk;
++		cmpxchg(&udp_sk(sk)->encap_rcv, eip_ipsec_proto_udp_rx,
++			state->orig_encap_rcv);
++		spin_unlock_bh(&eip_udp_socks_lock);
++
++		synchronize_net();
++		sock_put(sk);
++		kfree(state);
++	}
++}
++
+ /*
+  * eip_ipsec_proto_esp_deinit()
+  *	De-register ESP handler with the Linux.
+  */
+ void eip_ipsec_proto_esp_deinit(void)
+ {
+-	const struct inet6_protocol *ip6_prot;
+-	const struct net_protocol *ip_prot;
++	eip_ipsec_proto_udp_sock_restore();
+ 
+-	/*
+-	 * Revert v4 ESP handler to original handler.
+-	 */
+-	if (!disable_v4_offload) {
+-		inet_update_protocol(linux_esp_handler, IPPROTO_ESP, &ip_prot);
+-		xchg(&linux_esp_handler, NULL);
++	if (esp6_registered) {
++		xfrm6_protocol_deregister(&esp6_protocol, IPPROTO_ESP);
++		esp6_registered = false;
+ 	}
+ 
+-	inet6_update_protocol(linux_esp6_handler, IPPROTO_ESP, &ip6_prot);
+-	xchg(&linux_esp6_handler, NULL);
++	if (esp4_registered) {
++		xfrm4_protocol_deregister(&esp_protocol, IPPROTO_ESP);
++		esp4_registered = false;
++	}
+ }
+--- a/clients/ipsec/eip_ipsec_proto.h
++++ b/clients/ipsec/eip_ipsec_proto.h
+@@ -17,29 +17,16 @@
+ #ifndef __EIP_IPSEC_PROTO_H
+ #define __EIP_IPSEC_PROTO_H
+ 
+-#define EIP_IPSEC_PROTO_SPI_SKB_CB(__skb) ((struct eip_ipsec_proto_spi_skb_cb *)&((__skb)->cb[0]))
+ #define EIP_IPSEC_PROTO_NON_ESP_MARKER 0x0000
+ 
+-/*
+- * SFE hook for the receive processing.
+- */
+-extern int (*athrs_fast_nat_recv)(struct sk_buff *skb);
+-
+-/*
+- * eip_ipsec_proto_spi_skb_cb
+- *	IPsec SPI index in skb control block.
+- */
+-struct eip_ipsec_proto_spi_skb_cb {
+-	uint32_t spi;		/* SPI index for the specific flow */
+-};
++struct eip_ipsec_udp_sock;
+ 
+ void eip_ipsec_proto_udp_sock_restore(void);
+-bool eip_ipsec_proto_udp_sock_override(struct eip_ipsec_tuple *sa_tuple);
++bool eip_ipsec_proto_udp_sock_override(struct eip_ipsec_tuple *sa_tuple,
++				       struct eip_ipsec_udp_sock **state);
++void eip_ipsec_proto_udp_sock_release(struct eip_ipsec_udp_sock *state);
+ bool eip_ipsec_proto_esp_init(void);
+ void eip_ipsec_proto_esp_deinit(void);
+ void eip_ipsec_proto_dec_done(void *app_data, eip_req_t req);
+ void eip_ipsec_proto_dec_err(void *app_data, eip_req_t req, int err);
+-bool eip_ipsec_proto_vp_rx(struct ppe_vp_cb_info *info, void *cb_data);
+-void eip_ipsec_proto_rx_steer_cb(struct netfn_pkt_steer *rx_steer, struct sk_buff_head *q_head);
+-void eip_ipsec_proto_except(struct eip_ipsec_dev *eid, struct sk_buff *skb);
+ #endif /* !__EIP_IPSEC_PROTO_H */
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -26,8 +26,6 @@
+ #include <net/addrconf.h>
+ #include <net/xfrm.h>
+ #include <crypto/aes.h>
+-#include <ppe_acl.h>
+-
+ #include "eip_ipsec_priv.h"
+ 
+ /*
+@@ -42,9 +40,9 @@ static void eip_ipsec_sa_data_to_tr_info
+ 
+ 	memset(tr_info, 0, sizeof(*tr_info));
+ 
+-	base->svc = eip_is_inline_supported() ? EIP_SVC_HYBRID_IPSEC : EIP_SVC_IPSEC;
++	base->svc = EIP_SVC_IPSEC;
+ 
+-	strlcpy(base->alg_name, data->base.algo_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, data->base.algo_name, CRYPTO_MAX_ALG_NAME);
+ 	base->cipher.key_data = data->base.cipher.data;
+ 	base->cipher.key_len = data->base.cipher.len;
+ 	base->auth.key_data = data->base.auth.data;
+@@ -135,7 +133,7 @@ static bool eip_ipsec_sa_match_addr(stru
+  *
+  * This function must be called with rcu_read_lock_bh() or spin_lock_bh().
+  */
+-struct eip_ipsec_sa *eip_ipsec_sa_match_spi(struct list_head *sa_head, __be32 spi)
++static struct eip_ipsec_sa *eip_ipsec_sa_match_spi(struct list_head *sa_head, __be32 spi)
+ {
+ 	struct eip_ipsec_sa *sa;
+ 
+@@ -278,24 +276,6 @@ static struct eip_ipsec_sa *__sa_lookup(
+ }
+ 
+ /*
+- * eip_ipsec_sa_ref_get
+- *	Lookup SA using tuple and take ref.
+- */
+-struct eip_ipsec_sa *eip_ipsec_sa_ref_get(struct net_device *ndev, struct eip_ipsec_tuple *t)
+-{
+-	struct eip_ipsec_sa *sa;
+-
+-	rcu_read_lock_bh();
+-
+-	sa = __sa_lookup(ndev, t);
+-	if (likely(sa))
+-		eip_ipsec_sa_ref(sa);
+-
+-	rcu_read_unlock_bh();
+-	return sa;
+-}
+-
+-/*
+  * eip_ipsec_sa_dettach()
+  *	Dettach SA from device encap/decap DB.
+  */
+@@ -385,86 +365,44 @@ static void eip_ipsec_sa_set_mtu(struct
+ 	struct net_device *ndev = sa->ndev;
+ 	struct eip_tr_algo_info algo = {0};
+ 	struct eip_tr *tr = sa->tr;
+-	uint32_t mtu_overhead = 0;
+-	uint32_t mode;
+-
+-	mtu_overhead = sizeof(struct ip_esp_hdr);
+-	mode = base->flags & (EIP_IPSEC_FLAG_TUNNEL | EIP_IPSEC_FLAG_UDP | EIP_IPSEC_FLAG_IPV6);
++	u32 header_len = sizeof(struct ip_esp_hdr);
++	u32 trailer_len;
++	u32 mtu_overhead;
++
++	if (base->flags & EIP_IPSEC_FLAG_TUNNEL)
++		header_len += base->flags & EIP_IPSEC_FLAG_IPV6 ?
++			      sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+ 
+-	switch (mode) {
+-	case EIP_IPSEC_FLAG_TUNNEL:
+-		mtu_overhead += sizeof(struct iphdr);
+-		break;
+-	case (EIP_IPSEC_FLAG_TUNNEL | EIP_IPSEC_FLAG_IPV6):
+-		mtu_overhead += sizeof(struct ipv6hdr);
+-		break;
+-	case (EIP_IPSEC_FLAG_TUNNEL | EIP_IPSEC_FLAG_UDP):
+-		mtu_overhead += (sizeof(struct iphdr) + sizeof(struct udphdr));
+-		break;
+-	case EIP_IPSEC_FLAG_UDP:
+-		mtu_overhead += sizeof(struct udphdr);
+-		break;
+-	case EIP_IPSEC_FLAG_IPV6:
+-	default:
+-		break;
+-	}
++	if (base->flags & EIP_IPSEC_FLAG_UDP)
++		header_len += sizeof(struct udphdr);
+ 
+ 	eip_tr_get_algo_info(tr, &algo);
+-	mtu_overhead += (algo.blk_len + algo.iv_len + base->icv_len);
++	header_len += algo.iv_len;
++	trailer_len = algo.blk_len + 1 + base->icv_len;
++	mtu_overhead = header_len + trailer_len;
++
++	if (sa->xs) {
++		sa->xs->props.header_len = header_len;
++		sa->xs->props.trailer_len = trailer_len;
++	}
+ 
+ 	rtnl_lock();
+-	dev_set_mtu(ndev, sa_data->mtu - mtu_overhead);
++	dev_set_mtu(ndev, sa_data->mtu > mtu_overhead ?
++			  sa_data->mtu - mtu_overhead : 1);
+ 	rtnl_unlock();
+ }
+ 
+ /*
+- * eip_ipsec_sa_stats_sync
+- *	sync and store dev and SA stats from TR.
+- */
+-void eip_ipsec_sa_stats_sync(struct net_device *ndev, struct eip_ipsec_sa *sa)
+-{
+-	struct eip_ipsec_dev_stats *dev_stats;
+-	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+-	struct eip_hw_stats delta_stats = {0};
+-	struct eip_ipsec_sa_stats *sa_stats;
+-
+-	dev_stats = this_cpu_ptr(eid->stats_pcpu);
+-	sa_stats = this_cpu_ptr(sa->stats_pcpu);
+-
+-	/*  Fetch stats from Driver */
+-	eip_tr_get_hw_stats(sa->tr, &delta_stats );
+-
+-	if (sa->flags & EIP_IPSEC_FLAG_ENC) {
+-		dev_stats->tx_pkts +=  delta_stats.pkt_cnt;
+-		dev_stats->tx_bytes += delta_stats.byte_cnt;
+-		sa_stats->tx_pkts += delta_stats.pkt_cnt;
+-		sa_stats->tx_bytes += delta_stats.byte_cnt;
+-	} else {
+-
+-		dev_stats->rx_pkts += delta_stats.pkt_cnt;
+-		dev_stats->rx_bytes += delta_stats.byte_cnt;
+-		sa_stats->rx_pkts += delta_stats.pkt_cnt;
+-		sa_stats->rx_bytes += delta_stats.byte_cnt;
+-	}
+-}
+-
+-/*
+  * eip_ipsec_dev_get_summary_stats()
+  *	Update the summary stats.
+  */
+ static void eip_ipsec_sa_stats_get(struct eip_ipsec_sa *sa,
+ 		struct eip_ipsec_sa_stats *stats)
+ {
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	int words;
+ 	int cpu;
+ 	int i;
+ 
+-	if (eip_feature_check(drv->ctx, EIP_OFFLOAD_INNER_FLOW) &&
+-			eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW)) {
+-		eip_ipsec_sa_stats_sync(sa->ndev, sa);
+-	}
+-
+ 	words = (sizeof(*stats) / sizeof(uint64_t));
+ 	memset(stats, 0, sizeof(*stats));
+ 
+@@ -557,22 +495,26 @@ struct eip_ipsec_sa *eip_ipsec_sa_ref_ge
+ }
+ 
+ /*
+- * eip_ipsec_sa_ref_get_decap()
+- *	Return head decap SA.
++ * Select the exact outbound SA chosen by XFRM.  During rekey, a reqid can
++ * legitimately have more than one outbound SA on the same EIP netdevice.
+  */
+-struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap(struct net_device *ndev)
++struct eip_ipsec_sa *eip_ipsec_sa_ref_get_encap_xs(struct net_device *ndev,
++						   struct xfrm_state *xs)
+ {
+ 	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+ 	struct eip_ipsec_sa *sa;
+ 
+ 	rcu_read_lock_bh();
+-
+-	sa = list_first_or_null_rcu(&eid->dec_sa, struct eip_ipsec_sa, node);
+-	if (likely(sa))
+-		eip_ipsec_sa_ref(sa);
+-
++	list_for_each_entry_rcu(sa, &eid->enc_sa, node) {
++		if (!xs || sa->xs == xs) {
++			eip_ipsec_sa_ref(sa);
++			rcu_read_unlock_bh();
++			return sa;
++		}
++	}
+ 	rcu_read_unlock_bh();
+-	return sa;
++
++	return NULL;
+ }
+ 
+ /*
+@@ -647,7 +589,6 @@ int eip_ipsec_sa_add(struct net_device *
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+-	struct eip_ipsec_sa *old_sa = NULL;
+ 	struct eip_tr_info tr_info;
+ 	struct eip_ipsec_sa *sa;
+ 	bool udp_encap;
+@@ -720,7 +661,6 @@ int eip_ipsec_sa_add(struct net_device *
+ 	sa->head_room = EIP_IPSEC_DEV_MAX_HEADROOM; /* TODO: Calculate using SA type */
+ 	sa->tail_room = EIP_IPSEC_DEV_MAX_TAILROOM;
+ 	sa->tuple = *t;
+-	sa->flags = data->base.flags;
+ 
+ 	/*
+ 	 * Cache part of tuple used in datapath in network order.
+@@ -769,17 +709,15 @@ int eip_ipsec_sa_add(struct net_device *
+ 		goto fail_tr;
+ 	}
+ 
+-	/*
+-	 * If its a rekey for encap SA, Update the tunnel with new TR
+-	 */
+-	if (encap && eip_feature_check(drv->ctx, EIP_OFFLOAD_INNER_FLOW)) {
+-		old_sa = eip_ipsec_sa_ref_get_encap(ndev);
+-	}
+-
+ 	sa->xs = data->xs;
+ 
+ 	if (!encap && udp_encap) {
+-		eip_ipsec_proto_udp_sock_override(t);
++		if (!eip_ipsec_proto_udp_sock_override(t, &sa->udp_sock)) {
++			pr_warn("%p: Failed to override NAT-T socket for SPI(%u)\n",
++				ndev, t->esp_spi);
++			err = -ENOENT;
++			goto fail_udp;
++		}
+ 	}
+ 
+ 	/*
+@@ -790,62 +728,14 @@ int eip_ipsec_sa_add(struct net_device *
+ 	}
+ 
+ 	/*
+-	 * Set ACL rule id to invalid
+-	 */
+-	sa->acl_rule_id = EIP_IPSEC_INVALID_ACL_RULE_ID;
+-
+-	/*
+ 	 * TODO: Do we need to handle multiple sa_add() on multiple core.
+ 	 */
+ 	eip_ipsec_sa_attach(ndev, sa, encap);
+ 
+-	if (old_sa) {
+-		struct eip_tun_update_info info = {0};
+-
+-		info.valid_flags |= EIP_TUN_TR_VALID;
+-		info.tr = old_sa->tr;
+-		info.new_tr = sa->tr;
+-
+-		eip_tun_update(eid->tun, &info);
+-		eip_ipsec_sa_deref(old_sa);
+-	}
+-
+-	/*
+-	 * If flow is decap direction add flow to EIP.
+-	 */
+-	if (!encap) {
+-		if (eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW)) {
+-			if (eip_ipsec_flow_add(ndev, &sa->tuple, sa)) {
+-				/*
+-				 * If flow addition fails, fall back to the slow path so that
+-				 * packets continue to be processed without offload.
+-				 */
+-				pr_warn("%px: Failed to add flow for inline, Throughput will be impacted\n", ndev);
+-				goto out;
+-			}
+-		}
+-
+-		if (!eip_feature_check(drv->ctx, EIP_OFFLOAD_INNER_FLOW))
+-			return 0;
+-
+-		/*
+-		 * When both inner and outer offload are supported, the flow hardware
+-		 * operates in full inline mode. In this case, configure ACL rules.
+-		 */
+-		if (eip_feature_check(drv->ctx, EIP_OFFLOAD_INNER_FLOW) && eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW)) {
+-			sa->acl_rule_id = eip_ipsec_flow_match_spi(ntohl(sa->spi), ndev, sa->flags);
+-			if (sa->acl_rule_id == EIP_IPSEC_INVALID_ACL_RULE_ID) {
+-				pr_debug("%px: Failed to create ACL rule\n", sa);
+-				goto acl_fail;
+-			}
+-		}
+-	}
+-
+-out:
+ 	return 0;
+ 
+-acl_fail:
+-	eip_ipsec_flow_del(ndev,  &sa->tuple, encap);
++fail_udp:
++	eip_tr_free(sa->tr);
+ fail_tr:
+ 	dev_put(ndev);
+ 	dst_cache_destroy(&sa->dst_cache);
+@@ -862,9 +752,7 @@ fail_pcpu:
+  */
+ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ {
+-	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	struct eip_ipsec_sa *sa;
+-	s16 acl_ret;
+ 
+ 	might_sleep();
+ 
+@@ -877,37 +765,12 @@ void eip_ipsec_sa_del(struct net_device
+ 		return;
+ 	}
+ 
+-	if (sa->flags & EIP_IPSEC_FLAG_ENC)
+-		goto tr_disable;
+-
+-	/*
+-	 * If flow is decap direction adelete flow to EIP.
+-	 */
+-	if (eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW)) {
+-		/*
+-		 * Clean up the associated ACL rule when a valid rule ID is present.
+-		 * Note: ACL rules are configured and valid only when the hardware
+-		 * is operating in full inline mode.
+-		 */
+-		if (sa->acl_rule_id != EIP_IPSEC_INVALID_ACL_RULE_ID) {
+-			acl_ret = ppe_acl_rule_destroy(sa->acl_rule_id);
+-			if (acl_ret != PPE_ACL_RET_SUCCESS) {
+-				pr_warn("%px: Failed to destroy ACL rule ID %d, error %u\n",
+-						sa, sa->acl_rule_id, acl_ret);
+-			}
+-		}
+-
+-		/*
+-		 * Delete Flow.
+-		 */
+-		eip_ipsec_flow_del(ndev, &sa->tuple, false);
+-	}
+-
+-tr_disable:
+ 	/*
+ 	 * Disable TR. This also ensure no new packet being sent by driver.
+ 	 */
+ 	eip_tr_disable(sa->tr);
++	eip_ipsec_proto_udp_sock_release(sa->udp_sock);
++	sa->udp_sock = NULL;
+ 
+ 	/*
+ 	 * Wait for all outstanding SA operation.
+@@ -915,14 +778,6 @@ tr_disable:
+ 	wait_for_completion(&sa->completion);
+ 
+ 	/*
+-	 * Just before rekease TR get final stats
+-	 */
+-	if (eip_feature_check(drv->ctx, EIP_OFFLOAD_INNER_FLOW) &&
+-			eip_feature_check(drv->ctx, EIP_OFFLOAD_OUTER_FLOW)) {
+-		eip_ipsec_sa_stats_sync(ndev, sa);
+-	}
+-
+-	/*
+ 	 * Release the TR and other SA resources
+ 	 */
+ 	eip_tr_free(sa->tr);
+--- a/clients/ipsec/eip_ipsec_sa.h
++++ b/clients/ipsec/eip_ipsec_sa.h
+@@ -20,11 +20,7 @@
+ #include <net/dst_cache.h>
+ 
+ struct eip_ipsec_dev;
+-
+-/*
+- * ACL invalid rule id
+- */
+-#define EIP_IPSEC_INVALID_ACL_RULE_ID -1
++struct xfrm_state;
+ 
+ /*
+  * IPsec SA statistics.
+@@ -53,7 +49,6 @@ struct eip_ipsec_sa {
+ 	struct net_device *ndev;	/* Parent device object */
+ 	struct eip_ipsec_dev *eid;	/* Cached device private pointer */
+ 
+-	uint32_t flags;			/* SA flags */
+ 	struct kref ref;		/* Reference incremented for each flow & packet */
+ 	struct dst_cache dst_cache;	/* Destination route cache */
+ 	__be32 spi;			/* ESP Security Parameter Index */
+@@ -65,20 +60,18 @@ struct eip_ipsec_sa {
+ 	struct eip_ipsec_sa_stats __percpu *stats_pcpu;	/* SA statistics */
+ 	struct xfrm_state *xs;          /* offloaded xfrm sate to use in SKB after decap. */
+ 	struct eip_ipsec_tuple tuple;	/* SA tuple */
++	struct eip_ipsec_udp_sock *udp_sock; /* NAT-T callback override */
+ 	struct completion completion;   /* Completion to wait for all deref */
+ 	struct rcu_head rcu;            /* delay rcu free */
+-	s16 acl_rule_id;		/* ACL id fro decap direction */
+ };
+ 
+ void eip_ipsec_sa_final(struct kref *kref);
+ struct eip_ipsec_sa *eip_ipsec_sa_ref_get_encap(struct net_device *ndev);
+-struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap(struct net_device *ndev);
++struct eip_ipsec_sa *eip_ipsec_sa_ref_get_encap_xs(struct net_device *ndev,
++						   struct xfrm_state *xs);
+ struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap_v6(__be32 *addr, __be32 spi);
+ struct eip_ipsec_sa *eip_ipsec_sa_ref_get_decap_v4(__be32 *addr, __be32 spi);
+-struct eip_ipsec_sa *eip_ipsec_sa_match_spi(struct list_head *sa_head, __be32 spi);
+ ssize_t eip_ipsec_sa_read(struct net_device *ndev, bool encap, char *buf, ssize_t max_len);
+-struct eip_ipsec_sa *eip_ipsec_sa_ref_get(struct net_device *ndev, struct eip_ipsec_tuple *t);
+-void eip_ipsec_sa_stats_sync(struct net_device *ndev, struct eip_ipsec_sa *sa);
+ 
+ /*
+  * Increment SA reference.
+--- a/clients/ipsec/eip_ipsec_xfrm.c
++++ b/clients/ipsec/eip_ipsec_xfrm.c
+@@ -24,15 +24,16 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/completion.h>
++#include <linux/mutex.h>
++#include <linux/unaligned.h>
+ #include <net/xfrm.h>
+ #include <net/protocol.h>
++#include <net/gso.h>
+ #include <net/ip6_route.h>
+ #include <linux/inetdevice.h>
+ #include <linux/icmp.h>
+ #include <net/addrconf.h>
+ #include <linux/netfilter.h>
+-#include <ecm_interface_ipsec.h>
+-
+ #include "eip_ipsec_xfrm.h"
+ #include "eip_ipsec_priv.h"
+ 
+@@ -41,7 +42,7 @@
+  */
+ struct eip_ipsec_xfrm_algo {
+ 	const char *algo_name;	/*Crypto algorithm name */
+-	char *driver_name;	/* driver name */
++	const char *driver_name;	/* driver name */
+ };
+ 
+ static struct eip_ipsec_xfrm_algo xfrm_algo[] = {
+@@ -49,15 +50,40 @@ static struct eip_ipsec_xfrm_algo xfrm_a
+ 	{.algo_name = "echainiv(authenc(hmac(sha1),cbc(des3_ede)))", .driver_name = "eip-3des-cbc-sha1-hmac"},
+ 	{.algo_name = "echainiv(authenc(hmac(md5),cbc(aes)))", .driver_name = "eip-aes-cbc-md5-hmac"},
+ 	{.algo_name = "echainiv(authenc(hmac(md5),cbc(des3_ede)))", .driver_name = "eip-3des-cbc-md5-hmac"},
+-	{.algo_name = "echainiv(authenc(hmac(sha1),ecb(cipher_null)))", .driver_name = "eip-cipher_null-ecb-sha1-hmac"},
++	{.algo_name = "echainiv(authenc(hmac(sha1),ecb(cipher_null)))",
++	 .driver_name = "eip-cbc-null-sha1-hmac"},
+ 	{.algo_name = "echainiv(authenc(hmac(sha256),cbc(aes)))", .driver_name = "eip-aes-cbc-sha256-hmac"},
+ 	{.algo_name = "echainiv(authenc(hmac(sha256),cbc(des3_ede)))", .driver_name = "eip-3des-cbc-sha256-hmac"},
+ 	{.algo_name = "seqiv(rfc4106(gcm(aes)))", .driver_name = "eip-aes-gcm-rfc4106"},
+-	{.algo_name = "echainiv(authenc(hmac(sha256),ecb(cipher_null)))", .driver_name = "eip-cipher_null-ecb-sha256-hmac"},
++	{.algo_name = "echainiv(authenc(hmac(sha256),ecb(cipher_null)))",
++	 .driver_name = "eip-cbc-null-sha256-hmac"},
+ };
+ 
++static DEFINE_MUTEX(eip_ipsec_xfrm_state_lock);
++
+ static struct xfrm_state_afinfo *fallback_v4_afinfo;
+ static struct xfrm_state_afinfo *fallback_v6_afinfo;
++static const struct xfrm_type *fallback_v4_type;
++static const struct xfrm_type *fallback_v6_type;
++
++static const struct xfrm_type *eip_ipsec_xfrm_fallback_type(const struct xfrm_state *xs)
++{
++	return xs->props.family == AF_INET ? fallback_v4_type : fallback_v6_type;
++}
++
++static int eip_ipsec_xfrm_fallback_output(unsigned short family, struct net *net,
++					  struct sock *sk, struct sk_buff *skb)
++{
++	const struct xfrm_state_afinfo *afinfo;
++
++	afinfo = family == AF_INET ? fallback_v4_afinfo : fallback_v6_afinfo;
++	if (likely(afinfo && afinfo->output))
++		return afinfo->output(net, sk, skb);
++
++	XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++	return -EAFNOSUPPORT;
++}
+ 
+ /*
+  * eip_ipsec_xfrm_check_state()
+@@ -65,7 +91,7 @@ static struct xfrm_state_afinfo *fallbac
+  */
+ static inline bool eip_ipsec_xfrm_check_state(struct xfrm_state *xs)
+ {
+-	if (unlikely(!(xs->xflags & XFRM_STATE_OFFLOAD_NSS))) {
++	if (unlikely(!(xs->xflags & XFRM_STATE_OFFLOAD_EIP))) {
+ 		return false;
+ 	}
+ 
+@@ -73,12 +99,141 @@ static inline bool eip_ipsec_xfrm_check_
+ }
+ 
+ /*
++ * Keep the Linux lifetime and outbound sequence view in step with requests
++ * accepted by EIP.  EIP owns the actual ESP sequence and replay processing.
++ */
++static int eip_ipsec_xfrm_account_output(struct net *net,
++					 struct xfrm_state *xs,
++					 struct sk_buff *skb)
++{
++	int err = 0;
++
++	spin_lock_bh(&xs->lock);
++	if (unlikely(xs->km.state != XFRM_STATE_VALID)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
++		err = -EINVAL;
++		goto unlock;
++	}
++
++	if (unlikely(xfrm_state_check_expire(xs))) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEEXPIRED);
++		err = -EINVAL;
++		goto unlock;
++	}
++
++	if (unlikely(xfrm_replay_overflow(xs, skb))) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATESEQERROR);
++		err = -EOVERFLOW;
++		goto unlock;
++	}
++
++	xs->curlft.bytes += skb->len;
++	xs->curlft.packets++;
++	xs->lastused = ktime_get_real_seconds();
++
++unlock:
++	spin_unlock_bh(&xs->lock);
++	return err;
++}
++
++bool eip_ipsec_xfrm_input_state_ok(struct xfrm_state *xs)
++{
++	struct net *net;
++	bool valid = true;
++
++	if (unlikely(!xs || !eip_ipsec_xfrm_check_state(xs)))
++		return false;
++
++	net = xs_net(xs);
++	spin_lock_bh(&xs->lock);
++	if (unlikely(xs->km.state != XFRM_STATE_VALID)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEINVALID);
++		valid = false;
++	} else if (unlikely(xfrm_state_check_expire(xs))) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEEXPIRED);
++		valid = false;
++	}
++	spin_unlock_bh(&xs->lock);
++
++	return valid;
++}
++
++void eip_ipsec_xfrm_input_done(struct xfrm_state *xs, unsigned int len)
++{
++	spin_lock_bh(&xs->lock);
++	xs->curlft.bytes += len;
++	xs->curlft.packets++;
++	xs->lastused = ktime_get_real_seconds();
++	spin_unlock_bh(&xs->lock);
++}
++
++static int eip_ipsec_xfrm_xmit_one(struct net *net, struct sk_buff *skb)
++{
++	struct dst_entry *dst = skb_dst(skb);
++	struct xfrm_state *xs;
++	int err;
++
++	xs = dst ? dst->xfrm : NULL;
++	if (unlikely(!xs || !eip_ipsec_xfrm_check_state(xs))) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
++		kfree_skb(skb);
++		return -EINVAL;
++	}
++
++	/* EIP host mode currently handles one ESP transform per bundle. */
++	if (unlikely(xfrm_dst_child(dst) && xfrm_dst_child(dst)->xfrm)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -EOPNOTSUPP;
++	}
++
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		err = skb_checksum_help(skb);
++		if (unlikely(err)) {
++			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++			kfree_skb(skb);
++			return err;
++		}
++	}
++
++	err = eip_ipsec_xfrm_account_output(net, xs, skb);
++	if (unlikely(err)) {
++		kfree_skb(skb);
++		return err;
++	}
++
++	return net_xmit_eval(dev_queue_xmit(skb));
++}
++
++/*
+  * eip_ipsec_xfrm_xmit()
+  *	This is called for IPv4/v6 pakcets that are to be transformed.
+  */
+ static int eip_ipsec_xfrm_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	return dev_queue_xmit(skb);
++	struct sk_buff *segs, *nskb;
++	int err = 0;
++
++	if (!skb_is_gso(skb))
++		return eip_ipsec_xfrm_xmit_one(net, skb);
++
++	segs = skb_gso_segment(skb, 0);
++	kfree_skb(skb);
++	if (IS_ERR(segs))
++		return PTR_ERR(segs);
++	if (!segs)
++		return -EINVAL;
++
++	skb_list_walk_safe(segs, segs, nskb) {
++		skb_mark_not_on_list(segs);
++		err = eip_ipsec_xfrm_xmit_one(net, segs);
++		if (unlikely(err)) {
++			kfree_skb_list(nskb);
++			break;
++		}
++	}
++
++	return err;
+ }
+ 
+ /*
+@@ -87,35 +242,28 @@ static int eip_ipsec_xfrm_xmit(struct ne
+  */
+ static int eip_ipsec_xfrm_v4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	struct xfrm_state *xs = skb_dst(skb)->xfrm;
++	struct dst_entry *dst = skb_dst(skb);
++	struct xfrm_state *xs = dst ? dst->xfrm : NULL;
+ 	struct net_device *dev;
+ 	int ret = 0;
+ 
+-	/*
+-	 * No xfrm_state associated; Drop
+-	 */
+-	if (!xs) {
+-		pr_warn("%px: Failed to offload; No xfrm_state associated: drop\n", skb);
+-		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTNOSTATES);
+-		goto drop;
+-	}
++	if (!xs || !eip_ipsec_xfrm_check_state(xs))
++		return eip_ipsec_xfrm_fallback_output(AF_INET, net, sk, skb);
+ 
+-	if (!eip_ipsec_xfrm_check_state(xs)) {
+-		pr_warn("%px: state is not offloaded; xfrm_state %p :drop\n", skb, xs);
++	dev = READ_ONCE(xs->data);
++	if (unlikely(!dev)) {
+ 		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
+ 		goto drop;
+ 	}
+ 
+-	dev = xs->data;
+-	BUG_ON(!dev);
+-
+ 	skb->dev = dev;
+ 
+ 	/*
+ 	 * Call the Post routing hooks.
+ 	 */
+-	ret = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING, net, sk, skb, NULL, skb_dst(skb)->dev,
+-				eip_ipsec_xfrm_xmit, !(IPCB(skb)->flags & IPSKB_REROUTED));
++	ret = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING, net, sk, skb,
++			   NULL, dst->dev, eip_ipsec_xfrm_xmit,
++			   !(IPCB(skb)->flags & IPSKB_REROUTED));
+ 	return ret;
+ 
+ drop:
+@@ -124,64 +272,32 @@ drop:
+ }
+ 
+ /*
+- * eip_ipsec_xfrm_esp_get_mtu()
+- *	Get mtu for inner packet.
+- */
+-static uint32_t eip_ipsec_xfrm_esp_get_mtu(struct xfrm_state *xs, int mtu)
+-{
+-	struct net_device *dev;
+-
+-	/*
+-	 * WARN_ON if the xfrm_state is not offloaded.
+-	 */
+-	WARN_ON(!eip_ipsec_xfrm_check_state(xs));
+-
+-	/*
+-	 * since we are tracking each encap SA using a unique
+-	 * netdevice, hence net_device mtu is the same as SA mtu.
+-	 */
+-	dev = xs->data;
+-	BUG_ON(!dev);
+-	mtu = dev->mtu;
+-
+-	return mtu;
+-}
+-
+-/*
+  * eip_ipsec_xfrm_v6_output()
+  *	Called for IPv6 Plain text packets submitted for IPSec transformation.
+  */
+ static int eip_ipsec_xfrm_v6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	struct xfrm_state *xs = skb_dst(skb)->xfrm;
++	struct dst_entry *dst = skb_dst(skb);
++	struct xfrm_state *xs = dst ? dst->xfrm : NULL;
+ 	struct net_device *dev;
+ 	int mtu, ret = 0;
+ 
+-	/*
+-	 * No xfrm_state associated; Drop
+-	 */
+-	if (!xs) {
+-		pr_warn("%px: Failed to offload; No xfrm_state associated: drop\n", skb);
+-		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTNOSTATES);
+-		goto drop;
+-	}
++	if (!xs || !eip_ipsec_xfrm_check_state(xs))
++		return eip_ipsec_xfrm_fallback_output(AF_INET6, net, sk, skb);
+ 
+-	if (!eip_ipsec_xfrm_check_state(xs)) {
+-		pr_warn("%px: state is not offloaded; xfrm_state %p :drop\n", skb, xs);
++	dev = READ_ONCE(xs->data);
++	if (unlikely(!dev)) {
+ 		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
+ 		goto drop;
+ 	}
+ 
+-	dev = xs->data;
+-	BUG_ON(!dev);
+-
+ 	skb->dev = dev;
+ 
+ 	/*
+          * Reject the packets if greater than MTU.
+          */
+         mtu = READ_ONCE(dev->mtu);
+-	if (unlikely(!skb->ignore_df && skb->len > mtu)) {
++	if (unlikely(!skb_is_gso(skb) && !skb->ignore_df && skb->len > mtu)) {
+ 		pr_debug("%px: V6 inner packet size(%d) greater than MTU(%d\n)", skb, skb->len, mtu);
+ 		icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu);
+ 		goto drop;
+@@ -190,8 +306,9 @@ static int eip_ipsec_xfrm_v6_output(stru
+ 	/*
+ 	 * Call the Post routing hooks.
+ 	 */
+-	ret = NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING, net, sk, skb, NULL, skb_dst(skb)->dev,
+-				eip_ipsec_xfrm_xmit, !(IP6CB(skb)->flags & IP6SKB_REROUTED));
++	ret = NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING, net, sk, skb,
++			   NULL, dst->dev, eip_ipsec_xfrm_xmit,
++			   !(IP6CB(skb)->flags & IP6SKB_REROUTED));
+ 	return ret;
+ 
+ drop:
+@@ -205,6 +322,21 @@ drop:
+  */
+ static bool eip_ipsec_xfrm_verify_offload(struct xfrm_state *xs)
+ {
++	u32 replay_window = xs->replay_esn ? xs->replay_esn->replay_window :
++					       xs->props.replay_window;
++	unsigned int i;
++
++	if (xs_net(xs) != &init_net) {
++		pr_debug("%p: EIP offload is limited to init_net\n", xs);
++		return false;
++	}
++
++	if (xs->props.family != AF_INET && xs->props.family != AF_INET6)
++		return false;
++
++	if (xs->id.proto != IPPROTO_ESP)
++		return false;
++
+ 	/*
+ 	 * Tunnel and Transport Mode ESP only supported.
+ 	 */
+@@ -221,75 +353,69 @@ static bool eip_ipsec_xfrm_verify_offloa
+ 		return false;
+ 	}
+ 
+-	return true;
+-}
+-
+-/*
+- * eip_ipsec_xfrm_get_dev()
+- *	fetch the netdevice.
+- */
+-static struct net_device *eip_ipsec_xfrm_get_dev(struct net_device *kdev, struct sk_buff *skb, int32_t *type)
+-{
+-	uint8_t ip_ver = ip_hdr(skb)->version;
+-	struct net_device *dev = NULL;
+-	struct xfrm_state *xs = NULL;
++	/* The EIP-197 record format in this driver has no IPv6 NAT-T mode. */
++	if (xs->encap && xs->props.family == AF_INET6) {
++		pr_debug("%p: IPv6 NAT-T is not supported by EIP\n", xs);
++		return false;
++	}
+ 
+-	BUG_ON((ip_ver != IPVERSION) && (ip_ver != 6));
++	/* EIP lookup cannot reproduce namespace, mark, or xfrm-if semantics. */
++	if (xs->if_id || xs->mark.v || xs->mark.m ||
++	    xs->props.smark.v || xs->props.smark.m) {
++		pr_debug("%p: if_id and marked XFRM states use native ESP\n", xs);
++		return false;
++	}
+ 
+-	/*
+-	 * This is a plain text packet undergoing encap.
+-	 */
+-	*type = 0;
++	if (xs->tfcpad || xs->coaddr ||
++	    (xs->xflags & XFRM_STATE_OFFLOAD_DEV_REQUESTED) ||
++	    xs->xso.type != XFRM_DEV_OFFLOAD_UNSPECIFIED) {
++		pr_debug("%p: unsupported XFRM state attributes use native ESP\n", xs);
++		return false;
++	}
+ 
+-	xs = skb_dst(skb)->xfrm;
+-	if (xs) {
+-		/*
+-		 * check if the xfrm state is offloaded or not.
+-		 */
+-		if (!eip_ipsec_xfrm_check_state(xs)) {
+-			pr_debug("%p: Outbound Plain text packet(%px); not offloaded\n", xs, skb);
+-			return NULL;
+-		}
++	if (xs->props.flags & ~(XFRM_STATE_NOPMTUDISC | XFRM_STATE_ESN)) {
++		pr_debug("%p: unsupported XFRM flags 0x%x use native ESP\n",
++			 xs, xs->props.flags);
++		return false;
++	}
+ 
+-		dev = xs->data;
+-		BUG_ON(!dev);
+-		dev_hold(dev);
++	if (xs->props.extra_flags & ~XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
++		return false;
+ 
+-		return dev;
++	if (replay_window > IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ) {
++		pr_debug("%p: replay window %u exceeds EIP maximum %u\n", xs,
++			 replay_window, IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ);
++		return false;
+ 	}
+ 
+-	/*
+-	 * dst is not xfrm. This means packet could be:-
+-	 * 1. Outbound encapsulated (skb->iif = ipsecX)
+-	 * 2. Inbound decapsulated (skb->iif = ipsecX)
+-	 * 3. Inbound encapsulated (ECM never sees such a packet)
+-	 * 4. None of the above(don't care for us)
+-	 */
+-	dev = dev_get_by_index(&init_net, skb->skb_iif);
+-	if (!dev) {
+-		return NULL;
+-	}
++	/* EIP records start at sequence zero and cannot import migrated state. */
++	if (xs->replay.oseq || xs->replay.seq || xs->replay.bitmap)
++		return false;
+ 
+-	if (!eip_ipsec_dev_is_nss(dev)) {
+-		pr_debug("%p: Transform packet not managed by NSS\n", xs);
+-		dev_put(dev);
+-		return NULL;
++	if (xs->replay_esn) {
++		if (xs->replay_esn->oseq || xs->replay_esn->seq ||
++		    xs->replay_esn->oseq_hi || xs->replay_esn->seq_hi)
++			return false;
++
++		for (i = 0; i < xs->replay_esn->bmp_len; i++)
++			if (xs->replay_esn->bmp[i])
++				return false;
+ 	}
+ 
+-	return dev;
++	return true;
+ }
+ 
+ /*
+  * eip_ipsec_xfrm_get_algo()
+  *	Fetch the driver name for the given crypto algorithm
+  */
+-const char *eip_ipsec_xfrm_get_algo(const char *algo_name)
++static const char *eip_ipsec_xfrm_get_algo(const char *algo_name)
+ {
+ 	struct eip_ipsec_xfrm_algo *xalg = xfrm_algo;
+ 	uint32_t i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(xfrm_algo); i++, xalg++) {
+-		if (algo_name && strncmp(xalg->algo_name, algo_name, strlen(xalg->algo_name))) {
++		if (!algo_name || strcmp(xalg->algo_name, algo_name)) {
+ 			continue;
+ 		}
+ 
+@@ -312,6 +438,8 @@ static int eip_ipsec_xfrm_crypto_init(st
+ 		unsigned int key_len = 0;
+ 
+ 		key_len = ALIGN(xs->aead->alg_key_len, BITS_PER_BYTE) / BITS_PER_BYTE;
++		if (key_len < sizeof(uint32_t))
++			return -EINVAL;
+ 
+ 		/* Cipher */
+ 		sa_data->base.cipher.data = xs->aead->alg_key;
+@@ -319,7 +447,8 @@ static int eip_ipsec_xfrm_crypto_init(st
+ 		sa_data->base.icv_len = xs->aead->alg_icv_len / BITS_PER_BYTE;
+ 
+ 		/* Nonce */
+-		sa_data->base.nonce = *(uint32_t *)(xs->aead->alg_key + sa_data->base.cipher.len);
++		sa_data->base.nonce = get_unaligned((uint32_t *)(xs->aead->alg_key +
++							      sa_data->base.cipher.len));
+ 
+ 		/* obtain crypto algo name */
+ 		if (snprintf(algo_name, CRYPTO_MAX_ALG_NAME, "%s(%s)",
+@@ -358,13 +487,8 @@ static int eip_ipsec_xfrm_crypto_init(st
+ 				xs->ealg->alg_name, xs->geniv ? ")" : "") >= CRYPTO_MAX_ALG_NAME) {
+ 			return -ENAMETOOLONG;
+ 		}
+-	} else { /* Bypass mode */
+-		sa_data->base.auth.data = NULL;
+-		sa_data->base.auth.len = 0;
+-		sa_data->base.cipher.data = NULL;
+-		sa_data->base.cipher.len = 0;
+-		sa_data->base.icv_len = 0;
+-		return 0;
++	} else { /* Bypass mode is not a valid ESP transform for this client. */
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	/*
+@@ -385,31 +509,44 @@ static int eip_ipsec_xfrm_crypto_init(st
+  */
+ static int eip_ipsec_xfrm_sa_data_init(struct xfrm_state *xs, struct eip_ipsec_data *sa_data)
+ {
+-	struct net_device *local_dev;
++	struct net_device *local_dev = NULL;
+ 	xfrm_address_t remote = {0};
+ 	xfrm_address_t local = {0};
+ 	size_t ip_addr_len;
+ 	uint8_t ttl_hop_limit;
++	bool encap;
+ 	int ret;
+ 
++	if (xs->dir == XFRM_SA_DIR_OUT) {
++		encap = true;
++	} else if (xs->dir == XFRM_SA_DIR_IN) {
++		encap = false;
++	} else if (xs->props.family == AF_INET) {
++		local_dev = ip_dev_find(&init_net, xs->id.daddr.a4);
++		encap = !local_dev;
++		if (local_dev)
++			dev_put(local_dev);
++	} else {
++		rcu_read_lock();
++		local_dev = ipv6_dev_find(&init_net, &xs->id.daddr.in6, NULL);
++		encap = !local_dev;
++		rcu_read_unlock();
++	}
++
++	if (encap)
++		sa_data->base.flags |= EIP_IPSEC_FLAG_ENC;
++
+ 	if (xs->props.family == AF_INET) {
+ 		struct rtable *rt;
+ 
+-		local_dev = ip_dev_find(&init_net, xs->id.daddr.a4);
+-
+-		/*
+-		 * if the local_dev is not a valid pointer, then
+-		 * it is an encap direction packet.
+-		 */
+-		if (!local_dev) {
+-			sa_data->base.flags |= EIP_IPSEC_FLAG_ENC;
++		if (encap) {
+ 			remote.a4 = xs->id.daddr.a4;
+ 		} else {
+-			dev_put(local_dev);
+ 			remote.a4 = xs->props.saddr.a4;
+ 		}
+ 
+-		rt = ip_route_output(&init_net, remote.a4, 0, 0, 0);
++		rt = ip_route_output(&init_net, remote.a4, 0, 0, 0,
++				     RT_SCOPE_UNIVERSE);
+ 		if (IS_ERR(rt)) {
+ 			pr_warn("No IPv4 dst found\n");
+ 			return -1;
+@@ -422,30 +559,12 @@ static int eip_ipsec_xfrm_sa_data_init(s
+ 		struct rt6_info *rt6;
+ 
+ 		sa_data->base.flags |= EIP_IPSEC_FLAG_IPV6;
+-
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-		local_dev = ipv6_dev_find(&init_net, &xs->id.daddr.in6, 1);
+-#else
+-		rcu_read_lock();
+-		local_dev = ipv6_dev_find(&init_net, &xs->id.daddr.in6, NULL);
+-		if (local_dev)
+-			dev_hold(local_dev);
+-
+-		rcu_read_unlock();
+-#endif
+-
+ 		ip_addr_len = sizeof(remote.in6);
+ 
+-		/*
+-		 * if the local_dev is not a valid pointer, then
+-		 * it is an encap direction packet.
+-		 */
+-		if (!local_dev) {
+-			sa_data->base.flags |= EIP_IPSEC_FLAG_ENC;
++		if (encap) {
+ 			memcpy(&local.in6, &xs->props.saddr.in6, ip_addr_len);
+ 			memcpy(&remote.in6, &xs->id.daddr.in6, ip_addr_len);
+ 		} else {
+-			dev_put(local_dev);
+ 			memcpy(&local.in6, &xs->id.daddr.in6, ip_addr_len);
+ 			memcpy(&remote.in6, &xs->props.saddr.in6, ip_addr_len);
+ 		}
+@@ -472,6 +591,9 @@ static int eip_ipsec_xfrm_sa_data_init(s
+ 		sa_data->base.flags |= EIP_IPSEC_FLAG_UDP;
+ 	}
+ 
++	if (xs->props.flags & XFRM_STATE_ESN)
++		sa_data->base.flags |= EIP_IPSEC_FLAG_ESN;
++
+ 	ret = eip_ipsec_xfrm_crypto_init(xs, sa_data);
+ 	if (ret < 0) {
+ 		pr_warn("Crypto Initialisation failed\n");
+@@ -481,8 +603,10 @@ static int eip_ipsec_xfrm_sa_data_init(s
+ 	sa_data->xs = xs;
+ 
+ 	if (sa_data->base.flags & EIP_IPSEC_FLAG_ENC) {
+-		sa_data->base.flags |= EIP_IPSEC_FLAG_CP_DF;
+-		sa_data->base.flags |= EIP_IPSEC_FLAG_CP_TOS;
++		if (!(xs->props.flags & XFRM_STATE_NOPMTUDISC))
++			sa_data->base.flags |= EIP_IPSEC_FLAG_CP_DF;
++		if (!(xs->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP))
++			sa_data->base.flags |= EIP_IPSEC_FLAG_CP_TOS;
+ 		sa_data->hop_limit = ttl_hop_limit;
+ 		sa_data->df = 0;
+ 		return 0;
+@@ -493,7 +617,8 @@ static int eip_ipsec_xfrm_sa_data_init(s
+ 	 * TODO: XFRM only support 32bit. Check if there is any seperate option.
+ 	 * replay_win is in bits.
+ 	 */
+-	sa_data->replay_win = xs->props.replay_window;
++	sa_data->replay_win = xs->replay_esn ? xs->replay_esn->replay_window :
++					      xs->props.replay_window;
+ 	return 0;
+ }
+ 
+@@ -540,9 +665,8 @@ static void eip_ipsec_xfrm_sa_tuple_init
+  * eip_ipsec_xfrm_state_add()
+  *	xfrm_state add notification handler.
+  */
+-static int eip_ipsec_xfrm_state_add(struct xfrm_state *xs)
++static int __eip_ipsec_xfrm_state_add(struct xfrm_state *xs)
+ {
+-	struct eip_ctx *ctx = eip_ipsec_drv_g.ctx;
+ 	struct eip_ipsec_tuple sa_tuple = {0};
+ 	struct eip_ipsec_data sa_data = {0};
+ 	struct net_device *dev;
+@@ -600,9 +724,17 @@ static int eip_ipsec_xfrm_state_add(stru
+ 		return ret;
+ 	}
+ 
++	/* Publish ownership before the SA becomes visible to the receive path. */
++	dev_hold(dev);
++	WRITE_ONCE(xs->data, dev);
++	xs->xflags |= XFRM_STATE_OFFLOAD_EIP;
++
+ 	ret = eip_ipsec_sa_add(dev, &sa_data, &sa_tuple);
+ 	if (ret < 0) {
+ 		pr_warn("%p: unable to offload xfrm_state\n", xs);
++		xs->xflags &= ~XFRM_STATE_OFFLOAD_EIP;
++		WRITE_ONCE(xs->data, NULL);
++		dev_put(dev);
+ 		if (!eip_ipsec_dev_sa_exist(dev)) {
+ 			eip_ipsec_dev_unlink_id(dev, xs->props.reqid);
+ 			eip_ipsec_dev_del(dev);
+@@ -611,28 +743,25 @@ static int eip_ipsec_xfrm_state_add(stru
+ 		return ret;
+ 	}
+ 
+-	/*
+-	 * dereference: eip_ipsec_xfrm_state_delete()
+-	 */
+-	dev_hold(dev);
+-	xs->data = dev;
+-	xs->xflags |= XFRM_STATE_OFFLOAD_NSS;
++	return 0;
++}
+ 
+-	/*
+-	 * Set XFRM_STATE_OFFLOAD_NSS_HW in xfrm state.
+-	 */
+-	if (eip_feature_check(ctx, EIP_OFFLOAD_INNER_FLOW)) {
+-		xs->xflags |= XFRM_STATE_OFFLOAD_HW_INNER;
+-	}
++static int eip_ipsec_xfrm_state_add(struct xfrm_state *xs)
++{
++	int ret;
+ 
+-	return 0;
++	mutex_lock(&eip_ipsec_xfrm_state_lock);
++	ret = __eip_ipsec_xfrm_state_add(xs);
++	mutex_unlock(&eip_ipsec_xfrm_state_lock);
++
++	return ret;
+ }
+ 
+ /*
+  * eip_ipsec_xfrm_state_delete()
+  *	xfrm_state delete notification handler.
+  */
+-static void eip_ipsec_xfrm_state_delete(struct xfrm_state *xs)
++static void __eip_ipsec_xfrm_state_delete(struct xfrm_state *xs)
+ {
+ 	struct eip_ipsec_tuple sa_tuple;
+ 	struct net_device *dev;
+@@ -654,18 +783,33 @@ static void eip_ipsec_xfrm_state_delete(
+ 	 * fetch the net_deivce from the xfrm state.
+ 	 * reference: eip_ipsec_xfrm_state_add()
+ 	 */
+-	dev = xs->data;
+-	dev_put(dev);
++	dev = READ_ONCE(xs->data);
++	if (WARN_ON_ONCE(!dev)) {
++		xs->xflags &= ~XFRM_STATE_OFFLOAD_EIP;
++		WRITE_ONCE(xs->data, NULL);
++		return;
++	}
+ 
+ 	eip_ipsec_sa_del(dev, &sa_tuple);
++	xs->xflags &= ~XFRM_STATE_OFFLOAD_EIP;
++	WRITE_ONCE(xs->data, NULL);
+ 
+ 	if (eip_ipsec_dev_sa_exist(dev)) {
+ 		pr_debug("%p: Encap & Decap SA's are still linked to the given net_device %p\n", xs, dev);
++		dev_put(dev);
+ 		return;
+ 	}
+ 
+ 	eip_ipsec_dev_unlink_id(dev, xs->props.reqid);
+ 	eip_ipsec_dev_del(dev);
++	dev_put(dev);
++}
++
++static void eip_ipsec_xfrm_state_delete(struct xfrm_state *xs)
++{
++	mutex_lock(&eip_ipsec_xfrm_state_lock);
++	__eip_ipsec_xfrm_state_delete(xs);
++	mutex_unlock(&eip_ipsec_xfrm_state_lock);
+ }
+ 
+ /*
+@@ -678,15 +822,28 @@ static int eip_ipsec_xfrm_esp_init_state
+ static int eip_ipsec_xfrm_esp_init_state(struct xfrm_state *xs, struct netlink_ext_ack *extack)
+ #endif
+ {
+-	if (eip_ipsec_xfrm_state_add(xs)) {
++	const struct xfrm_type *fallback;
++	int err;
++
++	err = eip_ipsec_xfrm_state_add(xs);
++	if (!err)
++		return 0;
++
++	fallback = eip_ipsec_xfrm_fallback_type(xs);
++	if (fallback && fallback->init_state) {
++		pr_debug("%p: EIP offload unavailable (%d), using native ESP\n",
++			 xs, err);
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+-		NL_SET_ERR_MSG(extack, "Kernel is unable to initialize xfrm state");
++		return fallback->init_state(xs, extack);
++#else
++		return fallback->init_state(xs);
+ #endif
+-		pr_err("%p: Failed to offload xfrm state\n", xs);
+-		return -1;
+ 	}
+ 
+-	return 0;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
++	NL_SET_ERR_MSG(extack, "EIP offload failed and native ESP is unavailable");
++#endif
++	return err;
+ }
+ 
+ /*
+@@ -695,29 +852,44 @@ static int eip_ipsec_xfrm_esp_init_state
+  */
+ static void eip_ipsec_xfrm_esp_deinit_state(struct xfrm_state *xs)
+ {
+-	eip_ipsec_xfrm_state_delete(xs);
+-	return;
++	const struct xfrm_type *fallback;
++
++	if (eip_ipsec_xfrm_check_state(xs)) {
++		eip_ipsec_xfrm_state_delete(xs);
++		return;
++	}
++
++	fallback = eip_ipsec_xfrm_fallback_type(xs);
++	if (fallback && fallback->destructor)
++		fallback->destructor(xs);
+ }
+ 
+-static struct ecm_interface_ipsec_callback xfrm_ecm_ipsec_cb = {
+-	.tunnel_get_and_hold = eip_ipsec_xfrm_get_dev,
+-};
++static int eip_ipsec_xfrm_esp_input(struct xfrm_state *xs, struct sk_buff *skb)
++{
++	const struct xfrm_type *fallback;
++
++	if (unlikely(eip_ipsec_xfrm_check_state(xs)))
++		return -EOPNOTSUPP;
++
++	fallback = eip_ipsec_xfrm_fallback_type(xs);
++	return fallback && fallback->input ? fallback->input(xs, skb) : -EAFNOSUPPORT;
++}
++
++static int eip_ipsec_xfrm_esp_output(struct xfrm_state *xs, struct sk_buff *skb)
++{
++	const struct xfrm_type *fallback;
++
++	if (unlikely(eip_ipsec_xfrm_check_state(xs)))
++		return -EOPNOTSUPP;
++
++	fallback = eip_ipsec_xfrm_fallback_type(xs);
++	return fallback && fallback->output ? fallback->output(xs, skb) : -EAFNOSUPPORT;
++}
+ 
+ /*
+  * Trapping ipv4 packets to be sent for ipsec encapsulation.
+  */
+-static struct xfrm_state_afinfo xfrm_v4_afinfo = {
+-	.family = AF_INET,
+-	.proto = IPPROTO_IPIP,
+-	.output = eip_ipsec_xfrm_v4_output,
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	.output_finish = NULL,
+-	.extract_input = NULL,
+-	.extract_output = NULL,
+-#endif
+-	.transport_finish = NULL,
+-	.local_error = NULL,
+-};
++static struct xfrm_state_afinfo xfrm_v4_afinfo;
+ 
+ /*
+  * ESP proto specific init/de-init handlers for ipv4.
+@@ -731,26 +903,14 @@ static const struct xfrm_type xfrm_v4_ty
+ 	.flags = XFRM_TYPE_REPLAY_PROT,
+ 	.init_state = eip_ipsec_xfrm_esp_init_state,
+ 	.destructor = eip_ipsec_xfrm_esp_deinit_state,
+-	.get_mtu = eip_ipsec_xfrm_esp_get_mtu,
+-	.input = NULL,
+-	.output = NULL,
++	.input = eip_ipsec_xfrm_esp_input,
++	.output = eip_ipsec_xfrm_esp_output,
+ };
+ 
+ /*
+  * Trapping ipv6 packets to be sent for ipsec encapsulation.
+  */
+-static struct xfrm_state_afinfo xfrm_v6_afinfo = {
+-	.family = AF_INET6,
+-	.proto = IPPROTO_IPV6,
+-	.output = eip_ipsec_xfrm_v6_output,
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	.output_finish = NULL,
+-	.extract_input = NULL,
+-	.extract_output = NULL,
+-#endif
+-	.transport_finish = NULL,
+-	.local_error = NULL,
+-};
++static struct xfrm_state_afinfo xfrm_v6_afinfo;
+ 
+ /*
+  * ESP proto specific init/de-init handlers for ipv6.
+@@ -764,140 +924,124 @@ static const struct xfrm_type xfrm_v6_ty
+ 	.flags = XFRM_TYPE_REPLAY_PROT,
+ 	.init_state = eip_ipsec_xfrm_esp_init_state,
+ 	.destructor = eip_ipsec_xfrm_esp_deinit_state,
+-	.get_mtu = eip_ipsec_xfrm_esp_get_mtu,
+-	.input = NULL,
+-	.output = NULL,
++	.input = eip_ipsec_xfrm_esp_input,
++	.output = eip_ipsec_xfrm_esp_output,
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+ 	.hdr_offset = NULL,
+ #endif
+ };
+ 
++static void eip_ipsec_xfrm_copy_dynamic_types(struct xfrm_state_afinfo *dst,
++					      const struct xfrm_state_afinfo *src)
++{
++	dst->type_offload_esp = src->type_offload_esp;
++	dst->type_ipip = src->type_ipip;
++	dst->type_ipip6 = src->type_ipip6;
++	dst->type_comp = src->type_comp;
++	dst->type_ah = src->type_ah;
++	dst->type_routing = src->type_routing;
++	dst->type_dstopts = src->type_dstopts;
++}
++
+ /*
+- * eip_ipsec_xfrm_restore_afinfo()
+- *	Restore the native linux afinfo object.
++ * Install a shallow copy of the native provider with only ESP and output
++ * replaced.  This preserves native callbacks and all non-ESP XFRM types.
+  */
+-static void eip_ipsec_xfrm_restore_afinfo(uint16_t family)
++static int eip_ipsec_xfrm_override_afinfo(uint16_t family)
+ {
+-	const struct xfrm_type *type_dstopts, *type_routing;
+-	const struct xfrm_type *type_ipip, *type_ipv6;
+-	const struct xfrm_type *type_ah, *type_comp;
+-	struct xfrm_state_afinfo *afinfo;
+-	const struct xfrm_type *base;
++	struct xfrm_state_afinfo *replacement;
++	struct xfrm_state_afinfo *fallback;
++	const struct xfrm_type *fallback_type;
++	const struct xfrm_type *eip_type;
++	int err;
+ 
+-	/*
+-	 * unregister the xfrm types
+-	 */
+ 	if (family == AF_INET) {
+-		base = &xfrm_v4_type;
+-		afinfo = fallback_v4_afinfo;
++		replacement = &xfrm_v4_afinfo;
++		eip_type = &xfrm_v4_type;
+ 	} else {
+-		base = &xfrm_v6_type;
+-		afinfo = fallback_v6_afinfo;
++		replacement = &xfrm_v6_afinfo;
++		eip_type = &xfrm_v6_type;
+ 	}
+ 
+-	BUG_ON(!afinfo);
++	fallback = xfrm_state_get_afinfo(family);
++	if (!fallback)
++		return -EAFNOSUPPORT;
+ 
+-	type_ah = afinfo->type_ah;
+-	type_comp = afinfo->type_comp;
+-	type_ipip = afinfo->type_ipip;
+-	type_ipv6 = afinfo->type_ipip6;
+-	type_dstopts = afinfo->type_dstopts;
+-	type_routing = afinfo->type_routing;
+-
+-	/*
+-	 * Unregister types.
+-	 */
+-	if (type_routing) {
+-		xfrm_unregister_type(type_routing, family);
++	fallback_type = fallback->type_esp;
++	if (!fallback_type || !try_module_get(fallback_type->owner)) {
++		rcu_read_unlock();
++		return -EPROTONOSUPPORT;
+ 	}
+ 
+-	if (type_dstopts) {
+-		xfrm_unregister_type(type_dstopts, family);
+-	}
++	*replacement = *fallback;
++	rcu_read_unlock();
++	replacement->type_esp = eip_type;
++	replacement->output = family == AF_INET ? eip_ipsec_xfrm_v4_output :
++						       eip_ipsec_xfrm_v6_output;
+ 
+-	if (type_ipv6) {
+-		xfrm_unregister_type(type_ipv6, family);
+-	}
+-
+-	if (type_ipip) {
+-		xfrm_unregister_type(type_ipip, family);
++	if (family == AF_INET) {
++		fallback_v4_afinfo = fallback;
++		fallback_v4_type = fallback_type;
++	} else {
++		fallback_v6_afinfo = fallback;
++		fallback_v6_type = fallback_type;
+ 	}
+ 
+-	if (type_comp) {
+-		xfrm_unregister_type(type_comp, family);
+-	}
++	err = xfrm_state_update_afinfo(family, fallback, replacement);
++	if (!err)
++		return 0;
+ 
+-	if (type_ah) {
+-		xfrm_unregister_type(type_ah, family);
++	if (family == AF_INET) {
++		fallback_v4_afinfo = NULL;
++		fallback_v4_type = NULL;
++	} else {
++		fallback_v6_afinfo = NULL;
++		fallback_v6_type = NULL;
+ 	}
+-
+-	xfrm_unregister_type(base, family);
+-	xfrm_state_update_afinfo(family, afinfo);
++	module_put(fallback_type->owner);
++	memset(replacement, 0, sizeof(*replacement));
++	return err;
+ }
+ 
+ /*
+- * eip_ipsec_xfrm_override_afinfo()
+- *	Override the native linux afinfo object.
++ * Restore the native provider and carry across non-ESP registrations which
++ * may have changed while the EIP provider was active.
+  */
+-static void eip_ipsec_xfrm_override_afinfo(uint16_t family)
++static int eip_ipsec_xfrm_restore_afinfo(uint16_t family)
+ {
+-	const struct xfrm_type *type_dstopts, *type_routing;
+-	const struct xfrm_type *type_ipip, *type_ipv6;
+-	const struct xfrm_type *type_ah, *type_comp;
+-	struct xfrm_state_afinfo *afinfo;
+-	const struct xfrm_type *base;
++	struct xfrm_state_afinfo *replacement;
++	struct xfrm_state_afinfo *fallback;
++	const struct xfrm_type *fallback_type;
++	int err;
+ 
+-	/*
+-	 * Override ESP type.
+-	 */
+ 	if (family == AF_INET) {
+-		base = &xfrm_v4_type;
+-		afinfo = fallback_v4_afinfo = xfrm_state_update_afinfo(AF_INET, &xfrm_v4_afinfo);
++		replacement = &xfrm_v4_afinfo;
++		fallback = fallback_v4_afinfo;
++		fallback_type = fallback_v4_type;
+ 	} else {
+-		base = &xfrm_v6_type;
+-		afinfo = fallback_v6_afinfo = xfrm_state_update_afinfo(AF_INET6, &xfrm_v6_afinfo);
+-	}
+-
+-	BUG_ON(!afinfo);
+-
+-	xfrm_register_type(base, family);
+-
+-	type_ah = afinfo->type_ah;
+-	type_comp = afinfo->type_comp;
+-	type_ipip = afinfo->type_ipip;
+-	type_ipv6 = afinfo->type_ipip6;
+-	type_dstopts = afinfo->type_dstopts;
+-	type_routing = afinfo->type_routing;
+-
+-	/*
+-	 * Register types
+-	 *
+-	 * Propagating the registered xfrm_type from
+-	 * old afinfo object into new object.
+-	 */
+-	if (type_ah) {
+-		xfrm_register_type(type_ah, family);
+-	}
+-
+-	if (type_comp) {
+-		xfrm_register_type(type_comp, family);
+-	}
+-
+-	if (type_ipip) {
+-		xfrm_register_type(type_ipip, family);
++		replacement = &xfrm_v6_afinfo;
++		fallback = fallback_v6_afinfo;
++		fallback_type = fallback_v6_type;
+ 	}
+ 
+-	if (type_ipv6) {
+-		xfrm_register_type(type_ipv6, family);
+-	}
++	if (!fallback)
++		return 0;
+ 
+-	if (type_dstopts) {
+-		xfrm_register_type(type_dstopts, family);
+-	}
++	eip_ipsec_xfrm_copy_dynamic_types(fallback, replacement);
++	err = xfrm_state_update_afinfo(family, replacement, fallback);
++	if (err)
++		return err;
+ 
+-	if (type_routing) {
+-		xfrm_register_type(type_routing, family);
++	if (family == AF_INET) {
++		fallback_v4_afinfo = NULL;
++		fallback_v4_type = NULL;
++	} else {
++		fallback_v6_afinfo = NULL;
++		fallback_v6_type = NULL;
+ 	}
++	module_put(fallback_type->owner);
++	memset(replacement, 0, sizeof(*replacement));
++	return 0;
+ }
+ 
+ /*
+@@ -906,16 +1050,20 @@ static void eip_ipsec_xfrm_override_afin
+  */
+ int eip_ipsec_xfrm_init(void)
+ {
++	int err;
+ 
+-	/*
+-	 * overide the xfrm_state afinfo.
+-	 */
+-	if (!disable_v4_offload)
+-		eip_ipsec_xfrm_override_afinfo(AF_INET);
+-
+-	eip_ipsec_xfrm_override_afinfo(AF_INET6);
++	if (!disable_v4_offload) {
++		err = eip_ipsec_xfrm_override_afinfo(AF_INET);
++		if (err)
++			return err;
++	}
+ 
+-	ecm_interface_ipsec_register_callbacks(&xfrm_ecm_ipsec_cb);
++	err = eip_ipsec_xfrm_override_afinfo(AF_INET6);
++	if (err) {
++		if (!disable_v4_offload)
++			eip_ipsec_xfrm_restore_afinfo(AF_INET);
++		return err;
++	}
+ 
+ 	pr_info("eip xfrm module loaded\n");
+ 	return 0;
+@@ -927,15 +1075,10 @@ int eip_ipsec_xfrm_init(void)
+  */
+ void eip_ipsec_xfrm_exit(void)
+ {
+-	/*
+-	 * Restore the xfrm_state afinfo.
+-	 */
+ 	if (!disable_v4_offload)
+-		eip_ipsec_xfrm_restore_afinfo(AF_INET);
+-
+-	eip_ipsec_xfrm_restore_afinfo(AF_INET6);
++		WARN_ON(eip_ipsec_xfrm_restore_afinfo(AF_INET));
+ 
+-	ecm_interface_ipsec_unregister_callbacks();
++	WARN_ON(eip_ipsec_xfrm_restore_afinfo(AF_INET6));
+ 
+ 	pr_info("eip xfrm module unloaded\n");
+ }
+--- a/clients/ipsec/eip_ipsec_xfrm.h
++++ b/clients/ipsec/eip_ipsec_xfrm.h
+@@ -17,7 +17,7 @@
+ #ifndef __EIP_IPSEC_XFRM_H
+ #define __EIP_IPSEC_XFRM_H
+ 
+-#define IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ 64U
++#define IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ 384U
+ #define DEBUG_LEVEL 2U
+ 
+ #if (DEBUG_LEVEL < 1)
+@@ -28,4 +28,6 @@
+ 
+ void eip_ipsec_xfrm_exit(void);
+ int eip_ipsec_xfrm_init(void);
++bool eip_ipsec_xfrm_input_state_ok(struct xfrm_state *xs);
++void eip_ipsec_xfrm_input_done(struct xfrm_state *xs, unsigned int len);
+ #endif /* !__EIP_IPSEC_XFRM_H */
+--- a/driver/eip197/eip.c
++++ b/driver/eip197/eip.c
+@@ -220,6 +220,9 @@ bool eip_feature_check(struct eip_ctx *c
+ {
+ 	struct eip_pdev *ep = ctx->ep;
+ 
++	if (ctx->svc == EIP_SVC_IPSEC)
++		return false;
++
+ 	return (feature & ep->flags);
+ }
+ EXPORT_SYMBOL(eip_feature_check);
+--- a/driver/eip197/eip_ctx.c
++++ b/driver/eip197/eip_ctx.c
+@@ -223,10 +223,7 @@ struct eip_ctx *eip_ctx_alloc(enum eip_s
+ 		ctx->db_size = eip_tr_aead_get_svc_len();
+ 		ctx->dma = ep->la;
+ 		break;
+-	/*
+-	 * TODO: Replace EIP_SVC_HYBRID_IPSEC with EIP_SVC_IPSEC.
+-	 * Use eip_features_t flags to derive remaining IPsec-related information.
+-	 */
++	case EIP_SVC_IPSEC:
+ 	case EIP_SVC_HYBRID_IPSEC:
+ 		ctx->svc_db = eip_tr_ipsec_get_svc();
+ 		ctx->db_size = eip_tr_ipsec_get_svc_len();
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -204,7 +204,8 @@ static inline void eip_dma_hy_tr_deliver
+ {
+ 	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 
+-	BUG_ON(tr->svc != EIP_SVC_HYBRID_IPSEC);
++	BUG_ON(tr->svc != EIP_SVC_IPSEC &&
++	       tr->svc != EIP_SVC_HYBRID_IPSEC);
+ 
+ 	tr_stats->rx_frags += nsegs;
+ 	tr_stats->rx_pkts++;
+@@ -224,7 +225,8 @@ static inline void eip_dma_hy_tr_deliver
+ {
+ 	struct eip_tr_stats *tr_stats = this_cpu_ptr(tr->stats_pcpu);
+ 
+-	BUG_ON(tr->svc != EIP_SVC_HYBRID_IPSEC);
++	BUG_ON(tr->svc != EIP_SVC_IPSEC &&
++	       tr->svc != EIP_SVC_HYBRID_IPSEC);
+ 
+ 	tr_stats->rx_frags += nsegs;
+ 	tr_stats->rx_pkts++;
+--- a/driver/eip197/eip_tr.c
++++ b/driver/eip197/eip_tr.c
+@@ -371,7 +371,8 @@ struct eip_tr *eip_tr_alloc(struct eip_c
+ 	/*
+ 	 * Context is going to use hybrid ring, so refill it
+ 	 */
+-	if (tr->svc == EIP_SVC_HYBRID_IPSEC && ep->dma_refill_req) {
++	if ((tr->svc == EIP_SVC_IPSEC ||
++	     tr->svc == EIP_SVC_HYBRID_IPSEC) && ep->dma_refill_req) {
+ 		eip_dma_hy_refill_all(ctx);
+ 		ep->dma_refill_req = false;
+ 	}
+@@ -430,10 +431,7 @@ void eip_tr_disable(struct eip_tr *tr)
+ 		xchg(&ops->err_cb, eip_tr_dummy_err);
+ 		break;
+ 
+-		/*
+-		 * TODO: Replace EIP_SVC_HYBRID_IPSEC with EIP_SVC_IPSEC.
+-		 * Use eip_features_t flags to derive remaining IPsec-related information.
+-		 */
++	case EIP_SVC_IPSEC:
+ 	case EIP_SVC_HYBRID_IPSEC:
+ 		ops = &tr->ipsec.ops;
+ 		xchg(&ops->cb, eip_tr_dummy_cb);
