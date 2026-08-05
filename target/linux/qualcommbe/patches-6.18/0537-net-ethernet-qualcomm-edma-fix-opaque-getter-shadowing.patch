@@ -1,0 +1,69 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 23:58:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: edma: fix opaque getter shadowing
+
+The 64-bit opaque getter macros declare an internal variable called desc.
+Passing a caller variable with the same name expands to a self-initialized
+pointer, which is undefined and can be optimized into a NULL dereference.
+
+Use a reserved internal name in all four getters so their argument can have
+any valid identifier.  This fixes a direct-switch completion crash where
+EDMA_TXCMPL_OPAQUE_GET(desc) generated a load from address zero.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_rx.h | 16 ++++++++--------
+ drivers/net/ethernet/qualcomm/ppe/edma_tx.h | 12 ++++++------
+ 2 files changed, 14 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -42,9 +42,9 @@
+ #define EDMA_RXDESC_BUFFER_ADDR_GET(desc)	\
+ 				((u32)(le32_to_cpu((__force __le32)((desc)->word0))))
+ #define EDMA_RXDESC_OPAQUE_GET(_desc) ({ \
+-			typeof(_desc) (desc) = (_desc); \
+-			((uintptr_t)((u64)((desc)->word2) | \
+-			((u64)((desc)->word3) << 0x20))); })
++			typeof(_desc) (__desc) = (_desc); \
++			((uintptr_t)((u64)((__desc)->word2) | \
++			((u64)((__desc)->word3) << 0x20))); })
+ 
+ #define EDMA_RXDESC_SRCINFO_TYPE_PORTID		0x2000
+ #define EDMA_RXDESC_SRCINFO_TYPE_MASK		0xF000
+@@ -117,9 +117,9 @@
+ #endif
+ 
+ #define EDMA_RXFILL_OPAQUE_GET(_desc) ({ \
+-			typeof(_desc) (desc) = (_desc); \
+-			((uintptr_t)((u64)((desc)->word2) | \
+-			((u64)((desc)->word3) << 0x20))); })
++			typeof(_desc) (__desc) = (_desc); \
++			((uintptr_t)((u64)((__desc)->word2) | \
++			((u64)((__desc)->word3) << 0x20))); })
+ 
+ #define EDMA_RXFILL_PACKET_LEN_SET(desc, len)	{ \
+ 	(((desc)->word1) = (u32)((((u32)len) << EDMA_RXFILL_BUF_SIZE_SHIFT) & \
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.h
+@@ -115,13 +115,13 @@
+ 
+ #ifdef __LP64__
+ #define EDMA_TXDESC_OPAQUE_GET(_desc) ({ \
+-			typeof(_desc) (desc) = (_desc); \
+-			(((u64)(desc)->word3 << 32) | (desc)->word2); })
++			typeof(_desc) (__desc) = (_desc); \
++			(((u64)(__desc)->word3 << 32) | (__desc)->word2); })
+ 
+ #define EDMA_TXCMPL_OPAQUE_GET(_desc) ({ \
+-			typeof(_desc) (desc) = (_desc); \
+-			(((u64)(desc)->word1 << 32) | \
+-			(desc)->word0); })
++			typeof(_desc) (__desc) = (_desc); \
++			(((u64)(__desc)->word1 << 32) | \
++			(__desc)->word0); })
+ 
+ #define EDMA_TXDESC_OPAQUE_LO_SET(desc, ptr)	((desc)->word2 = \
+ 						(u32)(uintptr_t)(ptr))
