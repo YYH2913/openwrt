@@ -9,11 +9,14 @@ the implementation relies on, the sources the hardware programming was
 derived from, and the feature and hardware-validation limits that
 remain.
 
+Based-on: https://github.com/hurrian/openwrt-w1700k/commit/bdc7f266f873b3bd83f58296730d6e97e3185688
 Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 --- /dev/null
 +++ b/Documentation/networking/qualcomm-ppe-offload.rst
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,324 @@
 +.. SPDX-License-Identifier: GPL-2.0-only
 +
 +Qualcomm PPE hardware offload
@@ -78,6 +81,7 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +  TBF port shaper                 yes                register-portable
 +  on-die tunnel engine seam       present            absent
 +  virtual ports (wireless)        present            absent
++  EIP-197 IPsec (outer/full)      present            absent
 +
 +"Register-portable" means the table and flow programming applies
 +unchanged; what an HPPE port supplies is the EDMA glue, not new PPE
@@ -306,6 +310,13 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +   publishing either flow direction. The supported underlay is a PPE
 +   physical port with an optional 802.1Q VLAN and lifecycle-owned PPPoE;
 +   malformed or unrepresentable configurations stay on the software path.
++ - EIP-197 offloads supported ESP tunnel and transport SAs through an XFRM
++   state provider. Host look-aside remains the fallback path. Eligible
++   inbound ESP and NAT-T outer flows use PPE -> EIP -> PPE, while eligible
++   outbound clear-text flowtable entries use full-inline encryption. The
++   provider retains the exact SA and transform record for every hardware
++   flow, accounts hardware lifetime and sequence state, and falls back to
++   native ESP when an SA or route cannot be represented.
 +
 +Remaining work
 +--------------
@@ -314,9 +325,7 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +
 + - Other tunnel families: VXLAN, GENEVE and MAP-T. MAP-T needs stateless
 +   IPv4/IPv6 translation and paired translation rules rather than the
-+   IPIP6 transaction above. IPsec remains separate: it needs the EIP-197
-+   crypto engine, a separate device with its own firmware, and is out of
-+   scope.
++   IPIP6 transaction above.
 + - QoS beyond the root TBF offload and the mainline scheduler defaults
 +   (the hardware also has per-queue and flow shapers and a full
 +   scheduler hierarchy), and NAT66.
@@ -330,5 +339,5 @@ Signed-off-by: Kenneth Kasilag <kenneth@kasilag.me>
 +the unmodified egress tag mode preserves tags end to end on
 +VLAN-unaware bridges; whether a long hardware flow aging timer is usable
 +as a revalidation net for the stale-route blind spot above; and the
-+direct-switch and tunnel datapaths under sustained traffic on each
-+supported radio and underlay combination.
++direct-switch, tunnel and EIP inline datapaths under sustained traffic on
++each supported radio and underlay combination.
