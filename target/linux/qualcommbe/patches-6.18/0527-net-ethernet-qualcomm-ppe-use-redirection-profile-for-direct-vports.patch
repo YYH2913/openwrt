@@ -1,0 +1,141 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 19:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: use redirection profile for direct vports
+
+The vendor PPE driver assigns redirection queue profile 9 to both
+PPE direct-switch enqueue vports and direct WLAN vports.  Keep normal
+virtual ports on the EDMA CPU profile, but let direct vports select the
+separate profile so their eight-queue sets are not affected by EDMA RSS
+queue offsets.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_config.h |  1 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c     | 39 +++++++++++++++---------
+ 2 files changed, 26 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
+@@ -20,6 +20,7 @@
+ 
+ #define PPE_QUEUE_INTER_PRI_NUM			16
+ #define PPE_QUEUE_HASH_NUM			256
++#define PPE_QUEUE_REDIR_PROFILE_ID		9
+ 
+ /* The service code is used by EDMA port to transmit packet to PPE. */
+ #define PPE_EDMA_SC_BYPASS_ID			1
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -151,7 +151,7 @@
+  * ppe_drv_port_alloc() for a wireless virtual port.
+  */
+ static int ppe_vp_hw_set_queue(struct ppe_device *ppe_dev, int vp,
+-			       bool active, int queue)
++			       bool active, int queue, int profile)
+ {
+ 	struct ppe_queue_ucast_dest queue_dst = {};
+ 	int ret;
+@@ -178,7 +178,7 @@
+ 
+ 	if (active) {
+ 		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
+-					       EDMA_CPU_PORT_PROFILE_ID);
++					       profile);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -207,7 +207,16 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue);
++	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue,
++				   EDMA_CPU_PORT_PROFILE_ID);
++}
++
++static int ppe_vp_ds_hw_set_queue(struct ppe_device *ppe_dev, int vp,
++				  bool active, int queue)
++{
++	int profile = active ? PPE_QUEUE_REDIR_PROFILE_ID : 0;
++
++	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue, profile);
+ }
+ 
+ static int ppe_vp_hw_set_mtu(struct ppe_device *ppe_dev, int vp, int mtu)
+@@ -239,7 +248,7 @@
+ static void ppe_vp_hw_rollback(struct ppe_device *ppe_dev,
+ 			       struct ppe_vp_slot *slot, int vp)
+ {
+-	if (ppe_vp_hw_set_queue(ppe_dev, vp, false, 0))
++	if (ppe_vp_hw_set_queue(ppe_dev, vp, false, 0, 0))
+ 		slot->poisoned = true;
+ }
+ 
+@@ -580,9 +589,9 @@
+ 				goto out;
+ 			}
+ 			if (slot->ds_node == PPE_VP_DS_NODE_NONE) {
+-				ret = ppe_vp_hw_set_queue(ppe_dev,
+-						       PPE_VP_PORT_BASE + i, true,
+-						       queue);
++				ret = ppe_vp_ds_hw_set_queue(ppe_dev,
++							     PPE_VP_PORT_BASE + i, true,
++							     queue);
+ 				if (ret)
+ 					goto out;
+ 				slot->ds_node = node;
+@@ -603,8 +612,8 @@
+ 		goto out;
+ 	}
+ 
+-	ret = ppe_vp_hw_set_queue(ppe_dev, PPE_VP_PORT_BASE + free, true,
+-				      queue);
++	ret = ppe_vp_ds_hw_set_queue(ppe_dev, PPE_VP_PORT_BASE + free, true,
++				     queue);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -635,7 +644,7 @@
+ {
+ 	int ret;
+ 
+-	ret = ppe_vp_hw_set_queue(ppe_dev, port, false, 0);
++	ret = ppe_vp_ds_hw_set_queue(ppe_dev, port, false, 0);
+ 	if (ret) {
+ 		slot->poisoned = true;
+ 		dev_err(ppe_dev->dev,
+@@ -673,8 +682,8 @@
+ 			if (slot->ds_node_refs[next] && vp->ds_node_up[next])
+ 				break;
+ 		if (next < PPE_VP_DS_NODES) {
+-			ret = ppe_vp_hw_set_queue(ppe_dev, port, true,
+-						      slot->ds_queues[next]);
++			ret = ppe_vp_ds_hw_set_queue(ppe_dev, port, true,
++						     slot->ds_queues[next]);
+ 			if (ret) {
+ 				dev_err(ppe_dev->dev,
+ 					"failed to move VP %d to DS node %d: %d\n",
+@@ -819,7 +828,8 @@
+ 		if (up) {
+ 			if (slot->ds_node != PPE_VP_DS_NODE_NONE)
+ 				continue;
+-			ret = ppe_vp_hw_set_queue(ppe_dev, port, true, slot->ds_queues[node]);
++			ret = ppe_vp_ds_hw_set_queue(ppe_dev, port, true,
++						     slot->ds_queues[node]);
+ 			if (ret) {
+ 				dev_err(ppe_dev->dev,
+ 					"failed to activate VP %d on DS node %d: %d\n",
+@@ -840,7 +850,8 @@
+ 			if (slot->ds_node_refs[next] && vp->ds_node_up[next])
+ 				break;
+ 		if (next < PPE_VP_DS_NODES) {
+-			ret = ppe_vp_hw_set_queue(ppe_dev, port, true, slot->ds_queues[next]);
++			ret = ppe_vp_ds_hw_set_queue(ppe_dev, port, true,
++						     slot->ds_queues[next]);
+ 			if (!ret) {
+ 				slot->ds_node = next;
+ 				continue;
+-- 
+2.43.0
