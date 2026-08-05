@@ -1,0 +1,92 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 19:10:00 +0800
+Subject: [PATCH] wifi: mac80211: expose station link state in debugfs
+
+The station bitrate exported through nl80211 describes a current or last
+PPDU, not the association limit.  A narrow PPDU can therefore look like a
+bandwidth renegotiation even when the station remains EHT320-capable.
+
+Expose the mac80211 state which actually controls transmissions to a peer:
+the capability and operating-mode NSS limits, effective NSS and bandwidth,
+the peer bandwidth limit, SMPS mode, and RX OMI bandwidth limits.  This
+makes a real operating-mode change distinguishable from a driver rate-cache
+update on all mac80211 drivers.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ net/mac80211/debugfs_sta.c | 54 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+--- a/net/mac80211/debugfs_sta.c
++++ b/net/mac80211/debugfs_sta.c
+@@ -1231,6 +1231,59 @@ out:
+ }
+ LINK_STA_OPS(eht_capa);
+ 
++static unsigned int link_sta_bw_mhz(enum ieee80211_sta_rx_bandwidth bw)
++{
++	switch (bw) {
++	case IEEE80211_STA_RX_BW_20:
++		return 20;
++	case IEEE80211_STA_RX_BW_40:
++		return 40;
++	case IEEE80211_STA_RX_BW_80:
++		return 80;
++	case IEEE80211_STA_RX_BW_160:
++		return 160;
++	case IEEE80211_STA_RX_BW_320:
++		return 320;
++	}
++
++	return 0;
++}
++
++static const char *link_sta_smps_name(enum ieee80211_smps_mode mode)
++{
++	switch (mode) {
++	case IEEE80211_SMPS_AUTOMATIC:
++		return "automatic";
++	case IEEE80211_SMPS_OFF:
++		return "off";
++	case IEEE80211_SMPS_STATIC:
++		return "static";
++	case IEEE80211_SMPS_DYNAMIC:
++		return "dynamic";
++	case IEEE80211_SMPS_NUM_MODES:
++		break;
++	}
++
++	return "unknown";
++}
++
++static ssize_t link_sta_link_state_read(struct file *file, char __user *userbuf,
++					size_t count, loff_t *ppos)
++{
++	struct link_sta_info *link_sta = file->private_data;
++
++	return mac80211_format_buffer(userbuf, count, ppos,
++		"capa_nss=%u\nop_mode_nss=%u\neffective_nss=%u\nsmps=%s\n"
++		"peer_max_bw=%u\neffective_bw=%u\nrx_omi_bw_tx=%u\nrx_omi_bw_rx=%u\n",
++		link_sta->capa_nss, link_sta->op_mode_nss,
++		link_sta->pub->rx_nss, link_sta_smps_name(link_sta->pub->smps_mode),
++		link_sta_bw_mhz(link_sta->cur_max_bandwidth),
++		link_sta_bw_mhz(link_sta->pub->bandwidth),
++		link_sta_bw_mhz(link_sta->rx_omi_bw_tx),
++		link_sta_bw_mhz(link_sta->rx_omi_bw_rx));
++}
++LINK_STA_OPS(link_state);
++
+ #define DEBUGFS_ADD(name) \
+ 	debugfs_create_file(#name, 0400, \
+ 		sta->debugfs_dir, sta, &sta_ ##name## _ops)
+@@ -1329,6 +1382,7 @@ void ieee80211_link_sta_debugfs_add(stru
+ 	DEBUGFS_ADD(vht_capa);
+ 	DEBUGFS_ADD(he_capa);
+ 	DEBUGFS_ADD(eht_capa);
++	DEBUGFS_ADD(link_state);
+ 
+ 	DEBUGFS_ADD_COUNTER(rx_duplicates, rx_stats.num_duplicates);
+ 	DEBUGFS_ADD_COUNTER(rx_fragments, rx_stats.fragments);
+-- 
+2.43.0
