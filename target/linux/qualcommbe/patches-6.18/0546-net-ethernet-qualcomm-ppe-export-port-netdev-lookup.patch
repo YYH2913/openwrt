@@ -1,0 +1,94 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 31 Jul 2026 20:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: export port netdev lookup
+
+The EIP-197 hybrid inline path receives a physical source port in the
+result descriptor and needs the corresponding EDMA netdevice before it can
+reinject the decrypted packet into the network stack.  The downstream EIP
+driver used a private ppe_drv_port_num_to_dev() interface which is not part
+of the upstream qcom_ppe driver.
+
+Export a small public lookup API.  Take the device reference while holding
+the RCU read lock used to protect the EDMA port array, so removal cannot
+free the netdevice until the caller calls dev_put().
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c | 29 ++++++++++++++++++++
+ include/linux/soc/qcom/ppe.h                  | 21 ++++++++++++++
+ 2 files changed, 50 insertions(+)
+ create mode 100644 include/linux/soc/qcom/ppe.h
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -8,6 +8,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/of_net.h>
+ #include <linux/phylink.h>
++#include <linux/soc/qcom/ppe.h>
+ #include <net/pkt_cls.h>
+ #include <linux/printk.h>
+ 
+@@ -421,6 +422,34 @@ bool edma_port_dev_check(const struct ne
+ 	return dev->netdev_ops == &edma_port_netdev_ops;
+ }
+ 
++/**
++ * qcom_ppe_port_dev_get() - get the netdevice for a physical PPE port
++ * @port_num: PPE physical port number, starting at one
++ *
++ * The returned device carries a reference.  The caller must release it with
++ * dev_put() after it has finished accessing the device.
++ *
++ * Return: referenced netdevice on success, or NULL for an invalid or inactive
++ * port.
++ */
++struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
++{
++	struct net_device *dev = NULL;
++
++	if (unlikely(!edma_ctx || !edma_ctx->hw_info ||
++		     port_num < 1 || port_num > edma_ctx->hw_info->max_ports))
++		return NULL;
++
++	rcu_read_lock();
++	dev = rcu_dereference(edma_ctx->netdev_arr[port_num - 1]);
++	if (dev)
++		dev_hold(dev);
++	rcu_read_unlock();
++
++	return dev;
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_port_dev_get);
++
+ /**
+  * edma_port_destroy - EDMA port destroy.
+  * @port: PPE port
+--- /dev/null
++++ b/include/linux/soc/qcom/ppe.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 OpenWrt Project */
++
++#ifndef __LINUX_SOC_QCOM_PPE_H__
++#define __LINUX_SOC_QCOM_PPE_H__
++
++#include <linux/kconfig.h>
++#include <linux/stddef.h>
++
++struct net_device;
++
++#if IS_ENABLED(CONFIG_QCOM_PPE)
++struct net_device *qcom_ppe_port_dev_get(unsigned int port_num);
++#else
++static inline struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
++{
++	return NULL;
++}
++#endif
++
++#endif /* __LINUX_SOC_QCOM_PPE_H__ */
+-- 
+2.43.0
