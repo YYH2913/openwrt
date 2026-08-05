@@ -1,0 +1,813 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 23 Jul 2026 00:20:00 +0800
+Subject: [PATCH] wifi: ath12k: offload AP VLAN WDS peers to PPE
+
+AP_VLAN interfaces do not own firmware vdevs, but a four-address WDS
+station still needs a distinct PPE virtual port.  Sending all such peers
+through the parent AP virtual port loses the downstream peer selection and
+keeps bridged traffic on the software path.
+
+Allocate a direct-switch VP for each four-address AP_VLAN while reusing the
+parent AP firmware vdev, PMAC and bank in the hardware profile.  Move both
+the MLD and link peer mappings between the parent and VLAN VP from the
+sta_set_4addr callback, and use the parent vdev for firmware station state.
+
+Keep non-four-address AP_VLAN interfaces on the software path.  Preserve
+the logical parent and peer relationship across channel changes and
+firmware recovery, while invalidating hardware VP state before the PPE
+datapath is rebuilt.
+
+Based-on: ba31901cc92e3aa4aa2799876745af447b8a8bae
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-10-QSDK-DP-wifi-Enable-DS-support-for-WDS-AP_VLAN-inter.patch
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |   5 +-
+ drivers/net/wireless/ath/ath12k/core.h |  17 ++
+ drivers/net/wireless/ath/ath12k/mac.c  |  60 +++++
+ drivers/net/wireless/ath/ath12k/ppe.c  | 446 ++++++++++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/ppe.h  |  35 +++
+ 5 files changed, 503 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 879fb41..a01187d 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -20,6 +20,7 @@
+ #include "fw.h"
+ #include "hif.h"
+ #include "pci.h"
++#include "ppe.h"
+ #include "wow.h"
+ 
+ static int ahb_err, pci_err;
+@@ -1471,9 +1472,7 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	spin_lock_bh(&ar->data_lock);
+ 	list_for_each_safe(pos, n, &ar->arvifs) {
+ 		arvif = list_entry(pos, struct ath12k_link_vif, list);
+-		arvif->ppe_vp = -1;
+-		arvif->ppe_vp_profile = -1;
+-		arvif->ppe_search_idx = -1;
++		ath12k_ppe_ds_vif_invalidate(arvif);
+ 		list_del_init(pos);
+ 	}
+ 	spin_unlock_bh(&ar->data_lock);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index cafe80f..6e4170a 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -395,6 +395,19 @@ struct ath12k_vif {
+ 	struct ath12k_vif_cache *cache[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	/* indicates bitmap of link vif created in FW */
+ 	u32 links_map;
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	struct list_head ppe_vlan_list;
++	struct list_head ppe_vlan_node;
++	struct ath12k_vif *ppe_parent;
++	struct ath12k_base *ppe_vlan_ab;
++	int ppe_vlan_vp;
++	int ppe_vlan_profile;
++	bool ppe_vlan_peer_valid;
++	bool ppe_vlan_route_enabled;
++	bool ppe_vlan_route_programmed;
++	u8 ppe_vlan_peer[ETH_ALEN];
++	u8 ppe_vlan_link_peer[ETH_ALEN];
++#endif
+ 	/* Must be last - ends in a flexible-array member.
+ 	 *
+ 	 * FIXME: Driver should not copy struct ieee80211_chanctx_conf,
+@@ -597,6 +610,10 @@ struct ath12k_sta {
+ 
+ 	enum ieee80211_sta_state state;
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	struct ath12k_vif *ppe_vlan;
++#endif
++
+ 	struct ath12k_reoq_buf reoq_bufs[IEEE80211_NUM_TIDS + 1];
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 7f707c6..aa5d85f 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6964,6 +6964,20 @@ static int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 
+	lockdep_assert_wiphy(hw->wiphy);
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	/* Drop AP_VLAN routes while the firmware peer still exists. */
++	if (old_state == IEEE80211_STA_NONE &&
++	    new_state == IEEE80211_STA_NOTEXIST)
++		ath12k_ppe_ds_vlan_sta_remove(ahsta);
++
++	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
++		if (!ahvif->ppe_parent)
++			return -ENODEV;
++		ahvif = ahvif->ppe_parent;
++		vif = ahvif->vif;
++	}
++#endif
++
+ 	if (ieee80211_vif_is_mld(vif) && sta->valid_links) {
+ 		WARN_ON(!sta->mlo && hweight16(sta->valid_links) != 1);
+ 		link_id = ffs(sta->valid_links) - 1;
+@@ -7107,6 +7121,23 @@ exit:
+ 	return ret;
+ }
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++static void ath12k_mac_op_sta_set_4addr(struct ieee80211_hw *hw,
++					struct ieee80211_vif *vif,
++					struct ieee80211_sta *sta,
++					bool enabled)
++{
++	struct ath12k_vif *vlan = ath12k_vif_to_ahvif(vif);
++	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
++
++	lockdep_assert_wiphy(hw->wiphy);
++
++	if (vif->type != NL80211_IFTYPE_AP_VLAN)
++		return;
++	ath12k_ppe_ds_vlan_set_4addr(vlan, ahsta, enabled);
++}
++#endif
++
+ static int ath12k_mac_op_sta_set_txpwr(struct ieee80211_hw *hw,
+ 				       struct ieee80211_vif *vif,
+ 				       struct ieee80211_sta *sta)
+@@ -10085,6 +10116,10 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ {
+ 	struct ath12k_hw *ah = ath12k_hw_to_ah(hw);
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	struct ieee80211_vif *parent_vif;
++	struct ath12k_vif *parent;
++#endif
+ 	struct ath12k_reg_info *reg_info;
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k_base *ab;
+@@ -10097,6 +10132,20 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 
+ 	ahvif->ah = ah;
+ 	ahvif->vif = vif;
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	INIT_LIST_HEAD(&ahvif->ppe_vlan_list);
++	INIT_LIST_HEAD(&ahvif->ppe_vlan_node);
++	ahvif->ppe_vlan_vp = -1;
++	ahvif->ppe_vlan_profile = -1;
++
++	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
++		parent_vif = wdev_to_ieee80211_vif_vlan(ieee80211_vif_to_wdev(vif));
++		if (!parent_vif)
++			return -ENODEV;
++		parent = ath12k_vif_to_ahvif(parent_vif);
++		return ath12k_ppe_ds_vlan_add(ahvif, parent);
++	}
++#endif
+ 	arvif = &ahvif->deflink;
+ 
+ 	ath12k_mac_init_arvif(ahvif, arvif, -1);
+@@ -10226,6 +10276,13 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
++		ath12k_ppe_ds_vlan_remove(ahvif);
++		return;
++	}
++#endif
++
+ 	for (link_id = 0; link_id < ATH12K_NUM_MAX_LINKS; link_id++) {
+ 		/* if we cached some config but never received assign chanctx,
+ 		 * free the allocated cache.
+@@ -13060,6 +13117,9 @@ static const struct ieee80211_ops ath12k_ops = {
+ 	.set_key                        = ath12k_mac_op_set_key,
+ 	.set_rekey_data	                = ath12k_mac_op_set_rekey_data,
+ 	.sta_state                      = ath12k_mac_op_sta_state,
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	.sta_set_4addr                  = ath12k_mac_op_sta_set_4addr,
++#endif
+ 	.sta_set_txpwr			= ath12k_mac_op_sta_set_txpwr,
+ 	.link_sta_rc_update		= ath12k_mac_op_link_sta_rc_update,
+ 	.conf_tx                        = ath12k_mac_op_conf_tx,
+@@ -13937,6 +13997,9 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ 		ieee80211_hw_set(hw, MLO_MCAST_MULTI_LINK_TX);
+ 	}
+ 
++	if (ath12k_ppe_ds_enabled(ab))
++		ieee80211_hw_set(hw, SUPPORTS_VLAN_DATA_OFFLOAD);
++
+ 	hw->queues = ATH12K_HW_MAX_QUEUES;
+ 	wiphy->tx_queue_len = ATH12K_QUEUE_LEN;
+ 	hw->offchannel_tx_hw_queue = ATH12K_HW_MAX_QUEUES - 1;
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.c b/drivers/net/wireless/ath/ath12k/ppe.c
+index aa2ce64..0d0a640 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -849,11 +849,9 @@ next:
+ 	return done;
+ }
+ 
+-static void ath12k_ppe_ds_vp_write(struct ath12k_link_vif *arvif,
+-				   int profile, u32 value)
++static void ath12k_ppe_ds_vp_write(struct ath12k_base *ab, int profile,
++				   u32 value)
+ {
+-	struct ath12k_base *ab = arvif->ar->ab;
+-
+ 	ath12k_hif_write32(ab, ATH12K_PPE_VP_TABLE_BASE +
+ 			   profile * ATH12K_PPE_VP_TABLE_STRIDE, value);
+ }
+@@ -1019,16 +1017,193 @@ static int ath12k_ppe_ds_vif_program(struct ath12k_link_vif *arvif)
+ 		 u32_encode_bits(arvif->vdev_id, ATH12K_PPE_VP_VDEV_ID) |
+ 		 u32_encode_bits(arvif->ppe_search_idx,
+ 				 ATH12K_PPE_VP_SEARCH_IDX);
+-	ath12k_ppe_ds_vp_write(arvif, arvif->ppe_vp_profile, config);
++	ath12k_ppe_ds_vp_write(ab, arvif->ppe_vp_profile, config);
++	return 0;
++}
++
++static int
++ath12k_ppe_ds_vlan_route_apply(struct ath12k_vif *vlan,
++			       struct ath12k_link_vif *parent, bool enable);
++
++static int
++ath12k_ppe_ds_vlan_program(struct ath12k_vif *vlan,
++			   struct ath12k_link_vif *parent)
++{
++	struct ath12k_base *ab = parent->ar->ab;
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	struct ath12k_ppe_ds_vp_profile *profile;
++	u32 config;
++
++	if (vlan->ppe_vlan_profile < 0 ||
++	    vlan->ppe_vlan_profile >= ATH12K_PPE_DS_VP_PROFILES)
++		return -EINVAL;
++
++	spin_lock_bh(&ppe->vp_lock);
++	if (!test_bit(vlan->ppe_vlan_profile, &ppe->vp_profile_map)) {
++		spin_unlock_bh(&ppe->vp_lock);
++		return -ENOENT;
++	}
++	profile = &ppe->vp_profiles[vlan->ppe_vlan_profile];
++	if (profile->vp != vlan->ppe_vlan_vp || profile->refcount != 1) {
++		spin_unlock_bh(&ppe->vp_lock);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&ppe->vp_lock);
++
++	config = u32_encode_bits(vlan->ppe_vlan_vp, ATH12K_PPE_VP_NUM) |
++		 u32_encode_bits(parent->ar->lmac_id, ATH12K_PPE_VP_PMAC_ID) |
++		 u32_encode_bits(parent->bank_id, ATH12K_PPE_VP_BANK_ID) |
++		 u32_encode_bits(parent->vdev_id, ATH12K_PPE_VP_VDEV_ID);
++	ath12k_ppe_ds_vp_write(ab, vlan->ppe_vlan_profile, config);
+ 	return 0;
+ }
+ 
++static int
++ath12k_ppe_ds_vlan_attach(struct ath12k_vif *vlan,
++			  struct ath12k_link_vif *parent)
++{
++	struct ieee80211_vif *vif = vlan->vif;
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++	struct ath12k_base *ab = parent->ar->ab;
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
++	u32 refcount;
++	int released_search = -1;
++	int released_bank = DP_INVALID_BANK_ID;
++	int profile, search_idx;
++	int ret, vp;
++
++	if (!ppe->started || !parent->is_started || !wdev || !wdev->netdev ||
++	    !wdev->use_4addr)
++		return 0;
++
++	if (vlan->ppe_vlan_vp >= 64) {
++		ret = ath12k_ppe_ds_vlan_program(vlan, parent);
++		if (!ret)
++			goto restore_route;
++		if (ret != -ENOENT)
++			return ret;
++
++		vlan->ppe_vlan_vp = -1;
++		vlan->ppe_vlan_profile = -1;
++		vlan->ppe_vlan_route_programmed = false;
++	}
++
++	vp = qcom_ppe_ds_vp_alloc(ppe->node, wdev->netdev);
++	if (vp < 0)
++		return vp;
++
++	profile = ath12k_ppe_ds_vp_profile_alloc(ppe, vp,
++						 NL80211_IFTYPE_AP,
++						 &search_idx, &refcount);
++	if (profile < 0) {
++		qcom_ppe_ds_vp_free(ppe->node, vp);
++		return profile;
++	}
++	if (refcount != 1) {
++		ret = -EEXIST;
++		goto err_profile;
++	}
++
++	vlan->ppe_vlan_ab = ab;
++	vlan->ppe_vlan_vp = vp;
++	vlan->ppe_vlan_profile = profile;
++	ret = ath12k_ppe_ds_vlan_program(vlan, parent);
++	if (ret)
++		goto err_profile;
++
++	ath12k_info(ab,
++		    "PPE direct-switch AP_VLAN attached: netdev=%s parent-vdev=%u vp=%d profile=%d bank=%d\n",
++		    wdev->netdev->name, parent->vdev_id, vp, profile,
++		    parent->bank_id);
++
++restore_route:
++	if (vlan->ppe_vlan_route_enabled && vlan->ppe_vlan_peer_valid &&
++	    !vlan->ppe_vlan_route_programmed)
++		ath12k_ppe_ds_vlan_route_apply(vlan, parent, true);
++	return 0;
++
++err_profile:
++	ath12k_ppe_ds_vp_profile_put(ppe, profile, &released_search,
++				     &released_bank);
++	qcom_ppe_ds_vp_free(ppe->node, vp);
++	vlan->ppe_vlan_vp = -1;
++	vlan->ppe_vlan_profile = -1;
++	return ret;
++}
++
++static void
++ath12k_ppe_ds_vlan_detach(struct ath12k_vif *vlan,
++			  struct ath12k_link_vif *parent)
++{
++	struct ath12k_base *ab = vlan->ppe_vlan_ab;
++	struct ath12k_ppe_ds *ppe;
++	int search_idx = -1;
++	int bank_id = DP_INVALID_BANK_ID;
++	bool last;
++
++	if (!ab || vlan->ppe_vlan_vp < 64)
++		return;
++	ppe = &ab->dp.ppe_ds;
++
++	if (vlan->ppe_vlan_route_programmed && parent)
++		ath12k_ppe_ds_vlan_route_apply(vlan, parent, false);
++
++	qcom_ppe_ds_vp_free(ppe->node, vlan->ppe_vlan_vp);
++	last = ath12k_ppe_ds_vp_profile_put(ppe, vlan->ppe_vlan_profile,
++					    &search_idx, &bank_id);
++	if (last)
++		ath12k_ppe_ds_vp_write(ab, vlan->ppe_vlan_profile, 0);
++	vlan->ppe_vlan_vp = -1;
++	vlan->ppe_vlan_profile = -1;
++	vlan->ppe_vlan_route_programmed = false;
++}
++
++int ath12k_ppe_ds_vlan_add(struct ath12k_vif *vlan,
++			   struct ath12k_vif *parent)
++{
++	struct ieee80211_vif *parent_vif;
++	struct ath12k_link_vif *parent_link;
++
++	if (!vlan || !parent)
++		return -EINVAL;
++	parent_vif = parent->vif;
++	if (!parent_vif || ieee80211_vif_is_mld(parent_vif))
++		return -EOPNOTSUPP;
++
++	vlan->ppe_parent = parent;
++	list_add_tail(&vlan->ppe_vlan_node, &parent->ppe_vlan_list);
++	parent_link = &parent->deflink;
++	if (!parent_link->ar || !parent_link->is_created)
++		return 0;
++
++	return ath12k_ppe_ds_vlan_attach(vlan, parent_link);
++}
++
++void ath12k_ppe_ds_vlan_remove(struct ath12k_vif *vlan)
++{
++	struct ath12k_link_vif *parent = NULL;
++
++	if (!vlan)
++		return;
++	if (vlan->ppe_parent)
++		parent = &vlan->ppe_parent->deflink;
++	ath12k_ppe_ds_vlan_detach(vlan, parent);
++	if (!list_empty(&vlan->ppe_vlan_node))
++		list_del_init(&vlan->ppe_vlan_node);
++	vlan->ppe_parent = NULL;
++	vlan->ppe_vlan_ab = NULL;
++	vlan->ppe_vlan_peer_valid = false;
++	vlan->ppe_vlan_route_enabled = false;
++	vlan->ppe_vlan_route_programmed = false;
++}
++
+ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+ {
+ 	struct ath12k_base *ab = arvif->ar->ab;
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
+ 	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++	struct ath12k_vif *vlan;
+ 	u32 refcount;
+ 	int bank_id = DP_INVALID_BANK_ID;
+ 	int released_search = -1, released_bank = DP_INVALID_BANK_ID;
+@@ -1043,7 +1217,7 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+ 	if (arvif->ppe_vp >= 64) {
+ 		ret = ath12k_ppe_ds_vif_program(arvif);
+ 		if (!ret)
+-			return 0;
++			goto attach_vlans;
+ 		if (ret != -ENOENT)
+ 			return ret;
+ 
+@@ -1082,6 +1256,18 @@ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+ 		    "PPE direct-switch vdev %u attached: netdev=%s vp=%d profile=%d bank=%d refs=%u\n",
+ 		    arvif->vdev_id, wdev->netdev->name, vp, profile,
+ 		    refcount > 1 ? bank_id : arvif->bank_id, refcount);
++
++attach_vlans:
++	if (vif->type == NL80211_IFTYPE_AP) {
++		list_for_each_entry(vlan, &arvif->ahvif->ppe_vlan_list,
++				    ppe_vlan_node) {
++			ret = ath12k_ppe_ds_vlan_attach(vlan, arvif);
++			if (ret)
++				ath12k_warn(ab,
++					    "failed to attach AP_VLAN to PPE vdev %u: %d\n",
++					    arvif->vdev_id, ret);
++		}
++	}
+ 	return 0;
+ 
+ err_profile:
+@@ -1101,21 +1287,28 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
+ 	struct ath12k_base *ab;
+ 	struct ath12k_ppe_ds *ppe;
+ 	struct ieee80211_vif *vif;
++	struct ath12k_vif *vlan;
+ 	int search_idx = -1;
+ 	int bank_id = DP_INVALID_BANK_ID;
+ 	bool last;
+ 
+-	if (!arvif || !arvif->ar || arvif->ppe_vp < 64)
++	if (!arvif || !arvif->ar)
+ 		return;
+ 	ab = arvif->ar->ab;
+ 	ppe = &ab->dp.ppe_ds;
+ 	vif = ath12k_ahvif_to_vif(arvif->ahvif);
++	if (vif->type == NL80211_IFTYPE_AP)
++		list_for_each_entry(vlan, &arvif->ahvif->ppe_vlan_list,
++				    ppe_vlan_node)
++			ath12k_ppe_ds_vlan_detach(vlan, arvif);
++	if (arvif->ppe_vp < 64)
++		return;
+ 
+ 	qcom_ppe_ds_vp_free(ppe->node, arvif->ppe_vp);
+ 	last = ath12k_ppe_ds_vp_profile_put(ppe, arvif->ppe_vp_profile,
+ 					 &search_idx, &bank_id);
+ 	if (last)
+-		ath12k_ppe_ds_vp_write(arvif, arvif->ppe_vp_profile, 0);
++		ath12k_ppe_ds_vp_write(ab, arvif->ppe_vp_profile, 0);
+ 	if (last && vif->type == NL80211_IFTYPE_STATION) {
+ 		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
+ 				   search_idx * 4, 0);
+@@ -1127,6 +1320,88 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif)
+ 	arvif->ppe_search_idx = -1;
+ }
+ 
++static int
++ath12k_ppe_ds_peer_route_set(struct ath12k *ar, u32 vdev_id, int vp,
++			     const u8 *peer, const u8 *link_peer,
++			     bool track_peer, bool enable)
++{
++	struct ath12k_ppe_ds *ppe = &ar->ab->dp.ppe_ds;
++	int map_ret = 0;
++	int ret;
++
++	ret = ath12k_wmi_config_peer_ppeds_routing(ar, link_peer, vdev_id, vp,
++						   enable);
++	if (!track_peer)
++		return ret;
++
++	if (enable) {
++		if (ret)
++			return ret;
++		map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, vp, peer, true);
++		if (map_ret)
++			goto disable_wmi;
++		if (!ether_addr_equal(peer, link_peer)) {
++			map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, vp,
++							  link_peer, true);
++			if (map_ret) {
++				qcom_ppe_ds_vp_peer_set(ppe->node, vp, peer, false);
++				goto disable_wmi;
++			}
++		}
++		return 0;
++	}
++
++	map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, vp, peer, false);
++	if (!ether_addr_equal(peer, link_peer)) {
++		int link_ret;
++
++		link_ret = qcom_ppe_ds_vp_peer_set(ppe->node, vp, link_peer,
++						   false);
++		if (!map_ret)
++			map_ret = link_ret;
++	}
++	return ret ?: map_ret;
++
++disable_wmi:
++	ath12k_wmi_config_peer_ppeds_routing(ar, link_peer, vdev_id, vp,
++					     false);
++	return map_ret;
++}
++
++static int
++ath12k_ppe_ds_vlan_route_apply(struct ath12k_vif *vlan,
++			       struct ath12k_link_vif *parent, bool enable)
++{
++	struct ath12k_base *ab;
++	int ret;
++
++	if (!vlan || !parent || !parent->ar || !vlan->ppe_vlan_peer_valid)
++		return -EINVAL;
++	ab = parent->ar->ab;
++	if (!ab->dp.ppe_ds.started || vlan->ppe_vlan_ab != ab ||
++	    vlan->ppe_vlan_vp < 64)
++		return -ENODEV;
++
++	ret = ath12k_ppe_ds_peer_route_set(parent->ar, parent->vdev_id,
++					   vlan->ppe_vlan_vp,
++					   vlan->ppe_vlan_peer,
++					   vlan->ppe_vlan_link_peer,
++					   true, enable);
++	if (ret) {
++		ath12k_warn(ab,
++			    "failed to %s PPE AP_VLAN route for peer %pM vdev %u VP %d: %d\n",
++			    enable ? "enable" : "disable",
++			    vlan->ppe_vlan_link_peer, parent->vdev_id,
++			    vlan->ppe_vlan_vp, ret);
++		if (enable)
++			vlan->ppe_vlan_route_programmed = false;
++		return ret;
++	}
++
++	vlan->ppe_vlan_route_programmed = enable;
++	return 0;
++}
++
+ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+ 			      struct ath12k_link_vif *arvif,
+ 			      struct ath12k_link_sta *arsta, bool enable)
+@@ -1135,15 +1410,33 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
+ 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
++	struct ath12k_vif *vlan = arsta->ahsta->ppe_vlan;
+ 	bool track_peer = !sta->mlo || arsta->is_assoc_link;
+-	int ret, map_ret;
++	int ret, vp = arvif->ppe_vp;
+ 	u32 map = 0;
+ 
+-	if (!ppe->started || arvif->ppe_vp < 64)
++	if (!ppe->started)
+ 		return;
+ 
+-	if (vif->type == NL80211_IFTYPE_STATION &&
+-	    (!sta->mlo || arsta->is_assoc_link)) {
++	if (vlan && vif->type == NL80211_IFTYPE_AP &&
++	    vlan->ppe_parent == arvif->ahvif) {
++		vlan->ppe_vlan_route_enabled = enable;
++		if (enable && vlan->ppe_vlan_vp < 64) {
++			ret = ath12k_ppe_ds_vlan_attach(vlan, arvif);
++			if (ret) {
++				ath12k_warn(ab,
++					    "failed to allocate PPE AP_VLAN route for peer %pM: %d\n",
++					    arsta->addr, ret);
++				return;
++			}
++		}
++		vp = vlan->ppe_vlan_vp;
++	}
++
++	if (vp < 64)
++		return;
++
++	if (vif->type == NL80211_IFTYPE_STATION && track_peer) {
+ 		if (enable)
+ 			map = u32_encode_bits(arvif->ast_idx,
+ 					      ATH12K_PPE_SEARCH_AST_IDX) |
+@@ -1153,60 +1446,104 @@ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+ 				   arvif->ppe_search_idx * 4, map);
+ 	}
+ 
+-	ret = ath12k_wmi_config_peer_ppeds_routing(ar, arsta->addr,
+-						   arvif->vdev_id, arvif->ppe_vp,
+-					  enable);
++	ret = ath12k_ppe_ds_peer_route_set(ar, arvif->vdev_id, vp, sta->addr,
++					   arsta->addr, track_peer, enable);
+ 	if (ret)
+ 		ath12k_warn(ab,
+ 			    "failed to %s PPE routing for peer %pM vdev %u VP %d: %d\n",
+ 			    enable ? "enable" : "disable", arsta->addr,
+-			    arvif->vdev_id, arvif->ppe_vp, ret);
+-	if (!track_peer)
+-		return;
++			    arvif->vdev_id, vp, ret);
++	if (vlan && vp == vlan->ppe_vlan_vp)
++		vlan->ppe_vlan_route_programmed = enable && !ret;
+ 
+-	if (enable) {
+-		if (ret)
+-			goto clear_search;
++	if (ret && enable && vif->type == NL80211_IFTYPE_STATION)
++		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
++				   arvif->ppe_search_idx * 4, 0);
++}
+ 
+-		map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
+-						  sta->addr, true);
+-		if (map_ret)
+-			goto disable_wmi;
+-		if (!ether_addr_equal(sta->addr, arsta->addr)) {
+-			map_ret = qcom_ppe_ds_vp_peer_set(ppe->node,
+-							  arvif->ppe_vp,
+-							  arsta->addr, true);
+-			if (map_ret) {
+-				qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
+-							sta->addr, false);
+-				goto disable_wmi;
+-			}
+-		}
++void ath12k_ppe_ds_vlan_set_4addr(struct ath12k_vif *vlan,
++				  struct ath12k_sta *ahsta,
++				  bool enabled)
++{
++	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(ahsta);
++	struct ath12k_link_sta *arsta = &ahsta->deflink;
++	struct ath12k_vif *old_vlan = ahsta->ppe_vlan;
++	struct ath12k_link_vif *parent;
++	struct ath12k *ar;
++
++	if (!vlan || !vlan->ppe_parent || sta->mlo)
++		return;
++	parent = &vlan->ppe_parent->deflink;
++	if (!parent->ar || arsta->arvif != parent)
+ 		return;
++	ar = parent->ar;
++
++	if (old_vlan && old_vlan != vlan) {
++		ath12k_ppe_ds_peer_route(ar, parent, arsta, false);
++		old_vlan->ppe_vlan_peer_valid = false;
++		old_vlan->ppe_vlan_route_enabled = false;
++		old_vlan->ppe_vlan_route_programmed = false;
++		ahsta->ppe_vlan = NULL;
+ 	}
+ 
+-	map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
+-					  sta->addr, false);
+-	if (map_ret)
+-		ath12k_warn(ab, "failed to clear PPE route for peer %pM: %d\n",
+-			    sta->addr, map_ret);
+-	if (!ether_addr_equal(sta->addr, arsta->addr)) {
+-		map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
+-						  arsta->addr, false);
+-		if (map_ret)
+-			ath12k_warn(ab,
+-				    "failed to clear PPE route for link peer %pM: %d\n",
+-				    arsta->addr, map_ret);
++	if (enabled) {
++		if (!old_vlan && ahsta->state == IEEE80211_STA_AUTHORIZED)
++			ath12k_ppe_ds_peer_route(ar, parent, arsta, false);
++		ahsta->ppe_vlan = vlan;
++		ether_addr_copy(vlan->ppe_vlan_peer, sta->addr);
++		ether_addr_copy(vlan->ppe_vlan_link_peer, arsta->addr);
++		vlan->ppe_vlan_peer_valid = true;
++		vlan->ppe_vlan_route_enabled =
++			ahsta->state == IEEE80211_STA_AUTHORIZED;
++		if (vlan->ppe_vlan_route_enabled)
++			ath12k_ppe_ds_peer_route(ar, parent, arsta, true);
++		return;
+ 	}
+-	return;
+ 
+-disable_wmi:
+-	ath12k_warn(ab, "failed to map PPE route for peer %pM: %d\n",
+-		    sta->addr, map_ret);
+-	ath12k_wmi_config_peer_ppeds_routing(ar, arsta->addr, arvif->vdev_id,
+-					      arvif->ppe_vp, false);
+-clear_search:
+-	if (vif->type == NL80211_IFTYPE_STATION)
+-		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
+-				   arvif->ppe_search_idx * 4, 0);
++	if (ahsta->ppe_vlan != vlan)
++		return;
++	if (vlan->ppe_vlan_route_programmed)
++		ath12k_ppe_ds_peer_route(ar, parent, arsta, false);
++	ahsta->ppe_vlan = NULL;
++	vlan->ppe_vlan_peer_valid = false;
++	vlan->ppe_vlan_route_enabled = false;
++	vlan->ppe_vlan_route_programmed = false;
++
++	if (ahsta->state == IEEE80211_STA_AUTHORIZED)
++		ath12k_ppe_ds_peer_route(ar, parent, arsta, true);
++}
++
++void ath12k_ppe_ds_vlan_sta_remove(struct ath12k_sta *ahsta)
++{
++	struct ath12k_vif *vlan = ahsta->ppe_vlan;
++	struct ath12k_link_sta *arsta = &ahsta->deflink;
++	struct ath12k_link_vif *parent;
++
++	if (!vlan)
++		return;
++	parent = vlan->ppe_parent ? &vlan->ppe_parent->deflink : NULL;
++	if (vlan->ppe_vlan_route_programmed && parent && parent->ar &&
++	    arsta->arvif == parent)
++		ath12k_ppe_ds_peer_route(parent->ar, parent, arsta, false);
++	vlan->ppe_vlan_peer_valid = false;
++	vlan->ppe_vlan_route_enabled = false;
++	vlan->ppe_vlan_route_programmed = false;
++	ahsta->ppe_vlan = NULL;
++}
++
++void ath12k_ppe_ds_vif_invalidate(struct ath12k_link_vif *arvif)
++{
++	struct ath12k_vif *vlan;
++
++	if (!arvif)
++		return;
++	list_for_each_entry(vlan, &arvif->ahvif->ppe_vlan_list,
++			    ppe_vlan_node) {
++		vlan->ppe_vlan_vp = -1;
++		vlan->ppe_vlan_profile = -1;
++		vlan->ppe_vlan_route_programmed = false;
++	}
++	arvif->ppe_vp = -1;
++	arvif->ppe_vp_profile = -1;
++	arvif->ppe_search_idx = -1;
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.h b/drivers/net/wireless/ath/ath12k/ppe.h
+index 2b46a61..a8241e6 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -6,6 +6,8 @@ struct ath12k;
+ struct ath12k_base;
+ struct ath12k_link_sta;
+ struct ath12k_link_vif;
++struct ath12k_sta;
++struct ath12k_vif;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ #define ATH12K_PPE_DS_NAPI_WEIGHT 128
+@@ -23,6 +25,14 @@ void ath12k_ppe_ds_vif_detach(struct ath12k_link_vif *arvif);
+ void ath12k_ppe_ds_peer_route(struct ath12k *ar,
+ 			      struct ath12k_link_vif *arvif,
+ 			      struct ath12k_link_sta *arsta, bool enable);
++int ath12k_ppe_ds_vlan_add(struct ath12k_vif *vlan,
++			   struct ath12k_vif *parent);
++void ath12k_ppe_ds_vlan_remove(struct ath12k_vif *vlan);
++void ath12k_ppe_ds_vlan_set_4addr(struct ath12k_vif *vlan,
++				  struct ath12k_sta *ahsta,
++				  bool enabled);
++void ath12k_ppe_ds_vlan_sta_remove(struct ath12k_sta *ahsta);
++void ath12k_ppe_ds_vif_invalidate(struct ath12k_link_vif *arvif);
+ #else
+ static inline bool ath12k_ppe_ds_enabled(struct ath12k_base *ab)
+ {
+@@ -77,6 +87,31 @@ ath12k_ppe_ds_peer_route(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 			 struct ath12k_link_sta *arsta, bool enable)
+ {
+ }
++
++static inline int ath12k_ppe_ds_vlan_add(struct ath12k_vif *vlan,
++					 struct ath12k_vif *parent)
++{
++	return 0;
++}
++
++static inline void ath12k_ppe_ds_vlan_remove(struct ath12k_vif *vlan)
++{
++}
++
++static inline void
++ath12k_ppe_ds_vlan_set_4addr(struct ath12k_vif *vlan,
++			     struct ath12k_sta *ahsta, bool enabled)
++{
++}
++
++static inline void ath12k_ppe_ds_vlan_sta_remove(struct ath12k_sta *ahsta)
++{
++}
++
++static inline void
++ath12k_ppe_ds_vif_invalidate(struct ath12k_link_vif *arvif)
++{
++}
+ #endif
+ 
+ #endif
