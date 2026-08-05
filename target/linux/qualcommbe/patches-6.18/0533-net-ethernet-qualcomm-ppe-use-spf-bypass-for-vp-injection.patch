@@ -1,0 +1,105 @@
+From: Manish Verma <maniverm@qti.qualcomm.com>
+Date: Mon, 29 Jun 2026 16:09:18 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: use SPF bypass for VP injection
+
+The vendor virtual-port transmit path tags source-VP packets with service
+code 12.  That service code bypasses the four egress L2 checks which are
+not meaningful for a packet injected from a wireless virtual port, while
+leaving flow lookup, NAT and L3 routing active.
+
+Configure the same service-code entry and put it in source-VP EDMA
+descriptors.  Without it the PPE can reject the wireless uplink at source
+port filtering instead of matching the installed routed flow.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/d2fb3254b6f3b3f1d4cf8f3d1db4cf1d14f442ff
+Signed-off-by: Manish Verma <maniverm@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_tx.c    | 12 +++++++-----
+ drivers/net/ethernet/qualcomm/ppe/ppe_config.c | 18 ++++++++++++++++--
+ drivers/net/ethernet/qualcomm/ppe/ppe_config.h |  1 +
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -19,6 +19,7 @@
+ #include "edma_cfg_tx.h"
+ #include "edma_port.h"
+ #include "ppe.h"
++#include "ppe_config.h"
+ #include "ppe_regs.h"
+ 
+ static u32 edma_tx_num_descs_for_sg(struct sk_buff *skb)
+@@ -417,11 +418,11 @@ static void edma_tx_fill_desc(struct edm
+ 	/* Check if the packet needs TSO
+ 	 * This will be mostly true for SG packets.
+ 	 */
+-	/* A virtual-port inject tags the SOURCE with the virtual port and
+-	 * carries no bypass service code, so the PPE runs the L3 ingress
+-	 * pipeline (flow lookup, NAT) and routes the frame by a flow entry
+-	 * instead of forwarding it straight out a destination port. This is
+-	 * the wireless-to-wired uplink; see edma_tx_vp_inject(). It is handled
++	/* A virtual-port inject tags the source with the virtual port and
++	 * carries the source-port-filter bypass service code. Code 12 leaves
++	 * flow lookup and L3 routing active while bypassing inapplicable L2
++	 * egress checks. This is the wireless-to-wired uplink; see
++	 * edma_tx_vp_inject(). It is handled
+ 	 * before TSO so a source-tagged descriptor never also carries hardware
+ 	 * TSO, an unvalidated combination; the inject software-segments every
+ 	 * GSO frame upstream, so this path only ever sees non-GSO injects.
+@@ -428,6 +429,7 @@ static void edma_tx_fill_desc(struct edm
+ 	 */
+ 	if (src_vp >= 0) {
+ 		EDMA_SRC_INFO_SET(txd, src_vp);
++		EDMA_TXDESC_SERVICE_CODE_SET(txd, PPE_EDMA_SC_SPF_BYPASS_ID);
+ 		return;
+ 	}
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -2665,7 +2665,8 @@ static int ppe_queue_dest_init(struct pp
+-/* Initialize the service code 1 used by CPU port. */
++/* Initialize EDMA service codes used by CPU and virtual-port injection. */
+ static int ppe_servcode_init(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_sc_cfg sc_cfg = {};
++	int ret;
+ 
+ 	bitmap_zero(sc_cfg.bitmaps.counter, PPE_SC_BYPASS_COUNTER_SIZE);
+ 	bitmap_zero(sc_cfg.bitmaps.tunnel, PPE_SC_BYPASS_TUNNEL_SIZE);
+@@ -2678,7 +2679,20 @@ static int ppe_servcode_init(struct ppe_
+ 	bitmap_fill(sc_cfg.bitmaps.egress, PPE_SC_BYPASS_EGRESS_SIZE);
+ 	clear_bit(PPE_SC_BYPASS_EGRESS_ACL_POST_ROUTING_CHECK, sc_cfg.bitmaps.egress);
+ 
+-	return ppe_sc_config_set(ppe_dev, PPE_EDMA_SC_BYPASS_ID, sc_cfg);
++	ret = ppe_sc_config_set(ppe_dev, PPE_EDMA_SC_BYPASS_ID, sc_cfg);
++	if (ret)
++		return ret;
++
++	sc_cfg = (struct ppe_sc_cfg){};
++	set_bit(PPE_SC_BYPASS_EGRESS_VLAN_MEMBER_CHECK,
++		sc_cfg.bitmaps.egress);
++	set_bit(PPE_SC_BYPASS_EGRESS_SOURCE_FLTR, sc_cfg.bitmaps.egress);
++	set_bit(PPE_SC_BYPASS_EGRESS_BRIDGING_FWD, sc_cfg.bitmaps.egress);
++	set_bit(PPE_SC_BYPASS_EGRESS_L2_SOURCE_SECURITY,
++		sc_cfg.bitmaps.egress);
++	sc_cfg.next_service_code = PPE_EDMA_SC_SPF_BYPASS_ID;
++
++	return ppe_sc_config_set(ppe_dev, PPE_EDMA_SC_SPF_BYPASS_ID, sc_cfg);
+ }
+ 
+ /* Initialize PPE port configurations. */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
+@@ -24,6 +24,7 @@
+ 
+ /* The service code is used by EDMA port to transmit packet to PPE. */
+ #define PPE_EDMA_SC_BYPASS_ID			1
++#define PPE_EDMA_SC_SPF_BYPASS_ID		12
+ 
+ /* The PPE RSS hash configured for IPv4 and IPv6 packet separately. */
+ #define PPE_RSS_HASH_MODE_IPV4			BIT(0)
+-- 
+2.43.0
