@@ -1,0 +1,185 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 21:20:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: expose direct-switch hardware state
+
+The existing direct-switch debugfs view reports software lifecycle state
+and ring indices, but cannot distinguish a stopped EDMA ring from a PPE
+queue mapping or scheduler failure.
+
+Expose the direct-switch flow-enqueue and source-profile maps, EDMA v2 ring
+controls and mappings, queue-to-ring bitmaps, and the per-queue enable,
+pending, transmit and drop state.  This keeps diagnosis read-only and makes
+before/after traffic snapshots sufficient to locate the first idle stage.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -1520,12 +1520,155 @@ int qcom_ppe_ds_vp_peer_set(struct qcom_
+ }
+ EXPORT_SYMBOL_GPL(qcom_ppe_ds_vp_peer_set);
+ 
++static u32 ppe_ds_debugfs_read(struct regmap *regmap, u32 reg)
++{
++	u32 val = U32_MAX;
++
++	regmap_read(regmap, reg, &val);
++	return val;
++}
++
++static void ppe_ds_debugfs_global_maps(struct seq_file *s, struct ppe_ds *ds)
++{
++	struct regmap *regmap = ds->ppe_dev->regmap;
++	int port, src_profile, i;
++	u32 index, reg, val;
++
++	seq_puts(s, "flow_enqueue_map");
++	for (i = 0; i < PPE_DS_NODES; i++) {
++		index = PPE_DS_FLOW_ENQUEUE_MAP_BASE +
++			PPE_DS_PRI_PROFILE_BASE + i;
++		reg = PPE_DS_FLOW_ENQUEUE_MAP_ADDR +
++		      index * PPE_DS_FLOW_ENQUEUE_MAP_INC;
++		val = ppe_ds_debugfs_read(regmap, reg);
++		seq_printf(s, " %u=0x%08x", index, val);
++	}
++	seq_putc(s, '\n');
++
++	for (port = PPE_DS_ENQUEUE_VP_BASE - PPE_DS_NODES + 1;
++	     port <= PPE_VP_PORT_BASE; port++) {
++		seq_printf(s, "port%d_qmap", port);
++		for (src_profile = 0;
++		     src_profile < PPE_QUEUE_SRC_PROFILE_NUM; src_profile++) {
++			index = (src_profile << 8) + port;
++			reg = PPE_UCAST_QUEUE_MAP_TBL_ADDR +
++			      index * PPE_UCAST_QUEUE_MAP_TBL_INC;
++			val = ppe_ds_debugfs_read(regmap, reg);
++			seq_printf(s, " %d=%u/%u(0x%08x)", src_profile,
++				   (u32)FIELD_GET(PPE_UCAST_QUEUE_MAP_TBL_QUEUE_ID,
++						  val),
++				   (u32)FIELD_GET(PPE_UCAST_QUEUE_MAP_TBL_PROFILE_ID,
++						  val),
++				   val);
++		}
++		seq_putc(s, '\n');
++	}
++}
++
++static void
++ppe_ds_debugfs_node_hw(struct seq_file *s, struct qcom_ppe_ds_node *node)
++{
++	struct regmap *regmap = ppe_ds_regmap(node);
++	u32 ring_map[PPE_RING_TO_QUEUE_BITMAP_WORD_CNT] = {};
++	u32 qid2rid, ac, enq, deq, pending, tx, drop, l0, l0_port;
++	u32 ring = node->ppe2tcl.ring_id;
++	u32 reg, val;
++	unsigned int i, queue;
++
++	seq_printf(s,
++		   "  rxdesc ctrl=0x%08x disable=0x%08x done=0x%08x int_mask=0x%08x\n",
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXDESC_CTRL(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXDESC_DISABLE_DONE(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(ring))));
++	seq_printf(s,
++		   "  rxfill enable=0x%08x disable=0x%08x done=0x%08x int_mask=0x%08x\n",
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXFILL_DISABLE_DONE(ring))),
++		   ppe_ds_debugfs_read(regmap,
++				       ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(ring))));
++	seq_printf(s, "  rxdesc2fill reg=0x%08x val=0x%08x",
++		   ppe_ds_rxdesc2fill_reg(ring),
++		   ppe_ds_debugfs_read(regmap, ppe_ds_rxdesc2fill_reg(ring)));
++	seq_printf(s, " txdesc2cmpl reg=0x%08x val=0x%08x\n",
++		   ppe_ds_txdesc2cmpl_reg(ring),
++		   ppe_ds_debugfs_read(regmap, ppe_ds_txdesc2cmpl_reg(ring)));
++
++	seq_puts(s, "  qid2rid");
++	for (queue = node->queue_start;
++	     queue < node->queue_start + node->queue_count; queue += 4) {
++		reg = ppe_ds_reg(PPE_DS_QID2RID(queue / 4));
++		val = ppe_ds_debugfs_read(regmap, reg);
++		seq_printf(s, " %u=0x%08x", queue / 4, val);
++	}
++	seq_putc(s, '\n');
++
++	reg = PPE_RING_Q_MAP_TBL_ADDR + PPE_RING_Q_MAP_TBL_INC * ring;
++	if (regmap_bulk_read(regmap, reg, ring_map, ARRAY_SIZE(ring_map))) {
++		seq_puts(s, "  ring_queue_map=error\n");
++	} else {
++		seq_puts(s, "  ring_queue_map");
++		for (i = 0; i < ARRAY_SIZE(ring_map); i++)
++			seq_printf(s, " %u=0x%08x", i, ring_map[i]);
++		seq_putc(s, '\n');
++	}
++
++	for (queue = node->queue_start;
++	     queue < node->queue_start + node->queue_count; queue++) {
++		reg = ppe_ds_reg(PPE_DS_QID2RID(queue / 4));
++		qid2rid = ppe_ds_debugfs_read(regmap, reg);
++		qid2rid = (qid2rid >> ((queue % 4) * 8)) & U8_MAX;
++		reg = PPE_AC_UNICAST_QUEUE_CFG_TBL_ADDR +
++		      PPE_AC_UNICAST_QUEUE_CFG_TBL_INC * queue;
++		ac = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_ENQ_OPR_TBL_ADDR + PPE_ENQ_OPR_TBL_INC * queue;
++		enq = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_DEQ_OPR_TBL_ADDR + PPE_DEQ_OPR_TBL_INC * queue;
++		deq = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_AC_UNICAST_QUEUE_CNT_TBL_ADDR +
++		      PPE_AC_UNICAST_QUEUE_CNT_TBL_INC * queue;
++		pending = ppe_ds_debugfs_read(regmap, reg);
++		pending = FIELD_GET(PPE_AC_UNICAST_QUEUE_CNT_TBL_PEND_CNT,
++				    pending);
++		reg = PPE_QUEUE_TX_COUNTER_TBL_ADDR +
++		      PPE_QUEUE_TX_COUNTER_TBL_INC * queue;
++		tx = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_UNICAST_DROP_CNT_TBL_ADDR +
++		      PPE_UNICAST_DROP_CNT_TBL_INC *
++		      (queue * PPE_UNICAST_DROP_TYPES +
++		       PPE_UNICAST_DROP_FORCE_OFFSET);
++		drop = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_L0_FLOW_MAP_TBL_ADDR +
++		      PPE_L0_FLOW_MAP_TBL_INC * queue;
++		l0 = ppe_ds_debugfs_read(regmap, reg);
++		reg = PPE_L0_FLOW_PORT_MAP_TBL_ADDR +
++		      PPE_L0_FLOW_PORT_MAP_TBL_INC * queue;
++		l0_port = ppe_ds_debugfs_read(regmap, reg);
++		seq_printf(s,
++			   "  queue%u rid=%u ac=%u(0x%08x) enq_dis=%u deq_dis=%u pending=%u tx=%u drop=%u l0=0x%08x port=0x%08x\n",
++			   queue, qid2rid,
++			   !!(ac & PPE_AC_UNICAST_QUEUE_CFG_W0_EN), ac,
++			   !!(enq & PPE_ENQ_OPR_TBL_ENQ_DISABLE),
++			   !!(deq & PPE_DEQ_OPR_TBL_DEQ_DISABLE),
++			   pending, tx, drop, l0, l0_port);
++	}
++}
++
+ static int ppe_ds_debugfs_show(struct seq_file *s, void *unused)
+ {
+ 	struct ppe_ds *ds = s->private;
+ 	int i;
+ 
+ 	mutex_lock(&ds->lock);
++	ppe_ds_debugfs_global_maps(s, ds);
+ 	for (i = 0; i < PPE_DS_NODES; i++) {
+ 		struct qcom_ppe_ds_node *node = ds->nodes[i];
+ 		u32 p2t_prod = 0, p2t_cons = 0, r2p_prod = 0, r2p_cons = 0;
+@@ -1635,6 +1778,7 @@ static int ppe_ds_debugfs_show(struct seq
+ 			   atomic64_read(&node->stats.reo2ppe_buffers),
+ 			   atomic64_read(&node->stats.starts),
+ 			   atomic64_read(&node->stats.stops));
++		ppe_ds_debugfs_node_hw(s, node);
+ 	}
+ 	mutex_unlock(&ds->lock);
+ 	return 0;
+-- 
+2.43.0
