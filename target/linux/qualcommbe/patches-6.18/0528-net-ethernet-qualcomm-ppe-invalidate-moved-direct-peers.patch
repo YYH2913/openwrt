@@ -1,0 +1,181 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 20:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: invalidate moved direct peers
+
+A direct-switch peer can disappear from a vdev or move to a different
+radio while a hardware flow to its old PPE2TCL priority profile remains
+installed.  Such a flow keeps bypassing software route validation and can
+forward indefinitely into the wrong radio ring.
+
+Remember the rewritten destination address of virtual-port flows and
+invalidate matching rows whenever the effective peer-to-node mapping
+changes.  Mark invalidated rows as having no live priority profile so a
+later node restart cannot re-enable them; normal flowtable aging will
+remove and, when still needed, reinstall them with the current mapping.
+Also invalidate every row using a node profile when its final vdev
+attachment is removed.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c | 44 +++++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h |  2 ++
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c        | 18 ++++++++--
+ 3 files changed, 62 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -158,6 +158,7 @@ struct ppe_ft_vlan {
+  * @pub_ip: Public IP slot held by the flow, negative when none.
+  * @pppoe: PPPoE session slot held by the flow, negative when none.
+  * @vlan: VLAN uplink slot held by the flow, negative when none.
++ * @dmac: Rewritten Ethernet destination address.
+  * @eport: Egress PPE port of the flow.
+  * @packets: Hit packet count at the last stats read.
+  * @bytes: Hit byte count at the last stats read.
+@@ -178,6 +179,7 @@ struct ppe_ft_flow {
+ 	int vp;
+ 	int ivp;
+ 	struct ppe_vp_flow vp_flow;
++	u8 dmac[ETH_ALEN];
+ 	u8 eport;
+ 	u32 packets;
+ 	u64 bytes;
+@@ -2180,6 +2182,7 @@ static int ppe_ft_flow_replace(struct pp
+ 			nh.l3_if = ppe_ft_vp_l3_if(ft, ret);
+ 		}
+ 		flow->eport = nh.port;
++		ether_addr_copy(flow->dmac, data.eth.dst);
+ 		ether_addr_copy(nh.mac, data.eth.dst);
+ 	}
+ 
+@@ -3292,6 +3295,47 @@ void ppe_flowtable_port_profile_state(st
+ 	}
+ 	rhashtable_walk_stop(&iter);
+ 	rhashtable_walk_exit(&iter);
++	mutex_unlock(&ft->lock);
++}
++
++void ppe_flowtable_port_peer_invalidate(struct ppe_device *ppe_dev, int port,
++					const u8 *addr)
++{
++	struct ppe_flowtable *ft = ppe_dev->flowtable;
++	struct rhashtable_iter iter;
++	struct ppe_ft_flow *flow;
++
++	if (!ft || !addr)
++		return;
++
++	mutex_lock(&ft->lock);
++	rhashtable_walk_enter(&ft->flows, &iter);
++	rhashtable_walk_start(&iter);
++	while ((flow = rhashtable_walk_next(&iter))) {
++		int ret;
++
++		if (IS_ERR(flow)) {
++			if (PTR_ERR(flow) == -EAGAIN)
++				continue;
++			break;
++		}
++		if (flow->eport != port ||
++		    !ether_addr_equal(flow->dmac, addr))
++			continue;
++
++		ret = ppe_flow_entry_enable(ppe_dev, flow->index, false);
++		if (ret) {
++			dev_warn(ppe_dev->dev,
++				 "failed to invalidate flow %d for VP %d peer %pM: %d\n",
++				 flow->index, port, addr, ret);
++			continue;
++		}
++
++		/* Keep a node restart from re-enabling a stale peer flow. */
++		flow->entry.pri_profile = 0;
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
+ 	mutex_unlock(&ft->lock);
+ }
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -18,4 +18,6 @@ void ppe_flowtable_port_carrier(struct p
+ void ppe_flowtable_port_carrier(struct ppe_device *ppe_dev, int port, bool up);
+ void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
+ 				      u8 profile, bool up);
++void ppe_flowtable_port_peer_invalidate(struct ppe_device *ppe_dev, int port,
++					const u8 *addr);
+ #endif
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -660,6 +660,7 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 	int i = port - PPE_VP_PORT_BASE;
+ 	struct ppe_vp_slot *slot;
+ 	bool carrier_down = false;
++	bool profile_down = false;
+ 	int next, ret;
+ 
+ 	if (!vp || i < 0 || i >= PPE_VP_SLOTS || node < 0 ||
+@@ -673,8 +674,10 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 	}
+ 
+ 	slot->ds_node_refs[node]--;
+-	if (!slot->ds_node_refs[node])
++	if (!slot->ds_node_refs[node]) {
+ 		ppe_vp_ds_peers_purge(vp, port, node);
++		profile_down = true;
++	}
+ 	if (!rcu_access_pointer(slot->dev))
+ 		goto out_unlock;
+ 	if (slot->ds_node == node && !slot->ds_node_refs[node]) {
+@@ -700,6 +703,9 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 	}
+ out_unlock:
+ 	mutex_unlock(&vp->lock);
++	if (profile_down)
++		ppe_flowtable_port_profile_state(ppe_dev, port,
++						 PPE_VP_DS_PRI_PROFILE(node), false);
+ 	if (carrier_down)
+ 		ppe_flowtable_port_carrier(ppe_dev, port, false);
+ 	ppe_vp_put(ppe_dev, port);
+@@ -712,6 +718,7 @@ int ppe_vp_ds_peer_set(struct ppe_device
+ 	struct ppe_vp *vp = ppe_dev->vp;
+ 	struct ppe_vp_peer *peer;
+ 	int i = port - PPE_VP_PORT_BASE;
++	bool invalidate = false;
+ 	int ret = 0;
+ 
+ 	if (!vp || i < 0 || i >= PPE_VP_SLOTS || node < 0 ||
+@@ -724,8 +731,10 @@ int ppe_vp_ds_peer_set(struct ppe_device
+ 		if (!peer || !peer->node_refs[node])
+ 			goto out;
+ 		peer->node_refs[node]--;
+-		if (peer->node == node && !peer->node_refs[node])
++		if (peer->node == node && !peer->node_refs[node]) {
+ 			ppe_vp_ds_peer_select_node(peer);
++			invalidate = true;
++		}
+ 		if (peer->node == PPE_VP_DS_NODE_NONE) {
+ 			list_del(&peer->list);
+ 			kfree(peer);
+@@ -753,11 +762,16 @@ int ppe_vp_ds_peer_set(struct ppe_device
+ 		peer->node = PPE_VP_DS_NODE_NONE;
+ 		ether_addr_copy(peer->addr, addr);
+ 		list_add_tail(&peer->list, &vp->peers);
++		invalidate = true;
+ 	}
+ 	peer->node_refs[node]++;
++	if (peer->node != node)
++		invalidate = true;
+ 	peer->node = node;
+ out:
+ 	mutex_unlock(&vp->lock);
++	if (!ret && invalidate)
++		ppe_flowtable_port_peer_invalidate(ppe_dev, port, addr);
+ 	return ret;
+ }
+
+-- 
+2.43.0
