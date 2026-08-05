@@ -1,0 +1,388 @@
+From: Nitin Shetty <quic_nitinsj@quicinc.com>
+Date: Mon, 18 Jul 2022 19:32:52 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: preserve direct VP control punts
+
+Direct-switch peers send eligible Ethernet frames into the PPE with their
+VAP virtual port as source.  Unlike host-injected VP traffic, a source-VP
+punt is not necessarily a failed installed flow: DHCP, ARP and other
+control traffic legitimately follows this exception path back to the VAP.
+
+Do not trip the host-injection miss circuit breaker for a direct VP.  Align
+the software receive setup with the vendor VP exception callback, including
+the device, ingress ifindex and MAC header state.  Add per-VP source-punt
+and destination-delivery counters, record the last service code, and expose
+the active VP state through debugfs. This localizes missing DHCP without
+guessing from aggregate PPE counters.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/564c94d6cd7ad91f8f0339fc9790826d5195ef45
+Signed-off-by: Nitin Shetty <quic_nitinsj@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_rx.c     |  17 ++-
+ drivers/net/ethernet/qualcomm/ppe/edma_rx.h     |   3 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_debugfs.c |   2 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c      | 145 +++++++++++++++++++++---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.h      |   7 +-
+ 5 files changed, 158 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -180,7 +180,8 @@ static void edma_rx_vp_punt_finish(struc
+ 	if (edma_rx_deliver_vp(rxdesc_pri, skb))
+ 		return;
+ 
+-	if (unlikely(!ppe_vp_rx_fallback(edma_ctx->ppe_dev, vp, skb)))
++	if (unlikely(!ppe_vp_rx_fallback(edma_ctx->ppe_dev, vp, skb,
++					 EDMA_RXDESC_SERVICE_CODE_GET(rxdesc_pri))))
+ 		dev_kfree_skb_any(skb);
+ }
+ 
+@@ -206,14 +207,16 @@ static void edma_rx_vp_punt_last_segment
+ 	edma_rx_scatter_reset(rxdesc_ring);
+ 
+ 	if (unlikely(page_mode && !pskb_may_pull(skb_head, ETH_HLEN))) {
+-		ppe_vp_miss_disable(edma_ctx->ppe_dev, vp);
++		ppe_vp_rx_drop(edma_ctx->ppe_dev, vp, skb_head->len,
++			       EDMA_RXDESC_SERVICE_CODE_GET(pdesc_head));
+ 		dev_kfree_skb_any(skb_head);
+ 		return;
+ 	}
+ 
+ 	if (unlikely(!pskb_pull(skb_head,
+ 				EDMA_RXDESC_DATA_OFFSET_GET(pdesc_head)))) {
+-		ppe_vp_miss_disable(edma_ctx->ppe_dev, vp);
++		ppe_vp_rx_drop(edma_ctx->ppe_dev, vp, skb_head->len,
++			       EDMA_RXDESC_SERVICE_CODE_GET(pdesc_head));
+ 		dev_kfree_skb_any(skb_head);
+ 		return;
+ 	}
+@@ -440,11 +443,13 @@ static bool edma_rx_deliver_vp(struct ed
+ 	rcu_read_lock();
+ 	dev = ppe_vp_dev(ppe_dev, vp);
+ 	if (unlikely(!dev)) {
++		ppe_vp_dst_account(ppe_dev, vp, skb->len, true);
+ 		rcu_read_unlock();
+ 		dev_kfree_skb_any(skb);
+ 		return true;
+ 	}
+ 
++	ppe_vp_dst_account(ppe_dev, vp, skb->len, false);
+ 	skb->dev = dev;
+ 	skb_reset_mac_header(skb);
+ 	skb->protocol = eth_hdr(skb)->h_proto;
+@@ -493,7 +498,8 @@ static void edma_rx_vp_punt_single(struc
+ 	return;
+ 
+ drop:
+-	ppe_vp_miss_disable(edma_ctx->ppe_dev, vp);
++	ppe_vp_rx_drop(edma_ctx->ppe_dev, vp, pkt_length,
++		       EDMA_RXDESC_SERVICE_CODE_GET(rxdesc_pri));
+ 	dev_kfree_skb_any(skb);
+ }
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.h
+@@ -61,6 +61,9 @@
+ #define EDMA_RXDESC_MORE_BIT_MASK		0x40000000
+ #define EDMA_RXDESC_MORE_BIT_GET(desc)		((le32_to_cpu((__force __le32)((desc)->word1))) & \
+ 						EDMA_RXDESC_MORE_BIT_MASK)
++#define EDMA_RXDESC_SERVICE_CODE_MASK		GENMASK(24, 16)
++#define EDMA_RXDESC_SERVICE_CODE_GET(desc)	FIELD_GET(EDMA_RXDESC_SERVICE_CODE_MASK, \
++						le32_to_cpu((__force __le32)((desc)->word1)))
+ #define EDMA_RXDESC_SRC_DST_INFO_GET(desc)	\
+ 				((u32)((le32_to_cpu((__force __le32)((desc)->word4)))))
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_debugfs.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_debugfs.c
+@@ -19,6 +19,7 @@
+ #include "ppe_debugfs.h"
+ #include "ppe_flowtable.h"
+ #include "ppe_regs.h"
++#include "ppe_vp.h"
+ 
+ #define PPE_PKT_CNT_TBL_SIZE				3
+ #define PPE_DROP_PKT_CNT_TBL_SIZE			5
+@@ -833,6 +834,7 @@ void ppe_debugfs_setup(struct ppe_device
+ 	}
+ 
+ 	ppe_flowtable_debugfs_init(ppe_dev);
++	ppe_vp_debugfs_init(ppe_dev);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(debugfs_files); i++) {
+ 		entry = devm_kzalloc(ppe_dev->dev, sizeof(*entry), GFP_KERNEL);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -28,6 +28,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/bitfield.h>
++#include <linux/debugfs.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+ #include <linux/ip.h>
+@@ -41,6 +42,7 @@
+ #include <linux/rhashtable.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/regmap.h>
++#include <linux/seq_file.h>
+ #include <linux/skbuff.h>
+ 
+ #include <net/ip.h>
+@@ -85,6 +87,14 @@ struct ppe_vp_slot {
+ 	bool poisoned;
+ 	bool miss_disabled;
+ 	bool l3_configured;
++	atomic64_t rx_punts;
++	atomic64_t rx_bytes;
++	atomic64_t rx_delivered;
++	atomic64_t rx_dropped;
++	atomic64_t dst_packets;
++	atomic64_t dst_bytes;
++	atomic64_t dst_dropped;
++	atomic_t last_service_code;
+ };
+ 
+ struct ppe_vp {
+@@ -148,6 +158,18 @@ static const struct rhashtable_params pp
+ 	.automatic_shrinking = true,
+ };
+ 
++static void ppe_vp_stats_reset(struct ppe_vp_slot *slot)
++{
++	atomic64_set(&slot->rx_punts, 0);
++	atomic64_set(&slot->rx_bytes, 0);
++	atomic64_set(&slot->rx_delivered, 0);
++	atomic64_set(&slot->rx_dropped, 0);
++	atomic64_set(&slot->dst_packets, 0);
++	atomic64_set(&slot->dst_bytes, 0);
++	atomic64_set(&slot->dst_dropped, 0);
++	atomic_set(&slot->last_service_code, 0);
++}
++
+ /* Program or tear down the L2_VP_PORT_TBL entry and unicast queue map
+  * of a virtual port. The field set mirrors the vendor driver's
+  * ppe_drv_port_alloc() for a wireless virtual port.
+@@ -648,6 +670,7 @@ int ppe_vp_get(struct ppe_device *ppe_de
+ 	}
+ 
+ 	/* Publish the mapping before its optional ingress hook goes live. */
++	ppe_vp_stats_reset(&vp->slots[free]);
+ 	vp->slots[free].refcnt = 1;
+ 	WRITE_ONCE(vp->slots[free].miss_disabled, false);
+ 	rcu_assign_pointer(vp->slots[free].dev, dev);
+@@ -745,6 +768,7 @@ int ppe_vp_ds_attach(struct ppe_device *
+ 		goto out;
+ 	}
+ 
++	ppe_vp_stats_reset(&vp->slots[free]);
+ 	vp->slots[free].refcnt = 1;
+ 	vp->slots[free].direct = true;
+ 	vp->slots[free].ds_node = node;
+@@ -1091,31 +1115,39 @@ void ppe_vp_put(struct ppe_device *ppe_d
+ }
+ 
+ /**
+- * ppe_vp_rx_fallback - Fail a VP uplink open after a hardware flow miss
++ * ppe_vp_rx_fallback - Return a source-VP exception to its software device
+  * @ppe_dev: PPE device
+  * @vp: source virtual port of the punt
+  * @skb: complete punted frame, Ethernet header first
++ * @service_code: EDMA service code carried by the exception
+  *
+- * Tuple gating makes a miss anomalous: software installed the flow but the
+- * hardware did not match it. Disable further injection for the whole VP
+- * before returning this packet to the VAP. The persistent slot state, unlike
+- * skb control-buffer metadata, survives every receive layer and makes this
+- * packet and subsequent traffic take the software path without a loop.
++ * A host-injected VP punt indicates an unexpected flow miss, so its ingress
++ * injection is disabled before the packet re-enters the receive path. Direct
++ * switch VPs are different: DHCP, ARP and other non-flow traffic normally
++ * enter through REO2PPE and punt to the CPU with the VAP as source. They have
++ * no ingress injection hook and must remain enabled after such a punt.
+  *
+  * Return: true if the software receive path consumed the frame.
+  */
+-bool ppe_vp_rx_fallback(struct ppe_device *ppe_dev, int vp, struct sk_buff *skb)
++bool ppe_vp_rx_fallback(struct ppe_device *ppe_dev, int vp, struct sk_buff *skb,
++			u16 service_code)
+ {
+ 	struct ppe_vp *vpt = ppe_dev->vp;
++	struct ppe_vp_slot *slot;
+ 	struct net_device *dev;
+ 	int i = vp - PPE_VP_PORT_BASE;
+ 
+ 	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
+ 		return false;
++	slot = &vpt->slots[i];
++	atomic64_inc(&slot->rx_punts);
++	atomic64_add(skb->len, &slot->rx_bytes);
++	atomic_set(&slot->last_service_code, service_code);
+ 
+ 	rcu_read_lock();
+-	dev = rcu_dereference(vpt->slots[i].dev);
++	dev = rcu_dereference(slot->dev);
+ 	if (unlikely(!dev)) {
++		atomic64_inc(&slot->rx_dropped);
+ 		rcu_read_unlock();
+ 		return false;
+ 	}
+@@ -1124,13 +1156,52 @@ bool ppe_vp_rx_fallback(struct ppe_devic
+ 	 * ingress hook again, including after an RPS hand-off.
+ 	 */
+ 	ppe_vp_miss_disable(ppe_dev, vp);
++	skb_reset_mac_header(skb);
++	skb->dev = dev;
++	skb->skb_iif = dev->ifindex;
+ 	skb->protocol = eth_type_trans(skb, dev);
++	atomic64_inc(&slot->rx_delivered);
+ 	netif_receive_skb(skb);
+ 	rcu_read_unlock();
+ 
+ 	return true;
+ }
+ 
++void ppe_vp_rx_drop(struct ppe_device *ppe_dev, int vp, unsigned int len,
++		    u16 service_code)
++{
++	struct ppe_vp *vpt = ppe_dev->vp;
++	struct ppe_vp_slot *slot;
++	int i = vp - PPE_VP_PORT_BASE;
++
++	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
++		return;
++
++	slot = &vpt->slots[i];
++	atomic64_inc(&slot->rx_punts);
++	atomic64_add(len, &slot->rx_bytes);
++	atomic64_inc(&slot->rx_dropped);
++	atomic_set(&slot->last_service_code, service_code);
++	ppe_vp_miss_disable(ppe_dev, vp);
++}
++
++void ppe_vp_dst_account(struct ppe_device *ppe_dev, int vp, unsigned int len,
++			bool dropped)
++{
++	struct ppe_vp *vpt = ppe_dev->vp;
++	struct ppe_vp_slot *slot;
++	int i = vp - PPE_VP_PORT_BASE;
++
++	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
++		return;
++
++	slot = &vpt->slots[i];
++	atomic64_inc(&slot->dst_packets);
++	atomic64_add(len, &slot->dst_bytes);
++	if (dropped)
++		atomic64_inc(&slot->dst_dropped);
++}
++
+ void ppe_vp_miss_disable(struct ppe_device *ppe_dev, int vp)
+ {
+ 	struct ppe_vp *vpt = ppe_dev->vp;
+@@ -1138,6 +1209,8 @@ void ppe_vp_miss_disable(struct ppe_devi
+ 
+ 	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
+ 		return;
++	if (READ_ONCE(vpt->slots[i].direct))
++		return;
+ 
+ 	/* Pairs with the hook's acquire load: publish fail-open state before
+ 	 * any punt is submitted back to the receive path.
+@@ -1280,6 +1353,72 @@ static int ppe_vp_netdev_event(struct no
+ 	return NOTIFY_DONE;
+ }
+ 
++static unsigned int ppe_vp_peer_count_locked(struct ppe_vp *vp, int port)
++{
++	struct ppe_vp_peer *peer;
++	unsigned int count = 0;
++
++	list_for_each_entry(peer, &vp->peers, list)
++		if (peer->vp == port)
++			count++;
++
++	return count;
++}
++
++static int ppe_vp_debugfs_show(struct seq_file *s, void *unused)
++{
++	struct ppe_vp *vp = s->private;
++	int i;
++
++	seq_puts(s, "port dev carrier direct node refs node_refs peers flows hook l3 miss poison ");
++	seq_puts(s, "rx_punt rx_deliver rx_drop rx_bytes last_sc dst_pkts dst_drop dst_bytes\n");
++
++	mutex_lock(&vp->lock);
++	for (i = 0; i < PPE_VP_SLOTS; i++) {
++		struct ppe_vp_slot *slot = &vp->slots[i];
++		struct net_device *dev = rcu_access_pointer(slot->dev);
++		int port = PPE_VP_PORT_BASE + i;
++
++		if (!dev && !slot->refcnt && !slot->poisoned &&
++		    !atomic64_read(&slot->rx_punts) &&
++		    !atomic64_read(&slot->dst_packets))
++			continue;
++
++		seq_printf(s,
++			   "%d %s %d %d %d %d %d/%d/%d %u %d %d %d %d %d ",
++			   port, dev ? dev->name : "-",
++			   dev ? netif_carrier_ok(dev) : 0, slot->direct,
++			   slot->ds_node, slot->refcnt, slot->ds_node_refs[0],
++			   slot->ds_node_refs[1], slot->ds_node_refs[2],
++			   ppe_vp_peer_count_locked(vp, port),
++			   atomic_read(&slot->nflows), slot->hook_registered,
++			   slot->l3_configured, slot->miss_disabled,
++			   slot->poisoned);
++		seq_printf(s, "%lld %lld %lld %lld %d %lld %lld %lld\n",
++			   atomic64_read(&slot->rx_punts),
++			   atomic64_read(&slot->rx_delivered),
++			   atomic64_read(&slot->rx_dropped),
++			   atomic64_read(&slot->rx_bytes),
++			   atomic_read(&slot->last_service_code),
++			   atomic64_read(&slot->dst_packets),
++			   atomic64_read(&slot->dst_dropped),
++			   atomic64_read(&slot->dst_bytes));
++	}
++	mutex_unlock(&vp->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(ppe_vp_debugfs);
++
++void ppe_vp_debugfs_init(struct ppe_device *ppe_dev)
++{
++	if (!ppe_dev->vp || !ppe_dev->debugfs_root)
++		return;
++
++	debugfs_create_file("virtual_ports", 0444, ppe_dev->debugfs_root,
++			    ppe_dev->vp, &ppe_vp_debugfs_fops);
++}
++
+ int ppe_vp_setup(struct ppe_device *ppe_dev)
+ {
+ 	struct ppe_vp *vp;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -56,7 +56,11 @@ int ppe_vp_get(struct ppe_device *ppe_de
+ void ppe_vp_put(struct ppe_device *ppe_dev, int vp);
+ struct net_device *ppe_vp_dev(struct ppe_device *ppe_dev, int vp);
+ bool ppe_vp_rx_fallback(struct ppe_device *ppe_dev, int vp,
+-			struct sk_buff *skb);
++				struct sk_buff *skb, u16 service_code);
++void ppe_vp_rx_drop(struct ppe_device *ppe_dev, int vp, unsigned int len,
++		    u16 service_code);
++void ppe_vp_dst_account(struct ppe_device *ppe_dev, int vp, unsigned int len,
++			bool dropped);
+ void ppe_vp_miss_disable(struct ppe_device *ppe_dev, int vp);
+ int ppe_vp_flow_add(struct ppe_device *ppe_dev, int vp,
+ 		    struct ppe_vp_flow *flow);
+@@ -72,4 +76,5 @@ int ppe_vp_ds_peer_set(struct ppe_device
+ 		       const u8 *addr, bool enable);
+ int ppe_vp_ds_node_get(struct ppe_device *ppe_dev, int vp, const u8 *addr);
+ unsigned int ppe_vp_ds_peer_count(struct ppe_device *ppe_dev, int node);
++void ppe_vp_debugfs_init(struct ppe_device *ppe_dev);
+ #endif
+-- 
+2.43.0
