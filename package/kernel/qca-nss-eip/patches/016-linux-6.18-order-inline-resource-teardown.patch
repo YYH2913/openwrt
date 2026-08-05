@@ -1,0 +1,109 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 21:05:00 +0800
+Subject: [PATCH] qca-nss-eip: order inline resource teardown after TR disable
+
+EIP transform invalidation is submitted asynchronously. Releasing the PPE
+virtual port or tunnel before dropping the transform record leaves a small
+window in which an in-flight descriptor can still reference old metadata.
+Stop the flow first, disable and release the transform record, then release
+the PPE/EIP resources. Also tolerate a corrupted provider binding without
+dereferencing a missing shared tunnel during flow deletion.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_flow.c
++++ b/clients/ipsec/eip_ipsec_flow.c
+@@ -440,7 +440,10 @@ static void eip_ipsec_flow_del(void *priv)
+ 	mutex_lock(&eid->inner_lock);
+ 	if (flow->installed) {
+ 		info.tuple = flow->tuple;
+-		eip_flow_del(eid->inner_tun, &info);
++		if (eid->inner_tun)
++			eip_flow_del(eid->inner_tun, &info);
++		else
++			pr_warn("%p: EIP provider flow lost its shared tunnel\n", flow);
+ 		flow->installed = false;
+ 		list_del_init(&flow->node);
+ 		if (WARN_ON(!eid->inner_flow_count))
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -460,8 +460,11 @@ static void eip_ipsec_sa_inline_rollback(struct eip_ipsec_sa *sa)
+ static void eip_ipsec_sa_inline_rollback(struct eip_ipsec_sa *sa)
+ {
+ 	eip_ipsec_sa_inline_flow_stop(sa);
+-	if (sa->tr)
++	if (sa->tr) {
+ 		eip_tr_disable(sa->tr);
++		eip_tr_free(sa->tr);
++		sa->tr = NULL;
++	}
+ 	if (sa->ppe_vp >= 0) {
+ 		qcom_ppe_eip_vp_free(sa->ppe_vp);
+ 		sa->ppe_vp = -1;
+@@ -470,10 +473,6 @@ static void eip_ipsec_sa_inline_rollback(struct eip_ipsec_sa *sa)
+ 		eip_tun_free(sa->inline_tun);
+ 		sa->inline_tun = NULL;
+ 	}
+-	if (sa->tr) {
+-		eip_tr_free(sa->tr);
+-		sa->tr = NULL;
+-	}
+ 	sa->inline_offload = false;
+ }
+ 
+@@ -1111,18 +1110,7 @@ void eip_ipsec_sa_del(struct net_device *ndev, struct eip_ipsec_tuple *t)
+ 	inline_offload = sa->inline_offload;
+ 	if (inline_offload)
+ 		eip_ipsec_sa_inline_flow_stop(sa);
+-
+-	if (sa->ppe_vp >= 0) {
+-		qcom_ppe_eip_vp_free(sa->ppe_vp);
+-		sa->ppe_vp = -1;
+-	}
+-	if (sa->inline_tun) {
+-		eip_tun_free(sa->inline_tun);
+-		sa->inline_tun = NULL;
+-	}
+ 	sa->inline_offload = false;
+-	if (sa->inner_offload)
+-		eip_ipsec_flow_sa_put(sa);
+ 
+ 	eip_ipsec_proto_udp_sock_release(sa->udp_sock);
+ 	sa->udp_sock = NULL;
+@@ -1133,13 +1121,10 @@
+ 	if (inline_offload)
+ 		eip_ipsec_sa_sync_hw_stats(sa);
+ 
+-	/* No hardware flow can reach this record now.  Disable it before the SA
+-	 * database reference and any host packet references finish draining.
+-	 */
++	/* The TR owns the EIP metadata until it has been disabled. */
+ 	eip_tr_disable(sa->tr);
+ 
+-	/*
+-	 * Release the explicit teardown reference and wait for the RCU database
++	/* Release the explicit teardown reference and wait for the RCU database
+ 	 * reference plus every packet/callback reference to drain.
+ 	 */
+ 	eip_ipsec_sa_deref(sa);
+@@ -1147,6 +1132,18 @@
+ 
+ 	/* No worker or callback can touch the SA now. */
+ 	eip_tr_free(sa->tr);
++	sa->tr = NULL;
++
++	if (sa->ppe_vp >= 0) {
++		qcom_ppe_eip_vp_free(sa->ppe_vp);
++		sa->ppe_vp = -1;
++	}
++	if (sa->inline_tun) {
++		eip_tun_free(sa->inline_tun);
++		sa->inline_tun = NULL;
++	}
++	if (sa->inner_offload)
++		eip_ipsec_flow_sa_put(sa);
+ 	sa->xs = NULL;
+ 	dev_put(sa->ndev);
+ 	dst_cache_destroy(&sa->dst_cache);
