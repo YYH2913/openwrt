@@ -15,6 +15,8 @@ PCI enable/disable are updated to drop PERSTOUT bits in favor dedicated
 reset handling.
 
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/clk/clk-en7523.c | 39 ++++++++++++++++++++++++++++-----------
  1 file changed, 28 insertions(+), 11 deletions(-)
@@ -67,7 +69,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
  {
  	struct en_rst_data *rst_data = container_of(rcdev, struct en_rst_data, rcdev);
  	u32 addr = rst_data->bank_ofs[id / RST_NR_PER_BANK];
-+	u32 val;
++	u32 val = 0;
 +
 +	/* For PCIC reset logic is inverted, 0:assert 1:deassert*/
 +	if (addr == REG_NP_SCU_PCIC)
