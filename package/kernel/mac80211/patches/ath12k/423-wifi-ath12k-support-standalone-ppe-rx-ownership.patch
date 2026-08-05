@@ -1,0 +1,53 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: ath12k: support standalone PPE RX ownership
+
+The direct-switch attach path explicitly supports a standalone QCN9274 by
+assigning node zero when no WSI device group exists.  Its RX completion path,
+however, rejects every descriptor when ab->ag is NULL and then unconditionally
+dereferences ab->ag while walking the completion lists.
+
+Resolve descriptors against the local device in standalone mode and walk the
+fixed-size owner array.  This keeps grouped WSI validation unchanged while
+avoiding both leaked RX buffers and a NULL dereference on a standalone radio.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -435,16 +435,23 @@ ath12k_ppe_ds_rx_desc_owner(struct ath12
+ 	u32 cookie;
+ 	u8 device_id;
+ 
+-	if (!ab->ag || !rx_desc || !virt_addr_valid(rx_desc) ||
++	if (!rx_desc || !virt_addr_valid(rx_desc) ||
+ 	    !virt_addr_valid((u8 *)rx_desc + sizeof(*rx_desc) - 1) ||
+ 	    !IS_ALIGNED((uintptr_t)rx_desc, __alignof__(*rx_desc)))
+ 		return NULL;
+ 
+ 	device_id = rx_desc->device_id;
+-	if (device_id >= ab->ag->num_devices)
+-		return NULL;
++	if (ab->ag) {
++		if (device_id >= ab->ag->num_devices)
++			return NULL;
++
++		src_ab = ab->ag->ab[device_id];
++	} else {
++		if (device_id != ab->device_id)
++			return NULL;
+ 
+-	src_ab = ab->ag->ab[device_id];
++		src_ab = ab;
++	}
+ 	if (!src_ab || !src_ab->dp.rxbaddr ||
+ 	    rx_desc->magic != ATH12K_DP_RX_DESC_MAGIC)
+ 		return NULL;
+@@ -508,7 +515,7 @@ ath12k_ppe_ds_reo2ppe_complete(struct qc
+ 		owners[src_ab->device_id] = src_ab;
+ 	}
+ 
+-	for (i = 0; i < ab->ag->num_devices; i++) {
++	for (i = 0; i < ATH12K_MAX_DEVICES; i++) {
+ 		if (list_empty(&completed[i]))
+ 			continue;
+ 		src_ab = owners[i];
