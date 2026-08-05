@@ -1,0 +1,1381 @@
+From: Himanshu Joshi <himajosh@qti.qualcomm.com>
+Date: Tue, 3 Mar 2026 10:39:23 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: add EIP-197 outer inline path
+
+Program APPE service codes 7 and 8 for the inbound PPE-to-EIP-to-PPE
+path and steer service-code traffic to the EIP physical port. Add ESP
+3-tuple and NAT-T 5-tuple outer flows, including source-L3-interface
+validation and refcounted router-MAC bindings so rekeyed SAs can share
+a hardware row without leaking its dependencies.
+
+Allocate one source-only virtual port per inbound SA. Point it at EIP
+port 7, preserve the return service code and deliver exceptions through
+an RCU-protected callback. Publish the EIP API only after VP setup and
+revoke it before physical-port teardown, draining outer flows and
+quiescing callbacks while their hardware dependencies remain valid.
+
+Expose the resulting outer flows and VP state through debugfs.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/c4f168f22ac79625460fb5c17c0d8c1664803d03
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/169bf594df03ac4b29e0ccd3f6f87e70f0f3fb6e
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/39c0281b98922dcda04f91e30dd15bccbb0896ae
+Signed-off-by: Amit Gupta <quic_amitgupt@quicinc.com>
+Signed-off-by: Himanshu Joshi <himajosh@qti.qualcomm.com>
+Signed-off-by: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe.c
+@@ -261,6 +261,16 @@
+ 		return dev_err_probe(dev, ret,
+ 				     "PPE virtual port setup failed\n");
+ 	}
++	ret = ppe_flowtable_eip_start(ppe_dev);
++	if (ret) {
++		ppe_vp_inject_disable(ppe_dev);
++		ppe_port_mac_deinit(ppe_dev);
++		ppe_flowtable_destroy(ppe_dev);
++		ppe_vp_teardown(ppe_dev);
++		ppe_bridge_destroy(ppe_dev);
++		edma_destroy(ppe_dev);
++		return dev_err_probe(dev, ret, "PPE EIP API setup failed\n");
++	}
+ 
+ 	ppe_debugfs_setup(ppe_dev);
+ 	ret = ppe_ds_setup(ppe_dev);
+@@ -269,6 +279,7 @@
+ 		 * flow destruction cannot outlive its virtual port.
+ 		 */
+ 		ppe_vp_inject_disable(ppe_dev);
++		ppe_flowtable_eip_stop(ppe_dev);
+ 		ppe_port_mac_deinit(ppe_dev);
+ 		ppe_flowtable_destroy(ppe_dev);
+ 		ppe_vp_teardown(ppe_dev);
+@@ -293,6 +304,7 @@
+ 	 * rings can be unregistered. Full VP teardown follows flow flushing.
+ 	 */
+ 	ppe_vp_inject_disable(ppe_dev);
++	ppe_flowtable_eip_stop(ppe_dev);
+ 	ppe_port_mac_deinit(ppe_dev);
+ 
+ 	/* Netdevice teardown unbinds the flow blocks and quiesces their
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.c
+@@ -2665,8 +2665,12 @@
+ /* Initialize EDMA service codes used by CPU and virtual-port injection. */
+ static int ppe_servcode_init(struct ppe_device *ppe_dev)
+ {
++	struct ppe_queue_ucast_dest queue_dst = {
++		.service_code_en = true,
++		.service_code = PPE_EIP_SC_PPE2EIP_DECAP,
++	};
+ 	struct ppe_sc_cfg sc_cfg = {};
+-	int ret;
++	int profile, queue, queue_end, ret;
+ 
+ 	bitmap_zero(sc_cfg.bitmaps.counter, PPE_SC_BYPASS_COUNTER_SIZE);
+ 	bitmap_zero(sc_cfg.bitmaps.tunnel, PPE_SC_BYPASS_TUNNEL_SIZE);
+@@ -2692,7 +2696,59 @@
+ 		sc_cfg.bitmaps.egress);
+ 	sc_cfg.next_service_code = PPE_EDMA_SC_SPF_BYPASS_ID;
+ 
+-	return ppe_sc_config_set(ppe_dev, PPE_EDMA_SC_SPF_BYPASS_ID, sc_cfg);
++	ret = ppe_sc_config_set(ppe_dev, PPE_EDMA_SC_SPF_BYPASS_ID, sc_cfg);
++	if (ret)
++		return ret;
++
++	/* SC7 redirects an outer ESP/NAT-T flow to the EIP physical port.
++	 * EIP consumes an L3-offset packet and returns it with SC8.
++	 */
++	sc_cfg = (struct ppe_sc_cfg){};
++	sc_cfg.dest_port_valid = true;
++	sc_cfg.dest_port = PPE_EIP_PORT;
++	sc_cfg.next_service_code = PPE_EIP_SC_EIP2PPE;
++	sc_cfg.eip_field_update_bitmap = PPE_EIP_UPDATE_DEST_INFO |
++					 PPE_EIP_UPDATE_HASH_FLOW_INDEX |
++					 PPE_EIP_UPDATE_FAKE_L2_PROTO;
++	sc_cfg.eip_hw_service = PPE_EIP_HW_SERVICE_IPSEC;
++	/* Zero selects the L3 offset; one selects L4. */
++	sc_cfg.eip_offset_sel = 0;
++	set_bit(PPE_SC_BYPASS_EGRESS_L3_PKT_EDIT, sc_cfg.bitmaps.egress);
++	set_bit(PPE_SC_BYPASS_EGRESS_L2_SOURCE_SECURITY,
++		sc_cfg.bitmaps.egress);
++	ret = ppe_sc_config_set(ppe_dev, PPE_EIP_SC_PPE2EIP_DECAP, sc_cfg);
++	if (ret)
++		return ret;
++
++	/* SC8 is the tag on decrypted packets returning from EIP. Preserve it
++	 * across ingress flow processing so exception delivery can identify the
++	 * inline path.
++	 */
++	sc_cfg = (struct ppe_sc_cfg){};
++	sc_cfg.next_service_code = PPE_EIP_SC_EIP2PPE;
++	set_bit(PPE_SC_BYPASS_INGRESS_FLOW_SERVICE_CODE,
++		sc_cfg.bitmaps.ingress);
++	ret = ppe_sc_config_set(ppe_dev, PPE_EIP_SC_EIP2PPE, sc_cfg);
++	if (ret)
++		return ret;
++
++	ret = ppe_port_resource_get(ppe_dev, PPE_EIP_PORT, PPE_RES_UCAST,
++				    &queue, &queue_end);
++	if (ret)
++		return ret;
++
++	/* A service-code lookup is indexed by source profile. Program all four
++	 * profiles because EIP traffic can arrive from any physical port.
++	 */
++	for (profile = 0; profile < PPE_QUEUE_SRC_PROFILE_NUM; profile++) {
++		queue_dst.src_profile = profile;
++		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
++					       PPE_QUEUE_REDIR_PROFILE_ID);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
+ }
+ 
+ /* Initialize PPE port configurations. */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
+@@ -26,6 +26,15 @@
+ /* The service code is used by EDMA port to transmit packet to PPE. */
+ #define PPE_EDMA_SC_BYPASS_ID			1
+ #define PPE_EDMA_SC_SPF_BYPASS_ID		12
++#define PPE_EIP_SC_PPE2EIP_DECAP		7
++#define PPE_EIP_SC_EIP2PPE			8
++#define PPE_EIP_PORT				7
++#define PPE_EIP_HW_SERVICE_IPSEC		3
++
++/* FIELD_UPDATE_ACTION bits consumed by EIP-197. */
++#define PPE_EIP_UPDATE_DEST_INFO		BIT(2)
++#define PPE_EIP_UPDATE_HASH_FLOW_INDEX		BIT(6)
++#define PPE_EIP_UPDATE_FAKE_L2_PROTO		BIT(7)
+ 
+ /* The PPE RSS hash configured for IPv4 and IPv6 packet separately. */
+ #define PPE_RSS_HASH_MODE_IPV4			BIT(0)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -143,6 +143,11 @@
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_HOST_INDEX, flow->host_index);
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_PROTOCOL_TYPE, flow->proto);
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_AGE, 3);
++	if (flow->src_l3_if_valid) {
++		val[0] |= PPE_FLOW_W0_SRC_L3_IF_VALID;
++		val[0] |= FIELD_PREP(PPE_FLOW_W0_SRC_L3_IF,
++				     flow->src_l3_if);
++	}
+ 	val[0] |= FIELD_PREP(PPE_FLOW_W0_FWD_TYPE, flow->fwd_type);
+ 	val[1] = FIELD_PREP(PPE_FLOW_W1_NEXT_HOP, flow->nexthop);
+ 	val[1] |= FIELD_PREP(PPE_FLOW_W1_L4_PORT,
+@@ -151,11 +156,14 @@
+ 			     flow->pri_profile & 1);
+ 	val[2] = FIELD_PREP(PPE_FLOW_W2_PRI_PROFILE_HI,
+ 			    flow->pri_profile >> 1);
+-	val[3] = FIELD_PREP(PPE_FLOW_W3_L4_SPORT,
+-			    be16_to_cpu(flow->sport));
+-	val[3] |= FIELD_PREP(PPE_FLOW_W3_L4_DPORT_LO,
+-			     dport & GENMASK(3, 0));
+-	val[4] = FIELD_PREP(PPE_FLOW_W4_L4_DPORT_HI, dport >> 4);
++	val[2] |= FIELD_PREP(PPE_FLOW_W2_SERVICE_CODE, flow->service_code);
++	if (!flow->is_3tuple) {
++		val[3] = FIELD_PREP(PPE_FLOW_W3_L4_SPORT,
++				    be16_to_cpu(flow->sport));
++		val[3] |= FIELD_PREP(PPE_FLOW_W3_L4_DPORT_LO,
++				     dport & GENMASK(3, 0));
++		val[4] = FIELD_PREP(PPE_FLOW_W4_L4_DPORT_HI, dport >> 4);
++	}
+ 	if (flow->is_ipv6) {
+ 		u32 dip[4];
+ 
+@@ -164,6 +172,9 @@
+ 					     flow->pmtu & GENMASK(10, 0));
+ 		val[3] |= FIELD_PREP(PPE_FLOW_V6_W3_PMTU_HI,
+ 					     flow->pmtu >> 11);
++		if (flow->is_3tuple)
++			val[3] |= FIELD_PREP(PPE_FLOW_V6_3T_W3_IP_PROTOCOL,
++					     flow->ip_proto);
+ 
+ 		ppe_flow_ip6_words(&flow->dip.ip6, dip);
+ 		val[0] |= PPE_FLOW_W0_ENTRY_TYPE;
+@@ -179,11 +190,21 @@
+ 		val[2] |= FIELD_PREP(PPE_FLOW_W2_IP_ADDR_LO,
+ 				     ip & GENMASK(19, 0));
+ 		val[3] |= FIELD_PREP(PPE_FLOW_W3_IP_ADDR_HI, ip >> 20);
+-		val[4] |= PPE_FLOW_V4_W4_PMTU_CHECK_L3;
+-		val[4] |= FIELD_PREP(PPE_FLOW_V4_W4_PMTU_LO,
+-				     flow->pmtu & GENMASK(10, 0));
+-		val[5] = FIELD_PREP(PPE_FLOW_V4_W5_PMTU_HI,
+-				    flow->pmtu >> 11);
++		if (flow->is_3tuple) {
++			val[3] |= FIELD_PREP(PPE_FLOW_V4_3T_W3_IP_PROTOCOL,
++					     flow->ip_proto);
++			val[3] |= PPE_FLOW_V4_3T_W3_PMTU_CHECK_L3;
++			val[3] |= FIELD_PREP(PPE_FLOW_V4_3T_W3_PMTU_LO,
++					     flow->pmtu & GENMASK(2, 0));
++			val[4] |= FIELD_PREP(PPE_FLOW_V4_3T_W4_PMTU_HI,
++					     flow->pmtu >> 3);
++		} else {
++			val[4] |= PPE_FLOW_V4_W4_PMTU_CHECK_L3;
++			val[4] |= FIELD_PREP(PPE_FLOW_V4_W4_PMTU_LO,
++					     flow->pmtu & GENMASK(10, 0));
++			val[5] = FIELD_PREP(PPE_FLOW_V4_W5_PMTU_HI,
++					    flow->pmtu >> 11);
++		}
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -36,14 +36,19 @@
+ };
+ 
+ /**
+- * struct ppe_flow_entry - An IPv4 or IPv6 5-tuple flow.
++ * struct ppe_flow_entry - An IPv4 or IPv6 3-tuple or 5-tuple flow.
+  * @sip: Source IP address of the matched packets.
+  * @dip: Destination IP address of the matched packets.
+  * @is_ipv6: Address family of the flow. An IPv6 flow occupies two
+  * flow table entries and two host table entries.
++ * @is_3tuple: Match addresses and @ip_proto instead of L4 ports.
++ * @src_l3_if_valid: Match the source L3 interface when set.
++ * @src_l3_if: Source L3 interface required by the flow.
+  * @sport: Source L4 port.
+  * @dport: Destination L4 port.
+  * @proto: IP protocol, TCP or UDP.
++ * @ip_proto: IP protocol number used by a 3-tuple entry.
++ * @service_code: PPE service code assigned on a flow hit.
+  * @fwd_type: Forward type of the flow (PPE_FLOW_FWD_TYPE_*). IPv6
+  * flows are never translated, only routed.
+  * @pri_profile: Egress queue priority profile.
+@@ -60,9 +65,14 @@
+ 		struct in6_addr ip6;
+ 	} sip, dip;
+ 	bool is_ipv6;
++	bool is_3tuple;
++	bool src_l3_if_valid;
++	u8 src_l3_if;
+ 	__be16 sport;
+ 	__be16 dport;
+ 	u8 proto;
++	u8 ip_proto;
++	u8 service_code;
+ 	u8 fwd_type;
+ 	u8 pri_profile;
+ 	u16 pmtu;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -21,6 +21,8 @@
+ #include <linux/if_arp.h>
+ #include <linux/if_vlan.h>
+ #include <linux/ip.h>
++#include <linux/limits.h>
++#include <linux/lockdep.h>
+ #include <linux/netdevice.h>
+ #include <linux/ppp_channel.h>
+ #include <linux/rcupdate.h>
+@@ -28,6 +30,7 @@
+ #include <linux/rhashtable.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/seq_file.h>
++#include <linux/soc/qcom/ppe.h>
+ #include <linux/tc_act/tc_csum.h>
+ #include <net/flow_offload.h>
+ #include <net/ip6_tunnel.h>
+@@ -172,6 +175,7 @@
+ 	struct ppe_flow_entry entry;
+ 	u16 nexthop;
+ 	int my_mac;
++	int my_mac_l3_if;
+ 	int pub_ip;
+ 	int pppoe;
+ 	int vlan;
+@@ -185,6 +189,24 @@
+ 	u64 bytes;
+ };
+ 
++struct ppe_flowtable;
++
++/* One PPE outer tuple can be shared by several inbound SAs during rekey;
++ * EIP still keeps a distinct SPI flow and VP for every SA.
++ */
++struct qcom_ppe_eip_flow {
++	struct list_head node;
++	struct ppe_flowtable *ft;
++	struct qcom_ppe_eip_tuple tuple;
++	struct ppe_flow_entry entry;
++	int index;
++	int my_mac;
++	int my_mac_l3_if;
++	u8 ingress_port;
++	unsigned int refcnt;
++	bool poisoned;
++};
++
+ #define PPE_FT_TUNNELS	PPE_TUNNEL_ENTRIES
+ 
+ struct ppe_ft_tunnel {
+@@ -259,10 +281,12 @@
+ 	struct mutex lock;
+ 	struct rhashtable flows;
+ 	struct list_head zombies;
++	struct list_head eip_flows;
+ 	struct dentry *debugfs;
+ 	struct dentry *debugfs_rows;
+ 	struct dentry *debugfs_pipeline;
+ 	struct dentry *debugfs_reasons;
++	struct dentry *debugfs_eip;
+ 	atomic_long_t replace_calls;
+ 	atomic_long_t replace_unsupported;
+ 	atomic_long_t replace_failed;
+@@ -270,6 +294,7 @@
+ 	DECLARE_HASHTABLE(hosts, PPE_FT_HOST_HASH_BITS);
+ 	DECLARE_BITMAP(nexthop_used, PPE_NEXTHOP_TBL_ENTRIES);
+ 	struct ppe_ft_my_mac my_macs[PPE_MY_MAC_TBL_ENTRIES];
++	u16 my_mac_l3_refs[PPE_IN_L3_IF_TBL_ENTRIES][PPE_MY_MAC_TBL_ENTRIES];
+ 	struct ppe_ft_pub_ip pub_ips[PPE_PUB_IP_TBL_ENTRIES];
+ 	struct ppe_ft_pppoe pppoe[PPE_FT_PPPOE_SESSIONS];
+ 	struct ppe_ft_vlan vlans[PPE_L3_VLAN_UPLINKS];
+@@ -280,6 +305,16 @@
+ 	struct list_head block_cb_list;
+ };
+ 
++/* APPE platforms expose one PPE instance. This lock pins it across an
++ * exported EIP operation and serializes platform removal.
++ */
++static DEFINE_MUTEX(ppe_eip_api_lock);
++static struct ppe_flowtable *ppe_eip_ft;
++/* Flow handles retired during device teardown remain protected by the API
++ * lock until their EIP owners release the final reference.
++ */
++static LIST_HEAD(ppe_eip_retired_flows);
++
+ static const struct rhashtable_params ppe_ft_params = {
+ 	.head_offset = offsetof(struct ppe_ft_flow, node),
+ 	.key_offset = offsetof(struct ppe_ft_flow, cookie),
+@@ -456,6 +491,8 @@
+ 	bool is_new;
+ 	int i, ret;
+ 
++	lockdep_assert_held(&ft->lock);
++
+ 	i = ppe_ft_ref_get(ft->my_macs, sizeof(*ft->my_macs),
+ 			   PPE_MY_MAC_TBL_ENTRIES, ppe_ft_my_mac_match,
+ 			   addr, &is_new);
+@@ -477,6 +514,8 @@
+ 	struct ppe_ft_my_mac *slot;
+ 	int ret;
+ 
++	lockdep_assert_held(&ft->lock);
++
+ 	if (!ppe_ft_ref_put(ft->my_macs, sizeof(*ft->my_macs), index))
+ 		return;
+ 
+@@ -494,6 +533,76 @@
+ 	memset(slot, 0, sizeof(*slot));
+ }
+ 
++/* Retain the association between one L3 interface and a shared MY_MAC row.
++ * The table row and this bitmap edge have separate lifetimes in hardware.
++ */
++static int ppe_ft_l3_my_mac_get(struct ppe_flowtable *ft, int l3_if,
++				int my_mac)
++{
++	u16 *refcnt;
++	int ret;
++
++	lockdep_assert_held(&ft->lock);
++
++	if (l3_if < 0 || l3_if >= PPE_IN_L3_IF_TBL_ENTRIES ||
++	    my_mac < 0 || my_mac >= PPE_MY_MAC_TBL_ENTRIES)
++		return -EINVAL;
++
++	refcnt = &ft->my_mac_l3_refs[l3_if][my_mac];
++	if (*refcnt == U16_MAX)
++		return -EOVERFLOW;
++	if ((*refcnt)++)
++		return 0;
++
++	ret = ppe_l3_if_my_mac_set(ft->ppe_dev, l3_if, my_mac, true);
++	if (ret)
++		*refcnt = 0;
++
++	return ret;
++}
++
++/* Release both the L3 association and the MY_MAC reference held by a flow.
++ * A bitmap edge which cannot be removed retains one phantom table reference,
++ * preventing the row from being recycled underneath stale hardware state.
++ */
++static void ppe_ft_l3_my_mac_put(struct ppe_flowtable *ft, int l3_if,
++				 int my_mac)
++{
++	u16 *refcnt;
++	int ret;
++
++	lockdep_assert_held(&ft->lock);
++
++	if (my_mac < 0)
++		return;
++	if (l3_if < 0) {
++		ppe_ft_my_mac_put(ft, my_mac);
++		return;
++	}
++	if (WARN_ON_ONCE(l3_if >= PPE_IN_L3_IF_TBL_ENTRIES ||
++			 my_mac >= PPE_MY_MAC_TBL_ENTRIES))
++		return;
++
++	refcnt = &ft->my_mac_l3_refs[l3_if][my_mac];
++	if (WARN_ON_ONCE(!*refcnt))
++		return;
++	if (--*refcnt) {
++		ppe_ft_my_mac_put(ft, my_mac);
++		return;
++	}
++
++	ret = ppe_l3_if_my_mac_set(ft->ppe_dev, l3_if, my_mac, false);
++	if (ret) {
++		*refcnt = 1;
++		dev_err(ft->ppe_dev->dev,
++			"retaining MY_MAC %d association on L3 interface %d: %d\n",
++			my_mac, l3_if, ret);
++		return;
++	}
++
++	ppe_ft_my_mac_put(ft, my_mac);
++}
++
+ static bool ppe_ft_pub_ip_match(const void *entry, const void *key)
+ {
+ 	const struct ppe_ft_pub_ip *slot = entry;
+@@ -1780,6 +1889,301 @@
+ 		}
+ }
+ 
++static bool
++ppe_ft_eip_tuple_equal(const struct qcom_ppe_eip_tuple *a,
++		       const struct qcom_ppe_eip_tuple *b)
++{
++	if (a->ipv6 != b->ipv6 || a->protocol != b->protocol ||
++	    a->src_port != b->src_port || a->dst_port != b->dst_port)
++		return false;
++
++	if (a->ipv6)
++		return ipv6_addr_equal(&a->src.v6, &b->src.v6) &&
++		       ipv6_addr_equal(&a->dst.v6, &b->dst.v6);
++
++	return a->src.v4 == b->src.v4 && a->dst.v4 == b->dst.v4;
++}
++
++static int
++ppe_ft_eip_flow_install(struct ppe_flowtable *ft, struct net_device *ingress,
++			const struct qcom_ppe_eip_tuple *tuple,
++			struct qcom_ppe_eip_flow **result)
++{
++	struct qcom_ppe_eip_flow *flow;
++	struct edma_port_priv *port_priv;
++	int port, ret, err;
++
++	lockdep_assert_held(&ppe_eip_api_lock);
++	lockdep_assert_held(&ft->lock);
++
++	if (!ingress || !edma_port_dev_check(ingress))
++		return -EOPNOTSUPP;
++	if (tuple->protocol != IPPROTO_ESP && tuple->protocol != IPPROTO_UDP)
++		return -EPROTONOSUPPORT;
++	if (tuple->protocol == IPPROTO_UDP &&
++	    (!tuple->src_port || !tuple->dst_port))
++		return -EINVAL;
++	if (tuple->protocol == IPPROTO_ESP &&
++	    (tuple->src_port || tuple->dst_port))
++		return -EINVAL;
++
++	port_priv = netdev_priv(ingress);
++	port = port_priv->ppe_port->port_id;
++	if (port <= 0 || port >= ft->ppe_dev->num_ports)
++		return -EINVAL;
++
++	list_for_each_entry(flow, &ft->eip_flows, node) {
++		if (!ppe_ft_eip_tuple_equal(&flow->tuple, tuple))
++			continue;
++		if (flow->poisoned)
++			return -EIO;
++		/* A shared row is tied to one source L3 interface. Rekeyed SAs on
++		 * one WAN can share it, but the same tuple on another WAN cannot.
++		 */
++		if (flow->ingress_port != port)
++			return -EOPNOTSUPP;
++		if (flow->refcnt == UINT_MAX)
++			return -EOVERFLOW;
++		flow->refcnt++;
++		*result = flow;
++		return 0;
++	}
++
++	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
++	if (!flow)
++		return -ENOMEM;
++	flow->ft = ft;
++	flow->tuple = *tuple;
++	if (flow->tuple.protocol == IPPROTO_ESP) {
++		flow->tuple.src_port = 0;
++		flow->tuple.dst_port = 0;
++	}
++	flow->my_mac = -1;
++	flow->my_mac_l3_if = -1;
++	flow->ingress_port = port;
++	flow->entry.is_ipv6 = tuple->ipv6;
++	flow->entry.is_3tuple = tuple->protocol == IPPROTO_ESP;
++	flow->entry.src_l3_if_valid = true;
++	flow->entry.src_l3_if = port;
++	flow->entry.proto = flow->entry.is_3tuple ? PPE_FLOW_PROTOCOL_OTHER :
++						       PPE_FLOW_PROTOCOL_UDP;
++	flow->entry.ip_proto = tuple->protocol;
++	flow->entry.sport = tuple->src_port;
++	flow->entry.dport = tuple->dst_port;
++	flow->entry.service_code = PPE_EIP_SC_PPE2EIP_DECAP;
++	flow->entry.fwd_type = PPE_FLOW_FWD_TYPE_ROUTE;
++	flow->entry.pmtu = PPE_FLOW_PMTU_MAX;
++	if (tuple->ipv6) {
++		flow->entry.sip.ip6 = tuple->src.v6;
++		flow->entry.dip.ip6 = tuple->dst.v6;
++	} else {
++		flow->entry.sip.ip4 = tuple->src.v4;
++		flow->entry.dip.ip4 = tuple->dst.v4;
++	}
++
++	/* Flow lookup is entered only after the router-MAC check. Retain the
++	 * ingress MAC in the shared MY_MAC table and select it on this port's
++	 * L3 interface before publishing the outer flow.
++	 */
++	flow->my_mac = ppe_ft_my_mac_get(ft, ingress->dev_addr);
++	if (flow->my_mac < 0) {
++		ret = flow->my_mac;
++		goto err_free;
++	}
++	ret = ppe_l3_if_set(ft->ppe_dev, port, ingress->dev_addr,
++			    ingress->mtu, -1);
++	if (ret)
++		goto err_mac;
++	ret = ppe_port_l3_if_set(ft->ppe_dev, port, port);
++	if (ret)
++		goto err_mac;
++	ret = ppe_ft_l3_my_mac_get(ft, port, flow->my_mac);
++	if (ret)
++		goto err_mac;
++	flow->my_mac_l3_if = port;
++
++	ret = ppe_ft_host_get(ft, &flow->entry);
++	if (ret)
++		goto err_mac;
++	ret = ppe_flow_entry_add(ft->ppe_dev, &flow->entry);
++	if (ret < 0)
++		goto err_host;
++	flow->index = ret;
++	ret = ppe_flow_entry_enable(ft->ppe_dev, flow->index, true);
++	if (ret)
++		goto err_flow;
++
++	flow->refcnt = 1;
++	list_add_tail(&flow->node, &ft->eip_flows);
++	*result = flow;
++	return 0;
++
++err_flow:
++	err = ppe_flow_entry_del(ft->ppe_dev, flow->index);
++	if (err && err != -ENOENT) {
++		/* Keep dependencies alive underneath an undeletable row. */
++		flow->poisoned = true;
++		list_add_tail(&flow->node, &ft->eip_flows);
++		return ret;
++	}
++err_host:
++	ppe_ft_host_put(ft, &flow->entry);
++err_mac:
++	ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if, flow->my_mac);
++err_free:
++	kfree(flow);
++	return ret;
++}
++
++/* Remove one EIP outer row. A normal release quarantines an undeletable row
++ * with all dependencies intact. Driver teardown owns the hardware instance
++ * and can discard the software state after reporting the failed command.
++ */
++static bool ppe_ft_eip_flow_remove(struct ppe_flowtable *ft,
++				   struct qcom_ppe_eip_flow *flow,
++				   bool teardown)
++{
++	int ret, err;
++
++	lockdep_assert_held(&ppe_eip_api_lock);
++	lockdep_assert_held(&ft->lock);
++
++	ret = ppe_flow_entry_enable(ft->ppe_dev, flow->index, false);
++	err = ppe_flow_entry_del(ft->ppe_dev, flow->index);
++	if (err && err != -ENOENT) {
++		dev_err(ft->ppe_dev->dev,
++			"failed to remove EIP flow %d%s: %d\n", flow->index,
++			teardown ? " during teardown" : ", retaining resources",
++			err);
++		if (!teardown) {
++			flow->poisoned = true;
++			return false;
++		}
++	} else if (ret) {
++		dev_warn(ft->ppe_dev->dev,
++			 "EIP flow %d disable failed before successful delete: %d\n",
++			 flow->index, ret);
++	}
++
++	list_del(&flow->node);
++	ppe_ft_host_put(ft, &flow->entry);
++	ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if, flow->my_mac);
++	if (teardown && flow->refcnt) {
++		flow->ft = NULL;
++		list_add_tail(&flow->node, &ppe_eip_retired_flows);
++	} else {
++		kfree(flow);
++	}
++	return true;
++}
++
++static void ppe_ft_eip_flow_drain(struct ppe_flowtable *ft)
++{
++	struct qcom_ppe_eip_flow *flow, *tmp;
++
++	lockdep_assert_held(&ppe_eip_api_lock);
++	lockdep_assert_held(&ft->lock);
++
++	list_for_each_entry_safe(flow, tmp, &ft->eip_flows, node)
++		ppe_ft_eip_flow_remove(ft, flow, true);
++}
++
++int qcom_ppe_eip_flow_get(struct net_device *ingress,
++			  const struct qcom_ppe_eip_tuple *tuple,
++			  struct qcom_ppe_eip_flow **flow)
++{
++	struct ppe_flowtable *ft;
++	int ret;
++
++	if (!tuple || !flow)
++		return -EINVAL;
++	*flow = NULL;
++
++	mutex_lock(&ppe_eip_api_lock);
++	ft = ppe_eip_ft;
++	if (!ft) {
++		ret = -ENODEV;
++		goto out_api;
++	}
++
++	mutex_lock(&ft->lock);
++	ret = ppe_ft_eip_flow_install(ft, ingress, tuple, flow);
++	mutex_unlock(&ft->lock);
++out_api:
++	mutex_unlock(&ppe_eip_api_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_flow_get);
++
++void qcom_ppe_eip_flow_put(struct qcom_ppe_eip_flow *flow)
++{
++	struct qcom_ppe_eip_flow *candidate;
++	struct ppe_flowtable *ft;
++
++	if (!flow)
++		return;
++
++	mutex_lock(&ppe_eip_api_lock);
++	ft = ppe_eip_ft;
++	if (ft) {
++		mutex_lock(&ft->lock);
++		list_for_each_entry(candidate, &ft->eip_flows, node) {
++			if (candidate != flow)
++				continue;
++			if (WARN_ON_ONCE(!candidate->refcnt))
++				goto out_ft;
++			if (!--candidate->refcnt)
++				ppe_ft_eip_flow_remove(ft, candidate, false);
++			goto out_ft;
++		}
++		mutex_unlock(&ft->lock);
++	}
++
++	list_for_each_entry(candidate, &ppe_eip_retired_flows, node) {
++		if (candidate != flow)
++			continue;
++		if (WARN_ON_ONCE(!candidate->refcnt))
++			break;
++		if (!--candidate->refcnt) {
++			list_del(&candidate->node);
++			kfree(candidate);
++		}
++		break;
++	}
++	goto out_api;
++out_ft:
++	mutex_unlock(&ft->lock);
++out_api:
++	mutex_unlock(&ppe_eip_api_lock);
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_flow_put);
++
++int qcom_ppe_eip_vp_alloc(struct net_device *dev, qcom_ppe_eip_rx_t rx,
++			  void *data)
++{
++	struct ppe_flowtable *ft;
++	int ret;
++
++	mutex_lock(&ppe_eip_api_lock);
++	ft = ppe_eip_ft;
++	ret = ft ? ppe_vp_eip_alloc(ft->ppe_dev, dev, rx, data) : -ENODEV;
++	mutex_unlock(&ppe_eip_api_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_vp_alloc);
++
++void qcom_ppe_eip_vp_free(int vp)
++{
++	struct ppe_flowtable *ft;
++
++	mutex_lock(&ppe_eip_api_lock);
++	ft = ppe_eip_ft;
++	if (ft)
++		ppe_vp_eip_free(ft->ppe_dev, vp);
++	mutex_unlock(&ppe_eip_api_lock);
++}
++EXPORT_SYMBOL_GPL(qcom_ppe_eip_vp_free);
++
+ /* Delete a flow by the index returned by its add operation. */
+ static bool ppe_ft_flow_hw_del(struct ppe_flowtable *ft,
+ 			       struct ppe_ft_flow *flow)
+@@ -1882,6 +2286,7 @@
+ 
+ 	flow->cookie = f->cookie;
+ 	flow->my_mac = -1;
++	flow->my_mac_l3_if = -1;
+ 	flow->pub_ip = -1;
+ 	flow->pppoe = -1;
+ 	flow->vlan = -1;
+@@ -2454,10 +2859,10 @@
+ 				goto err_my_mac;
+ 		}
+ 
+-		ret = ppe_l3_if_my_mac_set(ft->ppe_dev, nh.l3_if,
+-					   flow->my_mac, true);
++		ret = ppe_ft_l3_my_mac_get(ft, nh.l3_if, flow->my_mac);
+ 		if (ret)
+ 			goto err_my_mac;
++		flow->my_mac_l3_if = nh.l3_if;
+ 	}
+ 
+ 	nexthop = find_first_zero_bit(ft->nexthop_used,
+@@ -2525,7 +2930,7 @@
+ err_host:
+ 	ppe_ft_host_put(ft, &flow->entry);
+ err_my_mac:
+-	ppe_ft_my_mac_put(ft, flow->my_mac);
++	ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if, flow->my_mac);
+ err_pppoe:
+ 	ppe_ft_pppoe_put(ft, flow->pppoe);
+ err_vlan:
+@@ -2574,7 +2979,8 @@
+ 	if (ppe_ft_flow_hw_del(ft, flow)) {
+ 		ppe_ft_host_put(ft, &flow->entry);
+ 		clear_bit(flow->nexthop, ft->nexthop_used);
+-		ppe_ft_my_mac_put(ft, flow->my_mac);
++		ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if,
++				     flow->my_mac);
+ 		ppe_ft_pppoe_put(ft, flow->pppoe);
+ 		ppe_ft_vlan_put(ft, flow->vlan);
+ 		ppe_ft_pub_ip_put(ft, flow->pub_ip);
+@@ -3291,6 +3697,53 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(ppe_ft_flows);
+ 
++static int ppe_ft_eip_flows_show(struct seq_file *seq, void *data)
++{
++	struct ppe_flowtable *ft = seq->private;
++	struct qcom_ppe_eip_flow *flow;
++
++	mutex_lock(&ft->lock);
++	list_for_each_entry(flow, &ft->eip_flows, node) {
++		u32 packets = 0, w0 = 0;
++		u16 bind_ref = 0;
++		u64 bytes = 0;
++
++		regmap_read(ft->ppe_dev->regmap,
++			    PPE_FLOW_TBL_ADDR + PPE_FLOW_TBL_INC * flow->index,
++			    &w0);
++		ppe_flow_stats_get(ft->ppe_dev, flow->index, &packets, &bytes);
++
++		if (flow->my_mac_l3_if >= 0 &&
++		    flow->my_mac_l3_if < PPE_IN_L3_IF_TBL_ENTRIES &&
++		    flow->my_mac >= 0 &&
++		    flow->my_mac < PPE_MY_MAC_TBL_ENTRIES)
++			bind_ref = ft->my_mac_l3_refs[flow->my_mac_l3_if]
++							 [flow->my_mac];
++
++		if (flow->tuple.ipv6) {
++			seq_printf(seq, "[%pI6c] -> [%pI6c]",
++				   &flow->tuple.src.v6, &flow->tuple.dst.v6);
++		} else {
++			seq_printf(seq, "%pI4 -> %pI4",
++				   &flow->tuple.src.v4, &flow->tuple.dst.v4);
++		}
++		seq_printf(seq,
++			   " proto:%u sport:%u dport:%u index:%d valid:%u ref:%u poisoned:%u ingress:%u l3_if:%d host:%u my_mac:%d bind_ref:%u service:%u packets:%u bytes:%llu\n",
++			   flow->tuple.protocol,
++			   be16_to_cpu(flow->tuple.src_port),
++			   be16_to_cpu(flow->tuple.dst_port), flow->index,
++			   !!(w0 & PPE_FLOW_W0_VALID), flow->refcnt,
++			   flow->poisoned, flow->ingress_port,
++			   flow->my_mac_l3_if, flow->entry.host_index,
++			   flow->my_mac, bind_ref, flow->entry.service_code,
++			   packets, (unsigned long long)bytes);
++	}
++	mutex_unlock(&ft->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(ppe_ft_eip_flows);
++
+ /**
+  * ppe_flowtable_debugfs_init - Expose the flowtable state in debugfs
+  * @ppe_dev: PPE device
+@@ -3318,6 +3771,9 @@
+ 	ft->debugfs_reasons = debugfs_create_file("reason_counters", 0400,
+ 						  ppe_dev->debugfs_root, ft,
+ 						  &ppe_ft_reason_counters_fops);
++	ft->debugfs_eip = debugfs_create_file("eip_outer_flows", 0400,
++					      ppe_dev->debugfs_root, ft,
++					      &ppe_ft_eip_flows_fops);
+ }
+ 
+ static int ppe_ft_block_cb(enum tc_setup_type type, void *type_data,
+@@ -3589,6 +4045,7 @@
+ 	mutex_init(&ft->lock);
+ 	INIT_LIST_HEAD(&ft->block_cb_list);
+ 	INIT_LIST_HEAD(&ft->zombies);
++	INIT_LIST_HEAD(&ft->eip_flows);
+ 
+ 	ret = rhashtable_init(&ft->flows, &ppe_ft_params);
+ 	if (ret) {
+@@ -3624,6 +4081,47 @@
+ 	return 0;
+ }
+ 
++int ppe_flowtable_eip_start(struct ppe_device *ppe_dev)
++{
++	struct ppe_flowtable *ft = ppe_dev->flowtable;
++	int ret = 0;
++
++	if (!ft || !ppe_dev->vp)
++		return -ENODEV;
++
++	mutex_lock(&ppe_eip_api_lock);
++	if (ppe_eip_ft && ppe_eip_ft != ft) {
++		dev_err(ppe_dev->dev,
++			"EIP API remains bound to another PPE instance\n");
++		ret = -EBUSY;
++	} else {
++		ppe_eip_ft = ft;
++	}
++	mutex_unlock(&ppe_eip_api_lock);
++
++	return ret;
++}
++
++void ppe_flowtable_eip_stop(struct ppe_device *ppe_dev)
++{
++	struct ppe_flowtable *ft = ppe_dev->flowtable;
++
++	if (!ft)
++		return;
++
++	mutex_lock(&ppe_eip_api_lock);
++	if (ppe_eip_ft != ft)
++		goto out;
++
++	mutex_lock(&ft->lock);
++	ppe_ft_eip_flow_drain(ft);
++	mutex_unlock(&ft->lock);
++	ppe_vp_eip_shutdown(ppe_dev);
++	ppe_eip_ft = NULL;
++out:
++	mutex_unlock(&ppe_eip_api_lock);
++}
++
+ static void ppe_ft_flow_free(void *ptr, void *arg)
+ {
+ 	kfree(ptr);
+@@ -3647,6 +4145,8 @@
+ 	if (!ft)
+ 		return;
+ 
++	ppe_flowtable_eip_stop(ppe_dev);
++
+ 	WARN_ON(!list_empty(&ft->block_cb_list));
+ 	ppp_unregister_channel_notifier(&ft->ppp_nb);
+ 	ppe_ft_flow_drain(ft);
+@@ -3684,6 +4184,7 @@
+ 	}
+ 	mutex_unlock(&ft->lock);
+ 
++	debugfs_remove(ft->debugfs_eip);
+ 	debugfs_remove(ft->debugfs_reasons);
+ 	debugfs_remove(ft->debugfs_pipeline);
+ 	debugfs_remove(ft->debugfs_rows);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -12,6 +12,8 @@
+ struct ppe_device;
+ 
+ int ppe_flowtable_setup(struct ppe_device *ppe_dev);
++int ppe_flowtable_eip_start(struct ppe_device *ppe_dev);
++void ppe_flowtable_eip_stop(struct ppe_device *ppe_dev);
+ void ppe_flowtable_destroy(struct ppe_device *ppe_dev);
+ int ppe_flowtable_setup_tc(struct net_device *dev, void *type_data);
+ void ppe_flowtable_debugfs_init(struct ppe_device *ppe_dev);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -740,6 +740,12 @@
+ #define PPE_FLOW_V4_W4_PMTU_LO			GENMASK(31, 21)
+ #define PPE_FLOW_V4_W5_PMTU_HI			GENMASK(2, 0)
+ 
++/* A 3-tuple entry replaces the L4 ports with the IP protocol number. */
++#define PPE_FLOW_V4_3T_W3_IP_PROTOCOL		GENMASK(19, 12)
++#define PPE_FLOW_V4_3T_W3_PMTU_CHECK_L3	BIT(28)
++#define PPE_FLOW_V4_3T_W3_PMTU_LO		GENMASK(31, 29)
++#define PPE_FLOW_V4_3T_W4_PMTU_HI		GENMASK(10, 0)
++
+ /* An IPv6 flow entry (entry type 1) spans two flow table entries: 9
+  * words. Words 0 and 1 match the IPv4 layout and the L4 ports sit at
+  * the IPv4 positions of words 3 and 4; the 128-bit address is stored
+@@ -750,6 +756,7 @@
+ #define PPE_FLOW_V6_W3_PMTU_HI			GENMASK(2, 0)
+ #define PPE_FLOW_V6_W4_IP_ADDR_0		GENMASK(31, 12)
+ #define PPE_FLOW_V6_W8_IP_ADDR_4		GENMASK(11, 0)
++#define PPE_FLOW_V6_3T_W3_IP_PROTOCOL		GENMASK(19, 12)
+ 
+ #define PPE_FLOW_FWD_TYPE_FORWARD		0
+ #define PPE_FLOW_FWD_TYPE_SNAT			1
+@@ -762,6 +769,7 @@
+ #define PPE_FLOW_PROTOCOL_TCP			1
+ #define PPE_FLOW_PROTOCOL_UDP			2
+ #define PPE_FLOW_PROTOCOL_UDP_LITE		3
++#define PPE_FLOW_PROTOCOL_OTHER			0
+ 
+ /* Next hop entries, providing the egress port, the destination MAC
+  * rewrite, the egress L3 interface (source MAC), the egress VLAN and
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -71,8 +71,14 @@
+ 	int node;
+ };
+ 
++struct ppe_vp_eip_rx {
++	qcom_ppe_eip_rx_t callback;
++	void *data;
++};
++
+ struct ppe_vp_slot {
+ 	struct net_device __rcu *dev;
++	struct ppe_vp_eip_rx __rcu *eip_rx;
+ 	struct rhashtable flows;
+ 	atomic_t nflows;
+ 	struct nf_hook_ops nf_ops;
+@@ -256,7 +262,8 @@
+  * ppe_drv_port_alloc() for a wireless virtual port.
+  */
+ static int ppe_vp_hw_set_queue(struct ppe_device *ppe_dev, int vp,
+-			       bool active, int queue, int profile)
++			       bool active, int queue, int profile,
++			       int physical_port)
+ {
+ 	u32 old_queue_map[PPE_QUEUE_SRC_PROFILE_NUM];
+ 	int ret, rollback;
+@@ -273,7 +280,7 @@
+ 		tbl[0] = PPE_L2_VP_PORT_W0_INVALID_VSI_FWD_EN |
+ 			 PPE_L2_VP_PORT_W0_PROMISC_EN |
+ 			 FIELD_PREP(PPE_L2_VP_PORT_W0_PHYSICAL_PORT,
+-				    PPE_VP_CPU_PORT);
++				    physical_port);
+ 		tbl[1] = PPE_L2_VP_PORT_W1_VP_TYPE |
+ 			 PPE_L2_VP_PORT_W1_CONTEXT_ACTIVE;
+ 	}
+@@ -318,7 +325,8 @@
+ 		return ret;
+ 
+ 	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue,
+-				   EDMA_CPU_PORT_PROFILE_ID);
++				   EDMA_CPU_PORT_PROFILE_ID,
++				   PPE_VP_CPU_PORT);
+ }
+ 
+ static int ppe_vp_ds_hw_set_queue(struct ppe_device *ppe_dev, int vp,
+@@ -326,7 +334,8 @@
+ {
+ 	int profile = active ? PPE_QUEUE_REDIR_PROFILE_ID : 0;
+ 
+-	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue, profile);
++	return ppe_vp_hw_set_queue(ppe_dev, vp, active, queue, profile,
++				   PPE_VP_CPU_PORT);
+ }
+ 
+ static int ppe_vp_hw_set_mtu(struct ppe_device *ppe_dev, int vp, int mtu)
+@@ -473,7 +482,8 @@
+ static void ppe_vp_hw_rollback(struct ppe_device *ppe_dev,
+ 			       struct ppe_vp_slot *slot, int vp)
+ {
+-	if (ppe_vp_hw_set_queue(ppe_dev, vp, false, 0, 0))
++	if (ppe_vp_hw_set_queue(ppe_dev, vp, false, 0, 0,
++				PPE_VP_CPU_PORT))
+ 		slot->poisoned = true;
+ }
+ 
+@@ -789,8 +799,158 @@
+ 	return PPE_VP_PORT_BASE + free;
+ }
+ 
++/**
++ * ppe_vp_eip_alloc - Allocate a source-only VP for one inbound IPsec SA
++ * @ppe_dev: PPE device
++ * @dev: IPsec software netdevice used for L3 context
++ * @rx: Exception callback for decrypted packets punted to the CPU
++ * @data: Callback data owned by the EIP client
++ *
++ * Unlike a wireless VP, an EIP VP is not published as a netdevice mapping
++ * and has no ingress hook.  Its source tag uniquely identifies one inbound
++ * SA during rekey, while its physical-port and queue mapping point at EIP
++ * port 7.  The callback is cleared and quiesced before free returns.
++ */
++int ppe_vp_eip_alloc(struct ppe_device *ppe_dev, struct net_device *dev,
++		     qcom_ppe_eip_rx_t rx, void *data)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	struct ppe_vp_eip_rx *eip_rx;
++	struct ppe_vp_slot *slot;
++	int free = -1, queue, queue_end, port, i, ret, err;
++	u32 reg;
++
++	if (!vp || !dev || !rx)
++		return -EINVAL;
++	eip_rx = kmalloc(sizeof(*eip_rx), GFP_KERNEL);
++	if (!eip_rx)
++		return -ENOMEM;
++	eip_rx->callback = rx;
++	eip_rx->data = data;
++
++	mutex_lock(&vp->lock);
++	if (vp->inject_disabled) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++
++	for (i = 0; i < PPE_VP_SLOTS; i++)
++		if (!vp->slots[i].poisoned && !vp->slots[i].refcnt &&
++		    !rcu_access_pointer(vp->slots[i].dev)) {
++			free = i;
++			break;
++		}
++	if (free < 0) {
++		ret = -ENOSPC;
++		goto out;
++	}
++
++	slot = &vp->slots[free];
++	port = PPE_VP_PORT_BASE + free;
++	ret = ppe_port_resource_get(ppe_dev, PPE_EIP_PORT, PPE_RES_UCAST,
++				    &queue, &queue_end);
++	if (ret)
++		goto out;
++
++	ret = ppe_vp_hw_set_queue(ppe_dev, port, true, queue,
++				  PPE_QUEUE_REDIR_PROFILE_ID, PPE_EIP_PORT);
++	if (ret)
++		goto out;
++
++	/* Max-size forward actions disable VP MTU/MRU exceptions. */
++	ret = ppe_vp_hw_set_mtu(ppe_dev, port,
++				FIELD_MAX(PPE_MRU_MTU_CTRL_W0_MTU) - ETH_HLEN);
++	if (ret)
++		goto err_hw;
++
++	ret = ppe_vp_l3_configure(ppe_dev, slot, dev, port);
++	if (ret)
++		goto err_hw;
++
++	reg = PPE_IN_L3_IF_TBL_ADDR +
++	      PPE_IN_L3_IF_TBL_INC * ppe_flowtable_vp_l3_if(ppe_dev, port);
++	ret = regmap_update_bits(ppe_dev->regmap, reg,
++				 PPE_IN_L3_IF_W0_TTL_DEC_BYPASS,
++				 PPE_IN_L3_IF_W0_TTL_DEC_BYPASS);
++	if (ret)
++		goto err_l3;
++
++	ppe_vp_stats_reset(slot);
++	slot->refcnt = 1;
++	WRITE_ONCE(slot->miss_disabled, false);
++	rcu_assign_pointer(slot->eip_rx, eip_rx);
++	eip_rx = NULL;
++	ret = port;
++	goto out;
++
++err_l3:
++	err = ppe_vp_l3_cleanup(ppe_dev, slot, port);
++	if (err)
++		slot->poisoned = true;
++err_hw:
++	err = ppe_vp_hw_set_queue(ppe_dev, port, false, 0, 0,
++				  PPE_VP_CPU_PORT);
++	if (err)
++		slot->poisoned = true;
++out:
++	mutex_unlock(&vp->lock);
++	kfree(eip_rx);
++	return ret;
++}
++
++void ppe_vp_eip_free(struct ppe_device *ppe_dev, int port)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	int i = port - PPE_VP_PORT_BASE;
++	struct ppe_vp_eip_rx *eip_rx;
++	struct ppe_vp_slot *slot;
++	int ret, err;
++
++	if (!vp || i < 0 || i >= PPE_VP_SLOTS)
++		return;
++
++	mutex_lock(&vp->lock);
++	slot = &vp->slots[i];
++	eip_rx = rcu_dereference_protected(slot->eip_rx,
++					   lockdep_is_held(&vp->lock));
++	if (!eip_rx || !slot->refcnt) {
++		mutex_unlock(&vp->lock);
++		return;
++	}
++
++	/* Stop new callbacks before disabling the hardware source port. Keep the
++	 * callback object and slot reservation alive until every old reader exits.
++	 */
++	rcu_assign_pointer(slot->eip_rx, NULL);
++	ret = ppe_vp_hw_set_queue(ppe_dev, port, false, 0, 0,
++				  PPE_VP_CPU_PORT);
++	err = ppe_vp_l3_cleanup(ppe_dev, slot, port);
++	if (!ret)
++		ret = err;
++	if (ret) {
++		slot->poisoned = true;
++		dev_err(ppe_dev->dev,
++			"failed to release EIP VP %d, quarantining slot: %d\n",
++				port, ret);
++	}
++
++	/* EDMA invokes the callback from NAPI/softirq context. */
++	synchronize_net();
++	kfree(eip_rx);
++	slot->refcnt = 0;
++	mutex_unlock(&vp->lock);
++}
++
++void ppe_vp_eip_shutdown(struct ppe_device *ppe_dev)
++{
++	int i;
++
++	for (i = 0; i < PPE_VP_SLOTS; i++)
++		ppe_vp_eip_free(ppe_dev, PPE_VP_PORT_BASE + i);
++}
++
+ int ppe_vp_ds_attach(struct ppe_device *ppe_dev, struct net_device *dev,
+-		     int queue, int node)
++			 int queue, int node)
+ {
+ 	struct ppe_vp *vp = ppe_dev->vp;
+ 	struct ppe_vp_slot *slot;
+@@ -1287,21 +1447,36 @@
+  * Return: true if the software receive path consumed the frame.
+  */
+ bool ppe_vp_rx_fallback(struct ppe_device *ppe_dev, int vp, struct sk_buff *skb,
+-			u16 service_code)
++				u16 service_code)
+ {
+-	struct ppe_vp *vpt = ppe_dev->vp;
++	struct ppe_vp_eip_rx *eip_rx;
++	struct ppe_vp *vpt;
+ 	struct ppe_vp_slot *slot;
+ 	struct net_device *dev;
++	bool consumed;
+ 	int i = vp - PPE_VP_PORT_BASE;
+ 
+-	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
++	rcu_read_lock();
++	vpt = READ_ONCE(ppe_dev->vp);
++	if (!vpt || i < 0 || i >= PPE_VP_SLOTS) {
++		rcu_read_unlock();
+ 		return false;
++	}
+ 	slot = &vpt->slots[i];
+ 	atomic64_inc(&slot->rx_punts);
+ 	atomic64_add(skb->len, &slot->rx_bytes);
+ 	atomic_set(&slot->last_service_code, service_code);
++	eip_rx = rcu_dereference(slot->eip_rx);
++	if (unlikely(eip_rx)) {
++		consumed = eip_rx->callback(eip_rx->data, skb, service_code);
++		if (consumed)
++			atomic64_inc(&slot->rx_delivered);
++		else
++			atomic64_inc(&slot->rx_dropped);
++		rcu_read_unlock();
++		return consumed;
++	}
+ 
+-	rcu_read_lock();
+ 	dev = rcu_dereference(slot->dev);
+ 	if (unlikely(!dev)) {
+ 		atomic64_inc(&slot->rx_dropped);
+@@ -1366,7 +1541,8 @@
+ 
+ 	if (!vpt || i < 0 || i >= PPE_VP_SLOTS)
+ 		return;
+-	if (READ_ONCE(vpt->slots[i].direct))
++	if (READ_ONCE(vpt->slots[i].direct) ||
++	    rcu_access_pointer(vpt->slots[i].eip_rx))
+ 		return;
+ 
+ 	/* Pairs with the hook's acquire load: publish fail-open state before
+@@ -1527,7 +1703,7 @@
+ 	struct ppe_vp *vp = s->private;
+ 	int i;
+ 
+-	seq_puts(s, "port dev carrier direct node refs node_refs peers flows hook l3 miss poison ");
++	seq_puts(s, "port dev carrier direct eip node refs node_refs peers flows hook l3 miss poison ");
+ 	seq_puts(s, "rx_punt rx_deliver rx_drop rx_bytes last_sc dst_pkts dst_drop dst_bytes ");
+ 	seq_puts(s, "qmap(src:queue/profile)\n");
+ 
+@@ -1543,10 +1719,12 @@
+ 			continue;
+ 
+ 		seq_printf(s,
+-			   "%d %s %d %d %d %d %d/%d/%d %u %d %d %d %d %d ",
++			   "%d %s %d %d %d %d %d %d/%d/%d %u %d %d %d %d %d ",
+ 			   port, dev ? dev->name : "-",
+ 			   dev ? netif_carrier_ok(dev) : 0, slot->direct,
+-			   slot->ds_node, slot->refcnt, slot->ds_node_refs[0],
++			   !!rcu_access_pointer(slot->eip_rx), slot->ds_node,
++			   slot->refcnt,
++			   slot->ds_node_refs[0],
+ 			   slot->ds_node_refs[1], slot->ds_node_refs[2],
+ 			   ppe_vp_peer_count_locked(vp, port),
+ 			   atomic_read(&slot->nflows), slot->hook_registered,
+@@ -1662,7 +1840,8 @@
+ 	if (!vp)
+ 		return;
+ 
+-	ppe_dev->vp = NULL;
++	ppe_vp_eip_shutdown(ppe_dev);
++	WRITE_ONCE(ppe_dev->vp, NULL);
+ 	unregister_netdevice_notifier(&vp->notifier);
+ 
+ 	/* The PPE port net devices are already unregistered, which flushed
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/in6.h>
+ #include <linux/rhashtable.h>
++#include <linux/soc/qcom/ppe.h>
+ 
+ struct ppe_device;
+ struct net_device;
+@@ -66,6 +67,10 @@
+ 		    struct ppe_vp_flow *flow);
+ void ppe_vp_flow_del(struct ppe_device *ppe_dev, int vp,
+ 		     struct ppe_vp_flow *flow);
++int ppe_vp_eip_alloc(struct ppe_device *ppe_dev, struct net_device *dev,
++		     qcom_ppe_eip_rx_t rx, void *data);
++void ppe_vp_eip_free(struct ppe_device *ppe_dev, int vp);
++void ppe_vp_eip_shutdown(struct ppe_device *ppe_dev);
+ 
+ int ppe_vp_ds_attach(struct ppe_device *ppe_dev, struct net_device *dev,
+ 		     int queue, int node);
+--- a/include/linux/soc/qcom/ppe.h
++++ b/include/linux/soc/qcom/ppe.h
+@@ -5,17 +5,73 @@
+ #define __LINUX_SOC_QCOM_PPE_H__
+ 
+ #include <linux/kconfig.h>
++#include <linux/errno.h>
++#include <linux/in6.h>
+ #include <linux/stddef.h>
++#include <linux/types.h>
+ 
+ struct net_device;
++struct sk_buff;
++struct qcom_ppe_eip_flow;
++
++/**
++ * struct qcom_ppe_eip_tuple - outer IPsec flow redirected to EIP-197
++ * @src: Outer source address in network byte order.
++ * @dst: Outer destination address in network byte order.
++ * @src_port: UDP source port for NAT-T, zero for ESP.
++ * @dst_port: UDP destination port for NAT-T, zero for ESP.
++ * @protocol: IPPROTO_ESP or IPPROTO_UDP.
++ * @ipv6: Select IPv6 rather than IPv4 addresses.
++ */
++struct qcom_ppe_eip_tuple {
++	union {
++		__be32 v4;
++		struct in6_addr v6;
++	} src, dst;
++	__be16 src_port;
++	__be16 dst_port;
++	u8 protocol;
++	bool ipv6;
++};
++
++typedef bool (*qcom_ppe_eip_rx_t)(void *data, struct sk_buff *skb,
++				   u16 service_code);
+ 
+ #if IS_REACHABLE(CONFIG_QCOM_PPE)
+ struct net_device *qcom_ppe_port_dev_get(unsigned int port_num);
++int qcom_ppe_eip_vp_alloc(struct net_device *dev, qcom_ppe_eip_rx_t rx,
++			  void *data);
++void qcom_ppe_eip_vp_free(int vp);
++int qcom_ppe_eip_flow_get(struct net_device *ingress,
++			  const struct qcom_ppe_eip_tuple *tuple,
++			  struct qcom_ppe_eip_flow **flow);
++void qcom_ppe_eip_flow_put(struct qcom_ppe_eip_flow *flow);
+ #else
+ static inline struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
+ {
+ 	return NULL;
+ }
++
++static inline int qcom_ppe_eip_vp_alloc(struct net_device *dev,
++					qcom_ppe_eip_rx_t rx, void *data)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void qcom_ppe_eip_vp_free(int vp)
++{
++}
++
++static inline int qcom_ppe_eip_flow_get(struct net_device *ingress,
++					const struct qcom_ppe_eip_tuple *tuple,
++					struct qcom_ppe_eip_flow **flow)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void qcom_ppe_eip_flow_put(struct qcom_ppe_eip_flow *flow)
++{
++}
+ #endif
+ 
+ #endif /* __LINUX_SOC_QCOM_PPE_H__ */
