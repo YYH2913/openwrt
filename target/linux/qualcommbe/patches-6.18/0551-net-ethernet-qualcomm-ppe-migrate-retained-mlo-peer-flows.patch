@@ -1,0 +1,198 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 2 Aug 2026 16:10:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: migrate retained MLO peer flows
+
+When the final virtual-port reference for a direct-switch node is removed,
+peer mappings shared with another MLO node select that remaining node.  The
+old priority profile is then invalidated, but no peer event follows to move
+the live flow to the newly selected profile.  It consequently remains on
+the CPU path until conntrack replaces it.
+
+Remember when purging a node moved at least one peer, invalidate the old
+profile first, then resynchronize flows which still have an explicit peer
+mapping.  A strict lookup deliberately excludes the single-node fallback:
+a station removed with the node must not be guessed to belong to another
+radio.  Keep all affected flows disabled if the shared VP queue could not
+be moved successfully.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -132,23 +132,29 @@
+ 	peer->node = PPE_VP_DS_NODE_NONE;
+ }
+ 
+-static void ppe_vp_ds_peers_purge(struct ppe_vp *vp, int port, int node)
++static bool ppe_vp_ds_peers_purge(struct ppe_vp *vp, int port, int node)
+ {
+ 	struct ppe_vp_peer *peer, *tmp;
++	bool moved = false;
+ 
+ 	list_for_each_entry_safe(peer, tmp, &vp->peers, list) {
+ 		if (peer->vp != port)
+ 			continue;
+ 		if (node >= 0) {
+ 			peer->node_refs[node] = 0;
+-			if (peer->node == node)
++			if (peer->node == node) {
+ 				ppe_vp_ds_peer_select_node(peer);
++				if (peer->node != PPE_VP_DS_NODE_NONE)
++					moved = true;
++			}
+ 			if (peer->node != PPE_VP_DS_NODE_NONE)
+ 				continue;
+ 		}
+ 		list_del(&peer->list);
+ 		kfree(peer);
+ 	}
++
++	return moved;
+ }
+ 
+ static const struct rhashtable_params ppe_vp_flow_params = {
+@@ -895,6 +901,7 @@
+ 	struct ppe_vp_slot *slot;
+ 	bool carrier_down = false;
+ 	bool profile_down = false;
++	bool peer_sync = false;
+ 	int next, ret;
+ 
+ 	if (!vp || i < 0 || i >= PPE_VP_SLOTS || node < 0 ||
+@@ -909,11 +916,13 @@
+ 
+ 	slot->ds_node_refs[node]--;
+ 	if (!slot->ds_node_refs[node]) {
+-		ppe_vp_ds_peers_purge(vp, port, node);
++		peer_sync = ppe_vp_ds_peers_purge(vp, port, node);
+ 		profile_down = true;
+ 	}
+-	if (!rcu_access_pointer(slot->dev))
++	if (!rcu_access_pointer(slot->dev)) {
++		peer_sync = false;
+ 		goto out_unlock;
++	}
+ 	if (slot->ds_node == node && !slot->ds_node_refs[node]) {
+ 		for (next = 0; next < PPE_VP_DS_NODES; next++)
+ 			if (slot->ds_node_refs[next] && vp->ds_node_up[next])
+@@ -945,3 +954,5 @@
++	if (peer_sync && !carrier_down)
++		ppe_flowtable_port_peers_sync(ppe_dev, port);
+ 	if (carrier_down)
+ 		ppe_flowtable_port_carrier(ppe_dev, port, false);
+ 	ppe_vp_put(ppe_dev, port);
+@@ -1074,6 +1085,38 @@
+ 	if (node < 0 || node >= PPE_VP_DS_NODES ||
+ 	    !vp->slots[i].ds_node_refs[node] || !vp->ds_node_up[node])
+ 		node = -ENETDOWN;
++out:
++	mutex_unlock(&vp->lock);
++	return node;
++}
++
++int ppe_vp_ds_peer_node_get(struct ppe_device *ppe_dev, int port,
++			    const u8 *addr)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	struct ppe_vp_peer *peer;
++	int i = port - PPE_VP_PORT_BASE;
++	int node;
++
++	if (!vp || i < 0 || i >= PPE_VP_SLOTS)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&vp->lock);
++	if (!vp->slots[i].direct) {
++		node = -EOPNOTSUPP;
++		goto out;
++	}
++
++	peer = ppe_vp_ds_peer_find(vp, port, addr);
++	if (!peer) {
++		node = -ENOENT;
++		goto out;
++	}
++
++	node = peer->node;
++	if (node < 0 || node >= PPE_VP_DS_NODES ||
++	    !vp->slots[i].ds_node_refs[node] || !vp->ds_node_up[node])
++		node = -ENETDOWN;
+ out:
+ 	mutex_unlock(&vp->lock);
+ 	return node;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -75,6 +75,8 @@
+ int ppe_vp_ds_peer_set(struct ppe_device *ppe_dev, int vp, int node,
+ 			       const u8 *addr, bool enable);
+ int ppe_vp_ds_node_get(struct ppe_device *ppe_dev, int vp, const u8 *addr);
++int ppe_vp_ds_peer_node_get(struct ppe_device *ppe_dev, int vp,
++			    const u8 *addr);
+ unsigned int ppe_vp_ds_peer_count(struct ppe_device *ppe_dev, int node);
+ void ppe_vp_debugfs_init(struct ppe_device *ppe_dev);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -3437,6 +3437,53 @@
+ 	mutex_unlock(&ft->lock);
+ }
+ 
++void ppe_flowtable_port_peers_sync(struct ppe_device *ppe_dev, int port)
++{
++	struct ppe_flowtable *ft = ppe_dev->flowtable;
++	struct rhashtable_iter iter;
++	struct ppe_ft_flow *flow;
++
++	if (!ft)
++		return;
++
++	mutex_lock(&ft->lock);
++	rhashtable_walk_enter(&ft->flows, &iter);
++	rhashtable_walk_start(&iter);
++	while ((flow = rhashtable_walk_next(&iter))) {
++		int node, ret;
++		u8 profile;
++
++		if (IS_ERR(flow)) {
++			if (PTR_ERR(flow) == -EAGAIN)
++				continue;
++			break;
++		}
++		if (flow->eport != port)
++			continue;
++
++		/* Do not use the single-node fallback here.  A detached peer may
++		 * no longer exist, while a peer retained by another MLO node has an
++		 * explicit mapping which can be migrated without guessing.
++		 */
++		node = ppe_vp_ds_peer_node_get(ppe_dev, port, flow->dmac);
++		if (node < 0)
++			continue;
++		profile = node + 1;
++
++		ret = ppe_flow_entry_profile_set(ppe_dev, flow->index, profile, true);
++		if (ret) {
++			dev_warn(ppe_dev->dev,
++				 "failed to resync flow %d for VP %d peer %pM profile %u: %d\n",
++				 flow->index, port, flow->dmac, profile, ret);
++			continue;
++		}
++		flow->entry.pri_profile = profile;
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++	mutex_unlock(&ft->lock);
++}
++
+ /**
+  * ppe_flowtable_port_carrier - Report the link state of a PPE port
+  * @ppe_dev: PPE device
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -24,1 +24,2 @@
++void ppe_flowtable_port_peers_sync(struct ppe_device *ppe_dev, int port);
+ #endif
+-- 
+2.43.0
