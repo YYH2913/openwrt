@@ -1,0 +1,57 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 21:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: release direct vports with node
+
+A WLAN recovery destroys and recreates its direct-switch node before
+mac80211 reconstructs the virtual interfaces.  Direct virtual-port
+references previously survived that destruction in the PPE-wide VP table,
+so every recovery leaked a reference and left peer routing associated with
+a node instance that no longer existed.
+
+Add a node-wide detach helper and use the normal detach path for every
+reference.  This preserves shared MLO ports owned by other running nodes,
+invalidates the removed node's flow profiles and releases the slot when its
+last user disappears.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c | 13 +++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.h |  1 +
+ 2 files changed, 14 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -712,6 +712,19 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 	return true;
+ }
+ 
++void ppe_vp_ds_node_detach(struct ppe_device *ppe_dev, int node)
++{
++	int i;
++
++	if (node < 0 || node >= PPE_VP_DS_NODES)
++		return;
++
++	/* A node may own several link-vif references to one shared MLO VP. */
++	for (i = 0; i < PPE_VP_SLOTS; i++)
++		while (ppe_vp_ds_detach(ppe_dev, PPE_VP_PORT_BASE + i, node))
++			;
++}
++
+ int ppe_vp_ds_peer_set(struct ppe_device *ppe_dev, int port, int node,
+ 		       const u8 *addr, bool enable)
+ {
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -68,6 +68,7 @@ int ppe_vp_ds_attach(struct ppe_device *
+ 		     int queue, int node);
+ bool ppe_vp_ds_detach(struct ppe_device *ppe_dev, int vp, int node);
+ void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up);
++void ppe_vp_ds_node_detach(struct ppe_device *ppe_dev, int node);
+ int ppe_vp_ds_peer_set(struct ppe_device *ppe_dev, int vp, int node,
+ 		       const u8 *addr, bool enable);
+ int ppe_vp_ds_node_get(struct ppe_device *ppe_dev, int vp, const u8 *addr);
+-- 
+2.43.0
