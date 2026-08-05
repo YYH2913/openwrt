@@ -1,0 +1,51 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: include vmalloc declarations directly
+
+Linux 6.18 no longer exposes vzalloc() and vfree() through the headers
+these translation units happen to include.  Include linux/vmalloc.h at
+each use.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_ctx.c
++++ b/driver/eip197/eip_ctx.c
+@@ -11,6 +11,7 @@
+ #include <linux/cache.h>
+ #include <linux/debugfs.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/rwlock_types.h>
+ 
+ #include "eip_priv.h"
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -24,6 +24,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ 
+--- a/clients/crypto/eip_crypto_aead.c
++++ b/clients/crypto/eip_crypto_aead.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <linux/version.h>
++#include <linux/vmalloc.h>
+ #include <linux/of.h>
+ 
+ #include <crypto/aes.h>
+--- a/clients/crypto/eip_crypto_ahash.c
++++ b/clients/crypto/eip_crypto_ahash.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <linux/version.h>
++#include <linux/vmalloc.h>
+ #include <linux/crypto.h>
+ 
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
