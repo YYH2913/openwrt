@@ -1,0 +1,59 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 22:10:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: reject ambiguous direct peer routes
+
+A direct virtual port shared by MLO links can have references to several
+PPE direct-switch nodes.  Falling back to its currently programmed static
+queue when the destination peer is not mapped can silently send a flow to
+the wrong radio.
+
+Keep the fallback when exactly one node owns the virtual port, but reject
+flow installation until peer routing is known when ownership is ambiguous.
+The peer is normally registered before its first routed flow, so this only
+turns an association race into a software-path fallback.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -794,6 +794,7 @@ int ppe_vp_ds_node_get(struct ppe_device
+ 	struct ppe_vp *vp = ppe_dev->vp;
+ 	struct ppe_vp_peer *peer;
+ 	int i = port - PPE_VP_PORT_BASE;
++	int fallback = PPE_VP_DS_NODE_NONE;
+ 	int node;
+ 
+ 	if (!vp || i < 0 || i >= PPE_VP_SLOTS)
+@@ -806,7 +807,24 @@ int ppe_vp_ds_node_get(struct ppe_device
+ 	}
+ 
+ 	peer = ppe_vp_ds_peer_find(vp, port, addr);
+-	node = peer ? peer->node : vp->slots[i].ds_node;
++	if (peer) {
++		node = peer->node;
++	} else {
++		/* A single-node VP has an unambiguous static queue.  A shared
++		 * MLO VP needs a peer mapping because its static queue only
++		 * identifies one of several possible radios.
++		 */
++		for (node = 0; node < PPE_VP_DS_NODES; node++) {
++			if (!vp->slots[i].ds_node_refs[node])
++				continue;
++			if (fallback != PPE_VP_DS_NODE_NONE) {
++				node = -ENOENT;
++				goto out;
++			}
++			fallback = node;
++		}
++		node = fallback;
++	}
+ 	if (node < 0 || node >= PPE_VP_DS_NODES ||
+ 	    !vp->slots[i].ds_node_refs[node] || !vp->ds_node_up[node])
+ 		node = -ENETDOWN;
+-- 
+2.43.0
