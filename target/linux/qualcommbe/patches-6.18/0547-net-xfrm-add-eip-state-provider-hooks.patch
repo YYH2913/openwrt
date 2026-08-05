@@ -1,0 +1,182 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: xfrm: add EIP state provider hooks
+
+The Qualcomm EIP-197 IPsec client is a full XFRM state provider rather
+than a conventional netdev crypto-offload driver. It must replace the
+per-family ESP state and output operations while loaded, preserve native
+ESP as a fallback, and restore the exact provider it replaced on unload.
+
+Add a compare-and-replace API for the RCU-protected state provider table
+and export the lock-held provider lookup. Keep EIP ownership separate from
+xfrmdev offload state, and remember XFRMA_OFFLOAD_DEV requests before the
+provider init callback so EIP and xfrmdev cannot claim the same SA.
+
+Import replay and lifetime state before provider initialization, export
+the replay overflow helper needed to mirror outbound sequence state, use
+the EIP-computed transform overhead for MTU calculations, and make ESP GRO
+fall back to the normal protocol path for EIP-owned SAs.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -329,6 +329,12 @@
+ #define XFRM_TIME_DEFER	1
+ #define XFRM_SOFT_EXPIRE 2
+ 
++/* State is owned by the Qualcomm EIP-197 XFRM provider. */
++#define XFRM_STATE_OFFLOAD_EIP	4
++
++/* The state was created with an XFRMA_OFFLOAD_DEV request. */
++#define XFRM_STATE_OFFLOAD_DEV_REQUESTED	8
++
+ enum {
+ 	XFRM_STATE_VOID,
+ 	XFRM_STATE_ACQ,
+@@ -428,6 +434,9 @@
+ int xfrm_state_register_afinfo(struct xfrm_state_afinfo *afinfo);
+ int xfrm_state_unregister_afinfo(struct xfrm_state_afinfo *afinfo);
+ struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family);
++int xfrm_state_update_afinfo(unsigned int family,
++			     struct xfrm_state_afinfo *expected,
++			     struct xfrm_state_afinfo *new);
+ struct xfrm_state_afinfo *xfrm_state_afinfo_get_rcu(unsigned int family);
+ 
+ struct xfrm_input_afinfo {
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -3089,6 +3089,34 @@
+ 		rcu_read_unlock();
+ 	return afinfo;
+ }
++EXPORT_SYMBOL_GPL(xfrm_state_get_afinfo);
++
++int xfrm_state_update_afinfo(unsigned int family,
++			     struct xfrm_state_afinfo *expected,
++			     struct xfrm_state_afinfo *new)
++{
++	struct xfrm_state_afinfo *old_afinfo;
++	int err = 0;
++
++	if (WARN_ON(family >= NPROTO || !expected || !new ||
++		    expected->family != family || new->family != family))
++		return -EINVAL;
++
++	spin_lock_bh(&xfrm_state_afinfo_lock);
++	old_afinfo = rcu_dereference_protected(xfrm_state_afinfo[family],
++					       lockdep_is_held(&xfrm_state_afinfo_lock));
++	if (old_afinfo != expected)
++		err = -ESTALE;
++	else
++		rcu_assign_pointer(xfrm_state_afinfo[family], new);
++	spin_unlock_bh(&xfrm_state_afinfo_lock);
++
++	if (!err)
++		synchronize_rcu();
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(xfrm_state_update_afinfo);
+ 
+ void xfrm_flush_gc(void)
+ {
+@@ -3115,6 +3143,13 @@
+ 	u32 blksize, net_adj = 0;
+ 	u32 overhead, payload_mtu;
+ 
++	if (x->xflags & XFRM_STATE_OFFLOAD_EIP) {
++		overhead = x->props.header_len + x->props.trailer_len;
++		if (mtu <= overhead)
++			return 1;
++		return mtu - overhead;
++	}
++
+ 	if (x->km.state != XFRM_STATE_VALID ||
+ 	    !type || type->proto != IPPROTO_ESP) {
+ 		if (mtu <= x->props.header_len)
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -954,17 +954,6 @@
+ 		}
+ 	}
+ 
+-	err = __xfrm_init_state(x, extack);
+-	if (err)
+-		goto error;
+-
+-	if (attrs[XFRMA_SEC_CTX]) {
+-		err = security_xfrm_state_alloc(x,
+-						nla_data(attrs[XFRMA_SEC_CTX]));
+-		if (err)
+-			goto error;
+-	}
+-
+ 	if ((err = xfrm_alloc_replay_state_esn(&x->replay_esn, &x->preplay_esn,
+ 					       attrs[XFRMA_REPLAY_ESN_VAL])))
+ 		goto error;
+@@ -980,6 +969,22 @@
+ 	/* override default values from above */
+ 	xfrm_update_ae_params(x, attrs, 0);
+ 
++	/* Providers run before xfrm_dev_state_add() populates xso. */
++	if (attrs[XFRMA_OFFLOAD_DEV])
++		x->xflags |= XFRM_STATE_OFFLOAD_DEV_REQUESTED;
++
++	/* State providers need the imported replay and lifetime state at init. */
++	err = __xfrm_init_state(x, extack);
++	if (err)
++		goto error;
++
++	if (attrs[XFRMA_SEC_CTX]) {
++		err = security_xfrm_state_alloc(x,
++						nla_data(attrs[XFRMA_SEC_CTX]));
++		if (err)
++			goto error;
++	}
++
+ 	xfrm_set_type_offload(x, attrs[XFRMA_OFFLOAD_DEV]);
+ 	/* configure the hardware if offload is requested */
+ 	if (attrs[XFRMA_OFFLOAD_DEV]) {
+--- a/net/xfrm/xfrm_replay.c
++++ b/net/xfrm/xfrm_replay.c
+@@ -768,6 +768,7 @@
+ 	return __xfrm_replay_overflow(x, skb);
+ }
+ #endif
++EXPORT_SYMBOL_GPL(xfrm_replay_overflow);
+ 
+ int xfrm_init_replay(struct xfrm_state *x, struct netlink_ext_ack *extack)
+ {
+--- a/net/ipv4/esp4_offload.c
++++ b/net/ipv4/esp4_offload.c
+@@ -63,6 +63,12 @@
+ 			x = NULL;
+ 		}
+ 
++		/* EIP consumes ESP in its protocol handler, outside xfrm_input(). */
++		if (unlikely(x && (x->xflags & XFRM_STATE_OFFLOAD_EIP))) {
++			xfrm_state_put(x);
++			goto out_reset;
++		}
++
+ 		if (!x)
+ 			goto out_reset;
+ 
+--- a/net/ipv6/esp6_offload.c
++++ b/net/ipv6/esp6_offload.c
+@@ -90,6 +90,12 @@
+ 			x = NULL;
+ 		}
+ 
++		/* EIP consumes ESP in its protocol handler, outside xfrm_input(). */
++		if (unlikely(x && (x->xflags & XFRM_STATE_OFFLOAD_EIP))) {
++			xfrm_state_put(x);
++			goto out_reset;
++		}
++
+ 		if (!x)
+ 			goto out_reset;
+ 
+-- 
+2.43.0
