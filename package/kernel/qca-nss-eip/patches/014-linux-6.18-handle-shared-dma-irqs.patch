@@ -1,0 +1,56 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: filter shared DMA interrupts by ring
+
+IPQ9574 routes one lookaside and one hybrid ring to each of four EIP IRQs.
+The lookaside handler previously assumed an IRQ was dedicated to its ring,
+so every hybrid interrupt also acknowledged the paired lookaside status
+and scheduled an empty NAPI poll.  The hybrid handler checked its status
+bits but still claimed interrupts raised only by the paired lookaside ring.
+
+Check each ring's status before acknowledging it and return IRQ_NONE when a
+shared interrupt has no work for that ring.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -336,6 +336,9 @@ static irqreturn_t eip_dma_handle_irq(in
+ {
+ 	struct eip_dma *dma = ctx;
+ 
++	if (!(ioread32(dma->out.proc_status) & EIP_HW_RDR_PROC_IRQ_STATUS))
++		return IRQ_NONE;
++
+ 	/*
+ 	 * Acknowledge interrupt. HW interrupt remain in disabled state
+ 	 * until our bottom half re-enables it.
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -600,6 +600,7 @@ static irqreturn_t eip_dma_hy_handle_irq
+ {
+ 	struct eip_dma *dma = ctx;
++	irqreturn_t ret = IRQ_NONE;
+ 
+ 	/*
+ 	 * Acknowledge interrupt. HW interrupt remain in disabled state
+ 	 * until our bottom half re-enables it.
+@@ -607,14 +608,16 @@ static irqreturn_t eip_dma_hy_handle_irq
+ 	if (ioread32(dma->in.proc_status) & EIP_HW_CDR_PROC_IRQ_STATUS) {
+ 		iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, dma->in.proc_status);
+ 		napi_schedule(&dma->in.napi);
++		ret = IRQ_HANDLED;
+ 	}
+ 
+ 	if (ioread32(dma->out.proc_status) & EIP_HW_RDR_PROC_IRQ_STATUS) {
+ 		iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
+ 		napi_schedule(&dma->out.napi);
++		ret = IRQ_HANDLED;
+ 	}
+ 
+-	return IRQ_HANDLED;
++	return ret;
+ }
+ 
+ /*
