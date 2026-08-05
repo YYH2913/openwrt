@@ -1,0 +1,52 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 18:25:00 +0800
+Subject: [PATCH] net: qualcomm: quiesce EIP VPs before zombie release
+
+A quarantined PPE row is retained when hardware deletion fails. Clearing
+VALID is best effort too, so a second command failure can leave the row
+forwarding to an EIP virtual port until device teardown.
+
+The teardown path currently drops the provider object, EIP flow and TR
+before shutting down EIP VPs. Reverse that order for zombies. Clearing the
+VP callback and queue mapping, followed by synchronize_net(), removes the
+remaining software path before the provider releases its EIP flow and
+transform references. The exported API is already shutting down, so later
+provider-side VP puts are intentionally no-ops.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -4333,18 +4333,19 @@ void ppe_flowtable_destroy(struct ppe_de
+ 	ppp_unregister_channel_notifier(&ft->ppp_nb);
+ 	ppe_ft_flow_drain(ft);
+ 
+-	/* Quarantined rows were disabled when deletion failed, but deliberately
+-	 * retained their provider objects while the PPE could still reference
+-	 * them. Device teardown is the final point at which those EIP resources
+-	 * can be released.
++	/* A quarantined row may still be valid when both delete and disable
++	 * failed. Stop EIP callbacks and queue mappings before releasing a
++	 * provider object whose flow or TR that row could still reach.
+ 	 */
+-	list_for_each_entry(flow, &ft->zombies, zombie_node)
+-		ppe_ft_eip_provider_put(flow);
++	ppe_flowtable_eip_stop(ppe_dev);
+ 
+-	/* Provider callbacks and their full-inline flows are gone before the
+-	 * exported EIP API drains outer flows and tears down EIP virtual ports.
++	/* EIP VP shutdown clears callbacks and waits for old NAPI readers. The
++	 * provider can now remove its inner EIP flow and release the TR even when
++	 * the original PPE row could not be invalidated. qcom_ppe_eip_vp_free()
++	 * is intentionally a no-op after the exported API has stopped.
+ 	 */
+-	ppe_flowtable_eip_stop(ppe_dev);
++	list_for_each_entry(flow, &ft->zombies, zombie_node)
++		ppe_ft_eip_provider_put(flow);
+ 	mutex_lock(&ft->lock);
+ 	for (i = 0; i < PPE_FT_PPPOE_SESSIONS; i++) {
+ 		if (!ft->pppoe[i].ref.refcnt)
+-- 
+2.43.0
