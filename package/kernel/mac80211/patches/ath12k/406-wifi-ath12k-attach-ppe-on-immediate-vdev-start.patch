@@ -1,0 +1,33 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 19:00:00 +0800
+Subject: [PATCH] wifi: ath12k: attach PPE on immediate vdev start
+
+The delayed station-vdev path attaches its direct-switch virtual port,
+but the normal channel-assignment path did not.  AP vdevs normally take
+the latter path, leaving them without a PPE VP even though all rings were
+running.  Attach the VP after a successful immediate vdev start and roll
+the vdev back if the attachment fails.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -11555,6 +11555,14 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 	}
+ 
+ 	arvif->is_started = true;
++	ret = ath12k_ppe_ds_vif_attach(arvif);
++	if (ret) {
++		ath12k_warn(ab, "failed to attach vdev %u to PPE: %d\n",
++			    arvif->vdev_id, ret);
++		ath12k_mac_vdev_stop(arvif);
++		arvif->is_started = false;
++		goto out;
++	}
+ 
+ 	/* TODO: Setup ps and cts/rts protection */
+ 
