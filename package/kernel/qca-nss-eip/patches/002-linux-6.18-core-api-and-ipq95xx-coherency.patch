@@ -1,0 +1,123 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: adapt the core driver to Linux 6.18
+
+IPQ95xx is I/O coherent and the vendor kernel used the now-removed global
+CONFIG_IO_COHERENCY option to compile out direct arm64 cache maintenance.
+Express that property locally instead of depending on private arm64 APIs.
+
+Also limit the SoC allow-list to IDs available in the upstream binding and
+adapt the platform remove callback and module entry points to current APIs.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/Makefile
++++ b/driver/eip197/Makefile
+@@ -8,6 +8,10 @@ NSS_EIP_DRIVER_INCLUDE = -I$(obj)/../exp
+ ccflags-y += $(NSS_EIP_DRIVER_INCLUDE)
+ 
+ ccflags-y += -Wall -Werror
++ifeq ($(SoC),ipq95xx)
++ccflags-y += -DEIP_DMA_COHERENT
++endif
++
+ ccflags-y += -DNSS_EIP_BUILD_ID=\"'Build_ID - $(shell date +'%m/%d/%y, %H:%M:%S') SoC=$(SoC)'\"
+ 
+ obj-m += $(NSS_EIP_MOD_NAME).o
+--- a/driver/eip197/eip_priv.h
++++ b/driver/eip197/eip_priv.h
+@@ -129,35 +129,35 @@ extern uint32_t eip_dma_tx_compl_napi_we
+  */
+ static inline void eip_dmac_inv_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_inv_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_flush_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_flush_range_no_dsb(start, end);
+ #endif
+ }
+--- a/driver/exports/eip.h
++++ b/driver/exports/eip.h
+@@ -397,12 +397,7 @@ static inline bool eip_is_enabled(void)
+ 			soc_id == QCOM_ID_IPQ9550 || soc_id == QCOM_ID_IPQ9574 ||
+ 			soc_id == QCOM_ID_IPQ9554 || soc_id == QCOM_ID_IPQ5332 ||
+ 			soc_id == QCOM_ID_IPQ5300 || soc_id == QCOM_ID_IPQ5424 ||
+-			soc_id == QCOM_ID_IPQ5404 || soc_id == QCOM_ID_IPQ5200 ||
+-			soc_id == QCOM_ID_IPQ5210 || soc_id == QCOM_ID_IPQ9610 ||
+-			soc_id == QCOM_ID_IPQ9620 || soc_id == QCOM_ID_IPQ9630 ||
+-			soc_id == QCOM_ID_IPQ9640 || soc_id == QCOM_ID_IPQ9650 ||
+-			soc_id == QCOM_ID_IPQ9670 || soc_id == QCOM_ID_QCF3200 ||
+-			soc_id == QCOM_ID_QCF3210 || soc_id == QCOM_ID_QCF2200);
++			soc_id == QCOM_ID_IPQ5404);
+ }
+ #endif
+ 
+--- a/driver/eip197/eip.c
++++ b/driver/eip197/eip.c
+@@ -157,7 +157,7 @@ fail_alloc:
+  * eip_device_remove()
+  *	Remove Device and free all linked resources.
+  */
+-static int eip_device_remove(struct platform_device *pdev)
++static void eip_device_remove(struct platform_device *pdev)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	struct eip_pdev *ep;
+@@ -183,7 +183,6 @@ static int eip_device_remove(struct plat
+ 	kfree(ep);
+ 	platform_set_drvdata(pdev, NULL);
+ 
+-	return 0;
+ }
+ 
+ /*
+@@ -229,7 +228,7 @@ EXPORT_SYMBOL(eip_feature_check);
+  * eip_init_module()
+  *	Initialize all the resources.
+  */
+-int __init eip_init_module(void)
++static int __init eip_init_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 
+@@ -276,7 +275,7 @@ int __init eip_init_module(void)
+  * eip_exit_module()
+  *	Cleanup during module exit.
+  */
+-void __exit eip_exit_module(void)
++static void __exit eip_exit_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	platform_driver_unregister(&eip_device);
