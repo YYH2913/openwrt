@@ -36,6 +36,15 @@ ipq95xx_setup_wlan()
 
 	case "$board" in
 	askey,sbe1v1k)
+		# Provide a regulatory default before wifi-detect creates radios.
+		# Without this, the 5/6 GHz APs are generated disabled with country=00.
+		ucidef_set_country AU
+		# Keep the OWE-only 6 GHz BSS distinct from the open 2/5 GHz
+		# defaults. Reusing one SSID with different AKMs makes clients cache
+		# an incompatible security profile and reject otherwise valid BSSes.
+		ucidef_set_wireless 2g OpenWrt-2G none
+		ucidef_set_wireless 5g OpenWrt-5G none
+		ucidef_set_wireless 6g OpenWrt-6G owe
 		ucidef_add_wlan "$DEV_PATH_PCIE0" "$DEV_PATH_PCIE1" "$DEV_PATH_PCIE2"
 		;;
 	esac
