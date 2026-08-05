@@ -1,0 +1,190 @@
+From: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Date: Fri, 30 May 2025 22:20:41 -0700
+Subject: [PATCH] wifi: ath12k: complete QCN9274 PPE receive routing
+
+Tell RxOLE to route eligible Ethernet traffic to REO2PPE while keeping
+raw, native Wi-Fi and fragmented IP frames on the host exception path.
+Use the QSDK production ring sizes for the downlink and completion paths,
+and use its refill/completion NAPI tuning for multigigabit traffic.
+
+Based-on: 4590caf67ab7de99e7a1ea2bc70d2429b5f855e1
+Based-on: 41c027804556a6adc68fa0d79400fb96655a909e
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0486-QSDK-DP-wifi-ath12k-Fixes-to-improve-DS-DL-performan.patch
+Signed-off-by: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Signed-off-by: Ganesh Kariganuru Mahabalesh <gkarigan@qti.qualcomm.com>
+Signed-off-by: Nithyanantham Paramasivam <nithp@qti.qualcomm.com>
+Signed-off-by: Nandha Kishore Easwaran <nandhaki@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Signed-off-by: Neha Bisht <nbisht@qti.qualcomm.com>
+Signed-off-by: Aloka Dixit <alokad@qti.qualcomm.com>
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 13 +++++++++++++
+ drivers/net/wireless/ath/ath12k/dp.h    | 23 +++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 42 +++++++++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_rx.h |  1 +
+ drivers/net/wireless/ath/ath12k/ppe.c   |  6 +++++-
+ 5 files changed, 82 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -201,9 +201,10 @@ struct ath12k_pdev_dp {
+ #define DP_TX_MONITOR_DEST_RING_SIZE	2048
+ 
+ #define DP_PPE2TCL_RING_SIZE		8192
+-#define DP_REO2PPE_RING_SIZE		8192
+-#define DP_PPE_WBM2SW_RING_SIZE		8192
++#define DP_REO2PPE_RING_SIZE		16384
++#define DP_PPE_WBM2SW_RING_SIZE		32768
+ #define DP_PPE_DS_TX_DESC_COUNT		8192
++#define HAL_REO2PPE_DST_IND		6
+ #define DP_PPE_DS_TX_SPT_PAGES		(DP_PPE_DS_TX_DESC_COUNT / \
+ 					 ATH12K_MAX_SPT_ENTRIES)
+ 
+@@ -541,10 +542,28 @@ enum htt_h2t_msg_type {
+ 	HTT_H2T_MSG_TYPE_RX_RING_SELECTION_CFG	= 0xc,
+ 	HTT_H2T_MSG_TYPE_EXT_STATS_CFG		= 0x10,
+ 	HTT_H2T_MSG_TYPE_PPDU_STATS_CFG		= 0x11,
++	HTT_H2T_MSG_TYPE_RXDMA_RXOLE_PPE_CFG	= 0x19,
+ 	HTT_H2T_MSG_TYPE_VDEV_TXRX_STATS_CFG	= 0x1a,
+ 	HTT_H2T_MSG_TYPE_TX_MONITOR_CFG		= 0x1b,
+ };
+ 
++#define HTT_H2T_RXOLE_PPE_CFG_MSG_TYPE			GENMASK(7, 0)
++#define HTT_H2T_RXOLE_PPE_CFG_OVERRIDE			BIT(8)
++#define HTT_H2T_RXOLE_PPE_CFG_REO_DST_IND		GENMASK(13, 9)
++#define HTT_H2T_RXOLE_PPE_CFG_MULTI_BUF_MSDU_OVERRIDE	BIT(14)
++#define HTT_H2T_RXOLE_PPE_CFG_INTRA_BSS_OVERRIDE	BIT(15)
++#define HTT_H2T_RXOLE_PPE_CFG_DECAP_RAW_OVERRIDE	BIT(16)
++#define HTT_H2T_RXOLE_PPE_CFG_DECAP_NWIFI_OVERRIDE	BIT(17)
++#define HTT_H2T_RXOLE_PPE_CFG_IP_FRAG_OVERRIDE		BIT(18)
++
++/*
++ * override selects reo_dst_ind for normal Ethernet frames.  Each exception
++ * bit clears use_ppe for that class so firmware retains the host slow path.
++ */
++struct htt_h2t_rxdma_rxole_ppe_cfg_cmd {
++	__le32 info0;
++} __packed;
++
+ #define HTT_VER_REQ_INFO_MSG_ID		GENMASK(7, 0)
+ #define HTT_OPTION_TCL_METADATA_VER_V1	1
+ #define HTT_OPTION_TCL_METADATA_VER_V2	2
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -138,6 +138,7 @@ void ath12k_dp_htt_htc_t2h_msg_handler(s
+ int ath12k_dp_rx_pdev_reo_setup(struct ath12k_base *ab);
+ void ath12k_dp_rx_pdev_reo_cleanup(struct ath12k_base *ab);
+ int ath12k_dp_rx_htt_setup(struct ath12k_base *ab);
++int ath12k_dp_rx_htt_rxdma_rxole_ppe_cfg(struct ath12k_base *ab);
+ int ath12k_dp_rx_alloc(struct ath12k_base *ab);
+ void ath12k_dp_rx_free(struct ath12k_base *ab);
+ int ath12k_dp_rx_pdev_alloc(struct ath12k_base *ab, int pdev_idx);
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -4602,6 +4602,48 @@ int ath12k_dp_rxdma_ring_sel_config_wcn7
+ 	return ret;
+ }
+ 
++int ath12k_dp_rx_htt_rxdma_rxole_ppe_cfg(struct ath12k_base *ab)
++{
++	struct htt_h2t_rxdma_rxole_ppe_cfg_cmd *cmd;
++	struct ath12k_dp *dp = &ab->dp;
++	struct sk_buff *skb;
++	u32 info0;
++	int ret;
++
++	skb = ath12k_htc_alloc_skb(ab, sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	skb_put(skb, sizeof(*cmd));
++	cmd = (void *)skb->data;
++
++	info0 = u32_encode_bits(HTT_H2T_MSG_TYPE_RXDMA_RXOLE_PPE_CFG,
++				HTT_H2T_RXOLE_PPE_CFG_MSG_TYPE) |
++		u32_encode_bits(1, HTT_H2T_RXOLE_PPE_CFG_OVERRIDE) |
++		u32_encode_bits(HAL_REO2PPE_DST_IND,
++				HTT_H2T_RXOLE_PPE_CFG_REO_DST_IND) |
++		u32_encode_bits(0,
++				HTT_H2T_RXOLE_PPE_CFG_MULTI_BUF_MSDU_OVERRIDE) |
++		u32_encode_bits(0, HTT_H2T_RXOLE_PPE_CFG_INTRA_BSS_OVERRIDE) |
++		u32_encode_bits(1, HTT_H2T_RXOLE_PPE_CFG_DECAP_RAW_OVERRIDE) |
++		u32_encode_bits(1,
++				HTT_H2T_RXOLE_PPE_CFG_DECAP_NWIFI_OVERRIDE) |
++		u32_encode_bits(1, HTT_H2T_RXOLE_PPE_CFG_IP_FRAG_OVERRIDE);
++	cmd->info0 = cpu_to_le32(info0);
++
++	ret = ath12k_htc_send(&ab->htc, dp->eid, skb);
++	if (ret) {
++		ath12k_warn(ab, "failed to send HTT RxOLE PPE config: %d\n",
++			    ret);
++		dev_kfree_skb_any(skb);
++		return ret;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_DP_HTT,
++		   "HTT RxOLE PPE config sent: 0x%x\n", info0);
++	return 0;
++}
++
+ int ath12k_dp_rx_htt_setup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = &ab->dp;
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -315,6 +315,13 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX;
+ 		break;
+ 	case HAL_WBM2SW_RELEASE:
++		if (ring_num == HAL_WBM2SW_PPEDS_TX_CMPL_RING_NUM) {
++			params.intr_batch_cntr_thres_entries =
++					HAL_SRNG_INT_BATCH_THRESHOLD_TX;
++			params.intr_timer_thres_us =
++					HAL_SRNG_INT_TIMER_THRESHOLD_TX;
++			break;
++		}
+ 		if (ab->hw_params->hw_ops->dp_srng_is_tx_comp_ring(ring_num)) {
+ 			params.intr_batch_cntr_thres_entries =
+ 					HAL_SRNG_INT_BATCH_THRESHOLD_TX;
+@@ -1112,6 +1112,12 @@ int ath12k_dp_pdev_alloc(struct ath12k_b
+ 	int ret;
+ 	int i;
+ 
++	if (ath12k_ppe_ds_enabled(ab)) {
++		ret = ath12k_dp_rx_htt_rxdma_rxole_ppe_cfg(ab);
++		if (ret)
++			goto out;
++	}
++
+ 	ret = ath12k_dp_rx_htt_setup(ab);
+ 	if (ret)
+ 		goto out;
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -14,7 +14,9 @@
+ 
+ #define ATH12K_PPE_DS_BUFFER_SIZE	2048
+ #define ATH12K_PPE_DS_HEADROOM		130
+-#define ATH12K_PPE_DS_RXFILL_THRESHOLD	32
++#define ATH12K_PPE_DS_RXFILL_THRESHOLD	256
++#define ATH12K_PPE_DS_RXFILL_BUDGET	128
++#define ATH12K_PPE_DS_TXCMPL_BUDGET	1024
+ 
+ #define ATH12K_PPE_VP_TABLE_BASE	0x00a44194
+ #define ATH12K_PPE_VP_TABLE_STRIDE	4
+@@ -488,6 +491,8 @@ int ath12k_ppe_ds_attach(struct ath12k_b
+ 	reg.buffer_size = ATH12K_PPE_DS_BUFFER_SIZE;
+ 	reg.headroom = ATH12K_PPE_DS_HEADROOM;
+ 	reg.rxfill_low_threshold = ATH12K_PPE_DS_RXFILL_THRESHOLD;
++	reg.rxfill_budget = ATH12K_PPE_DS_RXFILL_BUDGET;
++	reg.txcmpl_budget = ATH12K_PPE_DS_TXCMPL_BUDGET;
+ 	ret = qcom_ppe_ds_register(ppe->node, &reg);
+ 	if (ret)
+ 		goto err_cmpl;
+-- 
+2.51.0
