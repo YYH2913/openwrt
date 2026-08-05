@@ -1,0 +1,479 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 18:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: route direct vports by peer
+
+An MLO net device can span all three PPE direct-switch nodes, but a PPE
+virtual port has only one static queue.  Use the APPE per-flow priority
+profile to select an enqueue virtual port and therefore the PPE2TCL ring
+of the station's association node.
+
+Track authorized peer addresses against direct virtual ports, retain the
+static queue as a single-link and unknown-peer fallback, and reject flow
+installation when the selected node is stopped.  Disable installed flows
+for one node before its ring is stopped and restore them after restart so
+a shared MLO virtual port cannot keep forwarding into a quiesced ring.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.c      |   8 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_flow.h      |   2 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c |  61 +++++++-
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h |   4 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_regs.h      |   2 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c        | 169 +++++++++++++++++++++
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.h        |   4 +
+ 7 files changed, 241 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -147,6 +147,10 @@ static void ppe_flow_entry_pack(const st
+ 	val[1] = FIELD_PREP(PPE_FLOW_W1_NEXT_HOP, flow->nexthop);
+ 	val[1] |= FIELD_PREP(PPE_FLOW_W1_L4_PORT,
+ 			     be16_to_cpu(flow->nat_port));
++	val[1] |= FIELD_PREP(PPE_FLOW_W1_PRI_PROFILE_LO,
++			     flow->pri_profile & 1);
++	val[2] = FIELD_PREP(PPE_FLOW_W2_PRI_PROFILE_HI,
++			    flow->pri_profile >> 1);
+ 	val[3] = FIELD_PREP(PPE_FLOW_W3_L4_SPORT,
+ 			    be16_to_cpu(flow->sport));
+ 	val[3] |= FIELD_PREP(PPE_FLOW_W3_L4_DPORT_LO,
+@@ -166,8 +170,8 @@ static void ppe_flow_entry_pack(const st
+ 	} else {
+ 		u32 ip = be32_to_cpu(flow->dip.ip4);
+ 
+-		val[2] = FIELD_PREP(PPE_FLOW_W2_IP_ADDR_LO,
+-				    ip & GENMASK(19, 0));
++		val[2] |= FIELD_PREP(PPE_FLOW_W2_IP_ADDR_LO,
++				     ip & GENMASK(19, 0));
+ 		val[3] |= FIELD_PREP(PPE_FLOW_W3_IP_ADDR_HI, ip >> 20);
+ 	}
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.h
+@@ -47,6 +47,7 @@ struct ppe_flow_nexthop {
+  * @proto: IP protocol, TCP or UDP.
+  * @fwd_type: Forward type of the flow (PPE_FLOW_FWD_TYPE_*). IPv6
+  * flows are never translated, only routed.
++ * @pri_profile: Egress queue priority profile.
+  * @nexthop: Next hop entry index of the flow.
+  * @host_index: Source host-table index returned by hardware.
+  * @nat_port: Translated source port of SNAT flows, translated
+@@ -64,6 +65,7 @@ struct ppe_flow_entry {
+ 	__be16 dport;
+ 	u8 proto;
+ 	u8 fwd_type;
++	u8 pri_profile;
+ 	u16 nexthop;
+ 	u16 host_index;
+ 	__be16 nat_port;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -2222,6 +2222,14 @@ static int ppe_ft_flow_replace(struct pp
+ 	 * port from the flow entry itself.
+ 	 */
+ 	mutex_lock(&ft->lock);
++	if (flow->vp >= 0) {
++		ret = ppe_vp_ds_node_get(ft->ppe_dev, flow->vp,
++					 data.eth.dst);
++		if (ret >= 0)
++			flow->entry.pri_profile = ret + 1;
++		else if (ret != -EOPNOTSUPP)
++			goto err_vp;
++	}
+ 	if (tunnel_flow) {
+ 		struct in6_addr local, remote;
+ 		int link, mtu;
+@@ -2942,6 +2950,6 @@ static int ppe_ft_pipeline_state_show(st
+ 		} host_ip = {}, inline_ip = {};
+ 		__be32 dnat_ip, pub_ip_addr;
+-		u8 dmac[ETH_ALEN];
++		u8 dmac[ETH_ALEN], hw_profile;
+ 		int flow_err, host_err, nh_err, in_err, eg_err;
+ 		int my_mac_err = 0, pub_ip_err = 0;
+ 		int flow_words, host_words;
+@@ -2967,5 +2975,7 @@ static int ppe_ft_pipeline_state_show(st
+ 					    host_words);
+ 		hw_nh = FIELD_GET(PPE_FLOW_W1_NEXT_HOP, f[1]);
++		hw_profile = FIELD_GET(PPE_FLOW_W1_PRI_PROFILE_LO, f[1]) |
++			FIELD_GET(PPE_FLOW_W2_PRI_PROFILE_HI, f[2]) << 1;
+ 		reg = PPE_NEXTHOP_TBL_ADDR + PPE_NEXTHOP_TBL_INC * hw_nh;
+ 		nh_err = regmap_bulk_read(ft->ppe_dev->regmap, reg, nh,
+ 					  ARRAY_SIZE(nh));
+@@ -3010,5 +3020,6 @@ static int ppe_ft_pipeline_state_show(st
+ 		key_match = key_match && !flow_err && !host_err &&
+ 			hw_host == flow->entry.host_index &&
++			hw_profile == flow->entry.pri_profile &&
+ 			!(f[0] & PPE_FLOW_W0_HOST_INDEX_TYPE) &&
+ 			sport == be16_to_cpu(flow->entry.sport) &&
+ 			dport == be16_to_cpu(flow->entry.dport) &&
+@@ -3040,8 +3051,9 @@ static int ppe_ft_pipeline_state_show(st
+ 				   &flow->entry.dip.ip4,
+ 				   be16_to_cpu(flow->entry.dport));
+ 		seq_printf(seq,
+-			   " proto:%u fwd:%u index:%d host:%u nexthop:%u my_mac:%d pub_ip:%d packets:%u bytes:%llu\n",
+-			   flow->entry.proto, flow->entry.fwd_type, flow->index,
++			   " proto:%u fwd:%u profile:%u index:%d host:%u nexthop:%u my_mac:%d pub_ip:%d packets:%u bytes:%llu\n",
++			   flow->entry.proto, flow->entry.fwd_type,
++			   flow->entry.pri_profile, flow->index,
+ 			   flow->entry.host_index, flow->nexthop,
+ 			   flow->my_mac, flow->pub_ip, packets,
+ 			   (unsigned long long)bytes);
+@@ -3050,6 +3062,6 @@ static int ppe_ft_pipeline_state_show(st
+ 		ppe_ft_debug_words(seq, "flow_raw", f, flow_words);
+ 		seq_printf(seq,
+-			   "  flow_dec read:%d valid:%u type:%u host_dst:%u host:%u proto:%lu age:%lu src_l3_valid:%u src_l3:%lu fwd:%lu nexthop:%u nat_l4:%lu service:%lu",
++			   "  flow_dec read:%d valid:%u type:%u host_dst:%u host:%u proto:%lu age:%lu src_l3_valid:%u src_l3:%lu fwd:%lu nexthop:%u nat_l4:%lu profile:%u service:%lu",
+ 			   flow_err, !!(f[0] & PPE_FLOW_W0_VALID),
+ 			   !!(f[0] & PPE_FLOW_W0_ENTRY_TYPE),
+ 			   !!(f[0] & PPE_FLOW_W0_HOST_INDEX_TYPE), hw_host,
+@@ -3062,5 +3074,6 @@ static int ppe_ft_pipeline_state_show(st
+ 			   FIELD_GET(PPE_FLOW_W0_FWD_TYPE, f[0]), hw_nh,
+ 			   FIELD_GET(PPE_FLOW_W1_L4_PORT, f[1]),
++			   hw_profile,
+ 			   FIELD_GET(PPE_FLOW_W2_SERVICE_CODE, f[2]));
+ 		if (flow->entry.is_ipv6)
+ 			seq_printf(seq, " inline:%pI6c", &inline_ip.ip6);
+@@ -3175,7 +3188,7 @@ static int ppe_ft_flows_show(struct seq_
+ 				   be16_to_cpu(flow->entry.dport));
+ 		seq_printf(seq,
+-			   " proto:%u index:%d valid:%u host:%u host_dst:%u nexthop:%u packets:%u bytes:%llu\n",
+-			   flow->entry.proto, flow->index,
++			   " proto:%u profile:%u index:%d valid:%u host:%u host_dst:%u nexthop:%u packets:%u bytes:%llu\n",
++			   flow->entry.proto, flow->entry.pri_profile, flow->index,
+ 			   !!(w0 & PPE_FLOW_W0_VALID), flow->entry.host_index,
+ 			   !!(w0 & PPE_FLOW_W0_HOST_INDEX_TYPE), flow->nexthop,
+ 			   packets, (unsigned long long)bytes);
+@@ -3247,6 +3260,42 @@ static int ppe_ft_block_cb(enum tc_setup
+ 	}
+ }
+ 
++void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
++				      u8 profile, bool up)
++{
++	struct ppe_flowtable *ft = ppe_dev->flowtable;
++	struct rhashtable_iter iter;
++	struct ppe_ft_flow *flow;
++
++	if (!ft || !profile)
++		return;
++
++	mutex_lock(&ft->lock);
++	rhashtable_walk_enter(&ft->flows, &iter);
++	rhashtable_walk_start(&iter);
++	while ((flow = rhashtable_walk_next(&iter))) {
++		int ret;
++
++		if (IS_ERR(flow)) {
++			if (PTR_ERR(flow) == -EAGAIN)
++				continue;
++			break;
++		}
++		if (flow->eport != port || flow->entry.pri_profile != profile)
++			continue;
++
++		ret = ppe_flow_entry_enable(ppe_dev, flow->index, up);
++		if (ret)
++			dev_warn(ppe_dev->dev,
++				 "failed to %s flow %d for VP %d profile %u: %d\n",
++				 up ? "enable" : "disable", flow->index, port,
++				 profile, ret);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++	mutex_unlock(&ft->lock);
++}
++
+ /**
+  * ppe_flowtable_port_carrier - Report the link state of a PPE port
+  * @ppe_dev: PPE device
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -5,6 +5,8 @@
+ #ifndef __PPE_FLOWTABLE_H__
+ #define __PPE_FLOWTABLE_H__
+ 
++#include <linux/types.h>
++
+ struct net_device;
+ struct ppe_device;
+ 
+@@ -14,3 +16,5 @@ int ppe_flowtable_setup_tc(struct net_de
+ void ppe_flowtable_debugfs_init(struct ppe_device *ppe_dev);
+ void ppe_flowtable_port_carrier(struct ppe_device *ppe_dev, int port, bool up);
++void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
++				      u8 profile, bool up);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_regs.h
+@@ -687,6 +687,8 @@
+ #define PPE_FLOW_W1_L4_PORT			GENMASK(27, 12)
+ #define PPE_FLOW_W1_DE_ACCE			BIT(28)
+ #define PPE_FLOW_W1_COPY_TO_CPU			BIT(29)
++#define PPE_FLOW_W1_PRI_PROFILE_LO		BIT(31)
++#define PPE_FLOW_W2_PRI_PROFILE_HI		GENMASK(3, 0)
+ #define PPE_FLOW_W2_SERVICE_CODE		GENMASK(11, 4)
+ #define PPE_FLOW_W2_IP_ADDR_LO			GENMASK(31, 12)
+ #define PPE_FLOW_W3_IP_ADDR_HI			GENMASK(11, 0)
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -35,5 +35,6 @@
+ #include <linux/ipv6.h>
+ #include <linux/kernel.h>
++#include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/netfilter.h>
+@@ -56,6 +57,15 @@
+ #define PPE_VP_DS_NODES		3
+ 
+ #define PPE_VP_DS_NODE_NONE	-1
++#define PPE_VP_DS_PRI_PROFILE(node)	((node) + 1)
++
++struct ppe_vp_peer {
++	struct list_head list;
++	u8 addr[ETH_ALEN];
++	u16 node_refs[PPE_VP_DS_NODES];
++	int vp;
++	int node;
++};
+ 
+ struct ppe_vp_slot {
+ 	struct net_device __rcu *dev;
+@@ -79,11 +90,56 @@ struct ppe_vp {
+ 	struct ppe_device *ppe_dev;
+ 	struct mutex lock;		/* serialises slot allocation */
+ 	struct notifier_block notifier;
++	struct list_head peers;
+ 	bool inject_disabled;
+ 	bool ds_node_up[PPE_VP_DS_NODES];
+ 	struct ppe_vp_slot slots[PPE_VP_SLOTS];
+ };
+ 
++static struct ppe_vp_peer *
++ppe_vp_ds_peer_find(struct ppe_vp *vp, int port, const u8 *addr)
++{
++	struct ppe_vp_peer *peer;
++
++	list_for_each_entry(peer, &vp->peers, list)
++		if (peer->vp == port && ether_addr_equal(peer->addr, addr))
++			return peer;
++
++	return NULL;
++}
++
++static void ppe_vp_ds_peer_select_node(struct ppe_vp_peer *peer)
++{
++	int node;
++
++	for (node = 0; node < PPE_VP_DS_NODES; node++)
++		if (peer->node_refs[node]) {
++			peer->node = node;
++			return;
++		}
++
++	peer->node = PPE_VP_DS_NODE_NONE;
++}
++
++static void ppe_vp_ds_peers_purge(struct ppe_vp *vp, int port, int node)
++{
++	struct ppe_vp_peer *peer, *tmp;
++
++	list_for_each_entry_safe(peer, tmp, &vp->peers, list) {
++		if (peer->vp != port)
++			continue;
++		if (node >= 0) {
++			peer->node_refs[node] = 0;
++			if (peer->node == node)
++				ppe_vp_ds_peer_select_node(peer);
++			if (peer->node != PPE_VP_DS_NODE_NONE)
++				continue;
++		}
++		list_del(&peer->list);
++		kfree(peer);
++	}
++}
++
+ static const struct rhashtable_params ppe_vp_flow_params = {
+ 	.head_offset = offsetof(struct ppe_vp_flow, node),
+ 	.key_offset = offsetof(struct ppe_vp_flow, key),
+@@ -350,6 +404,8 @@ static void ppe_vp_slot_release(struct p
+ 			"failed to disable VP %d, quarantining slot: %d\n",
+ 			PPE_VP_PORT_BASE + i, ret);
+ 	}
++	ppe_vp_ds_peers_purge(vp, PPE_VP_PORT_BASE + i,
++			      PPE_VP_DS_NODE_NONE);
+ 	rcu_assign_pointer(vp->slots[i].dev, NULL);
+ 	if (!vp->slots[i].refcnt) {
+ 		memset(vp->slots[i].ds_node_refs, 0,
+@@ -608,6 +664,8 @@ bool ppe_vp_ds_detach(struct ppe_device
+ 	}
+ 
+ 	slot->ds_node_refs[node]--;
++	if (!slot->ds_node_refs[node])
++		ppe_vp_ds_peers_purge(vp, port, node);
+ 	if (!rcu_access_pointer(slot->dev))
+ 		goto out_unlock;
+ 	if (slot->ds_node == node && !slot->ds_node_refs[node]) {
+@@ -638,10 +696,109 @@ out_unlock:
+ 	return true;
+ }
+ 
++int ppe_vp_ds_peer_set(struct ppe_device *ppe_dev, int port, int node,
++		       const u8 *addr, bool enable)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	struct ppe_vp_peer *peer;
++	int i = port - PPE_VP_PORT_BASE;
++	int ret = 0;
++
++	if (!vp || i < 0 || i >= PPE_VP_SLOTS || node < 0 ||
++	    node >= PPE_VP_DS_NODES || !is_valid_ether_addr(addr))
++		return -EINVAL;
++
++	mutex_lock(&vp->lock);
++	peer = ppe_vp_ds_peer_find(vp, port, addr);
++	if (!enable) {
++		if (!peer || !peer->node_refs[node])
++			goto out;
++		peer->node_refs[node]--;
++		if (peer->node == node && !peer->node_refs[node])
++			ppe_vp_ds_peer_select_node(peer);
++		if (peer->node == PPE_VP_DS_NODE_NONE) {
++			list_del(&peer->list);
++			kfree(peer);
++		}
++		goto out;
++	}
++
++	if (!vp->slots[i].direct ||
++	    !rcu_access_pointer(vp->slots[i].dev) ||
++	    !vp->slots[i].ds_node_refs[node]) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (peer && peer->node_refs[node] == U16_MAX) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	if (!peer) {
++		peer = kzalloc(sizeof(*peer), GFP_KERNEL);
++		if (!peer) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		peer->vp = port;
++		peer->node = PPE_VP_DS_NODE_NONE;
++		ether_addr_copy(peer->addr, addr);
++		list_add_tail(&peer->list, &vp->peers);
++	}
++	peer->node_refs[node]++;
++	peer->node = node;
++out:
++	mutex_unlock(&vp->lock);
++	return ret;
++}
++
++int ppe_vp_ds_node_get(struct ppe_device *ppe_dev, int port, const u8 *addr)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	struct ppe_vp_peer *peer;
++	int i = port - PPE_VP_PORT_BASE;
++	int node;
++
++	if (!vp || i < 0 || i >= PPE_VP_SLOTS)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&vp->lock);
++	if (!vp->slots[i].direct) {
++		node = -EOPNOTSUPP;
++		goto out;
++	}
++
++	peer = ppe_vp_ds_peer_find(vp, port, addr);
++	node = peer ? peer->node : vp->slots[i].ds_node;
++	if (node < 0 || node >= PPE_VP_DS_NODES ||
++	    !vp->slots[i].ds_node_refs[node] || !vp->ds_node_up[node])
++		node = -ENETDOWN;
++out:
++	mutex_unlock(&vp->lock);
++	return node;
++}
++
++unsigned int ppe_vp_ds_peer_count(struct ppe_device *ppe_dev, int node)
++{
++	struct ppe_vp *vp = ppe_dev->vp;
++	struct ppe_vp_peer *peer;
++	unsigned int count = 0;
++
++	if (!vp || node < 0 || node >= PPE_VP_DS_NODES)
++		return 0;
++
++	mutex_lock(&vp->lock);
++	list_for_each_entry(peer, &vp->peers, list)
++		if (peer->node_refs[node])
++			count++;
++	mutex_unlock(&vp->lock);
++
++	return count;
++}
++
+ void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up)
+ {
+ 	struct ppe_vp *vp = ppe_dev->vp;
+-	u64 carrier_down = 0, carrier_up = 0;
++	u64 carrier_down = 0, carrier_up = 0, profile_ports = 0;
+ 	int i, next, port, ret;
+ 
+ 	if (!vp || node < 0 || node >= PPE_VP_DS_NODES)
+@@ -657,6 +825,7 @@ void ppe_vp_ds_node_state(struct ppe_dev
+ 		if (!slot->direct || !dev || !slot->ds_node_refs[node])
+ 			continue;
+ 		port = PPE_VP_PORT_BASE + i;
++		profile_ports |= BIT_ULL(i);
+ 
+ 		if (up) {
+ 			if (slot->ds_node != PPE_VP_DS_NODE_NONE)
+@@ -697,6 +866,10 @@ void ppe_vp_ds_node_state(struct ppe_dev
+ 	mutex_unlock(&vp->lock);
+ 
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
++		if (profile_ports & BIT_ULL(i))
++			ppe_flowtable_port_profile_state(ppe_dev,
++							 PPE_VP_PORT_BASE + i,
++					PPE_VP_DS_PRI_PROFILE(node), up);
+ 		if (carrier_down & BIT_ULL(i))
+ 			ppe_flowtable_port_carrier(ppe_dev, PPE_VP_PORT_BASE + i, false);
+ 		else if (carrier_up & BIT_ULL(i))
+@@ -940,6 +1114,7 @@ int ppe_vp_setup(struct ppe_device *ppe_
+ 
+ 	vp->ppe_dev = ppe_dev;
+ 	mutex_init(&vp->lock);
++	INIT_LIST_HEAD(&vp->peers);
+ 	vp->notifier.notifier_call = ppe_vp_netdev_event;
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+ 		ret = rhashtable_init(&vp->slots[i].flows,
+@@ -1004,6 +1179,9 @@ void ppe_vp_teardown(struct ppe_device *
+ 
+ 		if (dev)
+ 			ppe_vp_slot_release(ppe_dev, vp, i);
++		else
++			ppe_vp_ds_peers_purge(vp, PPE_VP_PORT_BASE + i,
++					      PPE_VP_DS_NODE_NONE);
+ 	}
+ 	mutex_unlock(&vp->lock);
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.h
+@@ -67,4 +67,8 @@ int ppe_vp_ds_attach(struct ppe_device *
+ 		     int queue, int node);
+ bool ppe_vp_ds_detach(struct ppe_device *ppe_dev, int vp, int node);
+ void ppe_vp_ds_node_state(struct ppe_device *ppe_dev, int node, bool up);
++int ppe_vp_ds_peer_set(struct ppe_device *ppe_dev, int vp, int node,
++		       const u8 *addr, bool enable);
++int ppe_vp_ds_node_get(struct ppe_device *ppe_dev, int vp, const u8 *addr);
++unsigned int ppe_vp_ds_peer_count(struct ppe_device *ppe_dev, int node);
+ #endif
+-- 
+2.43.0
