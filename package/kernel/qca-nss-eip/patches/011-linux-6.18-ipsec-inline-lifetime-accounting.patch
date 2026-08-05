@@ -1,0 +1,46 @@
+From: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Date: Wed, 11 Mar 2026 22:45:44 +0530
+Subject: [PATCH] ipsec: avoid double accounting inline output lifetime
+
+The hybrid transform record counts the host-submitted first packet and
+subsequent PPE-forwarded packets.  eip_ipsec_xfrm_account_output() also
+added that first packet directly to the XFRM lifetime, then the periodic
+transform record synchronization added it a second time.  This can expire
+an inline SA early.
+
+Keep state, expiry and replay validation for every host submission.  Leave
+packet and byte lifetime accounting entirely to hardware for inline SAs;
+host-only SAs continue to use software accounting.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/8810d6098f75a5a6f38dc539e29cd7cfef760c78
+Signed-off-by: Tushar Ganatra <tganatra@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_xfrm.c
++++ b/clients/ipsec/eip_ipsec_xfrm.c
+@@ -105,6 +105,8 @@ static int eip_ipsec_xfrm_account_output(
+ 					 struct xfrm_state *xs,
+ 					 struct sk_buff *skb)
+ {
++	struct net_device *dev = READ_ONCE(xs->data);
++	bool inline_offload;
+ 	int err = 0;
+ 
+ 	spin_lock_bh(&xs->lock);
+@@ -126,8 +128,12 @@ static int eip_ipsec_xfrm_account_output(
+ 		goto unlock;
+ 	}
+ 
+-	xs->curlft.bytes += skb->len;
+-	xs->curlft.packets++;
++	inline_offload = eip_ipsec_sa_is_inline_xs(dev, xs);
++	if (!inline_offload) {
++		xs->curlft.bytes += skb->len;
++		xs->curlft.packets++;
++	}
++
+ 	xs->lastused = ktime_get_real_seconds();
+ 
+ unlock:
