@@ -1,0 +1,62 @@
+From: Avula Sri Charan <asrichar@qti.qualcomm.com>
+Date: Tue, 22 Apr 2025 15:31:38 +0530
+Subject: [PATCH] wifi: ath12k: select WMI endpoints for QCN9274 AMSS mode
+
+QCN9274 hw2 supports both single-PHY and split-PHY firmware.  The
+upstream hardware parameters advertise the maximum of two radios, but
+the single-PHY AMSS image provides only the primary WMI control service.
+Using the maximum while booting that image makes ath12k request the
+nonexistent WMI MAC1 service, which the firmware rejects with HTC status
+1.  The driver then continues with a partially initialized control path.
+
+Remember the AMSS mode selected from the QCN9274 OTP board ID and select
+the single-PHY WMI mode before HTC is initialized when regular AMSS is in
+use.  Keep the two-endpoint setup for boards that select amss_dualmac.
+
+Based-on: 45b54d3221a7e1123a2282c8fd42b7819b01828d
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0127-QSDK-PLATFORM-wifi-ath12k-Enable-amss_dualmac.bin-lo.patch
+Signed-off-by: Avula Sri Charan <asrichar@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mhi.c  |  2 ++
+ drivers/net/wireless/ath/ath12k/wmi.c  |  4 +++-
+ 3 files changed, 6 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1186,6 +1186,7 @@ struct ath12k_base {
+ 		const u8 *amss_dualmac_data;
+ 		size_t amss_dualmac_len;
+ 		const u8 *m3_data;
++		bool dualmac;
+ 		size_t m3_len;
+ 
+ 		DECLARE_BITMAP(fw_features, ATH12K_FW_FEATURE_COUNT);
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -344,6 +344,8 @@ int ath12k_mhi_register(struct ath12k_pci *ab_pci)
+ 		}
+ 	}
+ 
++	ab->fw.dualmac = dualmac;
++
+ 	if (dualmac) {
+ 		if (ab->fw.amss_dualmac_data && ab->fw.amss_dualmac_len > 0) {
+ 			/* use MHI firmware file from firmware-N.bin */
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -10144,7 +10144,9 @@ int ath12k_wmi_attach(struct ath12k_base *ab)
+ 	ab->wmi_ab.preferred_hw_mode = WMI_HOST_HW_MODE_MAX;
+ 
+ 	/* It's overwritten when service_ext_ready is handled */
+-	if (ab->hw_params->single_pdev_only)
++	if (ab->hw_params->single_pdev_only ||
++	    (ab->hw_rev == ATH12K_HW_QCN9274_HW20 &&
++	     !ab->fw.dualmac))
+ 		ab->wmi_ab.preferred_hw_mode = WMI_HOST_HW_MODE_SINGLE;
+ 
+ 	/* TODO: Init remaining wmi soc resources required */
+-- 
+2.43.0
