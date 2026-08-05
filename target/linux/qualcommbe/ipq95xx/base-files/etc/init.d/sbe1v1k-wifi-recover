@@ -1,0 +1,111 @@
+#!/bin/sh /etc/rc.common
+
+# Recover the factory wireless configuration after a sysupgrade.  The
+# upstream detector may leave only a 6 GHz AP enabled, or preserve the
+# temporary regulatory domain "00" from an early probe.  Both states make
+# ordinary clients appear unable to connect.
+START=14
+
+recover()
+{
+	case "$(board_name)" in
+		askey,sbe1v1k) ;;
+		*) return 0 ;;
+	esac
+
+	local radios=0 aps=0
+	radios=$(uci -q show wireless | sed -n "s/^wireless\.[^.=]*=wifi-device$/x/p" | wc -l)
+	aps=$(uci -q show wireless | sed -n "s/^wireless\.[^.=]*=wifi-iface$/x/p" | wc -l)
+
+	# A PCI WLAN device can appear after the initial boot probe. Re-running
+	# wifi config is idempotent and only adds radios missing from UCI.
+	if [ "$radios" -lt 3 ] || [ "$aps" -lt 3 ]; then
+		wifi config >/dev/null 2>&1 || true
+	fi
+
+	[ -s /etc/config/wireless ] || return 0
+
+	local iface device band disabled ssid enabled_any=0 enabled_non6=0
+	local changed=0 country valid_country_code
+
+valid_country()
+{
+	case "$1" in
+		[A-Za-z][A-Za-z]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+	# Prefer an already configured two-letter regulatory domain.  The board
+	# configuration used by this device is AU; retain it as the last-resort
+	# fallback so a transient country=00 cannot stop hostapd on 6 GHz.
+	for device in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		country=$(uci -q get wireless.$device.country)
+		if valid_country "$country" && [ "$country" != "00" ]; then
+			valid_country_code=$(printf '%s' "$country" | tr 'a-z' 'A-Z')
+			break
+		fi
+	done
+	[ -n "$valid_country_code" ] || valid_country_code=AU
+
+	for iface in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+		[ "$(uci -q get wireless.$iface.mode)" = ap ] || continue
+		device=$(uci -q get wireless.$iface.device)
+		band=$(uci -q get wireless.$device.band)
+		ssid=$(uci -q get wireless.$iface.ssid)
+		# Migrate only the generated default. A shared OpenWrt SSID combines
+		# open 2/5 GHz BSSes with an OWE-only 6 GHz BSS, which leaves clients
+		# with an incompatible cached security profile.
+		case "$band:$ssid" in
+			2g:OpenWrt) uci -q set wireless.$iface.ssid=OpenWrt-2G; changed=1 ;;
+			5g:OpenWrt) uci -q set wireless.$iface.ssid=OpenWrt-5G; changed=1 ;;
+			6g:OpenWrt) uci -q set wireless.$iface.ssid=OpenWrt-6G; changed=1 ;;
+		esac
+		disabled=$(uci -q get wireless.$iface.disabled)
+		if [ "$disabled" != 1 ]; then
+			enabled_any=1
+			[ "$band" = 6g ] || enabled_non6=1
+		fi
+	done
+
+	# If no AP is enabled, or the only enabled AP is 6 GHz, restore all AP
+	# interfaces.  Existing SSIDs, encryption and keys are left untouched.
+	if [ "$enabled_any" = 0 ] || [ "$enabled_non6" = 0 ]; then
+		for iface in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+			[ "$(uci -q get wireless.$iface.mode)" = ap ] || continue
+			if [ "$(uci -q get wireless.$iface.disabled)" = 1 ]; then
+				uci -q set wireless.$iface.disabled=0
+				changed=1
+			fi
+		done
+	fi
+
+	# Replace only empty/invalid/00 domains.  A valid user-selected country is
+	# never overwritten.
+	for device in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		country=$(uci -q get wireless.$device.country)
+		if ! valid_country "$country" || [ "$country" = 00 ]; then
+			uci -q set wireless.$device.country="$valid_country_code"
+			changed=1
+		fi
+		if [ "$(uci -q get wireless.$device.disabled)" = 1 ]; then
+			uci -q set wireless.$device.disabled=0
+			changed=1
+		fi
+	done
+
+	if [ "$changed" = 1 ]; then
+		uci -q commit wireless
+		logger -t sbe1v1k-wifi "recovered AP enablement and regulatory country"
+	fi
+}
+
+start()
+{
+	recover
+}
+
+boot()
+{
+	recover
+}

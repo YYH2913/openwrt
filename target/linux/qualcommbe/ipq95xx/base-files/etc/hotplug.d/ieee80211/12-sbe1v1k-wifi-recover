@@ -1,0 +1,6 @@
+#!/bin/sh
+
+# The generic 10-wifi-detect hook already creates and retries late ath12k
+# radios. Board recovery runs once before netifd starts; another network
+# reload here races the generic hook and can tear down every AP together.
+exit 0
