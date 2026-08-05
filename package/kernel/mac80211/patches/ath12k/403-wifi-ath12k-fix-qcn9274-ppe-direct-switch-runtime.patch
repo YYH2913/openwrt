@@ -1,0 +1,254 @@
+From: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Date: Fri, 30 May 2025 22:20:41 -0700
+Subject: [PATCH] wifi: ath12k: fix QCN9274 PPE direct-switch runtime
+
+Use a WLAN VP profile index instead of the PPE port number when accessing
+the 32-entry QCN9274 table. Also include the three direct-switch rings when
+allocating PCI external interrupt groups, otherwise MSI8 leaves the PPE
+producer, consumer, and completion services without an IRQ.
+
+Based-on: 4590caf67ab7de99e7a1ea2bc70d2429b5f855e1
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-01-QSDK-DP-wifi-Add-support-for-PPE-DS-Direct-switch-fe.patch
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/bac92a8f29adc3bf8214fb2101fa419b112d2e1f
+Signed-off-by: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Signed-off-by: Ganesh Kariganuru Mahabalesh <gkarigan@qti.qualcomm.com>
+Signed-off-by: Nithyanantham Paramasivam <nithp@qti.qualcomm.com>
+Signed-off-by: Nandha Kishore Easwaran <nandhaki@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Signed-off-by: Neha Bisht <nbisht@qti.qualcomm.com>
+Signed-off-by: Aloka Dixit <alokad@qti.qualcomm.com>
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -314,6 +314,7 @@ struct ath12k_link_vif {
+ 	u16 ast_hash;
+ 	u16 ast_idx;
+ 	int ppe_vp;
++	int ppe_vp_profile;
+ 	int ppe_search_idx;
+ 	u16 tcl_metadata;
+ 	u8 hal_addr_search_flags;
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -374,6 +374,14 @@ struct ath12k_ppe_ds_stats {
+ 	atomic64_t rx_drop;
+ };
+ 
++#define ATH12K_PPE_DS_VP_PROFILES	32
++
++struct ath12k_ppe_ds_vp_profile {
++	int vp;
++	int search_idx;
++	u32 refcount;
++};
++
+ struct ath12k_ppe_ds {
+ 	struct qcom_ppe_ds_node *node;
+ 	struct dp_srng ppe2tcl_ring;
+@@ -385,5 +393,7 @@ struct ath12k_ppe_ds {
+ 	spinlock_t tx_desc_lock;
+ 	spinlock_t vp_lock;
++	struct ath12k_ppe_ds_vp_profile vp_profiles[ATH12K_PPE_DS_VP_PROFILES];
++	unsigned long vp_profile_map;
+ 	unsigned long search_idx_map;
+ 	bool registered;
+ 	bool started;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -3858,6 +3858,7 @@ static void ath12k_mac_init_arvif(struct
+ 	arvif->ahvif = ahvif;
+ 	arvif->link_id = _link_id;
+ 	arvif->ppe_vp = -1;
++	arvif->ppe_vp_profile = -1;
+ 	arvif->ppe_search_idx = -1;
+ 
+ 	INIT_LIST_HEAD(&arvif->list);
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -620,6 +620,12 @@ static int ath12k_pci_ext_irq_config(str
+ 			num_irq = 1;
+ 		}
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++		if (ab->hw_params->ring_mask->ppe2tcl[i] ||
++		    ab->hw_params->ring_mask->reo2ppe[i] ||
++		    ab->hw_params->ring_mask->ppeds_tx_cmpl[i])
++			num_irq = 1;
++#endif
+ 		irq_grp->num_irq = num_irq;
+ 		irq_grp->irqs[0] = base_idx + i;
+ 
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -647,12 +647,88 @@ int ath12k_ppe_ds_service_tx_completion(
+ }
+ 
+ static void ath12k_ppe_ds_vp_write(struct ath12k_link_vif *arvif,
+-				   u32 value)
++				   int profile, u32 value)
+ {
+ 	struct ath12k_base *ab = arvif->ar->ab;
+ 
+ 	ath12k_hif_write32(ab, ATH12K_PPE_VP_TABLE_BASE +
+-			   arvif->ppe_vp * ATH12K_PPE_VP_TABLE_STRIDE, value);
++			   profile * ATH12K_PPE_VP_TABLE_STRIDE, value);
++}
++
++static int
++ath12k_ppe_ds_vp_profile_alloc(struct ath12k_ppe_ds *ppe, int vp,
++			       enum nl80211_iftype type, int *search_idx)
++{
++	struct ath12k_ppe_ds_vp_profile *profile;
++	int i, idx;
++
++	spin_lock_bh(&ppe->vp_lock);
++	for_each_set_bit(i, &ppe->vp_profile_map,
++			 ATH12K_PPE_DS_VP_PROFILES) {
++		profile = &ppe->vp_profiles[i];
++		if (profile->vp != vp)
++			continue;
++		profile->refcount++;
++		*search_idx = max(profile->search_idx, 0);
++		spin_unlock_bh(&ppe->vp_lock);
++		return i;
++	}
++
++	idx = find_first_zero_bit(&ppe->vp_profile_map,
++				  ATH12K_PPE_DS_VP_PROFILES);
++	if (idx >= ATH12K_PPE_DS_VP_PROFILES) {
++		spin_unlock_bh(&ppe->vp_lock);
++		return -ENOSPC;
++	}
++
++	*search_idx = 0;
++	if (type == NL80211_IFTYPE_STATION) {
++		*search_idx = find_first_zero_bit(&ppe->search_idx_map,
++						 ATH12K_PPE_SEARCH_TABLE_SIZE);
++		if (*search_idx >= ATH12K_PPE_SEARCH_TABLE_SIZE) {
++			spin_unlock_bh(&ppe->vp_lock);
++			return -ENOSPC;
++		}
++		__set_bit(*search_idx, &ppe->search_idx_map);
++	}
++
++	__set_bit(idx, &ppe->vp_profile_map);
++	profile = &ppe->vp_profiles[idx];
++	profile->vp = vp;
++	profile->search_idx = type == NL80211_IFTYPE_STATION ? *search_idx : -1;
++	profile->refcount = 1;
++	spin_unlock_bh(&ppe->vp_lock);
++	return idx;
++}
++
++static bool
++ath12k_ppe_ds_vp_profile_put(struct ath12k_ppe_ds *ppe, int idx,
++			     int *search_idx)
++{
++	struct ath12k_ppe_ds_vp_profile *profile;
++	bool last = false;
++
++	if (idx < 0 || idx >= ATH12K_PPE_DS_VP_PROFILES)
++		return false;
++
++	spin_lock_bh(&ppe->vp_lock);
++	if (!test_bit(idx, &ppe->vp_profile_map))
++		goto out;
++
++	profile = &ppe->vp_profiles[idx];
++	if (--profile->refcount)
++		goto out;
++
++	*search_idx = profile->search_idx;
++	if (*search_idx >= 0 && *search_idx < ATH12K_PPE_SEARCH_TABLE_SIZE)
++		__clear_bit(*search_idx, &ppe->search_idx_map);
++	__clear_bit(idx, &ppe->vp_profile_map);
++	profile->vp = -1;
++	profile->search_idx = -1;
++	last = true;
++out:
++	spin_unlock_bh(&ppe->vp_lock);
++	return last;
+ }
+ 
+ int ath12k_ppe_ds_vif_attach(struct ath12k_link_vif *arvif)
+@@ -662,7 +738,7 @@ int ath12k_ppe_ds_vif_attach(struct ath1
+ 	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
+ 	u32 config = 0;
+-	int search_idx = 0;
+-	int vp;
++	int profile, search_idx;
++	int vp;
+ 
+ 	if (!ppe->started || !wdev || !wdev->netdev)
+ 		return 0;
+@@ -677,19 +753,14 @@ int ath12k_ppe_ds_vif_attach(struct ath1
+ 	if (vp < 0)
+ 		return vp;
+ 
+-	if (vif->type == NL80211_IFTYPE_STATION) {
+-		spin_lock_bh(&ppe->vp_lock);
+-		search_idx = find_first_zero_bit(&ppe->search_idx_map,
+-						ATH12K_PPE_SEARCH_TABLE_SIZE);
+-		if (search_idx < ATH12K_PPE_SEARCH_TABLE_SIZE)
+-			__set_bit(search_idx, &ppe->search_idx_map);
+-		spin_unlock_bh(&ppe->vp_lock);
+-		if (search_idx >= ATH12K_PPE_SEARCH_TABLE_SIZE) {
+-			qcom_ppe_ds_vp_free(ppe->node, vp);
+-			return -ENOSPC;
+-		}
++	profile = ath12k_ppe_ds_vp_profile_alloc(ppe, vp, vif->type,
++						 &search_idx);
++	if (profile < 0) {
++		qcom_ppe_ds_vp_free(ppe->node, vp);
++		return profile;
+ 	}
+ 
+ 	arvif->ppe_vp = vp;
++	arvif->ppe_vp_profile = profile;
+ 	arvif->ppe_search_idx = search_idx;
+ 	config |= u32_encode_bits(vp, ATH12K_PPE_VP_NUM) |
+@@ -700,6 +771,6 @@ int ath12k_ppe_ds_vif_attach(struct ath1
+ 		  u32_encode_bits(arvif->vdev_id, ATH12K_PPE_VP_VDEV_ID) |
+ 		  u32_encode_bits(search_idx, ATH12K_PPE_VP_SEARCH_IDX);
+-	ath12k_ppe_ds_vp_write(arvif, config);
++	ath12k_ppe_ds_vp_write(arvif, profile, config);
+ 	return 0;
+ }
+ 
+@@ -707,5 +778,7 @@ void ath12k_ppe_ds_vif_detach(struct ath
+ 	struct ath12k_ppe_ds *ppe;
+ 	struct ieee80211_vif *vif;
++	int search_idx = -1;
++	bool last;
+ 
+ 	if (!arvif || !arvif->ar || arvif->ppe_vp < 64)
+ 		return;
+@@ -713,15 +786,16 @@ void ath12k_ppe_ds_vif_detach(struct ath
+ 	ppe = &ab->dp.ppe_ds;
+ 	vif = ath12k_ahvif_to_vif(arvif->ahvif);
+ 
+-	ath12k_ppe_ds_vp_write(arvif, 0);
+ 	qcom_ppe_ds_vp_free(ppe->node, arvif->ppe_vp);
+-	if (vif->type == NL80211_IFTYPE_STATION) {
++	last = ath12k_ppe_ds_vp_profile_put(ppe, arvif->ppe_vp_profile,
++					 &search_idx);
++	if (last)
++		ath12k_ppe_ds_vp_write(arvif, arvif->ppe_vp_profile, 0);
++	if (last && vif->type == NL80211_IFTYPE_STATION) {
+ 		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
+-				   arvif->ppe_search_idx * 4, 0);
+-		spin_lock_bh(&ppe->vp_lock);
+-		__clear_bit(arvif->ppe_search_idx, &ppe->search_idx_map);
+-		spin_unlock_bh(&ppe->vp_lock);
++				   search_idx * 4, 0);
+ 	}
+ 	arvif->ppe_vp = -1;
++	arvif->ppe_vp_profile = -1;
+ 	arvif->ppe_search_idx = -1;
+ }
