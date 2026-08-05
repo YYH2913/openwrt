@@ -1,0 +1,146 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 18:30:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: remove dead EDMA index tracking
+
+Several RX and TX paths calculate descriptor boundary indices but never
+consume them.  The scatter-gather path also retains a descriptor pointer
+that is never used for rollback.  These leftovers fail W=1 builds with
+unused-but-set-variable errors and obscure the indices that actually
+control ring ownership.
+
+Remove the dead variables and assignments.  Producer and consumer index
+updates, descriptor lookup, DMA unmapping and rollback remain unchanged.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma_rx.c |  9 ++-------
+ drivers/net/ethernet/qualcomm/ppe/edma_tx.c | 29 ++---------------------------
+ 2 files changed, 4 insertions(+), 34 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -38,13 +38,12 @@
+ 	struct edma_rxfill_desc *rxfill_desc;
+ 	u32 buf_len = rxfill_ring->buf_len;
+ 	struct device *dev = ppe_dev->dev;
+-	u16 prod_idx, start_idx;
++	u16 prod_idx;
+ 	u16 num_alloc = 0;
+ 	u32 dma_map_size;
+ 	u32 reg;
+ 
+ 	prod_idx = rxfill_ring->prod_idx;
+-	start_idx = prod_idx;
+ 	dma_map_size = rx_alloc_size - EDMA_RX_SKB_HEADROOM - NET_IP_ALIGN;
+ 
+ 	while (likely(alloc_count--)) {
+@@ -231,9 +230,6 @@
+ 	struct edma_port_priv *port_dev;
+ 	struct sk_buff *skb_head;
+ 	struct net_device *dev;
+-	u32 pkt_length;
+-
+-	pkt_length = EDMA_RXDESC_PACKET_LEN_GET(rxdesc_pri);
+ 
+ 	skb_head = rxdesc_ring->head;
+ 
+@@ -637,7 +633,7 @@
+ 	struct edma_rxdesc_pri *next_rxdesc_pri;
+ 	struct regmap *regmap = ppe_dev->regmap;
+ 	struct device *dev = ppe_dev->dev;
+-	u32 prod_idx, cons_idx, end_idx;
++	u32 prod_idx, cons_idx;
+ 	u32 work_to_do, work_done = 0;
+ 	struct sk_buff *next_skb;
+ 	u32 work_leftover, reg;
+@@ -660,7 +656,6 @@
+ 		work_to_do = budget;
+ 
+ 	rxdesc_ring->work_leftover -= work_to_do;
+-	end_idx = (cons_idx + work_to_do) & EDMA_RX_RING_SIZE_MASK;
+ 	next_rxdesc_pri = EDMA_RXDESC_PRI_DESC(rxdesc_ring, cons_idx);
+ 
+ 	/* Get opaque from RXDESC. */
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -125,7 +125,7 @@
+ 	struct edma_txcmpl_stats *txcmpl_stats = &txcmpl_ring->txcmpl_stats;
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	struct regmap *regmap = ppe_dev->regmap;
+-	u32 cons_idx, end_idx, data, cpu_id;
++	u32 cons_idx, data, cpu_id;
+ 	struct device *dev = ppe_dev->dev;
+ 	u32 avail, count, txcmpl_errors;
+ 	struct edma_txcmpl_desc *txcmpl;
+@@ -161,7 +161,6 @@
+ 
+ 	count = avail;
+ 
+-	end_idx = (cons_idx + avail) & EDMA_TX_RING_SIZE_MASK;
+ 	txcmpl = EDMA_TXCMPL_DESC(txcmpl_ring, cons_idx);
+ 
+ 	while (likely(avail--)) {
+@@ -341,19 +340,13 @@
+ 				struct edma_txdesc_pri **txdesc, struct sk_buff *skb,
+ 				u32 *hw_next_to_use, u32 *invalid_frag)
+ {
+-	u32 nr_frags = 0, buf_len = 0, num_descs = 0, start_idx = 0, end_idx = 0;
++	u32 nr_frags = 0, buf_len = 0, num_descs = 0;
+ 	struct ppe_device *ppe_dev = edma_ctx->ppe_dev;
+ 	u32 start_hw_next_to_use = *hw_next_to_use;
+ 	struct edma_txdesc_pri *txd = *txdesc;
+ 	struct device *dev = ppe_dev->dev;
+ 	u8 i = 0;
+ 
+-	/* Hold onto the index mapped to *txdesc.
+-	 * This will be the index previous to that of current *hw_next_to_use.
+-	 */
+-	start_idx = (((*hw_next_to_use) + EDMA_TX_RING_SIZE_MASK)
+-		& EDMA_TX_RING_SIZE_MASK);
+-
+ 	/* Handle if the skb has nr_frags. */
+ 	nr_frags = skb_shinfo(skb)->nr_frags;
+ 	num_descs = nr_frags;
+@@ -402,9 +395,6 @@
+ 
+ 	EDMA_TXDESC_ENDIAN_SET(txd);
+ 
+-	/* This will be the index previous to that of current *hw_next_to_use. */
+-	end_idx = (((*hw_next_to_use) + EDMA_TX_RING_SIZE_MASK) & EDMA_TX_RING_SIZE_MASK);
+-
+ 	*txdesc = txd;
+ 
+ 	return num_descs;
+@@ -602,15 +592,6 @@
+ 
+ 	/* Process skb if it has frag_list */
+ 	if (unlikely(skb_has_frag_list(skb))) {
+-		struct edma_txdesc_pri *start_desc = NULL;
+-		u32 start_idx = 0, end_idx = 0;
+-
+-		/* Hold onto the index mapped to txd.
+-		 * This will be the index previous to that of current *hw_next_to_use.
+-		 */
+-		start_idx = (((*hw_next_to_use) + EDMA_TX_RING_SIZE_MASK)
+-			     & EDMA_TX_RING_SIZE_MASK);
+-		start_desc = txd;
+ 		start_hw_next_to_use = *hw_next_to_use;
+ 
+ 		/* Walk through all fraglist skbs. */
+@@ -671,12 +652,6 @@
+ 
+ 		EDMA_TXDESC_ENDIAN_SET(txd);
+ 
+-		/* This will be the index previous to
+-		 * that of current *hw_next_to_use.
+-		 */
+-		end_idx = (((*hw_next_to_use) + EDMA_TX_RING_SIZE_MASK) &
+-			   EDMA_TX_RING_SIZE_MASK);
+-
+ 		/* Update frag_list stats. */
+ 		u64_stats_update_begin(&stats->syncp);
+ 		stats->tx_fraglist_pkts++;
+-- 
+2.43.0
