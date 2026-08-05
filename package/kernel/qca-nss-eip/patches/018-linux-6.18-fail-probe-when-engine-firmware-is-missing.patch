@@ -1,0 +1,193 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: fail probe when engine firmware is missing
+
+EIP-197 needs all four packet-engine firmware images before lookaside or
+inline traffic can be processed.  The vendor driver logged a warning but
+continued probing when request_firmware() failed, leaving apparently loaded
+modules backed by an unusable engine.
+
+Return firmware errors to the platform probe and leave the selected RAM bank
+in reset.  This makes missing or inaccessible BIN-NSS firmware visible as a
+hard initialization failure instead of silent software fallback.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_hw.c
++++ b/driver/eip197/eip_hw.c
+@@ -379,11 +379,11 @@
+  * eip_hw_boot_ofpp()
+  *	load output flow post processor (OFPP) firmware
+  */
+-static void eip_hw_boot_ofpp(struct device *dev, void __iomem *base_addr, const char *fw_name)
++static int eip_hw_boot_ofpp(struct device *dev, void __iomem *base_addr, const char *fw_name)
+ {
+ 	const struct firmware *fw = NULL;
+ 	uint32_t *data;
+-	int i;
++	int i, ret;
+ 
+ 	/*
+ 	 * pulling engine out of reset
+@@ -394,9 +394,11 @@
+ 	/*
+ 	 * load the firmware to the engine
+ 	 */
+-	if (request_firmware(&fw, fw_name, dev)) {
+-		pr_warn("%px: FW(%s) load failed\n", dev, fw_name);
+-		return;
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		pr_err("%px: FW(%s) load failed: %d\n", dev, fw_name, ret);
++		iowrite32(0x0, base_addr + EIP_HW_PE_OCE_RAM_CTRL);
++		return ret;
+ 	}
+ 
+ 	for (i = 0, data = (uint32_t *)fw->data; i < fw->size; i += 4, data++)
+@@ -417,17 +419,19 @@
+ 
+ 	pr_info("%px: %s version(0x%x)\n", dev, fw_name,
+ 			ioread32(base_addr + EIP_HW_OCE_OFPP_VERSION_REG));
++
++	return 0;
+ }
+ 
+ /*
+  * eip_hw_boot_opue()
+  *	load output pull-up engine (OPUE) firmware
+  */
+-static void eip_hw_boot_opue(struct device *dev, void __iomem *base_addr, const char *fw_name)
++static int eip_hw_boot_opue(struct device *dev, void __iomem *base_addr, const char *fw_name)
+ {
+ 	const struct firmware *fw = NULL;
+ 	uint32_t *data;
+-	int i;
++	int i, ret;
+ 
+ 	/*
+ 	 * pulling engine out of reset
+@@ -438,9 +442,11 @@
+ 	/*
+ 	 * load the firmware to the engine
+ 	 */
+-	if (request_firmware(&fw, fw_name, dev)) {
+-		pr_warn("%px: FW(%s) load failed\n", dev, fw_name);
+-		return;
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		pr_err("%px: FW(%s) load failed: %d\n", dev, fw_name, ret);
++		iowrite32(0x0, base_addr + EIP_HW_PE_OCE_RAM_CTRL);
++		return ret;
+ 	}
+ 
+ 	for (i = 0, data = (uint32_t *)fw->data; i < fw->size; i += 4, data++)
+@@ -461,17 +467,19 @@
+ 
+ 	pr_info("%px: %s version(0x%x)\n", dev, fw_name,
+ 			ioread32(base_addr + EIP_HW_OCE_OPUE_VERSION_REG));
++
++	return 0;
+ }
+ 
+ /*
+  * eip_hw_boot_ifpp()
+  *	load input flow post processor (IFPP) firmware
+  */
+-static void eip_hw_boot_ifpp(struct device *dev, void __iomem *base_addr, const char *fw_name)
++static int eip_hw_boot_ifpp(struct device *dev, void __iomem *base_addr, const char *fw_name)
+ {
+ 	const struct firmware *fw = NULL;
+ 	uint32_t *data;
+-	int i;
++	int i, ret;
+ 
+ 	/*
+ 	 * pulling engine out of reset
+@@ -482,9 +490,11 @@
+ 	/*
+ 	 * load the firmware to the engine
+ 	 */
+-	if (request_firmware(&fw, fw_name, dev)) {
+-		pr_warn("%px: FW(%s) load failed\n", dev, fw_name);
+-		return;
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		pr_err("%px: FW(%s) load failed: %d\n", dev, fw_name, ret);
++		iowrite32(0x0, base_addr + EIP_HW_PE_ICE_RAM_CTRL);
++		return ret;
+ 	}
+ 
+ 	for (i = 0, data = (uint32_t *)fw->data; i < fw->size; i += 4, data++)
+@@ -505,17 +515,19 @@
+ 
+ 	pr_info("%px: %s version(0x%x)\n", dev, fw_name,
+ 			ioread32(base_addr + EIP_HW_ICE_IFPP_VERSION_REG));
++
++	return 0;
+ }
+ 
+ /*
+  * eip_hw_boot_ipue()
+  *	load input pull-up engine (IPUE) firmware
+  */
+-static void eip_hw_boot_ipue(struct device *dev, void __iomem *base_addr, const char *fw_name)
++static int eip_hw_boot_ipue(struct device *dev, void __iomem *base_addr, const char *fw_name)
+ {
+ 	const struct firmware *fw = NULL;
+ 	uint32_t *data;
+-	int i;
++	int i, ret;
+ 
+ 	/*
+ 	 * pulling engine out of reset
+@@ -526,9 +538,11 @@
+ 	/*
+ 	 * load the firmware to the engine
+ 	 */
+-	if (request_firmware(&fw, fw_name, dev)) {
+-		pr_warn("%px: FW(%s) load failed\n", dev, fw_name);
+-		return;
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		pr_err("%px: FW(%s) load failed: %d\n", dev, fw_name, ret);
++		iowrite32(0x0, base_addr + EIP_HW_PE_ICE_RAM_CTRL);
++		return ret;
+ 	}
+ 
+ 	for (i = 0, data = (uint32_t *)fw->data; i < fw->size; i += 4, data++)
+@@ -549,6 +563,8 @@
+ 
+ 	pr_info("%px: %s version(0x%x)\n", dev, fw_name,
+ 		ioread32(base_addr + EIP_HW_ICE_IPUE_VERSION_REG));
++
++	return 0;
+ }
+ 
+ /*
+@@ -717,10 +733,21 @@
+ 	/*
+ 	 * load engine firmware;
+ 	 */
+-	eip_hw_boot_ifpp(&pdev->dev, base_addr, "ifpp.bin");
+-	eip_hw_boot_ipue(&pdev->dev, base_addr, "ipue.bin");
+-	eip_hw_boot_ofpp(&pdev->dev, base_addr, "ofpp.bin");
+-	eip_hw_boot_opue(&pdev->dev, base_addr, "opue.bin");
++	status = eip_hw_boot_ifpp(&pdev->dev, base_addr, "ifpp.bin");
++	if (status)
++		goto fail_init;
++
++	status = eip_hw_boot_ipue(&pdev->dev, base_addr, "ipue.bin");
++	if (status)
++		goto fail_init;
++
++	status = eip_hw_boot_ofpp(&pdev->dev, base_addr, "ofpp.bin");
++	if (status)
++		goto fail_init;
++
++	status = eip_hw_boot_opue(&pdev->dev, base_addr, "opue.bin");
++	if (status)
++		goto fail_init;
+ 
+ 	/*
+ 	 * Allow passing 16 bytes of metadata information from
