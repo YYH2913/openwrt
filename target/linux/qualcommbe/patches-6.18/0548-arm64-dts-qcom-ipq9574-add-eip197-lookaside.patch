@@ -1,0 +1,113 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] arm64: dts: qcom: ipq9574: add EIP-197 engine
+
+Describe the EIP-197 crypto engine, its four look-aside DMA rings and four
+hybrid DMA rings.  Enable PPE outer-flow offload so inbound ESP can pass
+through PPE -> EIP -> PPE without being punted through the host networking
+stack, and inner-flow offload so routed outbound ESP can use the
+full-inline PPE -> EIP -> PPE path.
+
+The companion node instantiates the Crypto API client after the core EIP
+driver has initialized the hardware.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/ipq9574.dtsi | 86 +++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+
+--- a/arch/arm64/boot/dts/qcom/ipq9574.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq9574.dtsi
+@@ -1276,6 +1276,92 @@
+ 			status = "disabled";
+ 		};
+ 
++		eip: crypto@39800000 {
++			compatible = "qcom,eip";
++			reg = <0x39800000 0x7ffff>;
++			reg-names = "eip_pbase";
++			reg_offset = <0x80000>;
++
++			clocks = <&nsscc NSS_CC_CRYPTO_CLK>,
++				 <&nsscc NSS_CC_NSSNOC_CRYPTO_CLK>,
++				 <&nsscc NSS_CC_CRYPTO_PPE_CLK>;
++			clock-names = "crypto_clk",
++				      "crypto_nocclk",
++				      "crypto_ppeclk";
++			clock-frequency = /bits/ 64 <600000000 600000000 300000000>;
++			qcom,inline-enabled;
++			qcom,outer-offload;
++			qcom,inner-offload;
++
++			interrupts = <GIC_SPI 385 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 386 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 387 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 388 IRQ_TYPE_LEVEL_HIGH>;
++			status = "okay";
++
++			dma0 {
++				tx_cpu = /bits/ 8 <0>;
++				rx_cpu = /bits/ 8 <0>;
++				ring-name = "lookaside";
++				ring-id = /bits/ 8 <0>;
++			};
++
++			dma1 {
++				tx_cpu = /bits/ 8 <1>;
++				rx_cpu = /bits/ 8 <1>;
++				ring-name = "lookaside";
++				ring-id = /bits/ 8 <1>;
++			};
++
++			dma2 {
++				tx_cpu = /bits/ 8 <2>;
++				rx_cpu = /bits/ 8 <2>;
++				ring-name = "lookaside";
++				ring-id = /bits/ 8 <2>;
++			};
++
++			dma3 {
++				tx_cpu = /bits/ 8 <3>;
++				rx_cpu = /bits/ 8 <3>;
++				ring-name = "lookaside";
++				ring-id = /bits/ 8 <3>;
++			};
++
++			dma4 {
++				tx_cpu = /bits/ 8 <0>;
++				rx_cpu = /bits/ 8 <0>;
++				ring-name = "hybrid";
++				ring-id = /bits/ 8 <4>;
++			};
++
++			dma5 {
++				tx_cpu = /bits/ 8 <1>;
++				rx_cpu = /bits/ 8 <1>;
++				ring-name = "hybrid";
++				ring-id = /bits/ 8 <5>;
++			};
++
++			dma6 {
++				tx_cpu = /bits/ 8 <2>;
++				rx_cpu = /bits/ 8 <2>;
++				ring-name = "hybrid";
++				ring-id = /bits/ 8 <6>;
++			};
++
++			dma7 {
++				tx_cpu = /bits/ 8 <3>;
++				rx_cpu = /bits/ 8 <3>;
++				ring-name = "hybrid";
++				ring-id = /bits/ 8 <7>;
++			};
++
++		};
++
++		eip_crypto: eip-crypto {
++			compatible = "qcom,eip_crypto";
++			status = "okay";
++		};
++
+ 		nsscc: clock-controller@39b00000 {
+ 			compatible = "qcom,ipq9574-nsscc";
+ 			reg = <0x39b00000 0x80000>;
