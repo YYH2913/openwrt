@@ -1,0 +1,75 @@
+From: Neelansh Mittal <quic_neelansh@quicinc.com>
+Date: Wed, 23 Feb 2022 12:48:10 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: match IPQ9574 EDMA v2 start
+
+IPQ9574 uses EDMA v2.  Its downstream direct-switch driver enables each
+RXDESC or RXFILL ring before clearing the corresponding disable request.
+The current port does these operations in the reverse order, which can
+leave PPE dequeue unable to feed an otherwise configured PPE2TCL ring.
+
+Match the EDMA v2 start sequence.  Also stop clearing RXDESC_CTRL bit 10:
+WR_PH is an EDMA v3 field and is neither defined nor changed by the v2
+driver.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/82d0ffed35565b7b3e2fb440ff58e0e50c7d4297
+Signed-off-by: Manish Verma <quic_maniverm@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -44,7 +44,6 @@
+ #define PPE_DS_RX_MOD_TIMER		1000
+ #define PPE_DS_TX_MOD_TIMER		150
+ #define PPE_DS_DMA_HIGH_MASK		GENMASK(7, 0)
+-#define PPE_DS_RXDESC_WR_PH		BIT(10)
+ #define PPE_DS_ENQUEUE_VP_BASE		63
+ #define PPE_DS_PRI_PROFILE_BASE		1
+ #define PPE_DS_FLOW_ENQUEUE_MAP_ADDR	0x9d000
+@@ -824,12 +823,6 @@ static int ppe_ds_configure(struct qcom_
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = regmap_clear_bits(regmap,
+-				ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+-				PPE_DS_RXDESC_WR_PH);
+-	if (ret)
+-		return ret;
+-
+ 	ret = regmap_read(regmap,
+ 			  ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
+ 			  &data);
+@@ -1291,23 +1284,23 @@ int qcom_ppe_ds_start(struct qcom_ppe_ds
+ 	ppe_ds_napi_enable(node);
+ 
+ 	ret = regmap_update_bits(regmap,
+-				 ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id)),
+-				 PPE_DS_RING_DISABLE, 0);
++				 ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
++				 EDMA_RXDESC_RX_EN, EDMA_RXDESC_RX_EN);
+ 	if (ret)
+ 		goto err_start;
+ 	ret = regmap_update_bits(regmap,
+-				 ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id)),
++				 ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id)),
+ 				 PPE_DS_RING_DISABLE, 0);
+ 	if (ret)
+ 		goto err_start;
+ 	ret = regmap_update_bits(regmap,
+-				 ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+-				 EDMA_RXDESC_RX_EN, EDMA_RXDESC_RX_EN);
++				 ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
++				 EDMA_RXFILL_RING_EN, EDMA_RXFILL_RING_EN);
+ 	if (ret)
+ 		goto err_start;
+ 	ret = regmap_update_bits(regmap,
+-				 ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
+-				 EDMA_RXFILL_RING_EN, EDMA_RXFILL_RING_EN);
++				 ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id)),
++				 PPE_DS_RING_DISABLE, 0);
+ 	if (ret)
+ 		goto err_start;
+ 	ret = regmap_update_bits(regmap,
+-- 
+2.43.0
