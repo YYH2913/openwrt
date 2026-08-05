@@ -2,6 +2,7 @@
 /* Qualcomm IPQ9574 PPE direct-switch support. */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -21,6 +22,7 @@
 #include "edma.h"
 #include "ppe.h"
 #include "ppe_api.h"
+#include "ppe_config.h"
 #include "ppe_ds.h"
 #include "ppe_regs.h"
 #include "ppe_vp.h"
@@ -38,9 +40,21 @@
 #define PPE_DS_RING_DISABLE		BIT(0)
 #define PPE_DS_POLL_US			10
 #define PPE_DS_POLL_TIMEOUT_US		100000
-#define PPE_DS_PPE2TCL_TIMER_US		3
+/* IPQ9574 EDMA v2 moderation values, in 128-clock timer units. */
+#define PPE_DS_RX_MOD_TIMER		1000
+#define PPE_DS_TX_MOD_TIMER		150
 #define PPE_DS_DMA_HIGH_MASK		GENMASK(7, 0)
 #define PPE_DS_RXDESC_WR_PH		BIT(10)
+#define PPE_DS_ENQUEUE_VP_BASE		63
+#define PPE_DS_PRI_PROFILE_BASE		1
+#define PPE_DS_SRC_PROFILES		4
+#define PPE_DS_FLOW_ENQUEUE_MAP_ADDR	0x9d000
+#define PPE_DS_FLOW_ENQUEUE_MAP_INC	4
+#define PPE_DS_FLOW_ENQUEUE_MAP_BASE	512
+#define PPE_DS_FLOW_ENQUEUE_VP		GENMASK(7, 0)
+#define PPE_DS_FLOW_ENQUEUE_VALID	BIT(8)
+#define PPE_DS_RXDESC2FILL_PER_REG	10
+#define PPE_DS_TXDESC2CMPL_PER_REG	6
 
 enum ppe_ds_irq {
 	PPE_DS_IRQ_TXCMPL,
@@ -68,12 +82,16 @@ struct ppe_ds_stats {
 	atomic64_t vp_attach;
 	atomic64_t vp_detach;
 	atomic64_t vp_fail;
+	atomic64_t peer_set;
+	atomic64_t peer_clear;
+	atomic64_t peer_fail;
 	atomic64_t starts;
 	atomic64_t stops;
 };
 
 struct ppe_ds {
 	struct ppe_device *ppe_dev;
+	/* Protects node allocation and global stop state. */
 	struct mutex lock;
 	struct qcom_ppe_ds_node *nodes[PPE_DS_NODES];
 	int irqs[PPE_DS_NODES][PPE_DS_IRQ_COUNT];
@@ -85,11 +103,14 @@ struct qcom_ppe_ds_node {
 	struct ppe_ds *ds;
 	struct device *client;
 	const struct qcom_ppe_ds_ops *ops;
+	/* Serializes lifecycle transitions and ring ownership. */
 	struct mutex lock;
 	enum ppe_ds_state state;
 	int id;
 	u32 queue_start;
 	u32 queue_count;
+	u8 enqueue_vp;
+	u8 pri_profile;
 
 	struct qcom_ppe_ds_reg reg;
 	struct edma_rxfill_ring rxfill;
@@ -128,23 +149,134 @@ static inline u32 ppe_ds_reg(u32 reg)
 	return EDMA_BASE_OFFSET + reg;
 }
 
+static u32 ppe_ds_rxdesc2fill_reg(u32 ring)
+{
+	return ppe_ds_reg(EDMA_REG_RXDESC2FILL_MAP_0_ADDR +
+			  ring / PPE_DS_RXDESC2FILL_PER_REG * sizeof(u32));
+}
+
+static u32 ppe_ds_txdesc2cmpl_reg(u32 ring)
+{
+	return ppe_ds_reg(EDMA_REG_TXDESC2CMPL_MAP_0_ADDR +
+			  ring / PPE_DS_TXDESC2CMPL_PER_REG * sizeof(u32));
+}
+
 static bool ppe_ds_ring_valid(u32 count)
 {
 	return count >= 64 && count <= U16_MAX && is_power_of_2(count);
 }
 
-static void ppe_ds_rxfill_write(struct qcom_ppe_ds_node *node, u32 count)
+static int ppe_ds_redir_profile_setup(struct ppe_device *ppe_dev)
+{
+	int priority, ret;
+
+	for (priority = 0; priority < PPE_QUEUE_INTER_PRI_NUM; priority++) {
+		ret = ppe_queue_ucast_offset_pri_set(ppe_dev,
+						     PPE_QUEUE_REDIR_PROFILE_ID,
+						     priority,
+						     min(priority,
+							 PPE_DS_QUEUES_PER_NODE - 1));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int ppe_ds_queue_base_set(struct qcom_ppe_ds_node *node,
+				 int queue, int profile)
+{
+	struct ppe_queue_ucast_dest queue_dst = {
+		.dest_port = node->enqueue_vp,
+	};
+	int src_profile, ret;
+
+	for (src_profile = 0; src_profile < PPE_DS_SRC_PROFILES;
+	     src_profile++) {
+		queue_dst.src_profile = src_profile;
+		ret = ppe_queue_ucast_base_set(node->ds->ppe_dev, queue_dst,
+					       queue, profile);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int ppe_ds_queue_base_clear(struct qcom_ppe_ds_node *node, int profile)
+{
+	struct ppe_queue_ucast_dest queue_dst = {
+		.dest_port = node->enqueue_vp,
+	};
+	int src_profile, ret, err = 0;
+
+	for (src_profile = 0; src_profile < PPE_DS_SRC_PROFILES;
+	     src_profile++) {
+		queue_dst.src_profile = src_profile;
+		ret = ppe_queue_ucast_base_set(node->ds->ppe_dev, queue_dst, 0,
+					       profile);
+		if (ret && !err)
+			err = ret;
+	}
+
+	return err;
+}
+
+static int ppe_ds_enqueue_map_set(struct qcom_ppe_ds_node *node, bool enable)
+{
+	struct regmap *regmap = ppe_ds_regmap(node);
+	u32 reg, val = 0;
+	int ret, err;
+
+	reg = PPE_DS_FLOW_ENQUEUE_MAP_ADDR +
+	      (PPE_DS_FLOW_ENQUEUE_MAP_BASE + node->pri_profile) *
+	      PPE_DS_FLOW_ENQUEUE_MAP_INC;
+	if (enable) {
+		ret = ppe_ds_queue_base_set(node, node->queue_start,
+					    PPE_QUEUE_REDIR_PROFILE_ID);
+		if (ret) {
+			err = ppe_ds_queue_base_clear(node,
+						      PPE_QUEUE_REDIR_PROFILE_ID);
+			if (err)
+				dev_warn(node->client,
+					 "failed to roll back enqueue VP %u queues: %d\n",
+					 node->enqueue_vp, err);
+			return ret;
+		}
+
+		val = FIELD_PREP(PPE_DS_FLOW_ENQUEUE_VP, node->enqueue_vp) |
+		      PPE_DS_FLOW_ENQUEUE_VALID;
+		ret = regmap_write(regmap, reg, val);
+		if (!ret)
+			return 0;
+
+		err = ppe_ds_queue_base_clear(node, PPE_QUEUE_REDIR_PROFILE_ID);
+		if (err)
+			dev_warn(node->client,
+				 "failed to roll back enqueue VP %u queues: %d\n",
+				 node->enqueue_vp, err);
+		return ret;
+	}
+
+	ret = regmap_write(regmap, reg, 0);
+	err = ppe_ds_queue_base_clear(node, PPE_QUEUE_REDIR_PROFILE_ID);
+	return ret ?: err;
+}
+
+static int ppe_ds_rxfill_write(struct qcom_ppe_ds_node *node, u32 count)
 {
 	struct edma_rxfill_ring *ring = &node->rxfill;
 	u32 i, prod = ring->prod_idx;
+	int ret;
 
 	for (i = 0; i < count; i++) {
 		struct qcom_ppe_ds_rxfill *buf = &node->rxfill_bufs[i];
 		struct edma_rxfill_desc *desc = EDMA_RXFILL_DESC(ring, prod);
 
 		desc->word0 = lower_32_bits(buf->dma);
-		desc->word1 = (node->reg.buffer_size - node->reg.headroom) <<
-				 EDMA_RXFILL_BUF_SIZE_SHIFT;
+		desc->word1 = (upper_32_bits(buf->dma) & PPE_DS_DMA_HIGH_MASK) |
+			      (node->reg.buffer_size - node->reg.headroom) <<
+			      EDMA_RXFILL_BUF_SIZE_SHIFT;
 		desc->word2 = lower_32_bits(buf->cookie);
 		desc->word3 = upper_32_bits(buf->cookie);
 		EDMA_RXFILL_ENDIAN_SET(desc);
@@ -152,17 +284,23 @@ static void ppe_ds_rxfill_write(struct qcom_ppe_ds_node *node, u32 count)
 	}
 
 	if (!count)
-		return;
+		return 0;
 
 	dma_wmb();
-	regmap_write(ppe_ds_regmap(node),
-		     ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(ring->ring_id)), prod);
+	ret = regmap_write(ppe_ds_regmap(node),
+			   ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(ring->ring_id)),
+			   prod);
+	if (ret)
+		return ret;
 	ring->prod_idx = prod;
+
+	return 0;
 }
 
 static u32 ppe_ds_refill(struct qcom_ppe_ds_node *node, u32 request)
 {
-	u32 filled;
+	u32 filled, i;
+	int ret;
 
 	if (!request)
 		return 0;
@@ -174,7 +312,15 @@ static u32 ppe_ds_refill(struct qcom_ppe_ds_node *node, u32 request)
 	if (WARN_ON_ONCE(filled > request))
 		filled = request;
 
-	ppe_ds_rxfill_write(node, filled);
+	ret = ppe_ds_rxfill_write(node, filled);
+	if (unlikely(ret)) {
+		dev_warn_ratelimited(node->client,
+				     "failed to publish RXFILL producer: %d\n", ret);
+		for (i = 0; i < filled; i++)
+			node->ops->ppe2tcl_release(node,
+						   node->rxfill_bufs[i].cookie);
+		filled = 0;
+	}
 	atomic64_add(filled, &node->stats.refill_buffers);
 	if (filled != request)
 		atomic64_inc(&node->stats.refill_short);
@@ -188,10 +334,17 @@ static int ppe_ds_ppe2tcl_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct edma_rxdesc_ring, napi);
 	struct qcom_ppe_ds_node *node =
 		container_of(ring, struct qcom_ppe_ds_node, ppe2tcl);
-	u32 prod, status;
+	u32 prod, status = 0;
+	int ret;
 
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(ring->ring_id)), &prod);
+	ret = regmap_read(ppe_ds_regmap(node),
+			  ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(ring->ring_id)),
+			  &prod);
+	if (unlikely(ret)) {
+		dev_warn_ratelimited(node->client,
+				     "failed to read PPE2TCL producer: %d\n", ret);
+		goto complete;
+	}
 	prod &= EDMA_RXDESC_PROD_IDX_MASK;
 	node->ops->ppe2tcl_produce(node, prod);
 	atomic64_inc(&node->stats.ppe2tcl_updates);
@@ -199,11 +352,17 @@ static int ppe_ds_ppe2tcl_poll(struct napi_struct *napi, int budget)
 	/* INT_STAT is clear-on-read. Keep NAPI scheduled if the ring advanced
 	 * after the producer-index snapshot.
 	 */
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXDESC_INT_STAT(ring->ring_id)), &status);
+	ret = regmap_read(ppe_ds_regmap(node),
+			  ppe_ds_reg(EDMA_REG_RXDESC_INT_STAT(ring->ring_id)),
+			  &status);
+	if (unlikely(ret))
+		dev_warn_ratelimited(node->client,
+				     "failed to read PPE2TCL interrupt status: %d\n",
+				     ret);
 	if (status & EDMA_RXDESC_RING_INT_STATUS_MASK)
 		return budget;
 
+complete:
 	if (napi_complete_done(napi, 0) &&
 	    READ_ONCE(node->state) == PPE_DS_STARTED)
 		regmap_write(ppe_ds_regmap(node),
@@ -218,12 +377,19 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 	struct qcom_ppe_ds_node *node =
 		container_of(napi, struct qcom_ppe_ds_node, rxfill_napi);
 	struct edma_rxfill_ring *ring = &node->rxfill;
-	u32 cons, done = 0, filled, request, status;
+	u32 cons, done = 0, filled, request, status = 0;
+	int ret;
 
 	do {
-		regmap_read(ppe_ds_regmap(node),
-			    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)),
-			    &cons);
+		ret = regmap_read(ppe_ds_regmap(node),
+				  ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)),
+				  &cons);
+		if (unlikely(ret)) {
+			dev_warn_ratelimited(node->client,
+					     "failed to read RXFILL consumer: %d\n",
+					     ret);
+			break;
+		}
 		cons &= EDMA_RXFILL_CONS_IDX_MASK;
 		request = (cons - ring->prod_idx + ring->count - 1) &
 			  (ring->count - 1);
@@ -240,9 +406,15 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 			return done;
 
 		/* Refill again when the consumer advanced after our snapshot. */
-		regmap_read(ppe_ds_regmap(node),
-			    ppe_ds_reg(EDMA_REG_RXFILL_INT_STAT(ring->ring_id)),
-			    &status);
+		ret = regmap_read(ppe_ds_regmap(node),
+				  ppe_ds_reg(EDMA_REG_RXFILL_INT_STAT(ring->ring_id)),
+				  &status);
+		if (unlikely(ret)) {
+			dev_warn_ratelimited(node->client,
+					     "failed to read RXFILL interrupt status: %d\n",
+					     ret);
+			break;
+		}
 		if ((status & PPE_DS_RXFILL_INT) && !request)
 			return budget;
 	} while (status & PPE_DS_RXFILL_INT);
@@ -259,10 +431,22 @@ static int ppe_ds_rxfill_poll(struct napi_struct *napi, int budget)
 static u32 ppe_ds_txcmpl_reap(struct qcom_ppe_ds_node *node, u32 budget)
 {
 	struct edma_txcmpl_ring *ring = &node->txcmpl;
-	u32 cons = ring->cons_idx, prod, count, i;
+	u32 cons = ring->cons_idx, prod = cons, count, i;
+	int ret;
 
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(ring->id)), &prod);
+	if (WARN_ON_ONCE(!ring->desc || !node->txcmpl_bufs ||
+			 !node->ops || !node->ops->reo2ppe_complete))
+		return 0;
+
+	ret = regmap_read(ppe_ds_regmap(node),
+			  ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(ring->id)),
+			  &prod);
+	if (unlikely(ret)) {
+		dev_warn_ratelimited(node->client,
+				     "failed to read TX completion producer: %d\n",
+				     ret);
+		return 0;
+	}
 	prod &= EDMA_TXCMPL_PROD_IDX_MASK;
 	count = min_t(u32, EDMA_DESC_AVAIL_COUNT(prod, cons, ring->count),
 		      budget);
@@ -270,18 +454,26 @@ static u32 ppe_ds_txcmpl_reap(struct qcom_ppe_ds_node *node, u32 budget)
 		dma_rmb();
 
 	for (i = 0; i < count; i++) {
-		struct edma_txcmpl_desc *desc = EDMA_TXCMPL_DESC(ring, cons);
+		struct edma_txcmpl_desc *txcmpl_desc;
 
-		node->txcmpl_bufs[i].cookie = EDMA_TXCMPL_OPAQUE_GET(desc);
+		txcmpl_desc = EDMA_TXCMPL_DESC(ring, cons);
+		node->txcmpl_bufs[i].cookie =
+			EDMA_TXCMPL_OPAQUE_GET(txcmpl_desc);
 		cons = (cons + 1) & (ring->count - 1);
 	}
 
 	if (!count)
 		return 0;
 
+	ret = regmap_write(ppe_ds_regmap(node),
+			   ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(ring->id)), cons);
+	if (unlikely(ret)) {
+		dev_warn_ratelimited(node->client,
+				     "failed to publish TX completion consumer: %d\n",
+				     ret);
+		return 0;
+	}
 	ring->cons_idx = cons;
-	regmap_write(ppe_ds_regmap(node),
-		     ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(ring->id)), cons);
 	node->ops->reo2ppe_complete(node, node->txcmpl_bufs, count);
 	atomic64_add(count, &node->stats.reo2ppe_buffers);
 
@@ -294,7 +486,8 @@ static int ppe_ds_txcmpl_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct edma_txcmpl_ring, napi);
 	struct qcom_ppe_ds_node *node =
 		container_of(ring, struct qcom_ppe_ds_node, txcmpl);
-	u32 done = 0, status;
+	u32 done = 0, status = 0;
+	int ret;
 
 	do {
 		done += ppe_ds_txcmpl_reap(node, budget - done);
@@ -304,8 +497,15 @@ static int ppe_ds_txcmpl_poll(struct napi_struct *napi, int budget)
 		/* TX_INT_STAT is clear-on-read. Reap again when an event raced
 		 * with the producer-index snapshot before unmasking the IRQ.
 		 */
-		regmap_read(ppe_ds_regmap(node),
-			    ppe_ds_reg(EDMA_REG_TX_INT_STAT(ring->id)), &status);
+		ret = regmap_read(ppe_ds_regmap(node),
+				  ppe_ds_reg(EDMA_REG_TX_INT_STAT(ring->id)),
+				  &status);
+		if (unlikely(ret)) {
+			dev_warn_ratelimited(node->client,
+					     "failed to read TX completion interrupt status: %d\n",
+					     ret);
+			break;
+		}
 	} while (status & EDMA_TXCMPL_RING_INT_STATUS_MASK);
 
 	if (napi_complete_done(napi, done) &&
@@ -323,6 +523,8 @@ static irqreturn_t ppe_ds_ppe2tcl_irq(int irq, void *data)
 
 	regmap_write(ppe_ds_regmap(node),
 		     ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(node->ppe2tcl.ring_id)), 0);
+	if (unlikely(READ_ONCE(node->state) != PPE_DS_STARTED))
+		return IRQ_HANDLED;
 	atomic64_inc(&node->stats.ppe2tcl_irqs);
 	napi_schedule_irqoff(&node->ppe2tcl.napi);
 
@@ -335,6 +537,8 @@ static irqreturn_t ppe_ds_rxfill_irq(int irq, void *data)
 
 	regmap_write(ppe_ds_regmap(node),
 		     ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(node->rxfill.ring_id)), 0);
+	if (unlikely(READ_ONCE(node->state) != PPE_DS_STARTED))
+		return IRQ_HANDLED;
 	atomic64_inc(&node->stats.refill_irqs);
 	napi_schedule_irqoff(&node->rxfill_napi);
 
@@ -347,6 +551,8 @@ static irqreturn_t ppe_ds_txcmpl_irq(int irq, void *data)
 
 	regmap_write(ppe_ds_regmap(node),
 		     ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)), 0);
+	if (unlikely(READ_ONCE(node->state) != PPE_DS_STARTED))
+		return IRQ_HANDLED;
 	atomic64_inc(&node->stats.reo2ppe_irqs);
 	napi_schedule_irqoff(&node->txcmpl.napi);
 
@@ -442,6 +648,41 @@ static void ppe_ds_napi_disable(struct qcom_ppe_ds_node *node)
 	node->napi_enabled = false;
 }
 
+static void ppe_ds_irqs_mask(struct qcom_ppe_ds_node *node)
+{
+	struct regmap *regmap = ppe_ds_regmap(node);
+
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(node->rxfill.ring_id)), 0);
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(node->ppe2tcl.ring_id)), 0);
+	regmap_write(regmap,
+		     ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)), 0);
+}
+
+static void ppe_ds_irqs_sync(struct qcom_ppe_ds_node *node)
+{
+	if (node->rxfill_irq_requested)
+		synchronize_irq(node->rxfill_irq);
+	if (node->ppe2tcl_irq_requested)
+		synchronize_irq(node->ppe2tcl_irq);
+	if (node->txcmpl_irq_requested)
+		synchronize_irq(node->txcmpl_irq);
+}
+
+static void ppe_ds_napi_quiesce(struct qcom_ppe_ds_node *node)
+{
+	/* A poll that observed STARTED before the state transition can rearm
+	 * its interrupt after the first mask.  Disable NAPI, then mask and sync
+	 * once more to close that race before ring memory is reclaimed.
+	 */
+	ppe_ds_irqs_mask(node);
+	ppe_ds_irqs_sync(node);
+	ppe_ds_napi_disable(node);
+	ppe_ds_irqs_mask(node);
+	ppe_ds_irqs_sync(node);
+}
+
 static void ppe_ds_napi_del(struct qcom_ppe_ds_node *node)
 {
 	if (!node->napi_added)
@@ -460,16 +701,20 @@ static int ppe_ds_map_rings(struct qcom_ppe_ds_node *node)
 	int queues[PPE_DS_QUEUES_PER_NODE];
 	int i, ret;
 
-	reg = ppe_ds_reg(EDMA_REG_RXDESC2FILL_MAP_0_ADDR);
-	mask = EDMA_RXDESC2FILL_MAP_RXDESC_MASK << (ring * 3);
-	val = node->rxfill.ring_id << (ring * 3);
+	reg = ppe_ds_rxdesc2fill_reg(ring);
+	mask = EDMA_RXDESC2FILL_MAP_RXDESC_MASK <<
+	       ((ring % PPE_DS_RXDESC2FILL_PER_REG) * 3);
+	val = node->rxfill.ring_id <<
+	      ((ring % PPE_DS_RXDESC2FILL_PER_REG) * 3);
 	ret = regmap_update_bits(regmap, reg, mask, val);
 	if (ret)
 		return ret;
 
-	reg = ppe_ds_reg(EDMA_REG_TXDESC2CMPL_MAP_0_ADDR);
-	mask = EDMA_TXDESC2CMPL_MAP_TXDESC_MASK << (ring * 5);
-	val = node->txcmpl.id << (ring * 5);
+	reg = ppe_ds_txdesc2cmpl_reg(ring);
+	mask = EDMA_TXDESC2CMPL_MAP_TXDESC_MASK <<
+	       ((ring % PPE_DS_TXDESC2CMPL_PER_REG) * 5);
+	val = node->txcmpl.id <<
+	      ((ring % PPE_DS_TXDESC2CMPL_PER_REG) * 5);
 	ret = regmap_update_bits(regmap, reg, mask, val);
 	if (ret)
 		return ret;
@@ -497,11 +742,13 @@ static void ppe_ds_unmap_rings(struct qcom_ppe_ds_node *node)
 	u32 empty[10] = {};
 	int i;
 
-	reg = ppe_ds_reg(EDMA_REG_RXDESC2FILL_MAP_0_ADDR);
-	mask = EDMA_RXDESC2FILL_MAP_RXDESC_MASK << (ring * 3);
+	reg = ppe_ds_rxdesc2fill_reg(ring);
+	mask = EDMA_RXDESC2FILL_MAP_RXDESC_MASK <<
+	       ((ring % PPE_DS_RXDESC2FILL_PER_REG) * 3);
 	regmap_update_bits(regmap, reg, mask, 0);
-	reg = ppe_ds_reg(EDMA_REG_TXDESC2CMPL_MAP_0_ADDR);
-	mask = EDMA_TXDESC2CMPL_MAP_TXDESC_MASK << (ring * 5);
+	reg = ppe_ds_txdesc2cmpl_reg(ring);
+	mask = EDMA_TXDESC2CMPL_MAP_TXDESC_MASK <<
+	       ((ring % PPE_DS_TXDESC2CMPL_PER_REG) * 5);
 	regmap_update_bits(regmap, reg, mask, 0);
 
 	for (i = 0; i < node->queue_count; i++) {
@@ -516,101 +763,95 @@ static void ppe_ds_unmap_rings(struct qcom_ppe_ds_node *node)
 static int ppe_ds_configure(struct qcom_ppe_ds_node *node)
 {
 	struct regmap *regmap = ppe_ds_regmap(node);
-	u32 data;
+	struct reg_sequence config[] = {
+		{ ppe_ds_reg(EDMA_REG_RXFILL_BA(node->rxfill.ring_id)),
+		  lower_32_bits(node->rxfill.dma) },
+		{ ppe_ds_reg(EDMA_REG_RXFILL_BA_HIGH(node->rxfill.ring_id)),
+		  upper_32_bits(node->rxfill.dma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_RXFILL_RING_SIZE(node->rxfill.ring_id)),
+		  node->rxfill.count & EDMA_RXFILL_RING_SIZE_MASK },
+		{ ppe_ds_reg(EDMA_REG_RXFILL_FC_THRE(node->rxfill.ring_id)),
+		  FIELD_PREP(GENMASK(10, 0), PPE_DS_FC_XOFF) |
+		  FIELD_PREP(GENMASK(22, 12), PPE_DS_FC_XON) },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_BA(node->ppe2tcl.ring_id)),
+		  lower_32_bits(node->ppe2tcl.pdma) },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_PREHEADER_BA(node->ppe2tcl.ring_id)),
+		  lower_32_bits(node->ppe2tcl.sdma) },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_BA_HIGH(node->ppe2tcl.ring_id)),
+		  upper_32_bits(node->ppe2tcl.pdma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_PREHEADER_BA_HIGH(node->ppe2tcl.ring_id)),
+		  upper_32_bits(node->ppe2tcl.sdma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_RING_SIZE(node->ppe2tcl.ring_id)),
+		  node->ppe2tcl.count & EDMA_RXDESC_RING_SIZE_MASK },
+		{ ppe_ds_reg(EDMA_REG_RXDESC_FC_THRE(node->ppe2tcl.ring_id)),
+		  FIELD_PREP(GENMASK(10, 0), PPE_DS_FC_XOFF) |
+		  FIELD_PREP(GENMASK(22, 12), PPE_DS_FC_XON) },
+		{ ppe_ds_reg(EDMA_REG_RX_MOD_TIMER(node->ppe2tcl.ring_id)),
+		  PPE_DS_RX_MOD_TIMER },
+		{ ppe_ds_reg(EDMA_REG_RX_INT_CTRL(node->ppe2tcl.ring_id)),
+		  EDMA_RX_NE_INT_EN },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_BA(node->reo2ppe.id)),
+		  lower_32_bits(node->reo2ppe.pdma) },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_BA2(node->reo2ppe.id)),
+		  lower_32_bits(node->reo2ppe.sdma) },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_BA_HIGH(node->reo2ppe.id)),
+		  upper_32_bits(node->reo2ppe.pdma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_BA2_HIGH(node->reo2ppe.id)),
+		  upper_32_bits(node->reo2ppe.sdma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_RING_SIZE(node->reo2ppe.id)),
+		  node->reo2ppe.count & EDMA_TXDESC_RING_SIZE_MASK },
+		{ ppe_ds_reg(EDMA_REG_TXDESC_PROD_IDX(node->reo2ppe.id)), 0 },
+		{ ppe_ds_reg(EDMA_REG_TXCMPL_BA(node->txcmpl.id)),
+		  lower_32_bits(node->txcmpl.dma) },
+		{ ppe_ds_reg(EDMA_REG_TXCMPL_BA_HIGH(node->txcmpl.id)),
+		  upper_32_bits(node->txcmpl.dma) & PPE_DS_DMA_HIGH_MASK },
+		{ ppe_ds_reg(EDMA_REG_TXCMPL_RING_SIZE(node->txcmpl.id)),
+		  node->txcmpl.count & EDMA_TXDESC_RING_SIZE_MASK },
+		{ ppe_ds_reg(EDMA_REG_TXCMPL_CTRL(node->txcmpl.id)),
+		  EDMA_TXCMPL_RETMODE_OPAQUE },
+		{ ppe_ds_reg(EDMA_REG_TX_MOD_TIMER(node->txcmpl.id)),
+		  PPE_DS_TX_MOD_TIMER },
+		{ ppe_ds_reg(EDMA_REG_TX_INT_CTRL(node->txcmpl.id)),
+		  EDMA_TX_NE_INT_EN },
+	};
+	u32 data = 0;
 	int ret;
 
 	ret = ppe_ds_map_rings(node);
 	if (ret)
 		return ret;
 
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_RXFILL_BA(node->rxfill.ring_id)),
-		     lower_32_bits(node->rxfill.dma));
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_BA_HIGH(node->rxfill.ring_id)),
-		     upper_32_bits(node->rxfill.dma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_RING_SIZE(node->rxfill.ring_id)),
-		     node->rxfill.count & EDMA_RXFILL_RING_SIZE_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_FC_THRE(node->rxfill.ring_id)),
-		     FIELD_PREP(GENMASK(10, 0), PPE_DS_FC_XOFF) |
-		     FIELD_PREP(GENMASK(22, 12), PPE_DS_FC_XON));
+	ret = regmap_multi_reg_write(regmap, config, ARRAY_SIZE(config));
+	if (ret)
+		return ret;
 
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_BA(node->ppe2tcl.ring_id)),
-		     lower_32_bits(node->ppe2tcl.pdma));
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_PREHEADER_BA(node->ppe2tcl.ring_id)),
-		     lower_32_bits(node->ppe2tcl.sdma));
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_BA_HIGH(node->ppe2tcl.ring_id)),
-		     upper_32_bits(node->ppe2tcl.pdma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_PREHEADER_BA_HIGH(node->ppe2tcl.ring_id)),
-		     upper_32_bits(node->ppe2tcl.sdma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_RING_SIZE(node->ppe2tcl.ring_id)),
-		     node->ppe2tcl.count & EDMA_RXDESC_RING_SIZE_MASK);
-	regmap_clear_bits(regmap,
-			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
-			  PPE_DS_RXDESC_WR_PH);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_FC_THRE(node->ppe2tcl.ring_id)),
-		     FIELD_PREP(GENMASK(10, 0), PPE_DS_FC_XOFF) |
-		     FIELD_PREP(GENMASK(22, 12), PPE_DS_FC_XON));
-	data = EDMA_MICROSEC_TO_TIMER_UNIT(PPE_DS_PPE2TCL_TIMER_US,
-					   node->ds->ppe_dev->clk_rate / MHZ);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RX_MOD_TIMER(node->ppe2tcl.ring_id)), data);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RX_INT_CTRL(node->ppe2tcl.ring_id)),
-		     EDMA_RX_NE_INT_EN);
+	ret = regmap_clear_bits(regmap,
+				ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+				PPE_DS_RXDESC_WR_PH);
+	if (ret)
+		return ret;
 
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXDESC_BA(node->reo2ppe.id)),
-		     lower_32_bits(node->reo2ppe.pdma));
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXDESC_BA2(node->reo2ppe.id)),
-		     lower_32_bits(node->reo2ppe.sdma));
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXDESC_BA_HIGH(node->reo2ppe.id)),
-		     upper_32_bits(node->reo2ppe.pdma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXDESC_BA2_HIGH(node->reo2ppe.id)),
-		     upper_32_bits(node->reo2ppe.sdma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TXDESC_RING_SIZE(node->reo2ppe.id)),
-		     node->reo2ppe.count & EDMA_TXDESC_RING_SIZE_MASK);
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXDESC_PROD_IDX(node->reo2ppe.id)),
-		     0);
-
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXCMPL_BA(node->txcmpl.id)),
-		     lower_32_bits(node->txcmpl.dma));
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXCMPL_BA_HIGH(node->txcmpl.id)),
-		     upper_32_bits(node->txcmpl.dma) & PPE_DS_DMA_HIGH_MASK);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TXCMPL_RING_SIZE(node->txcmpl.id)),
-		     node->txcmpl.count & EDMA_TXDESC_RING_SIZE_MASK);
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TXCMPL_CTRL(node->txcmpl.id)),
-		     EDMA_TXCMPL_RETMODE_OPAQUE);
-	data = EDMA_MICROSEC_TO_TIMER_UNIT(250,
-					   node->ds->ppe_dev->clk_rate / MHZ);
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TX_MOD_TIMER(node->txcmpl.id)),
-		     data);
-	regmap_write(regmap, ppe_ds_reg(EDMA_REG_TX_INT_CTRL(node->txcmpl.id)),
-		     EDMA_TX_NE_INT_EN);
-	regmap_read(regmap, ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
-		    &data);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
+			  &data);
+	if (ret)
+		return ret;
 	node->txcmpl.cons_idx = data & EDMA_TXCMPL_PROD_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
-		     node->txcmpl.cons_idx);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
+			   node->txcmpl.cons_idx);
+	if (ret)
+		return ret;
 
-	regmap_read(regmap,
-		    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
-		    &data);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
+			  &data);
+	if (ret)
+		return ret;
 	node->rxfill.prod_idx = data & EDMA_RXFILL_CONS_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
-		     node->rxfill.prod_idx);
-
-	return 0;
+	return regmap_write(regmap,
+			    ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
+			    node->rxfill.prod_idx);
 }
 
 static int ppe_ds_resources_alloc(struct qcom_ppe_ds_node *node)
@@ -697,16 +938,22 @@ static void ppe_ds_release_pending_fill(struct qcom_ppe_ds_node *node)
 {
 	struct edma_rxfill_ring *ring = &node->rxfill;
 	u32 cons;
+	int ret;
 
-	if (!node->ops->ppe2tcl_release)
+	ret = regmap_read(ppe_ds_regmap(node),
+			  ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)),
+			  &cons);
+	if (ret) {
+		dev_warn(node->client, "failed to read RXFILL consumer: %d\n", ret);
 		return;
-
-	regmap_read(ppe_ds_regmap(node),
-		    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(ring->ring_id)), &cons);
+	}
 	cons &= EDMA_RXFILL_CONS_IDX_MASK;
 	while (cons != ring->prod_idx) {
-		struct edma_rxfill_desc *desc = EDMA_RXFILL_DESC(ring, cons);
-		u64 cookie = EDMA_RXFILL_OPAQUE_GET(desc);
+		struct edma_rxfill_desc *rxfill_desc;
+		u64 cookie;
+
+		rxfill_desc = EDMA_RXFILL_DESC(ring, cons);
+		cookie = EDMA_RXFILL_OPAQUE_GET(rxfill_desc);
 
 		node->ops->ppe2tcl_release(node, cookie);
 		cons = (cons + 1) & (ring->count - 1);
@@ -720,42 +967,59 @@ static int ppe_ds_reset_ring_indices(struct qcom_ppe_ds_node *node)
 {
 	struct regmap *regmap = ppe_ds_regmap(node);
 	u32 ppe2tcl, reo2ppe, data;
+	int ret;
 
 	/* Drop descriptors left across a WLAN restart and resume both owners at
 	 * the same empty position.  EDMA retains these indexes while the UMAC
 	 * and its software SRNG state can be reset independently.
 	 */
-	regmap_read(regmap,
-		    ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(node->ppe2tcl.ring_id)),
-		    &ppe2tcl);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_RXDESC_PROD_IDX(node->ppe2tcl.ring_id)),
+			  &ppe2tcl);
+	if (ret)
+		return ret;
 	ppe2tcl &= EDMA_RXDESC_PROD_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_CONS_IDX(node->ppe2tcl.ring_id)),
-		     ppe2tcl);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_RXDESC_CONS_IDX(node->ppe2tcl.ring_id)),
+			   ppe2tcl);
+	if (ret)
+		return ret;
 
-	regmap_read(regmap,
-		    ppe_ds_reg(EDMA_REG_TXDESC_CONS_IDX(node->reo2ppe.id)),
-		    &reo2ppe);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_TXDESC_CONS_IDX(node->reo2ppe.id)),
+			  &reo2ppe);
+	if (ret)
+		return ret;
 	reo2ppe &= EDMA_TXDESC_CONS_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TXDESC_PROD_IDX(node->reo2ppe.id)),
-		     reo2ppe);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_TXDESC_PROD_IDX(node->reo2ppe.id)),
+			   reo2ppe);
+	if (ret)
+		return ret;
 
-	regmap_read(regmap,
-		    ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
-		    &data);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
+			  &data);
+	if (ret)
+		return ret;
 	node->txcmpl.cons_idx = data & EDMA_TXCMPL_PROD_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
-		     node->txcmpl.cons_idx);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
+			   node->txcmpl.cons_idx);
+	if (ret)
+		return ret;
 
-	regmap_read(regmap,
-		    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
-		    &data);
+	ret = regmap_read(regmap,
+			  ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
+			  &data);
+	if (ret)
+		return ret;
 	node->rxfill.prod_idx = data & EDMA_RXFILL_CONS_IDX_MASK;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
-		     node->rxfill.prod_idx);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
+			   node->rxfill.prod_idx);
+	if (ret)
+		return ret;
 
 	return node->ops->ring_reset(node, ppe2tcl, reo2ppe);
 }
@@ -767,10 +1031,11 @@ qcom_ppe_ds_node_alloc_id(struct device *client,
 {
 	struct qcom_ppe_ds_node *node;
 	struct ppe_ds *ds;
-	int id;
+	int id, ret;
 
 	if (!client || !ops || !ops->ppe2tcl_produce || !ops->ring_reset ||
-	    !ops->ppe2tcl_refill || !ops->reo2ppe_complete)
+	    !ops->ppe2tcl_refill || !ops->ppe2tcl_release ||
+	    !ops->reo2ppe_complete)
 		return ERR_PTR(-EINVAL);
 
 	mutex_lock(&ppe_ds_global_lock);
@@ -814,18 +1079,31 @@ qcom_ppe_ds_node_alloc_id(struct device *client,
 	node->id = id;
 	node->queue_start = PPE_DS_QUEUE_BASE + id * PPE_DS_QUEUES_PER_NODE;
 	node->queue_count = PPE_DS_QUEUES_PER_NODE;
+	node->enqueue_vp = PPE_DS_ENQUEUE_VP_BASE - id;
+	node->pri_profile = PPE_DS_PRI_PROFILE_BASE + id;
 	node->txcmpl_irq = ds->irqs[id][PPE_DS_IRQ_TXCMPL];
 	node->ppe2tcl_irq = ds->irqs[id][PPE_DS_IRQ_PPE2TCL];
 	node->rxfill_irq = ds->irqs[id][PPE_DS_IRQ_RXFILL];
 	node->state = PPE_DS_ALLOCATED;
 	mutex_init(&node->lock);
+	ret = ppe_ds_enqueue_map_set(node, true);
+	if (ret) {
+		mutex_destroy(&node->lock);
+		put_device(node->client);
+		kfree(node);
+		mutex_unlock(&ds->lock);
+		mutex_unlock(&ppe_ds_global_lock);
+		return ERR_PTR(ret);
+	}
 	ds->nodes[id] = node;
 	mutex_unlock(&ds->lock);
 	mutex_unlock(&ppe_ds_global_lock);
 
-	dev_info(client, "allocated PPE direct-switch node %d, queues %u-%u\n",
+	dev_info(client,
+		 "allocated PPE direct-switch node %d, queues %u-%u, enqueue-vp %u profile %u\n",
 		 id, node->queue_start,
-		 node->queue_start + node->queue_count - 1);
+		 node->queue_start + node->queue_count - 1,
+		 node->enqueue_vp, node->pri_profile);
 	return node;
 }
 EXPORT_SYMBOL_GPL(qcom_ppe_ds_node_alloc_id);
@@ -910,8 +1188,9 @@ int qcom_ppe_ds_register(struct qcom_ppe_ds_node *node,
 
 	node->state = PPE_DS_REGISTERED;
 	dev_info(node->client,
-		 "registered PPE direct-switch node %d on EDMA rings %u\n",
-		 node->id, ring);
+		 "PPE direct-switch node %d ring %u sizes %u/%u/%u/%u\n",
+		 node->id, ring, node->ppe2tcl.count, node->reo2ppe.count,
+		 node->rxfill.count, node->txcmpl.count);
 	mutex_unlock(&node->lock);
 	return 0;
 
@@ -964,39 +1243,75 @@ int qcom_ppe_ds_start(struct qcom_ppe_ds_node *node)
 	}
 	ppe_ds_napi_enable(node);
 
-	regmap_update_bits(regmap,
-			   ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id)),
-			   PPE_DS_RING_DISABLE, 0);
-	regmap_update_bits(regmap,
-			   ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id)),
-			   PPE_DS_RING_DISABLE, 0);
-	regmap_update_bits(regmap,
-			   ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
-			   EDMA_RXDESC_RX_EN, EDMA_RXDESC_RX_EN);
-	regmap_update_bits(regmap,
-			   ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
-			   EDMA_RXFILL_RING_EN, EDMA_RXFILL_RING_EN);
-	regmap_update_bits(regmap,
-			   ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
-			   EDMA_TXDESC_CTRL_TXEN_MASK,
-			   EDMA_TXDESC_CTRL_TXEN_MASK);
+	ret = regmap_update_bits(regmap,
+				 ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id)),
+				 PPE_DS_RING_DISABLE, 0);
+	if (ret)
+		goto err_start;
+	ret = regmap_update_bits(regmap,
+				 ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id)),
+				 PPE_DS_RING_DISABLE, 0);
+	if (ret)
+		goto err_start;
+	ret = regmap_update_bits(regmap,
+				 ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+				 EDMA_RXDESC_RX_EN, EDMA_RXDESC_RX_EN);
+	if (ret)
+		goto err_start;
+	ret = regmap_update_bits(regmap,
+				 ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
+				 EDMA_RXFILL_RING_EN, EDMA_RXFILL_RING_EN);
+	if (ret)
+		goto err_start;
+	ret = regmap_update_bits(regmap,
+				 ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+				 EDMA_TXDESC_CTRL_TXEN_MASK,
+				 EDMA_TXDESC_CTRL_TXEN_MASK);
+	if (ret)
+		goto err_start;
 
 	data = node->reg.rxfill_low_threshold ?: 32;
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_UGT_THRE(node->rxfill.ring_id)),
-		     data & U16_MAX);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_RXFILL_UGT_THRE(node->rxfill.ring_id)),
+			   data & U16_MAX);
+	if (ret)
+		goto err_start;
 	WRITE_ONCE(node->state, PPE_DS_STARTED);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(node->rxfill.ring_id)),
-		     PPE_DS_RXFILL_INT);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(node->ppe2tcl.ring_id)),
-		     EDMA_RXDESC_INT_MASK_PKT_INT);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)),
-		     EDMA_TX_INT_MASK_PKT_INT);
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(node->rxfill.ring_id)),
+			   PPE_DS_RXFILL_INT);
+	if (ret)
+		goto err_start;
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(node->ppe2tcl.ring_id)),
+			   EDMA_RXDESC_INT_MASK_PKT_INT);
+	if (ret)
+		goto err_start;
+	ret = regmap_write(regmap,
+			   ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)),
+			   EDMA_TX_INT_MASK_PKT_INT);
+	if (ret)
+		goto err_start;
 	ppe_vp_ds_node_state(node->ds->ppe_dev, node->id, true);
 	atomic64_inc(&node->stats.starts);
+	goto out;
+
+err_start:
+	WRITE_ONCE(node->state, PPE_DS_REGISTERED);
+	ppe_ds_napi_quiesce(node);
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+			  EDMA_TXDESC_CTRL_TXEN_MASK);
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
+			  EDMA_RXDESC_RX_EN);
+	regmap_clear_bits(regmap,
+			  ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
+			  EDMA_RXFILL_RING_EN);
+	ppe_ds_release_pending_fill(node);
+	dev_err(node->client,
+		"PPE direct-switch node %d failed to start: %d\n",
+		node->id, ret);
 out:
 	mutex_unlock(&node->lock);
 	return ret;
@@ -1007,7 +1322,7 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 {
 	struct regmap *regmap;
 	int ret;
-	u32 val;
+	u32 reg, val;
 
 	if (!node)
 		return;
@@ -1022,54 +1337,49 @@ void qcom_ppe_ds_stop(struct qcom_ppe_ds_node *node)
 		node->ops->quiesce(node);
 
 	regmap = ppe_ds_regmap(node);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXFILL_INT_MASK(node->rxfill.ring_id)), 0);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_RXDESC_INT_MASK(node->ppe2tcl.ring_id)), 0);
-	regmap_write(regmap,
-		     ppe_ds_reg(EDMA_REG_TX_INT_MASK(node->txcmpl.id)), 0);
-	synchronize_irq(node->rxfill_irq);
-	synchronize_irq(node->ppe2tcl_irq);
-	synchronize_irq(node->txcmpl_irq);
-	ppe_ds_napi_disable(node);
+	ppe_ds_napi_quiesce(node);
 
 	regmap_clear_bits(regmap,
 			  ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
 			  EDMA_TXDESC_CTRL_TXEN_MASK);
 	ret = regmap_read_poll_timeout(regmap,
-			 ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
-			 val, !(val & EDMA_TXDESC_CTRL_TXEN_MASK),
-			 PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+				       ppe_ds_reg(EDMA_REG_TXDESC_CTRL(node->reo2ppe.id)),
+				       val, !(val & EDMA_TXDESC_CTRL_TXEN_MASK),
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
 	if (ret)
 		dev_warn(node->client, "REO2PPE ring %u did not stop: %d\n",
 			 node->reo2ppe.id, ret);
 	regmap_clear_bits(regmap,
 			  ppe_ds_reg(EDMA_REG_RXDESC_CTRL(node->ppe2tcl.ring_id)),
 			  EDMA_RXDESC_RX_EN);
-	regmap_set_bits(regmap,
-			ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id)),
-			PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE(node->ppe2tcl.ring_id));
+	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXDESC_DISABLE_DONE(node->ppe2tcl.ring_id));
 	ret = regmap_read_poll_timeout(regmap,
-			 ppe_ds_reg(EDMA_REG_RXDESC_DISABLE_DONE(node->ppe2tcl.ring_id)),
-			 val, val & PPE_DS_RING_DISABLE,
-			 PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+				       reg,
+				       val, val & PPE_DS_RING_DISABLE,
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
 	if (ret)
 		dev_warn(node->client, "PPE2TCL ring %u did not stop: %d\n",
 			 node->ppe2tcl.ring_id, ret);
 	regmap_clear_bits(regmap,
 			  ppe_ds_reg(EDMA_REG_RXFILL_RING_EN(node->rxfill.ring_id)),
 			  EDMA_RXFILL_RING_EN);
-	regmap_set_bits(regmap,
-			ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id)),
-			PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE(node->rxfill.ring_id));
+	regmap_set_bits(regmap, reg, PPE_DS_RING_DISABLE);
+	reg = ppe_ds_reg(EDMA_REG_RXFILL_DISABLE_DONE(node->rxfill.ring_id));
 	ret = regmap_read_poll_timeout(regmap,
-			 ppe_ds_reg(EDMA_REG_RXFILL_DISABLE_DONE(node->rxfill.ring_id)),
-			 val, val & PPE_DS_RING_DISABLE,
-			 PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
+				       reg,
+				       val, val & PPE_DS_RING_DISABLE,
+				       PPE_DS_POLL_US, PPE_DS_POLL_TIMEOUT_US);
 	if (ret)
 		dev_warn(node->client, "RXFILL ring %u did not stop: %d\n",
 			 node->rxfill.ring_id, ret);
 
+	/* Match the vendor stop sequence: descriptors already fetched by EDMA
+	 * can reach the completion ring after all ring enable bits are clear.
+	 */
+	usleep_range(5000, 6000);
 	ppe_ds_txcmpl_reap(node, node->txcmpl.count - 1);
 	ppe_ds_release_pending_fill(node);
 	atomic64_inc(&node->stats.stops);
@@ -1085,6 +1395,7 @@ void qcom_ppe_ds_node_free(struct qcom_ppe_ds_node *node)
 	if (!node)
 		return;
 	qcom_ppe_ds_stop(node);
+	ppe_vp_ds_node_detach(node->ds->ppe_dev, node->id);
 
 	mutex_lock(&node->lock);
 	if (node->state == PPE_DS_REGISTERED) {
@@ -1102,6 +1413,11 @@ void qcom_ppe_ds_node_free(struct qcom_ppe_ds_node *node)
 		mutex_unlock(&ds->lock);
 		return;
 	}
+
+	if (ppe_ds_enqueue_map_set(node, false))
+		dev_warn(node->client,
+			 "failed to clear enqueue mapping for direct-switch node %d\n",
+			 node->id);
 	ds->nodes[node->id] = NULL;
 	mutex_unlock(&ds->lock);
 
@@ -1191,6 +1507,27 @@ void qcom_ppe_ds_vp_free(struct qcom_ppe_ds_node *node, int vp)
 }
 EXPORT_SYMBOL_GPL(qcom_ppe_ds_vp_free);
 
+int qcom_ppe_ds_vp_peer_set(struct qcom_ppe_ds_node *node, int vp,
+			    const u8 *addr, bool enable)
+{
+	int ret;
+
+	if (!node || !addr)
+		return -EINVAL;
+
+	ret = ppe_vp_ds_peer_set(node->ds->ppe_dev, vp, node->id, addr,
+				 enable);
+	if (ret)
+		atomic64_inc(&node->stats.peer_fail);
+	else if (enable)
+		atomic64_inc(&node->stats.peer_set);
+	else
+		atomic64_inc(&node->stats.peer_clear);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_ppe_ds_vp_peer_set);
+
 static int ppe_ds_debugfs_show(struct seq_file *s, void *unused)
 {
 	struct ppe_ds *ds = s->private;
@@ -1199,7 +1536,10 @@ static int ppe_ds_debugfs_show(struct seq_file *s, void *unused)
 	mutex_lock(&ds->lock);
 	for (i = 0; i < PPE_DS_NODES; i++) {
 		struct qcom_ppe_ds_node *node = ds->nodes[i];
-		u32 p2t_prod, p2t_cons, r2p_prod, r2p_cons;
+		u32 p2t_prod = 0, p2t_cons = 0, r2p_prod = 0, r2p_cons = 0;
+		u32 fill_prod = 0, fill_cons = 0, cmpl_prod = 0, cmpl_cons = 0;
+		u32 rx_timer = 0, tx_timer = 0, rx_map = 0, tx_map = 0, map;
+		unsigned int peer_maps;
 
 		if (!node) {
 			seq_printf(s, "node%d state=free ring=%d queues=%d-%d\n",
@@ -1220,30 +1560,85 @@ static int ppe_ds_debugfs_show(struct seq_file *s, void *unused)
 		regmap_read(ppe_ds_regmap(node),
 			    ppe_ds_reg(EDMA_REG_TXDESC_CONS_IDX(node->reo2ppe.id)),
 			    &r2p_cons);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_RXFILL_PROD_IDX(node->rxfill.ring_id)),
+			    &fill_prod);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_RXFILL_CONS_IDX(node->rxfill.ring_id)),
+			    &fill_cons);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_TXCMPL_PROD_IDX(node->txcmpl.id)),
+			    &cmpl_prod);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_TXCMPL_CONS_IDX(node->txcmpl.id)),
+			    &cmpl_cons);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_RX_MOD_TIMER(node->ppe2tcl.ring_id)),
+			    &rx_timer);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_reg(EDMA_REG_TX_MOD_TIMER(node->txcmpl.id)),
+			    &tx_timer);
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_rxdesc2fill_reg(node->ppe2tcl.ring_id), &map);
+		rx_map = map >> ((node->ppe2tcl.ring_id %
+				 PPE_DS_RXDESC2FILL_PER_REG) * 3) &
+		 EDMA_RXDESC2FILL_MAP_RXDESC_MASK;
+		regmap_read(ppe_ds_regmap(node),
+			    ppe_ds_txdesc2cmpl_reg(node->reo2ppe.id), &map);
+		tx_map = map >> ((node->reo2ppe.id %
+				 PPE_DS_TXDESC2CMPL_PER_REG) * 5) &
+		 EDMA_TXDESC2CMPL_MAP_TXDESC_MASK;
+		peer_maps = ppe_vp_ds_peer_count(ds->ppe_dev, node->id);
 		seq_printf(s,
-			   "node%d state=%u ring=%d queues=%u-%u "
-			   "ppe2tcl=%u/%u reo2ppe=%u/%u vp=%lld "
-			   "attach=%lld detach=%lld vp_fail=%lld "
-			   "ppe2tcl_irq=%lld ppe2tcl_update=%lld "
-			   "refill_irq=%lld refill=%lld refill_short=%lld "
-			   "reo2ppe_irq=%lld reo2ppe_done=%lld "
-			   "start=%lld stop=%lld\n",
+			   "node%d state=%u ring=%d map=%u/%u queues=%u-%u enqueue_vp=%u profile=%u queue_profile=%u ",
 			   i, node->state, i + PPE_DS_RING_BASE,
+			   rx_map, tx_map,
 			   node->queue_start,
 			   node->queue_start + node->queue_count - 1,
-			   p2t_prod & EDMA_RXDESC_PROD_IDX_MASK,
-			   p2t_cons & EDMA_RXDESC_CONS_IDX_MASK,
-			   r2p_prod & EDMA_TXDESC_PROD_IDX_MASK,
-			   r2p_cons & EDMA_TXDESC_CONS_IDX_MASK,
+			   node->enqueue_vp, node->pri_profile,
+			   PPE_QUEUE_REDIR_PROFILE_ID);
+		p2t_prod &= EDMA_RXDESC_PROD_IDX_MASK;
+		p2t_cons &= EDMA_RXDESC_CONS_IDX_MASK;
+		r2p_prod &= EDMA_TXDESC_PROD_IDX_MASK;
+		r2p_cons &= EDMA_TXDESC_CONS_IDX_MASK;
+		fill_prod &= EDMA_RXFILL_PROD_IDX_MASK;
+		fill_cons &= EDMA_RXFILL_CONS_IDX_MASK;
+		cmpl_prod &= EDMA_TXCMPL_PROD_IDX_MASK;
+		cmpl_cons &= EDMA_TXCMPL_PROD_IDX_MASK;
+		seq_printf(s,
+			   "timer=%u/%u ppe2tcl=%u/%u/%u/%u reo2ppe=%u/%u/%u/%u ",
+			   rx_timer, tx_timer, p2t_prod, p2t_cons,
+			   EDMA_DESC_AVAIL_COUNT(p2t_prod, p2t_cons,
+						 node->ppe2tcl.count), node->ppe2tcl.count,
+			   r2p_prod, r2p_cons,
+			   EDMA_DESC_AVAIL_COUNT(r2p_prod, r2p_cons,
+						 node->reo2ppe.count), node->reo2ppe.count);
+		seq_printf(s, "rxfill=%u/%u/%u/%u txcmpl=%u/%u/%u/%u ",
+			   fill_prod, fill_cons,
+			   EDMA_DESC_AVAIL_COUNT(fill_prod, fill_cons,
+						 node->rxfill.count), node->rxfill.count,
+			   cmpl_prod, cmpl_cons,
+			   EDMA_DESC_AVAIL_COUNT(cmpl_prod, cmpl_cons,
+						 node->txcmpl.count), node->txcmpl.count);
+		seq_printf(s,
+			   "vp=%lld attach=%lld detach=%lld vp_fail=%lld ",
 			   atomic64_read(&node->stats.vp_refs),
 			   atomic64_read(&node->stats.vp_attach),
 			   atomic64_read(&node->stats.vp_detach),
-			   atomic64_read(&node->stats.vp_fail),
+			   atomic64_read(&node->stats.vp_fail));
+		seq_printf(s, "peer_maps=%u peer_set=%lld peer_clear=%lld peer_fail=%lld ",
+			   peer_maps,
+			   atomic64_read(&node->stats.peer_set),
+			   atomic64_read(&node->stats.peer_clear),
+			   atomic64_read(&node->stats.peer_fail));
+		seq_printf(s, "ppe2tcl_irq=%lld ppe2tcl_update=%lld ",
 			   atomic64_read(&node->stats.ppe2tcl_irqs),
-			   atomic64_read(&node->stats.ppe2tcl_updates),
+			   atomic64_read(&node->stats.ppe2tcl_updates));
+		seq_printf(s, "refill_irq=%lld refill=%lld refill_short=%lld ",
 			   atomic64_read(&node->stats.refill_irqs),
 			   atomic64_read(&node->stats.refill_buffers),
-			   atomic64_read(&node->stats.refill_short),
+			   atomic64_read(&node->stats.refill_short));
+		seq_printf(s, "reo2ppe_irq=%lld reo2ppe_done=%lld start=%lld stop=%lld\n",
 			   atomic64_read(&node->stats.reo2ppe_irqs),
 			   atomic64_read(&node->stats.reo2ppe_buffers),
 			   atomic64_read(&node->stats.starts),
@@ -1260,7 +1655,7 @@ int ppe_ds_setup(struct ppe_device *ppe_dev)
 	struct device_node *edma_np;
 	struct ppe_ds *ds;
 	char name[20];
-	int i, irq;
+	int i, irq, ret;
 
 	if (!ppe_dev->variant->has_vports)
 		return 0;
@@ -1292,6 +1687,12 @@ int ppe_ds_setup(struct ppe_device *ppe_dev)
 		ds->irqs[i][PPE_DS_IRQ_RXFILL] = irq;
 	}
 	of_node_put(edma_np);
+
+	ret = ppe_ds_redir_profile_setup(ppe_dev);
+	if (ret) {
+		mutex_destroy(&ds->lock);
+		return ret;
+	}
 
 	ds->debugfs = debugfs_create_file("direct_switch", 0444,
 					  ppe_dev->debugfs_root, ds,

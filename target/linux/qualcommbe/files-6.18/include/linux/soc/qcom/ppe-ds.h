@@ -39,8 +39,8 @@ struct qcom_ppe_ds_txcmpl {
 struct qcom_ppe_ds_ops {
 	void (*ppe2tcl_produce)(struct qcom_ppe_ds_node *node, u16 prod);
 	u32 (*ppe2tcl_refill)(struct qcom_ppe_ds_node *node, u32 count,
-			       u32 size, u32 headroom,
-			       struct qcom_ppe_ds_rxfill *buffers);
+			      u32 size, u32 headroom,
+			      struct qcom_ppe_ds_rxfill *buffers);
 	void (*ppe2tcl_release)(struct qcom_ppe_ds_node *node, u64 cookie);
 	void (*reo2ppe_complete)(struct qcom_ppe_ds_node *node,
 				 struct qcom_ppe_ds_txcmpl *buffers,
@@ -103,5 +103,7 @@ u16 qcom_ppe_ds_reo2ppe_cons(struct qcom_ppe_ds_node *node);
 int qcom_ppe_ds_vp_alloc(struct qcom_ppe_ds_node *node,
 			 struct net_device *dev);
 void qcom_ppe_ds_vp_free(struct qcom_ppe_ds_node *node, int vp);
+int qcom_ppe_ds_vp_peer_set(struct qcom_ppe_ds_node *node, int vp,
+			    const u8 *addr, bool enable);
 
 #endif
