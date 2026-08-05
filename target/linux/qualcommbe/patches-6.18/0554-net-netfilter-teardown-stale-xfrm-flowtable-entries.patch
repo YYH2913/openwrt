@@ -1,0 +1,52 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 13:20:00 +0800
+Subject: [PATCH] netfilter: flowtable: tear down stale XFRM hardware flows
+
+The software flowtable path validates cached XFRM destinations before every
+packet, but packets handled by a hardware flow never reach that check.  An
+XFRM state can therefore remain programmed after it has been deleted, while
+hardware statistics keep both the flow and conntrack entry alive.
+
+Validate both cached XFRM destinations from the periodic flowtable garbage
+collector.  XFRM marks a deleted state dead before dropping its database
+reference, so xfrm_dst_check() rejects the bundle and the normal hardware
+delete path releases provider, state and destination references in order.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -452,6 +452,24 @@ static bool nf_flow_custom_gc(struct nf_f
+ 	return flow_table->type->gc && flow_table->type->gc(flow);
+ }
+ 
++static bool nf_flow_xfrm_dst_valid(const struct flow_offload *flow)
++{
++	int dir;
++
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct flow_offload_tuple *tuple;
++
++		tuple = &flow->tuplehash[dir].tuple;
++		if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
++			continue;
++		if (!tuple->dst_cache ||
++		    !dst_check(tuple->dst_cache, tuple->dst_cookie))
++			return false;
++	}
++
++	return true;
++}
++
+ /**
+  * nf_flow_table_tcp_timeout() - new timeout of offloaded tcp entry
+  * @ct:		Flowtable offloaded tcp ct
+@@ -561,6 +579,7 @@ static void nf_flow_offload_gc_step(struc
+ 
+ 	if (nf_flow_has_expired(flow) ||
+ 	    nf_ct_is_dying(flow->ct) ||
++	    !nf_flow_xfrm_dst_valid(flow) ||
+ 	    nf_flow_custom_gc(flow_table, flow)) {
+ 		flow_offload_teardown(flow);
+ 		teardown = true;
