@@ -1,0 +1,133 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: allocate dummy NAPI netdevices on Linux 6.18
+
+init_dummy_netdev() is internal to the networking core in Linux 6.18.  Use
+the exported alloc_netdev_dummy() API and account for its ownership in all
+lookaside and hybrid ring init/deinit paths.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/eip197/eip_dma.h
++++ b/driver/eip197/eip_dma.h
+@@ -70,7 +70,7 @@ struct eip_hw_ring {
+ 	void __iomem *proc_thresh;	/* HW processed threshold register */
+ 	void __iomem *proc_status;	/* HW status register */
+ 
+-	struct net_device ndev;		/* Dummy_netdev for NAPI */
++	struct net_device *ndev;		/* Dummy netdev for NAPI */
+ 	struct napi_struct napi;	/* NAPI handler */
+ 
+ 	void *kaddr;			/* Pointer to allocated memory */
+@@ -133,6 +133,8 @@ extern const char *dma_name[];
+ extern struct file_operations dma_stats_ops;
+ 
+ int eip_dma_tx_sg(struct eip_dma *dma, struct eip_sw_desc *sw, struct scatterlist *src, struct scatterlist *dst);
++int eip_dma_tx_linear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
++int eip_dma_tx_nonlinear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ int eip_dma_hy_tx_linear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ int eip_dma_hy_tx_nonlinear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ 
+--- a/driver/eip197/eip_dma.c
++++ b/driver/eip197/eip_dma.c
+@@ -743,6 +743,7 @@ void eip_dma_la_deinit(struct eip_dma *d
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->out.napi);
+ 	netif_napi_del(&dma->out.napi);
++	free_netdev(dma->out.ndev);
+ 	kfree(dma->out.kaddr);
+ 	kfree(dma->in.kaddr);
+ 
+@@ -800,11 +801,16 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 		goto fail_irq;
+ 	}
+ 
+-	init_dummy_netdev(&dma->out.ndev);
++	dma->out.ndev = alloc_netdev_dummy(0);
++	if (!dma->out.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
++	netif_napi_add(dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll,
++	netif_napi_add_weight(dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll,
+ 			eip_dma_rx_napi_weight);
+ #endif
+ 	napi_enable(&dma->out.napi);
+@@ -819,6 +825,8 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	pr_info("%px: DMA ring(%u) configured and Rx mapped to cpu(%u)\n", dma, ring_id, rx_cpu);
+ 	return 0;
+ 
++fail_netdev:
++	free_irq(dma->irq, dma);
+ fail_irq:
+ 	kfree(dma->out.kaddr);
+ fail_res:
+--- a/driver/eip197/eip_dma_hy.c
++++ b/driver/eip197/eip_dma_hy.c
+@@ -829,6 +829,8 @@ void eip_dma_hy_deinit(struct eip_dma *d
+ 	napi_disable(&dma->out.napi);
+ 	netif_napi_del(&dma->in.napi);
+ 	netif_napi_del(&dma->out.napi);
++	free_netdev(dma->in.ndev);
++	free_netdev(dma->out.ndev);
+ 	eip_dma_hy_free_skb(dma);
+ 	kfree(dma->out.desc);
+ 	kfree(dma->in.desc);
+@@ -893,11 +895,22 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	/*
+ 	 * Initialize NAPI for transmit completion for input ring.
+ 	 */
+-	init_dummy_netdev(&dma->in.ndev);
++	dma->in.ndev = alloc_netdev_dummy(0);
++	if (!dma->in.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev_in;
++	}
++
++	dma->out.ndev = alloc_netdev_dummy(0);
++	if (!dma->out.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev_out;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll, eip_dma_tx_compl_napi_weight);
++	netif_napi_add(dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll, eip_dma_tx_compl_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll,
++	netif_napi_add_weight(dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll,
+ 			eip_dma_tx_compl_napi_weight);
+ #endif
+ 	napi_enable(&dma->in.napi);
+@@ -905,11 +918,10 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	/*
+ 	 * Initialize NAPI for receiving packet for output ring.
+ 	 */
+-	init_dummy_netdev(&dma->out.ndev);
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll, eip_dma_rx_napi_weight);
++	netif_napi_add(dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll, eip_dma_rx_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll,
++	netif_napi_add_weight(dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll,
+ 			eip_dma_rx_napi_weight);
+ #endif
+ 	napi_enable(&dma->out.napi);
+@@ -925,6 +937,11 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	pr_info("%px: DMA ring(%u) configured and Rx mapped to cpu(%u)\n", dma, ring_id, rx_cpu);
+ 	return 0;
+ 
++fail_netdev_out:
++	free_netdev(dma->in.ndev);
++fail_netdev_in:
++	free_irq(dma->irq, dma);
++
+ fail_irq:
+ 	kfree(dma->out.kaddr);
+ fail_res:
