@@ -1,0 +1,223 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: ethernet: qualcomm: ppe: clear lifecycle L3 interfaces
+
+The reserved PPPoE and VLAN-uplink slots own L3 interface rows, but their
+rollback and final-release paths only clear the entries which point at those
+rows.  This leaves stale routing, MTU, source-MAC and PPPoE state behind when
+a slot is reused.
+
+Clear the L3 row after its users have been detached.  If rollback cannot
+clear every programmed row, retain the existing quarantine semantics so the
+slot and its lower-layer dependency cannot be reused underneath stale
+hardware state.  Also retry the complete VLAN cleanup during flowtable
+teardown.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -694,15 +694,29 @@ static int ppe_ft_pppoe_dev_get(struct p
+ 
+ static void ppe_ft_pppoe_put(struct ppe_flowtable *ft, int index)
+ {
+-	int vlan;
++	struct ppe_ft_pppoe *session;
++	int vlan, ret = 0, err;
+ 
+ 	if (!ppe_ft_ref_put(ft->pppoe, sizeof(*ft->pppoe), index))
+ 		return;
+ 
+-	if (WARN_ON_ONCE(ft->pppoe[index].connected))
+-		ppe_pppoe_session_set(ft->ppe_dev, index, false, 0, NULL, 0);
+-	vlan = ft->pppoe[index].vlan;
+-	memset(&ft->pppoe[index], 0, sizeof(ft->pppoe[index]));
++	session = &ft->pppoe[index];
++	if (WARN_ON_ONCE(session->connected))
++		ret = ppe_pppoe_session_set(ft->ppe_dev, index, false, 0, NULL, 0);
++	err = ppe_l3_if_clear(ft->ppe_dev, ppe_ft_pppoe_l3_if(ft, index));
++	if (!ret)
++		ret = err;
++	if (ret) {
++		session->poisoned = true;
++		session->ref.refcnt = 1;
++		dev_err(ft->ppe_dev->dev,
++			"quarantining PPPoE session %d during release: %d\n",
++			index, ret);
++		return;
++	}
++
++	vlan = session->vlan;
++	memset(session, 0, sizeof(*session));
+ 	ppe_ft_vlan_put(ft, vlan);
+ }
+ 
+@@ -769,7 +783,23 @@ static int ppe_ft_pppoe_connect(struct p
+ 
+ 	ret = ppe_l3_if_set(ft->ppe_dev, ppe_ft_pppoe_l3_if(ft, i),
+ 			    topo.local, topo.mtu, topo.sid);
+-	if (ret)
+-		goto out_ref_or_vlan;
++	if (ret) {
++		if (!is_new)
++			goto out_ref_or_vlan;
++		cleanup_ret = ppe_l3_if_clear(ft->ppe_dev,
++					      ppe_ft_pppoe_l3_if(ft, i));
++		if (!cleanup_ret)
++			goto out_ref_or_vlan;
++
++		want.ref.refcnt = 1;
++		want.ppp_dev = NULL;
++		want.connected = false;
++		want.poisoned = true;
++		*session = want;
++		dev_err(ft->ppe_dev->dev,
++			"quarantining partial PPPoE L3 interface %d: %d\n",
++			i, cleanup_ret);
++		goto out_unlock;
++	}
+ 
+ 	ret = ppe_pppoe_session_set(ft->ppe_dev, i, true, topo.sid,
+@@ -778,5 +807,8 @@ static int ppe_ft_pppoe_connect(struct p
+ 		cleanup_ret = ppe_pppoe_session_set(ft->ppe_dev, i, false,
+ 						    0, NULL, 0);
++		if (!cleanup_ret && is_new)
++			cleanup_ret = ppe_l3_if_clear(ft->ppe_dev,
++						      ppe_ft_pppoe_l3_if(ft, i));
+ 		if (cleanup_ret) {
+ 			if (is_new) {
+ 				want.ref.refcnt = 1;
+@@ -927,7 +959,7 @@ static int ppe_ft_vlan_get(struct ppe_fl
+ 	struct ppe_ft_vlan want = { .vid = vid, .port = port };
+ 	const u8 no_mac[ETH_ALEN] = {};
+ 	bool is_new;
+-	int i, ret, err;
++	int i, ret, err, cleanup_ret;
+ 
+ 	i = ppe_ft_ref_get(ft->vlans, sizeof(*ft->vlans),
+ 			   PPE_L3_VLAN_UPLINKS, ppe_ft_vlan_match,
+@@ -940,13 +972,25 @@ static int ppe_ft_vlan_get(struct ppe_fl
+ 	 */
+ 	ret = ppe_l3_if_set(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, i),
+ 			    no_mac, mtu, -1);
+-	if (ret)
++	if (ret) {
++		err = ppe_l3_if_clear(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, i));
++		if (err)
++			goto quarantine;
+ 		return ret;
++	}
+ 
+ 	ret = ppe_vsi_l3_if_set(ft->ppe_dev, ppe_ft_vlan_vsi(i),
+ 				ppe_ft_vlan_l3_if(ft, i));
+-	if (ret)
++	if (ret) {
++		err = ppe_vsi_l3_if_set(ft->ppe_dev, ppe_ft_vlan_vsi(i), -1);
++		cleanup_ret = ppe_l3_if_clear(ft->ppe_dev,
++					      ppe_ft_vlan_l3_if(ft, i));
++		if (!err)
++			err = cleanup_ret;
++		if (err)
++			goto quarantine;
+ 		return ret;
++	}
+ 
+ 	ret = ppe_ing_xlt_rule_set(ft->ppe_dev, ppe_ft_vlan_xlt(i),
+ 				   BIT(port), vid, ppe_ft_vlan_vsi(i), true);
+@@ -954,13 +1002,15 @@ static int ppe_ft_vlan_get(struct ppe_fl
+ 		err = ppe_ing_xlt_rule_clear(ft->ppe_dev,
+ 					     ppe_ft_vlan_xlt(i));
+-		err |= ppe_vsi_l3_if_set(ft->ppe_dev, ppe_ft_vlan_vsi(i), -1);
+-		if (err) {
+-			want.ref.refcnt = 1;
+-			want.poisoned = true;
+-			ft->vlans[i] = want;
+-			dev_err(ft->ppe_dev->dev,
+-				"quarantining partial VLAN slot %d\n", i);
+-		}
++		cleanup_ret = ppe_vsi_l3_if_set(ft->ppe_dev,
++						 ppe_ft_vlan_vsi(i), -1);
++		if (!err)
++			err = cleanup_ret;
++		cleanup_ret = ppe_l3_if_clear(ft->ppe_dev,
++					      ppe_ft_vlan_l3_if(ft, i));
++		if (!err)
++			err = cleanup_ret;
++		if (err)
++			goto quarantine;
+ 		return ret;
+ 	}
+ 
+@@ -969,5 +1017,15 @@ static int ppe_ft_vlan_get(struct ppe_fl
+ 
+ 	return i;
++
++quarantine:
++	want.ref.refcnt = 1;
++	want.poisoned = true;
++	ft->vlans[i] = want;
++	dev_err(ft->ppe_dev->dev,
++		"quarantining partial VLAN slot %d during rollback: %d\n",
++		i, err);
++
++	return ret;
+ }
+ 
+ static void ppe_ft_vlan_put(struct ppe_flowtable *ft, int index)
+@@ -991,6 +1048,10 @@ static void ppe_ft_vlan_put(struct ppe_f
+ 	err = ppe_fdb_vsi_flush(ft->ppe_dev, ppe_ft_vlan_vsi(index));
+ 	if (!ret)
+ 		ret = err;
++	err = ppe_l3_if_clear(ft->ppe_dev, ppe_ft_vlan_l3_if(ft, index));
++	if (!ret)
++		ret = err;
++
+ 	if (ret) {
+ 		slot->poisoned = true;
+ 		slot->ref.refcnt = 1;
+@@ -3501,7 +3562,7 @@ void ppe_flowtable_destroy(struct ppe_de
+ 	struct ppe_ft_flow *flow, *flow_tmp;
+ 	struct ppe_ft_host *host;
+ 	struct hlist_node *tmp;
+-	int i;
++	int i, ret, err;
+ 
+ 	if (!ft)
+ 		return;
+@@ -3513,11 +3574,34 @@ void ppe_flowtable_destroy(struct ppe_de
+ 	for (i = 0; i < PPE_FT_PPPOE_SESSIONS; i++) {
+ 		if (!ft->pppoe[i].ref.refcnt)
+ 			continue;
+-		if (ft->pppoe[i].connected)
+-			ppe_pppoe_session_set(ft->ppe_dev, i, false, 0, NULL, 0);
++		ret = 0;
++		if (ft->pppoe[i].connected) {
++			ret = ppe_pppoe_session_set(ft->ppe_dev, i, false,
++						    0, NULL, 0);
++			ft->pppoe[i].connected = false;
++		}
++		err = ppe_l3_if_clear(ft->ppe_dev,
++					  ppe_ft_pppoe_l3_if(ft, i));
++		if (!ret)
++			ret = err;
++		if (ret)
++			dev_err(ft->ppe_dev->dev,
++				"failed to clear PPPoE slot %d during teardown: %d\n",
++				i, ret);
+ 		ppe_ft_vlan_put(ft, ft->pppoe[i].vlan);
+ 		memset(&ft->pppoe[i], 0, sizeof(ft->pppoe[i]));
+ 	}
++
++	/* A quarantined slot or a hardware-flow zombie can retain VLAN
++	 * references after the ordinary flow drain.  Teardown owns all of
++	 * them now, so collapse their references and retry the full cleanup.
++	 */
++	for (i = 0; i < PPE_L3_VLAN_UPLINKS; i++) {
++		if (!ft->vlans[i].ref.refcnt)
++			continue;
++		ft->vlans[i].ref.refcnt = 1;
++		ppe_ft_vlan_put(ft, i);
++	}
+ 	mutex_unlock(&ft->lock);
+ 
+ 	debugfs_remove(ft->debugfs_reasons);
