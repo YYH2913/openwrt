@@ -1,0 +1,83 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 21:20:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: do not revive detached peer flows
+
+Stopping a direct-switch node is temporary, so its flows retain their
+priority profile and are enabled again after the same rings restart.
+Removing the node's final vdev reference is different: its peer mappings
+are gone and any flow using that profile must remain invalid until the
+flowtable ages and rebuilds it.
+
+Pass that distinction to the profile state helper.  After a permanent
+detach successfully disables a flow, clear its recorded profile so a new
+node instance with the same ID cannot enable the stale row.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c | 7 +++++--
+ drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h | 2 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c        | 5 +++--
+ 3 files changed, 9 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -3263,7 +3263,7 @@ static int ppe_ft_block_cb(enum tc_setup
+ }
+ 
+ void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
+-				      u8 profile, bool up)
++				      u8 profile, bool up, bool invalidate)
+ {
+ 	struct ppe_flowtable *ft = ppe_dev->flowtable;
+ 	struct rhashtable_iter iter;
+@@ -3287,11 +3287,14 @@ void ppe_flowtable_port_profile_state(st
+ 			continue;
+ 
+ 		ret = ppe_flow_entry_enable(ppe_dev, flow->index, up);
+-		if (ret)
++		if (ret) {
+ 			dev_warn(ppe_dev->dev,
+ 				 "failed to %s flow %d for VP %d profile %u: %d\n",
+ 				 up ? "enable" : "disable", flow->index, port,
+ 				 profile, ret);
++		} else if (invalidate) {
++			flow->entry.pri_profile = 0;
++		}
+ 	}
+ 	rhashtable_walk_stop(&iter);
+ 	rhashtable_walk_exit(&iter);
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.h
+@@ -17,6 +17,6 @@ void ppe_flowtable_debugfs_init(struct p
+ void ppe_flowtable_port_carrier(struct ppe_device *ppe_dev, int port, bool up);
+ void ppe_flowtable_port_profile_state(struct ppe_device *ppe_dev, int port,
+-				      u8 profile, bool up);
++				      u8 profile, bool up, bool invalidate);
+ void ppe_flowtable_port_peer_invalidate(struct ppe_device *ppe_dev, int port,
+ 					const u8 *addr);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -705,7 +705,8 @@ out_unlock:
+ 	mutex_unlock(&vp->lock);
+ 	if (profile_down)
+ 		ppe_flowtable_port_profile_state(ppe_dev, port,
+-						 PPE_VP_DS_PRI_PROFILE(node), false);
++						 PPE_VP_DS_PRI_PROFILE(node), false,
++						 true);
+ 	if (carrier_down)
+ 		ppe_flowtable_port_carrier(ppe_dev, port, false);
+ 	ppe_vp_put(ppe_dev, port);
+@@ -899,7 +900,7 @@ void ppe_vp_ds_node_state(struct ppe_dev
+ 		if (profile_ports & BIT_ULL(i))
+ 			ppe_flowtable_port_profile_state(ppe_dev,
+ 							 PPE_VP_PORT_BASE + i,
+-					PPE_VP_DS_PRI_PROFILE(node), up);
++					PPE_VP_DS_PRI_PROFILE(node), up, false);
+ 		if (carrier_down & BIT_ULL(i))
+ 			ppe_flowtable_port_carrier(ppe_dev, PPE_VP_PORT_BASE + i, false);
+ 		else if (carrier_up & BIT_ULL(i))
+-- 
+2.43.0
