@@ -1,0 +1,48 @@
+From: KARTHIK KUMAR T <kartt@qti.qualcomm.com>
+Date: Thu, 18 Sep 2025 11:17:52 +0530
+Subject: [PATCH] wifi: ath12k: coalesce PPE2TCL consumer interrupts
+
+The direct-switch port inherited QSDK's latency-oriented 3 us timer for
+the PPE2TCL consumer-index interrupt.  With a zero packet threshold, the
+short interval causes nearly per-packet MSI and NAPI work while the WLAN
+hardware consumes a sustained PPE downlink flow, and can make the CPU the
+ring-index handoff bottleneck.
+
+Use a 30 us interval, within QSDK's supported 3--125 us range, to batch
+consumer-index updates.  The ring remains timer driven with a zero packet
+threshold, so a partially filled ring is still reported without waiting
+for another packet.
+
+Based-on: 9f3bc97f624f278c08df0f1a9b90727fa45286df
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0545-QSDK-ath12k-wifi7-reduced-the-PPE2TCL-interrupt.patch
+Signed-off-by: KARTHIK KUMAR T <kartt@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c  | 2 +-
+ drivers/net/wireless/ath/ath12k/ppe.h | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -293,7 +293,7 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 		break;
+ 	case HAL_PPE2TCL:
+ 		params.intr_batch_cntr_thres_entries = 0;
+-		params.intr_timer_thres_us = 3;
++		params.intr_timer_thres_us = ATH12K_PPE2TCL_INTR_TIMER_US;
+ 		break;
+ 	case HAL_RXDMA_BUF:
+ 	case HAL_RXDMA_MONITOR_BUF:
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -8,6 +8,7 @@ struct ath12k_link_vif;
+ struct ath12k_sta;
+ struct ath12k_vif;
+ 
++#define ATH12K_PPE2TCL_INTR_TIMER_US 30
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ #define ATH12K_PPE_DS_NAPI_WEIGHT 128
+ #define ATH12K_PPE_DS_TX_CMPL_NAPI_SCALE 4
+-- 
+2.43.0
