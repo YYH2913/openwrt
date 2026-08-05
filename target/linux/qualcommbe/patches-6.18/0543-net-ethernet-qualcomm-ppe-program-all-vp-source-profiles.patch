@@ -1,0 +1,251 @@
+From: Sourav Poddar <souravp@qti.qualcomm.com>
+Date: Thu, 28 Aug 2025 11:42:38 +0530
+Subject: [PATCH] net: ethernet: qualcomm: ppe: program all VP source profiles
+
+The APPE unicast destination table is indexed by both source profile and
+destination port.  Programming only source profile zero leaves packets
+from the other three port profiles on their reset queue mapping.  A flow
+can then hit its hardware row and resolve the correct WLAN virtual port,
+but still be delivered to an EDMA CPU queue instead of the direct-switch
+PPE2TCL queue.
+
+Follow the vendor driver and program all four source profiles whenever a
+virtual port queue is established, moved or cleared.  Snapshot the old
+rows before changing them so a partial regmap failure cannot leave a
+virtual port split across queues.  Use the same common profile count for
+direct-switch enqueue VPs and expose every virtual-port queue row in
+debugfs.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/commit/6f4d37667a13b9560f636c06dc101c9e82483747
+Signed-off-by: Sourav Poddar <quic_souravp@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/ppe_config.h |   1 +
+ drivers/net/ethernet/qualcomm/ppe/ppe_ds.c     |   5 +-
+ drivers/net/ethernet/qualcomm/ppe/ppe_vp.c     | 110 ++++++++++++++++++-------
+ 3 files changed, 85 insertions(+), 31 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_config.h
+@@ -18,6 +18,7 @@
+ 
+ #define PPE_QUEUE_INTER_PRI_NUM			16
+ #define PPE_QUEUE_HASH_NUM			256
++#define PPE_QUEUE_SRC_PROFILE_NUM		4
+ #define PPE_QUEUE_REDIR_PROFILE_ID		9
+ 
+ /* The service code is used by EDMA port to transmit packet to PPE. */
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_ds.c
+@@ -47,7 +47,6 @@
+ #define PPE_DS_RXDESC_WR_PH		BIT(10)
+ #define PPE_DS_ENQUEUE_VP_BASE		63
+ #define PPE_DS_PRI_PROFILE_BASE		1
+-#define PPE_DS_SRC_PROFILES		4
+ #define PPE_DS_FLOW_ENQUEUE_MAP_ADDR	0x9d000
+ #define PPE_DS_FLOW_ENQUEUE_MAP_INC	4
+ #define PPE_DS_FLOW_ENQUEUE_MAP_BASE	512
+@@ -191,7 +190,7 @@ static int ppe_ds_queue_base_set(struct
+ 	};
+ 	int src_profile, ret;
+ 
+-	for (src_profile = 0; src_profile < PPE_DS_SRC_PROFILES;
++	for (src_profile = 0; src_profile < PPE_QUEUE_SRC_PROFILE_NUM;
+ 	     src_profile++) {
+ 		queue_dst.src_profile = src_profile;
+ 		ret = ppe_queue_ucast_base_set(node->ds->ppe_dev, queue_dst,
+@@ -210,7 +209,7 @@ static int ppe_ds_queue_base_clear(struc
+ 	};
+ 	int src_profile, ret, err = 0;
+ 
+-	for (src_profile = 0; src_profile < PPE_DS_SRC_PROFILES;
++	for (src_profile = 0; src_profile < PPE_QUEUE_SRC_PROFILE_NUM;
+ 	     src_profile++) {
+ 		queue_dst.src_profile = src_profile;
+ 		ret = ppe_queue_ucast_base_set(node->ds->ppe_dev, queue_dst, 0,
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -171,15 +171,90 @@ static void ppe_vp_stats_reset(struct pp
+ 	atomic_set(&slot->last_service_code, 0);
+ }
+ 
++static u32 ppe_vp_queue_map_reg(int vp, int src_profile)
++{
++	int index = (src_profile << 8) + vp;
++
++	return PPE_UCAST_QUEUE_MAP_TBL_ADDR +
++	       index * PPE_UCAST_QUEUE_MAP_TBL_INC;
++}
++
++static int
++ppe_vp_queue_map_read(struct ppe_device *ppe_dev, int vp,
++		      u32 map[PPE_QUEUE_SRC_PROFILE_NUM])
++{
++	int src_profile, ret;
++
++	for (src_profile = 0; src_profile < PPE_QUEUE_SRC_PROFILE_NUM;
++	     src_profile++) {
++		ret = regmap_read(ppe_dev->regmap,
++				  ppe_vp_queue_map_reg(vp, src_profile),
++				  &map[src_profile]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int
++ppe_vp_queue_map_restore(struct ppe_device *ppe_dev, int vp,
++			 const u32 map[PPE_QUEUE_SRC_PROFILE_NUM], int count)
++{
++	int err = 0, ret;
++
++	while (count--) {
++		ret = regmap_write(ppe_dev->regmap,
++				   ppe_vp_queue_map_reg(vp, count), map[count]);
++		if (ret && !err)
++			err = ret;
++	}
++
++	return err;
++}
++
++static int ppe_vp_queue_map_set(struct ppe_device *ppe_dev, int vp, int queue,
++				int profile,
++				u32 old[PPE_QUEUE_SRC_PROFILE_NUM])
++{
++	struct ppe_queue_ucast_dest queue_dst = {
++		.dest_port = vp,
++	};
++	int rollback, src_profile, ret;
++
++	ret = ppe_vp_queue_map_read(ppe_dev, vp, old);
++	if (ret)
++		return ret;
++
++	for (src_profile = 0; src_profile < PPE_QUEUE_SRC_PROFILE_NUM;
++	     src_profile++) {
++		queue_dst.src_profile = src_profile;
++		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
++					       profile);
++		if (!ret)
++			continue;
++
++		rollback = ppe_vp_queue_map_restore(ppe_dev, vp, old,
++						    src_profile);
++		if (rollback)
++			dev_err(ppe_dev->dev,
++				"failed to restore VP %d queue map: %d\n",
++				vp, rollback);
++		return ret;
++	}
++
++	return 0;
++}
++
+ /* Program or tear down the L2_VP_PORT_TBL entry and unicast queue map
+  * of a virtual port. The field set mirrors the vendor driver's
+  * ppe_drv_port_alloc() for a wireless virtual port.
+  */
+ static int ppe_vp_hw_set_queue(struct ppe_device *ppe_dev, int vp,
+ 			       bool active, int queue, int profile)
+ {
+-	struct ppe_queue_ucast_dest queue_dst = {};
+-	int ret;
++	u32 old_queue_map[PPE_QUEUE_SRC_PROFILE_NUM];
++	int ret, rollback;
+ 	u32 tbl[4] = {};
+ 	u32 reg;
+ 
+@@ -197,29 +272,34 @@ static int ppe_vp_hw_set_queue(struct pp
+ 			 PPE_L2_VP_PORT_W1_CONTEXT_ACTIVE;
+ 	}
+ 
+-	queue_dst.dest_port = vp;
+ 	reg = PPE_L2_VP_PORT_TBL_ADDR + PPE_L2_VP_PORT_TBL_INC * vp;
+ 
+ 	if (active) {
+-		ret = ppe_queue_ucast_base_set(ppe_dev, queue_dst, queue,
+-					       profile);
++		ret = ppe_vp_queue_map_set(ppe_dev, vp, queue, profile,
++					   old_queue_map);
+ 		if (ret)
+ 			return ret;
+ 
+ 		ret = regmap_bulk_write(ppe_dev->regmap, reg, tbl,
+ 					ARRAY_SIZE(tbl));
+-		if (ret)
+-			ppe_queue_ucast_base_set(ppe_dev, queue_dst, 0,
+-						 EDMA_CPU_PORT_PROFILE_ID);
++		if (ret) {
++			rollback = ppe_vp_queue_map_restore(ppe_dev, vp,
++							    old_queue_map,
++							    PPE_QUEUE_SRC_PROFILE_NUM);
++			if (rollback)
++				dev_err(ppe_dev->dev,
++					"failed to restore VP %d queue map: %d\n",
++					vp, rollback);
++		}
+ 		return ret;
+ 	}
+ 
+ 	ret = regmap_bulk_write(ppe_dev->regmap, reg, tbl, ARRAY_SIZE(tbl));
+ 	if (ret)
+ 		return ret;
+ 
+-	return ppe_queue_ucast_base_set(ppe_dev, queue_dst, 0,
+-					EDMA_CPU_PORT_PROFILE_ID);
++	return ppe_vp_queue_map_set(ppe_dev, vp, 0,
++				    EDMA_CPU_PORT_PROFILE_ID, old_queue_map);
+ }
+ 
+ static int ppe_vp_hw_set(struct ppe_device *ppe_dev, int vp, bool active)
+@@ -1382,7 +1462,8 @@ static int ppe_vp_debugfs_show(struct se
+ 	int i;
+ 
+ 	seq_puts(s, "port dev carrier direct node refs node_refs peers flows hook l3 miss poison ");
+-	seq_puts(s, "rx_punt rx_deliver rx_drop rx_bytes last_sc dst_pkts dst_drop dst_bytes\n");
++	seq_puts(s, "rx_punt rx_deliver rx_drop rx_bytes last_sc dst_pkts dst_drop dst_bytes ");
++	seq_puts(s, "qmap(src:queue/profile)\n");
+ 
+ 	mutex_lock(&vp->lock);
+ 	for (i = 0; i < PPE_VP_SLOTS; i++) {
+@@ -1409,7 +1490,7 @@ static int ppe_vp_debugfs_show(struct se
+ 			   atomic_read(&slot->nflows), slot->hook_registered,
+ 			   slot->l3_configured, slot->miss_disabled,
+ 			   slot->poisoned);
+-		seq_printf(s, "%lld %lld %lld %lld %d %lld %lld %lld\n",
++		seq_printf(s, "%lld %lld %lld %lld %d %lld %lld %lld ",
+ 			   atomic64_read(&slot->rx_punts),
+ 			   atomic64_read(&slot->rx_delivered),
+ 			   atomic64_read(&slot->rx_dropped),
+@@ -1418,6 +1499,24 @@ static int ppe_vp_debugfs_show(struct se
+ 			   atomic64_read(&slot->dst_packets),
+ 			   atomic64_read(&slot->dst_dropped),
+ 			   atomic64_read(&slot->dst_bytes));
++		for (int src_profile = 0;
++		     src_profile < PPE_QUEUE_SRC_PROFILE_NUM; src_profile++) {
++			u32 val;
++			int ret;
++
++			ret = regmap_read(vp->ppe_dev->regmap,
++					  ppe_vp_queue_map_reg(port, src_profile),
++					  &val);
++			if (ret)
++				seq_printf(s, "%s%d:error", src_profile ? "," : "",
++					   src_profile);
++			else
++				seq_printf(s, "%s%d:%u/%u", src_profile ? "," : "",
++					   src_profile,
++					   (u32)FIELD_GET(PPE_UCAST_QUEUE_MAP_TBL_QUEUE_ID, val),
++					   (u32)FIELD_GET(PPE_UCAST_QUEUE_MAP_TBL_PROFILE_ID, val));
++		}
++		seq_putc(s, '\n');
+ 	}
+ 	mutex_unlock(&vp->lock);
+ 
+-- 
+2.43.0
