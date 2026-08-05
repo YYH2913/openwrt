@@ -1,0 +1,51 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 14:45:00 +0800
+Subject: [PATCH] wifi: ath12k: keep non-payload PPDU rates out of station_info
+
+ath12k updates a station's visible TX bitrate for every PPDU record.  A
+non-QoS PPDU or a QoS Null PPDU sent at a legacy, HE or narrow rate can
+therefore replace an EHT320 data rate in station_info even though the
+station remains associated with EHT capabilities.  This makes iw report an
+apparent Wi-Fi 7 to Wi-Fi 6 downgrade through
+NL80211_STA_INFO_TX_BITRATE while the link did not renegotiate.
+
+Only update txrate and last_txrate for PPDUs which completed at least one
+MSDU with payload bytes.  Do not use the QoS TID as a frame-type proxy:
+legacy non-QoS data is valid payload and must remain visible.  The per-SKB
+completion path still reports attempted payload-data rates, including
+failed attempts.  Continue accumulating retry and airtime statistics for
+other PPDUs so the visible-rate fix does not discard those counters.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1614,6 +1614,16 @@ ath12k_update_per_peer_tx_stats(struct a
+ 		rcu_read_unlock();
+ 		return;
+ 	}
++
++	/* PPDUs without completed payload bytes do not describe the peer's
++	 * data rate. Account their retries and airtime without replacing it.
++	 */
++	if (!succ_pkts || !succ_bytes) {
++		arsta->tx_retry_failed += tx_retry_failed;
++		arsta->tx_retry_count += tx_retry_count;
++		arsta->tx_duration += tx_duration;
++		goto exit_unlock;
++	}
+ 
+ 	memset(&arsta->txrate, 0, sizeof(arsta->txrate));
+ 
+@@ -1684,6 +1694,7 @@ ath12k_update_per_peer_tx_stats(struct a
+ 			HTT_USR_CMPLTN_SHORT_RETRY(usr_stats->cmpltn_cmn.flags);
+ 	}
+ 
++exit_unlock:
+ 	spin_unlock_bh(&ab->base_lock);
+ 	rcu_read_unlock();
+ }
