@@ -1,0 +1,172 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 20:15:00 +0800
+Subject: [PATCH] qca-nss-eip: release deferred full-inline resources
+
+Provider flows normally retain their outbound SA, so the last SA cannot be
+destroyed before the last provider flow.  The defensive SA teardown path
+kept the shared EIP tunnel and VP when that invariant was violated, but the
+last flow deletion did not release them.  A later SA could then overwrite
+the retained pointers and leak both hardware resources permanently.
+
+Centralize extraction and lockless release of the shared resources.  Run it
+after both SA and flow count transitions.  Reuse a complete retained tunnel
+and VP pair when a replacement SA arrives before the final flow deletion.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/ipsec/eip_ipsec_flow.c
++++ b/clients/ipsec/eip_ipsec_flow.c
+@@ -29,6 +29,11 @@
+ 	bool installed;
+ };
+ 
++struct eip_ipsec_inner_resources {
++	struct eip_tun *tun;
++	int vp;
++};
++
+ static bool eip_ipsec_provider_registered;
+ 
+ bool eip_ipsec_flow_provider_active(void)
+@@ -36,6 +41,34 @@
+ 	return READ_ONCE(eip_ipsec_provider_registered);
+ }
+ 
++static struct eip_ipsec_inner_resources
++eip_ipsec_flow_resources_take(struct eip_ipsec_dev *eid)
++{
++	struct eip_ipsec_inner_resources resources = { .vp = -1 };
++
++	lockdep_assert_held(&eid->inner_lock);
++
++	if (eid->inner_sa_count || eid->inner_flow_count ||
++	    !list_empty(&eid->inner_flows))
++		return resources;
++
++	resources.tun = eid->inner_tun;
++	resources.vp = eid->inner_vp;
++	eid->inner_tun = NULL;
++	eid->inner_vp = -1;
++
++	return resources;
++}
++
++static void
++eip_ipsec_flow_resources_free(struct eip_ipsec_inner_resources *resources)
++{
++	if (resources->vp >= 0)
++		qcom_ppe_eip_vp_free(resources->vp);
++	if (resources->tun)
++		eip_tun_free(resources->tun);
++}
++
+ static void
+ eip_ipsec_flow_tuple_set(struct eip_flow_tuple *dst,
+ 			 const struct qcom_ppe_eip_inner_tuple *src)
+@@ -222,7 +255,7 @@
+ 		return -EOPNOTSUPP;
+ 
+ 	mutex_lock(&eid->inner_lock);
+-	if (eid->inner_sa_count) {
++	if (eid->inner_tun || eid->inner_vp >= 0 || eid->inner_sa_count) {
+ 		if (WARN_ON(!eid->inner_tun || eid->inner_vp < 0)) {
+ 			mutex_unlock(&eid->inner_lock);
+ 			return -EIO;
+@@ -237,6 +270,10 @@
+ 		mutex_unlock(&eid->inner_lock);
+ 		return vp;
+ 	}
++	if (WARN_ON(eid->inner_flow_count || !list_empty(&eid->inner_flows))) {
++		mutex_unlock(&eid->inner_lock);
++		return -EIO;
++	}
+ 
+ 	tun = eip_tun_alloc(drv->inline_ctx);
+ 	if (!tun) {
+@@ -263,8 +300,7 @@
+ void eip_ipsec_flow_sa_put(struct eip_ipsec_sa *sa)
+ {
+ 	struct eip_ipsec_dev *eid = sa->eid;
+-	struct eip_tun *tun = NULL;
+-	int vp = -1;
++	struct eip_ipsec_inner_resources resources;
+ 
+ 	mutex_lock(&eid->inner_lock);
+ 	if (!sa->inner_offload) {
+@@ -283,30 +319,19 @@
+ 		return;
+ 	}
+ 
+-	/* An XFRM state cannot reach its destructor while a provider flow holds
+-	 * it.  Retain the shared resources rather than freeing below a bad user.
++	/* A provider flow normally keeps its SA alive. If that invariant is
++	 * violated, leave the resources for the final flow deletion to release.
+ 	 */
+-	if (WARN_ON(eid->inner_flow_count || !list_empty(&eid->inner_flows))) {
+-		mutex_unlock(&eid->inner_lock);
+-		return;
+-	}
+-
+-	tun = eid->inner_tun;
+-	vp = eid->inner_vp;
+-	eid->inner_tun = NULL;
+-	eid->inner_vp = -1;
++	WARN_ON(eid->inner_flow_count || !list_empty(&eid->inner_flows));
++	resources = eip_ipsec_flow_resources_take(eid);
+ 	mutex_unlock(&eid->inner_lock);
+ 
+-	if (vp >= 0)
+-		qcom_ppe_eip_vp_free(vp);
+-	if (tun)
+-		eip_tun_free(tun);
++	eip_ipsec_flow_resources_free(&resources);
+ }
+ 
+ void eip_ipsec_flow_dev_cleanup(struct eip_ipsec_dev *eid)
+ {
+-	struct eip_tun *tun;
+-	int vp;
++	struct eip_ipsec_inner_resources resources;
+ 
+ 	mutex_lock(&eid->inner_lock);
+ 	if (WARN_ON(eid->inner_sa_count || eid->inner_flow_count ||
+@@ -315,16 +340,10 @@
+ 		return;
+ 	}
+ 
+-	tun = eid->inner_tun;
+-	vp = eid->inner_vp;
+-	eid->inner_tun = NULL;
+-	eid->inner_vp = -1;
++	resources = eip_ipsec_flow_resources_take(eid);
+ 	mutex_unlock(&eid->inner_lock);
+ 
+-	if (vp >= 0)
+-		qcom_ppe_eip_vp_free(vp);
+-	if (tun)
+-		eip_tun_free(tun);
++	eip_ipsec_flow_resources_free(&resources);
+ }
+ 
+ static int
+@@ -410,6 +429,7 @@
+ static void eip_ipsec_flow_del(void *priv)
+ {
+ 	struct eip_ipsec_flow *flow = priv;
++	struct eip_ipsec_inner_resources resources;
+ 	struct eip_ipsec_dev *eid;
+ 	struct eip_flow_info info = {};
+ 
+@@ -428,8 +448,10 @@
+ 		else
+ 			eid->inner_flow_count--;
+ 	}
++	resources = eip_ipsec_flow_resources_take(eid);
+ 	mutex_unlock(&eid->inner_lock);
+ 
++	eip_ipsec_flow_resources_free(&resources);
+ 	dev_put(flow->dev);
+ 	eip_ipsec_sa_deref(flow->sa);
+ 	/* This may schedule XFRM destruction, so release it after the SA flow
