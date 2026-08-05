@@ -1,0 +1,165 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 17:30:00 +0800
+Subject: [PATCH] wifi: ath12k: use HTT PPDU stats for reported TX rate
+
+The WBM completion descriptor is emitted per MSDU and does not carry NSS.
+ath12k_dp_tx_update_txcompl() therefore combines its rate fields with an
+unrelated cached NSS.  On QCN9274 the completion also reports BW20 for
+EHT320 payload traffic, so every completion overwrites the accurate HTT
+PPDU rate with a physically impossible EHT20 rate.
+
+Do not build the station_info rate from this incomplete descriptor.  The
+HTT PPDU stats path supplies preamble, MCS, NSS, GI, bandwidth and RU
+information together and is the same source used by the vendor driver.
+The per-SKB completion still reaches mac80211 with the most recent HTT
+rate, preserving ACK, failure and airtime accounting.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 125 ------------------------
+ 1 file changed, 125 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -698,124 +698,6 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 	}
+ }
+ 
+-static void ath12k_dp_tx_update_txcompl(struct ath12k *ar, struct hal_tx_status *ts)
+-{
+-	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_peer *peer;
+-	struct ieee80211_sta *sta;
+-	struct ath12k_sta *ahsta;
+-	struct ath12k_link_sta *arsta;
+-	struct rate_info txrate = {};
+-	u16 rate, ru_tones;
+-	u8 rate_idx = 0;
+-	int ret;
+-
+-	spin_lock_bh(&ab->base_lock);
+-	peer = ath12k_peer_find_by_id(ab, ts->peer_id);
+-	if (!peer || !peer->sta) {
+-		ath12k_dbg(ab, ATH12K_DBG_DP_TX,
+-			   "failed to find the peer by id %u\n", ts->peer_id);
+-		spin_unlock_bh(&ab->base_lock);
+-		return;
+-	}
+-	sta = peer->sta;
+-	ahsta = ath12k_sta_to_ahsta(sta);
+-	arsta = &ahsta->deflink;
+-
+-	/* This is to prefer choose the real NSS value arsta->last_txrate.nss,
+-	 * if it is invalid, then choose the NSS value while assoc.
+-	 */
+-	if (arsta->last_txrate.nss)
+-		txrate.nss = arsta->last_txrate.nss;
+-	else
+-		txrate.nss = arsta->peer_nss;
+-	spin_unlock_bh(&ab->base_lock);
+-
+-	switch (ts->pkt_type) {
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11A:
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11B:
+-		ret = ath12k_mac_hw_ratecode_to_legacy_rate(ts->mcs,
+-							    ts->pkt_type,
+-							    &rate_idx,
+-							    &rate);
+-		if (ret < 0) {
+-			ath12k_warn(ab, "Invalid tx legacy rate %d\n", ret);
+-			return;
+-		}
+-
+-		txrate.legacy = rate;
+-		break;
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11N:
+-		if (ts->mcs > ATH12K_HT_MCS_MAX) {
+-			ath12k_warn(ab, "Invalid HT mcs index %d\n", ts->mcs);
+-			return;
+-		}
+-
+-		if (txrate.nss != 0)
+-			txrate.mcs = ts->mcs + 8 * (txrate.nss - 1);
+-
+-		txrate.flags = RATE_INFO_FLAGS_MCS;
+-
+-		if (ts->sgi)
+-			txrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+-		break;
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11AC:
+-		if (ts->mcs > ATH12K_VHT_MCS_MAX) {
+-			ath12k_warn(ab, "Invalid VHT mcs index %d\n", ts->mcs);
+-			return;
+-		}
+-
+-		txrate.mcs = ts->mcs;
+-		txrate.flags = RATE_INFO_FLAGS_VHT_MCS;
+-
+-		if (ts->sgi)
+-			txrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+-		break;
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11AX:
+-		if (ts->mcs > ATH12K_HE_MCS_MAX) {
+-			ath12k_warn(ab, "Invalid HE mcs index %d\n", ts->mcs);
+-			return;
+-		}
+-
+-		txrate.mcs = ts->mcs;
+-		txrate.flags = RATE_INFO_FLAGS_HE_MCS;
+-		txrate.he_gi = ath12k_he_gi_to_nl80211_he_gi(ts->sgi);
+-		break;
+-	case HAL_TX_RATE_STATS_PKT_TYPE_11BE:
+-		if (ts->mcs > ATH12K_EHT_MCS_MAX) {
+-			ath12k_warn(ab, "Invalid EHT mcs index %d\n", ts->mcs);
+-			return;
+-		}
+-
+-		txrate.mcs = ts->mcs;
+-		txrate.flags = RATE_INFO_FLAGS_EHT_MCS;
+-		txrate.eht_gi = ath12k_mac_eht_gi_to_nl80211_eht_gi(ts->sgi);
+-		break;
+-	default:
+-		ath12k_warn(ab, "Invalid tx pkt type: %d\n", ts->pkt_type);
+-		return;
+-	}
+-
+-	txrate.bw = ath12k_mac_bw_to_mac80211_bw(ts->bw);
+-
+-	if (ts->ofdma && ts->pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11AX) {
+-		txrate.bw = RATE_INFO_BW_HE_RU;
+-		ru_tones = ath12k_mac_he_convert_tones_to_ru_tones(ts->tones);
+-		txrate.he_ru_alloc =
+-			ath12k_he_ru_tones_to_nl80211_he_ru_alloc(ru_tones);
+-	}
+-
+-	if (ts->ofdma && ts->pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11BE) {
+-		txrate.bw = RATE_INFO_BW_EHT_RU;
+-		txrate.eht_ru_alloc =
+-			ath12k_mac_eht_ru_tones_to_nl80211_eht_ru_alloc(ts->tones);
+-	}
+-
+-	spin_lock_bh(&ab->base_lock);
+-	arsta->txrate = txrate;
+-	spin_unlock_bh(&ab->base_lock);
+-}
+-
+ static void ath12k_dp_tx_complete_msdu(struct ath12k *ar,
+ 				       struct ath12k_tx_desc_params *desc_params,
+ 				       struct hal_tx_status *ts,
+@@ -920,13 +802,6 @@ static void ath12k_dp_tx_complete_msdu(s
+ 		break;
+ 	}
+ 
+-	/* NOTE: Tx rate status reporting. Tx completion status does not have
+-	 * necessary information (for example nss) to build the tx rate.
+-	 * Might end up reporting it out-of-band from HTT stats.
+-	 */
+-
+-	ath12k_dp_tx_update_txcompl(ar, ts);
+-
+ 	spin_lock_bh(&ab->base_lock);
+ 	peer = ath12k_peer_find_by_id(ab, ts->peer_id);
+ 	if (!peer || !peer->sta) {
+-- 
+2.43.0
