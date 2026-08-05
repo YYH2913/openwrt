@@ -1,0 +1,109 @@
+From: Pritam Kumar Jha <quic_pritamku@quicinc.com>
+Date: Tue, 28 Feb 2023 17:57:43 +0530
+Subject: [PATCH] qca-nss-eip: synchronize inline ESP output sequence state
+
+Full-inline packets enter EIP directly from PPE and never run the host XFRM
+output callback.  EIP advances the ESP sequence number in the transform
+record, but Linux consequently retains the sequence value from the last
+host packet.  State dumps and rekey monitoring then report stale output
+sequence state for the accelerated part of the connection.
+
+Return the absolute encapsulation sequence snapshot with the existing
+transform-record hardware counters.  Reconcile XFRM's output replay state
+under the state lock, updating it only when hardware is ahead so a host
+packet which has been allocated but has not completed in EIP is never
+counted twice or moved backwards.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Based-on: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/commit/e91ed8549a6b17016e0b00f920af4ee82a96ca09
+Signed-off-by: Pritam Kumar Jha <quic_pritamku@quicinc.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/driver/exports/eip.h
++++ b/driver/exports/eip.h
+@@ -163,5 +163,6 @@ struct eip_hw_stats {
+ 	uint64_t pkt_cnt;	/* Number of packet processed */
+ 	uint64_t byte_cnt;	/* Number of bytes processed */
++	u64 seq_num;		/* Current outbound IPsec sequence number */
+ };
+ 
+ /*
+--- a/driver/eip197/eip_tr.c
++++ b/driver/eip197/eip_tr.c
+@@ -260,6 +260,7 @@ void eip_tr_get_stats(struct eip_tr *tr,
+ void eip_tr_get_hw_stats(struct eip_tr *tr, struct eip_hw_stats *delta)
+ {
+ 	uint32_t *words;
++	u32 seq_offset;
+ 
+ 	if (!tr || !delta) {
+ 		pr_warn("Failed to get HW stats : Transform Record/eip_stats is invalid\n");
+@@ -269,6 +270,18 @@ void eip_tr_get_hw_stats(struct eip_tr *
+ 	words = tr->hw_words;
+ 	eip_dmac_inv_range(words, words + EIP_HW_CTX_SIZE_LARGE_WORDS);
+ 
++	delta->seq_num = 0;
++	if ((tr->tr_flags & EIP_TR_IPSEC_FLAG_ENC) &&
++	    (tr->ctrl_words[1] & EIP_TR_IPSEC_SEQ_NUM_OFFSET_EN)) {
++		seq_offset = (tr->ctrl_words[1] >> 24) & 0x3f;
++		if (tr->tr_flags & EIP_TR_IPSEC_FLAG_ESN) {
++			delta->seq_num = U64_FROM_U32(words[seq_offset + 1],
++						      words[seq_offset]);
++		} else {
++			delta->seq_num = words[seq_offset];
++		}
++	}
++
+ 	/* Compute delta packet and bytes counts */
+ 	delta->pkt_cnt = U64_FROM_U32(words[77], words[76])  - tr->tr_stats.pkt_cnt;
+ 	delta->byte_cnt = U64_FROM_U32(words[79], words[78]) - tr->tr_stats.byte_cnt;
+--- a/clients/ipsec/eip_ipsec_sa.c
++++ b/clients/ipsec/eip_ipsec_sa.c
+@@ -606,9 +606,37 @@ static void eip_ipsec_sa_stats_get(struc
+ 	}
+ }
+ 
++static void eip_ipsec_sa_sync_xfrm_oseq(struct eip_ipsec_sa *sa,
++					struct xfrm_state *xs, u64 seq_num)
++{
++	u64 host_oseq;
++
++	if (!(sa->flags & EIP_IPSEC_FLAG_ENC) || !seq_num)
++		return;
++
++	if (xs->replay_esn) {
++		host_oseq = ((u64)xs->replay_esn->oseq_hi << 32) |
++			  xs->replay_esn->oseq;
++		if (seq_num <= host_oseq)
++			return;
++
++		xs->replay_esn->oseq = lower_32_bits(seq_num);
++		xs->replay_esn->oseq_hi = upper_32_bits(seq_num);
++		return;
++	}
++
++	/* Non-ESN records expose a 32-bit sequence value.  The absolute
++	 * comparison keeps an already allocated host packet ahead of a slightly
++	 * older hardware snapshot.
++	 */
++	if (seq_num > xs->replay.oseq)
++		xs->replay.oseq = lower_32_bits(seq_num);
++}
++
+ /* Fully inline packets never reach an EIP completion callback.  Consume the
+  * transform-record deltas periodically so Linux lifetime limits and the
+- * driver counters include PPE-forwarded traffic as well as exception punts.
++ * driver counters include PPE-forwarded traffic as well as exception punts.
++ * The same snapshot also reconciles the ESP sequence number owned by EIP.
+  */
+ void eip_ipsec_sa_sync_hw_stats(struct eip_ipsec_sa *sa)
+ {
+@@ -645,6 +673,7 @@ void eip_ipsec_sa_sync_hw_stats(struct e
+ 		return;
+ 
+ 	spin_lock_bh(&xs->lock);
++	eip_ipsec_sa_sync_xfrm_oseq(sa, xs, delta.seq_num);
+ 	if (xs->km.state != XFRM_STATE_DEAD) {
+ 		xs->curlft.packets += delta.pkt_cnt;
+ 		xs->curlft.bytes += delta.byte_cnt;
