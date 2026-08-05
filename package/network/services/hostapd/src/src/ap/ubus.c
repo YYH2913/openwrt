@@ -1688,18 +1688,47 @@ static const struct blobmsg_policy addr_policy[] = {
 };
 
 static bool
-hostapd_add_b64_data(const char *name, const struct wpabuf *buf)
+hostapd_add_b64_raw(const char *name, const void *data, size_t len)
 {
 	char *str;
 
-	if (!buf)
+	if (!data)
 		return false;
 
-	str = blobmsg_alloc_string_buffer(&b, name, B64_ENCODE_LEN(wpabuf_len(buf)));
-	b64_encode(wpabuf_head(buf), wpabuf_len(buf), str, B64_ENCODE_LEN(wpabuf_len(buf)));
+	str = blobmsg_alloc_string_buffer(&b, name, B64_ENCODE_LEN(len));
+	b64_encode(data, len, str, B64_ENCODE_LEN(len));
 	blobmsg_add_string_buffer(&b);
 
 	return true;
+}
+
+static bool
+hostapd_add_b64_data(const char *name, const struct wpabuf *buf)
+{
+	return buf && hostapd_add_b64_raw(name, wpabuf_head(buf),
+					   wpabuf_len(buf));
+}
+
+static int
+hostapd_bss_get_beacon_ies(struct ubus_context *ctx, struct ubus_object *obj,
+			   struct ubus_request_data *req, const char *method,
+			   struct blob_attr *msg)
+{
+	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
+	struct wpa_driver_ap_params params;
+
+	if (ieee802_11_build_ap_params(hapd, &params) < 0)
+		return UBUS_STATUS_UNKNOWN_ERROR;
+
+	blob_buf_init(&b, 0);
+	hostapd_add_b64_raw("beacon_head", params.head, params.head_len);
+	hostapd_add_b64_raw("beacon_tail", params.tail, params.tail_len);
+	hostapd_add_b64_raw("probe_response", params.proberesp,
+			    params.proberesp_len);
+	ieee802_11_free_ap_params(&params);
+	ubus_send_reply(ctx, req, b.head);
+
+	return 0;
 }
 
 static int
@@ -1736,6 +1765,7 @@ static const struct ubus_method bss_methods[] = {
 	UBUS_METHOD_NOARG("reload", hostapd_bss_reload),
 	UBUS_METHOD_NOARG("get_clients", hostapd_bss_get_clients),
 #ifdef CONFIG_TAXONOMY
+	UBUS_METHOD_NOARG("get_beacon_ies", hostapd_bss_get_beacon_ies),
 	UBUS_METHOD("get_sta_ies", hostapd_bss_get_sta_ies, addr_policy),
 #endif
 	UBUS_METHOD_NOARG("get_status", hostapd_bss_get_status),
