@@ -1,0 +1,111 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 4 Aug 2026 23:35:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: complete kernel-doc
+
+Document the port and source-VP arguments added to the EDMA control paths,
+and the flowtable state added for direct switching, tunnels, and EIP inline
+offload.  This keeps the migrated driver clean under a W=1 build.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
+@@ -233,5 +233,6 @@ void edma_cfg_tx_fill_per_port_tx_map(st
+ /**
+  * edma_cfg_tx_rings_enable - Enable Tx rings.
++ * @port_id: PPE port ID.
+  *
+  * Enable Tx rings.
+  */
+@@ -258,5 +259,6 @@ void edma_cfg_tx_rings_enable(u32 port_i
+ /**
+  * edma_cfg_tx_rings_disable - Disable Tx rings.
++ * @port_id: PPE port ID.
+  *
+  * Disable Tx rings.
+  */
+@@ -533,5 +535,6 @@ void edma_cfg_tx_rings(void)
+ /**
+  * edma_cfg_tx_disable_interrupts - EDMA disable TX interrupts.
++ * @port_id: PPE port ID.
+  *
+  * Disable TX interrupt masks.
+  */
+@@ -553,5 +556,6 @@ void edma_cfg_tx_disable_interrupts(u32
+ /**
+  * edma_cfg_tx_enable_interrupts - EDMA enable TX interrupts.
++ * @port_id: PPE port ID.
+  *
+  * Enable TX interrupt masks.
+  */
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -704,6 +704,7 @@ static u32 edma_tx_avail_desc(struct edm
+  * @skb: Socket Buffer.
+  * @txdesc_ring: Tx Descriptor ring.
+  * @stats: EDMA Tx Statistics.
++ * @src_vp: Source virtual port, or a negative value for physical ingress.
+  *
+  * Check for available descriptors, fill the descriptors
+  * and transmit both linear and non linear packets.
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -154,14 +154,25 @@ static_assert(offsetof(struct ppe_ft_vlan
+ /**
+  * struct ppe_ft_flow - An offloaded flow.
+  * @node: Hash table node, keyed by the flow cookie.
++ * @zombie_node: Quarantine list node for an undeletable hardware flow.
++ * @rcu: RCU callback used to release a removed flow.
+  * @cookie: Flow cookie of the rule.
+  * @index: Hardware flow table index.
+  * @entry: The flow, kept for the delete command.
+  * @nexthop: Next hop index of the flow.
+  * @my_mac: Router MAC slot held by the flow, negative when none.
++ * @my_mac_l3_if: L3 interface bound to @my_mac, negative when none.
+  * @pub_ip: Public IP slot held by the flow, negative when none.
+  * @pppoe: PPPoE session slot held by the flow, negative when none.
+  * @vlan: VLAN uplink slot held by the flow, negative when none.
++ * @tunnel: Refcounted tunnel slot held by the flow, negative when none.
++ * @vp: Egress virtual port held by the flow, negative when none.
++ * @ivp: Ingress virtual port held by the flow, negative when none.
++ * @eip_ops: Pinned EIP provider operations for a full-inline flow.
++ * @eip_priv: Provider-owned full-inline flow handle.
++ * @eip_dev: EIP IPsec netdevice selected as the flow destination.
++ * @eip_vp: EIP inline input virtual port, negative when none.
++ * @vp_flow: Direct-switch ingress flow mapping retained for teardown.
+  * @dmac: Rewritten Ethernet destination address.
+  * @eport: Egress PPE port of the flow.
+  * @packets: Hit packet count at the last stats read.
+@@ -271,14 +282,29 @@ struct ppe_ft_host {
+  * @ppe_dev: Back pointer to the PPE device.
+  * @lock: Serializes rule installation, removal and the allocators.
+  * @flows: Offloaded flows, keyed by flow cookie.
++ * @zombies: Quarantined flows whose hardware rows could not be deleted.
++ * @eip_flows: Refcounted outer-inline EIP flow handles.
++ * @debugfs: Flow summary debugfs entry.
++ * @debugfs_rows: Raw hardware flow-row debugfs entry.
++ * @debugfs_pipeline: Pipeline state debugfs entry.
++ * @debugfs_reasons: Offload reason-counter debugfs entry.
++ * @debugfs_eip: EIP outer-flow debugfs entry.
++ * @replace_calls: Number of flow replace requests.
++ * @replace_unsupported: Number of unsupported replace requests.
++ * @replace_failed: Replace requests which failed after validation.
++ * @destroy_calls: Number of flow destroy requests.
++ * @hosts: Refcount of the flows sharing a source host entry.
+  * @nexthop_used: Allocation bitmap of the next hop entries.
+  * @my_macs: Refcounted router MAC slots.
++ * @my_mac_l3_refs: Per-L3-interface references to router MAC slots.
+  * @pub_ips: Refcounted public IP slots.
+  * @pppoe: Refcounted PPPoE session slots.
+  * @vlans: Refcounted VLAN uplink slots.
++ * @tunnels: Refcounted tunnel slots.
++ * @tunnel_underlays: Refcounted tunnel underlay L3-interface state.
++ * @tunnel_pppoe_ports: Refcounted PPPoE tunnel-port state.
+  * @ppp_nb: PPP channel lifecycle notifier.
+  * @block_cb_list: Flow block callbacks bound to the PPE ports.
+- * @hosts: Refcount of the flows sharing a source host entry.
+  */
+ struct ppe_flowtable {
+ 	struct ppe_device *ppe_dev;
