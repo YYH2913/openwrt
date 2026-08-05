@@ -1,0 +1,39 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Wed, 22 Jul 2026 21:10:00 +0800
+Subject: [PATCH] wifi: ath12k: reset PPE VP state on recovery
+
+The ath12k datapath object survives firmware recovery even though its bank
+profiles and direct-switch node are destroyed and recreated.
+Reinitializing the PPE descriptor pool without clearing the VP allocation
+bitmaps leaves
+profiles marked busy with stale reference counts.  Repeated recoveries can
+therefore exhaust the profile table or reuse a bank from the previous
+datapath instance.
+
+Reset both allocation maps and all profile reference counts when the new
+direct-switch descriptor pool is initialized.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -169,10 +169,13 @@ static int ath12k_ppe_ds_tx_desc_init(st
+ 	INIT_LIST_HEAD(&ppe->tx_desc_free_list);
+ 	spin_lock_init(&ppe->tx_desc_lock);
+ 	spin_lock_init(&ppe->vp_lock);
++	ppe->vp_profile_map = 0;
++	ppe->search_idx_map = 0;
+ 	for (i = 0; i < ATH12K_PPE_DS_VP_PROFILES; i++) {
+ 		ppe->vp_profiles[i].vp = -1;
+ 		ppe->vp_profiles[i].search_idx = -1;
+ 		ppe->vp_profiles[i].bank_id = DP_INVALID_BANK_ID;
++		ppe->vp_profiles[i].refcount = 0;
+ 	}
+ 
+ 	ppe->tx_desc_pages = kcalloc(DP_PPE_DS_TX_SPT_PAGES,
+-- 
+2.43.0
