@@ -1,0 +1,55 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: xfrm: dispatch only EIP-owned states to EIP
+
+Do not replace the per-family output function from a loadable provider.  It
+is shared by ESP, AH and IPComp and is copied into long-lived dst bundles,
+which lets non-EIP bundles retain a stale module function after unload.
+Dispatch through the EIP state type only when that state was successfully
+claimed; native and unsupported states continue through the normal path.
+
+Allocate an XFRM security context before provider initialization so a
+provider can reject labelled states instead of claiming them before their
+label is visible.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -784,6 +784,8 @@ int xfrm_output(struct sock *sk, struct s
+ 	}
+ 
+ 	secpath_reset(skb);
++	if (unlikely(x->xflags & XFRM_STATE_OFFLOAD_EIP))
++		return x->type->output(x, skb);
+ 
+ 	if (xfrm_dev_offload_ok(skb, x)) {
+ 		struct sec_path *sp;
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -973,11 +973,6 @@ static struct xfrm_state *xfrm_state_cons
+ 	if (attrs[XFRMA_OFFLOAD_DEV])
+ 		x->xflags |= XFRM_STATE_OFFLOAD_DEV_REQUESTED;
+ 
+-	/* State providers need the imported replay and lifetime state at init. */
+-	err = __xfrm_init_state(x, extack);
+-	if (err)
+-		goto error;
+-
+ 	if (attrs[XFRMA_SEC_CTX]) {
+ 		err = security_xfrm_state_alloc(x,
+ 						nla_data(attrs[XFRMA_SEC_CTX]));
+@@ -985,6 +980,11 @@ static struct xfrm_state *xfrm_state_cons
+ 			goto error;
+ 	}
+ 
++	/* State providers need the imported replay and lifetime state at init. */
++	err = __xfrm_init_state(x, extack);
++	if (err)
++		goto error;
++
+ 	xfrm_set_type_offload(x, attrs[XFRMA_OFFLOAD_DEV]);
+ 	/* configure the hardware if offload is requested */
+ 	if (attrs[XFRMA_OFFLOAD_DEV]) {
+-- 
+2.43.0
