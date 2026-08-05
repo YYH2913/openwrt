@@ -1,0 +1,212 @@
+From: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Date: Mon, 4 Aug 2025 19:18:12 +0530
+Subject: [PATCH] wifi: ath12k: recycle PPE direct-switch buffers
+
+The non-cookie-converted WBM completion keeps the software cookie in
+buf_va_hi, just like the regular ath12k TX completion path.  Reading the
+release-status words instead can return an unrelated descriptor and
+eventually starve the PPE2TCL fill ring.
+
+Also retain a small hot list of completed PPE buffers. Allocating, mapping,
+unmapping and freeing an skb for every packet dominates the direct-switch
+TX path at multi-gigabit rates. This follows the vendor driver's 1024-entry
+hot-list policy while preserving the DMA API ownership used by this driver.
+
+Based-on: 41c027804556a6adc68fa0d79400fb96655a909e
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0486-QSDK-DP-wifi-ath12k-Fixes-to-improve-DS-DL-performan.patch
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h  |  2 ++
+ drivers/net/wireless/ath/ath12k/ppe.c | 68 ++++++++++++++++++++------
+ 2 files changed, 56 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -390,7 +390,9 @@ struct ath12k_ppe_ds {
+ 	struct dp_srng txcmpl_ring;
+ 	struct ath12k_ppe_ds_tx_desc **tx_desc_pages;
+ 	struct list_head tx_desc_free_list;
++	struct list_head tx_desc_reuse_list;
+ 	spinlock_t tx_desc_lock;
++	u32 tx_desc_reuse_count;
+ 	spinlock_t vp_lock;
+ 	struct ath12k_ppe_ds_vp_profile vp_profiles[ATH12K_PPE_DS_VP_PROFILES];
+ 	unsigned long vp_profile_map;
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -20,6 +20,7 @@
+ #define ATH12K_PPE_DS_RXFILL_THRESHOLD	256
+ #define ATH12K_PPE_DS_RXFILL_BUDGET	128
+ #define ATH12K_PPE_DS_TXCMPL_BUDGET	1024
++#define ATH12K_PPE_DS_TX_REUSE_LIMIT	1024
+ 
+ #define ATH12K_PPE_VP_TABLE_BASE	0x00a44194
+ #define ATH12K_PPE_VP_TABLE_STRIDE	4
+@@ -136,26 +137,44 @@ ath12k_ppe_ds_tx_desc_complete(struct at
+ {
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+-	struct ath12k_ppe_ds_tx_desc *desc;
++	struct ath12k_ppe_ds_tx_desc *desc, *tmp;
++	LIST_HEAD(release);
+ 	struct sk_buff *skb;
+ 
+ 	if (list_empty(completed))
+ 		return;
+ 
+-	list_for_each_entry(desc, completed, list) {
++	/* Keep the same bounded hot-list policy as the vendor datapath.  These
++	 * buffers were never CPU-owned, so their existing bidirectional mapping
++	 * can be published to EDMA again without a CPU sync.
++	 */
++	spin_lock_bh(&ppe->tx_desc_lock);
++	list_for_each_entry_safe(desc, tmp, completed, list) {
++		list_del_init(&desc->list);
++		if (desc->skb &&
++		    ppe->tx_desc_reuse_count < ATH12K_PPE_DS_TX_REUSE_LIMIT) {
++			list_add_tail(&desc->list, &ppe->tx_desc_reuse_list);
++			ppe->tx_desc_reuse_count++;
++			continue;
++		}
++		list_add_tail(&desc->list, &release);
++	}
++	spin_unlock_bh(&ppe->tx_desc_lock);
++
++	list_for_each_entry(desc, &release, list) {
+ 		skb = desc->skb;
+ 		if (skb) {
+ 			dma_unmap_single(ab->dev, desc->paddr, desc->dma_len,
+ 					 DMA_BIDIRECTIONAL);
+ 			dev_kfree_skb_any(skb);
+ 		}
+ 
+ 		desc->skb = NULL;
+ 		desc->paddr = 0;
+ 		desc->dma_len = 0;
+ 	}
+ 
+ 	spin_lock_bh(&ppe->tx_desc_lock);
+-	list_splice_tail_init(completed, &ppe->tx_desc_free_list);
++	list_splice_tail_init(&release, &ppe->tx_desc_free_list);
+ 	spin_unlock_bh(&ppe->tx_desc_lock);
+ }
+ 
+@@ -167,6 +186,8 @@ static int ath12k_ppe_ds_tx_desc_init(st
+ 	int i, j;
+ 
+ 	INIT_LIST_HEAD(&ppe->tx_desc_free_list);
++	INIT_LIST_HEAD(&ppe->tx_desc_reuse_list);
++	ppe->tx_desc_reuse_count = 0;
+ 	spin_lock_init(&ppe->tx_desc_lock);
+ 	spin_lock_init(&ppe->vp_lock);
+ 	ppe->vp_profile_map = 0;
+@@ -223,8 +244,16 @@ static void ath12k_ppe_ds_tx_desc_cleanu
+ 		if (!descs)
+ 			continue;
+ 		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
+-			if (descs[j].in_use)
+-				ath12k_ppe_ds_tx_desc_release_locked(ab, &descs[j]);
++			if (descs[j].skb) {
++				dma_unmap_single(ab->dev, descs[j].paddr,
++						 descs[j].dma_len,
++						 DMA_BIDIRECTIONAL);
++				dev_kfree_skb_any(descs[j].skb);
++				descs[j].skb = NULL;
++				descs[j].paddr = 0;
++				descs[j].dma_len = 0;
++				descs[j].in_use = false;
++			}
+ 			*((struct ath12k_ppe_ds_tx_desc **)
+ 			  ab->dp.spt_info[i].vaddr + j) = NULL;
+ 		}
+@@ -235,6 +264,8 @@ static void ath12k_ppe_ds_tx_desc_cleanu
+ 		kfree(ppe->tx_desc_pages[i]);
+ 	kfree(ppe->tx_desc_pages);
+ 	ppe->tx_desc_pages = NULL;
++	ppe->tx_desc_reuse_count = 0;
++	INIT_LIST_HEAD(&ppe->tx_desc_reuse_list);
+ 	INIT_LIST_HEAD(&ppe->tx_desc_free_list);
+ }
+ 
+@@ -271,42 +302,53 @@ ath12k_ppe_ds_ppe2tcl_refill(struct qco
+ 	u32 done = 0;
+ 
+ 	dma_len = size - headroom;
+ 	while (done < count) {
+ 		spin_lock_bh(&ppe->tx_desc_lock);
+-		desc = list_first_entry_or_null(&ppe->tx_desc_free_list,
+-						struct ath12k_ppe_ds_tx_desc,
+-						list);
+-		if (desc)
++		desc = list_first_entry_or_null(&ppe->tx_desc_reuse_list,
++						struct ath12k_ppe_ds_tx_desc, list);
++		if (desc) {
+ 			list_del_init(&desc->list);
++			ppe->tx_desc_reuse_count--;
++		} else {
++			desc = list_first_entry_or_null(&ppe->tx_desc_free_list,
++							struct ath12k_ppe_ds_tx_desc,
++							list);
++			if (desc)
++				list_del_init(&desc->list);
++		}
+ 		spin_unlock_bh(&ppe->tx_desc_lock);
+ 		if (!desc)
+ 			break;
+ 
++		if (desc->skb)
++			goto publish;
++
+ 		skb = alloc_skb(size, GFP_ATOMIC | __GFP_NOWARN);
+ 		if (!skb) {
+ 			spin_lock_bh(&ppe->tx_desc_lock);
+ 			list_add_tail(&desc->list, &ppe->tx_desc_free_list);
+ 			spin_unlock_bh(&ppe->tx_desc_lock);
+ 			break;
+ 		}
+ 		skb_reserve(skb, headroom);
+ 		paddr = dma_map_single(ab->dev, skb->data, dma_len,
+ 				       DMA_BIDIRECTIONAL);
+ 		if (dma_mapping_error(ab->dev, paddr)) {
+ 			dev_kfree_skb_any(skb);
+ 			spin_lock_bh(&ppe->tx_desc_lock);
+ 			list_add_tail(&desc->list, &ppe->tx_desc_free_list);
+ 			spin_unlock_bh(&ppe->tx_desc_lock);
+ 			break;
+ 		}
+ 
+ 		desc->skb = skb;
+ 		desc->paddr = paddr;
+ 		desc->dma_len = dma_len;
++publish:
+ 		desc->in_use = true;
+-		buffers[done].dma = paddr;
++		buffers[done].dma = desc->paddr;
+ 		buffers[done].cookie = desc->cookie;
+ 		done++;
+ 	}
+ 
+ 	atomic64_add(done, &ppe->stats.tx_alloc);
+@@ -768,17 +810,15 @@ int ath12k_ppe_ds_service_tx_completion(
+ 		if (le32_get_bits(desc->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+ 			addr = le32_to_cpu(desc->buf_va_lo) |
+ 			       (u64)le32_to_cpu(desc->buf_va_hi) << 32;
+ 			tx_desc = (void *)(uintptr_t)addr;
+ 			if (!ath12k_ppe_ds_tx_desc_valid(ab, tx_desc))
+ 				tx_desc = NULL;
+ 		} else {
+-			cookie = le32_get_bits(desc->info0,
+-					       HAL_WBM_COMPL_TX_INFO0_SW_COOKIE_LO) |
+-				 le32_get_bits(desc->info3,
+-					       HAL_WBM_COMPL_TX_INFO3_SW_COOKIE_HI) << 12;
++			cookie = le32_get_bits(desc->buf_va_hi,
++					       BUFFER_ADDR_INFO1_SW_COOKIE);
+ 			tx_desc = ath12k_ppe_ds_tx_desc_get(ab, cookie);
+ 		}
+ 		if (tx_desc && tx_desc->in_use) {
+ 			tx_desc->in_use = false;
+ 			list_add_tail(&tx_desc->list, &completed);
+ 		}
+-- 
+2.50.1
