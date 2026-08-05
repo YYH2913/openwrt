@@ -1,0 +1,52 @@
+From: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Date: Wed, 10 Sep 2025 21:14:27 +0530
+Subject: [PATCH] wifi: ath12k: read PPE MEC status from the HTT overlay
+
+Firmware completions use an HTT status overlay on the WBM descriptor.
+Reading HTT status bits from the WBM info0 word instead interprets the
+TQM release reason as an HTT status.  That can either miss a MEC
+notification or discard a real PPE completion, leaving its direct-switch
+buffer incorrectly owned.
+
+Cast the descriptor to the HTT overlay before filtering MEC notifications.
+Its leading reserved words already account for the status offset, matching
+the final QSDK layout after its HTT_TX_WBM_COMP_STATUS_OFFSET cleanup.
+
+Based-on: 27de30f7c1e9832d82d6ef03adf0aed8fee3a513
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0531-UPSTREAM-DP-wifi-ath12k-Remove-the-usage-of-HTT_TX_W.patch
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -797,6 +797,7 @@ int ath12k_ppe_ds_service_tx_completion(
+ 	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ath12k_ppe_ds_tx_desc *tx_desc;
+ 	LIST_HEAD(completed);
++	struct htt_tx_wbm_completion *status_desc;
+ 	struct hal_wbm_completion_ring_tx *desc;
+ 	struct hal_srng *srng;
+ 	u64 addr;
+@@ -815,9 +816,12 @@ int ath12k_ppe_ds_service_tx_completion(
+ 		if (le32_get_bits(desc->info0,
+ 				  HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE) ==
+-					  HAL_WBM_REL_SRC_MODULE_FW &&
+-		    le32_get_bits(desc->info0, HTT_TX_WBM_COMP_INFO0_STATUS) ==
+-					  HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY)
+-			goto next;
++					  HAL_WBM_REL_SRC_MODULE_FW) {
++			status_desc = (struct htt_tx_wbm_completion *)desc;
++			if (le32_get_bits(status_desc->info0,
++					  HTT_TX_WBM_COMP_INFO0_STATUS) ==
++			    HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY)
++				goto next;
++		}
+ 		if (le32_get_bits(desc->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+ 			addr = le32_to_cpu(desc->buf_va_lo) |
+ 			       (u64)le32_to_cpu(desc->buf_va_hi) << 32;
+-- 
+2.43.0
