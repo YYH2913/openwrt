@@ -1,0 +1,116 @@
+From: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Date: Fri, 30 May 2025 22:20:41 -0700
+Subject: [PATCH] wifi: ath12k: map PPE direct-switch peers
+
+Tell the PPE direct-switch core which node owns an authorized station so
+downlink hardware flows can select the corresponding PPE2TCL ring.  For
+MLO, the association link is the node authority; record both the common
+station address and link address because either can appear in the flow's
+Ethernet rewrite.
+
+Commit the mapping only after WMI accepts PPE routing, roll WMI back if
+the host mapping fails, and always attempt host cleanup during disable.
+
+Based-on: 4590caf67ab7de99e7a1ea2bc70d2429b5f855e1
+Link: https://git.codelinaro.org/clo/qsdk/oss/system/feeds/wlan-open/-/blob/1ee3a4ab7c59ceaff347c4668fc6c7604a04c323/patches/ath12k/0337-01-QSDK-DP-wifi-Add-support-for-PPE-DS-Direct-switch-fe.patch
+Signed-off-by: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Signed-off-by: Ganesh Kariganuru Mahabalesh <gkarigan@qti.qualcomm.com>
+Signed-off-by: Nithyanantham Paramasivam <nithp@qti.qualcomm.com>
+Signed-off-by: Nandha Kishore Easwaran <nandhaki@qti.qualcomm.com>
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Signed-off-by: Neha Bisht <nbisht@qti.qualcomm.com>
+Signed-off-by: Aloka Dixit <alokad@qti.qualcomm.com>
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/ppe.c | 57 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 55 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -2,6 +2,7 @@
+ /* Qualcomm QCN9274 PPE direct-switch support. */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/etherdevice.h>
+ #include <linux/mm.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/ppe-ds.h>
+@@ -1022,11 +1023,14 @@ void ath12k_ppe_ds_peer_route(struct ath
+ 			      struct ath12k_link_sta *arsta, bool enable)
+ {
+ 	struct ath12k_base *ab = ar->ab;
++	struct ath12k_ppe_ds *ppe = &ab->dp.ppe_ds;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
+ 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
++	bool track_peer = !sta->mlo || arsta->is_assoc_link;
++	int ret, map_ret;
+ 	u32 map = 0;
+ 
+-	if (!ab->dp.ppe_ds.started || arvif->ppe_vp < 64)
++	if (!ppe->started || arvif->ppe_vp < 64)
+ 		return;
+ 
+ 	if (vif->type == NL80211_IFTYPE_STATION &&
+@@ -1040,6 +1044,55 @@ void ath12k_ppe_ds_peer_route(struct ath
+ 				   arvif->ppe_search_idx * 4, map);
+ 	}
+ 
++	ret = ath12k_wmi_config_peer_ppeds_routing(ar, arsta->addr,
++						   arvif->vdev_id, arvif->ppe_vp,
++					  enable);
++	if (!track_peer)
++		return;
++
++	if (enable) {
++		if (ret)
++			goto clear_search;
++
++		map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
++						  sta->addr, true);
++		if (map_ret)
++			goto disable_wmi;
++		if (!ether_addr_equal(sta->addr, arsta->addr)) {
++			map_ret = qcom_ppe_ds_vp_peer_set(ppe->node,
++							  arvif->ppe_vp,
++							  arsta->addr, true);
++			if (map_ret) {
++				qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
++							sta->addr, false);
++				goto disable_wmi;
++			}
++		}
++		return;
++	}
++
++	map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
++					  sta->addr, false);
++	if (map_ret)
++		ath12k_warn(ab, "failed to clear PPE route for peer %pM: %d\n",
++			    sta->addr, map_ret);
++	if (!ether_addr_equal(sta->addr, arsta->addr)) {
++		map_ret = qcom_ppe_ds_vp_peer_set(ppe->node, arvif->ppe_vp,
++						  arsta->addr, false);
++		if (map_ret)
++			ath12k_warn(ab,
++				    "failed to clear PPE route for link peer %pM: %d\n",
++				    arsta->addr, map_ret);
++	}
++	return;
++
++disable_wmi:
++	ath12k_warn(ab, "failed to map PPE route for peer %pM: %d\n",
++		    sta->addr, map_ret);
+ 	ath12k_wmi_config_peer_ppeds_routing(ar, arsta->addr, arvif->vdev_id,
+-					      arvif->ppe_vp, enable);
++					      arvif->ppe_vp, false);
++clear_search:
++	if (vif->type == NL80211_IFTYPE_STATION)
++		ath12k_hif_write32(ab, ATH12K_PPE_SEARCH_TABLE_BASE +
++				   arvif->ppe_search_idx * 4, 0);
+ }
+-- 
+2.43.0
