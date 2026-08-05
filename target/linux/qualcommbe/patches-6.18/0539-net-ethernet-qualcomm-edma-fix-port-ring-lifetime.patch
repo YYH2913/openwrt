@@ -1,0 +1,166 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 23 Jul 2026 12:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: edma: fix port ring lifetime
+
+The per-port TX ring disable path computes the correct ring index and then
+overwrites it with the CPU index.  Consequently, tearing down any port only
+disables port 1 rings.  A WAN restart leaves its own rings live while also
+stopping unrelated LAN rings.
+
+The netdev lookup array has a related lifetime issue.  It is published before
+registration succeeds and cleared only after free_netdev(), while RX NAPI and
+virtual-port injection read it concurrently.  Publish registered devices with
+RCU and withdraw them before unregister_netdev(), whose network grace period
+then protects readers that already borrowed the pointer.  Allocate the array
+as pointers rather than full struct net_device objects as well.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/qualcomm/ppe/edma.c        |  5 ++---
+ drivers/net/ethernet/qualcomm/ppe/edma.h        |  2 +-
+ drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c |  3 +--
+ drivers/net/ethernet/qualcomm/ppe/edma_port.c   | 28 ++++++++++++++++------------
+ drivers/net/ethernet/qualcomm/ppe/edma_rx.c     |  2 +-
+ drivers/net/ethernet/qualcomm/ppe/edma_tx.c     |  4 ++--
+ 6 files changed, 23 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -659,9 +659,8 @@ static int edma_hw_configure(void)
+ 	}
+ 
+ 	/* Allocate memory for netdevices. */
+-	edma_ctx->netdev_arr = kzalloc((sizeof(**edma_ctx->netdev_arr) *
+-					 hw_info->max_ports),
+-					 GFP_KERNEL);
++	edma_ctx->netdev_arr = kcalloc(hw_info->max_ports,
++					 sizeof(*edma_ctx->netdev_arr), GFP_KERNEL);
+ 	if (!edma_ctx->netdev_arr)
+ 		return -ENOMEM;
+ 
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.h
+@@ -132,7 +132,7 @@ struct edma_intr_info {
+  * @vp_q_mask: CPU-to-Tx-queue mask of the VP inject
+  */
+ struct edma_context {
+-	struct net_device **netdev_arr;
++	struct net_device __rcu **netdev_arr;
+ 	struct net_device *dummy_dev;
+ 	struct ppe_device *ppe_dev;
+ 	struct edma_hw_info *hw_info;
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_cfg_tx.c
+@@ -272,10 +272,9 @@ void edma_cfg_tx_rings_disable(u32 port_
+ 		txdesc_ring = &edma_ctx->tx_rings[ring_idx];
+ 		u32 data;
+ 
+-		txdesc_ring = &edma_ctx->tx_rings[i];
+ 		reg = EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CTRL(txdesc_ring->id);
+ 		regmap_read(regmap, reg, &data);
+-		data &= ~EDMA_TXDESC_TX_ENABLE;
++		data &= ~EDMA_TXDESC_CTRL_TXEN_MASK;
+ 		regmap_write(regmap, reg, data);
+ 	}
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -421,22 +421,28 @@ bool edma_port_dev_check(const struct ne
+ void edma_port_destroy(struct ppe_port *port)
+ {
+ 	int port_id = port->port_id;
+-	struct net_device *netdev = edma_ctx->netdev_arr[port_id - 1];
++	struct net_device *netdev;
+ 	int ret;
+ 
+-	edma_port_deconfigure(netdev);
+-	edma_port_stats_free(netdev);
++	/* Withdraw the carrier first. unregister_netdev() stops its queues and
++	 * supplies the network grace period for VP injection and RX readers
++	 * which acquired the device before it was withdrawn. Only then is it
++	 * safe to dismantle the rings borrowed by those readers.
++	 */
++	netdev = rcu_access_pointer(edma_ctx->netdev_arr[port_id - 1]);
++	RCU_INIT_POINTER(edma_ctx->netdev_arr[port_id - 1], NULL);
+ 	unregister_netdev(netdev);
++	edma_port_deconfigure(netdev);
++	edma_port_stats_free(netdev);
+ 	ret = ppe_port_l3_if_set(port->ppe_dev, port_id, -1);
+ 	if (ret)
+ 		netdev_warn(netdev, "failed to unbind L3 interface: %d\n", ret);
+ 	ret = ppe_port_clear_mac_address(port);
+ 	if (ret)
+ 		netdev_warn(netdev, "failed to clear L3 port MAC: %d\n", ret);
+ 	ret = ppe_l3_if_clear(port->ppe_dev, port_id);
+ 	if (ret)
+ 		netdev_warn(netdev, "failed to clear L3 interface: %d\n", ret);
+ 	free_netdev(netdev);
+ 	ppe_port_phylink_destroy(port);
+-	edma_ctx->netdev_arr[port_id - 1] = NULL;
+ }
+ 
+ /**
+@@ -527,13 +533,6 @@ int edma_port_setup(struct ppe_port *port
+ 		goto l3_setup_fail;
+ 	}
+ 
+-	/* We expect 'port_id' to correspond to ports numbers on SoC.
+-	 * These begin from '1' and hence we subtract
+-	 * one when using it as an array index.
+-	 */
+-	edma_ctx->netdev_arr[port_id - 1] = netdev;
+-
+ 	edma_port_configure(netdev);
+ 
+ 	ret = ppe_port_phylink_setup(port, netdev);
+@@ -548,6 +547,12 @@ int edma_port_setup(struct ppe_port *port
+ 		goto register_netdev_fail;
+ 	}
+ 
++	/* Port IDs start at one. Publish only a fully registered device so RX
++	 * and VP injection never borrow a partially initialized netdev.
++	 */
++	rcu_assign_pointer(edma_ctx->netdev_arr[port_id - 1], netdev);
++
+ 	netdev_dbg(netdev, "Setup EDMA port%d done\n", port_id);
+ 	return ret;
+ 
+@@ -556,7 +561,6 @@ register_netdev_fail:
+ 	ppe_port_phylink_destroy(port);
+ port_phylink_setup_fail:
+ 	edma_port_deconfigure(netdev);
+-	edma_ctx->netdev_arr[port_id - 1] = NULL;
+ 	edma_port_stats_free(netdev);
+ l3_setup_fail:
+ 	ppe_port_l3_if_set(ppe_dev, port_id, -1);
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_rx.c
+@@ -612,7 +612,7 @@ static struct net_device *edma_rx_get_sr
+ 		 * subtract one since the indices start form '0' and
+ 		 * port numbers start from '1'.
+ 		 */
+-		ndev = edma_ctx->netdev_arr[src_port_num - 1];
++		ndev = rcu_dereference_bh(edma_ctx->netdev_arr[src_port_num - 1]);
+ 	}
+ 
+ 	if (likely(ndev))
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_tx.c
+@@ -894,11 +894,11 @@ int edma_tx_vp_inject(u32 vp_id, struct
+ 	 */
+ 	rcu_read_lock();
+ 	i = READ_ONCE(edma_ctx->vp_inject_port);
+-	dev = edma_ctx->netdev_arr[i];
++	dev = rcu_dereference(edma_ctx->netdev_arr[i]);
+ 	if (unlikely(!dev || !netif_running(dev))) {
+ 		dev = NULL;
+ 		for (i = 0; i < hw_info->max_ports; i++) {
+-			struct net_device *cand = edma_ctx->netdev_arr[i];
++			struct net_device *cand = rcu_dereference(edma_ctx->netdev_arr[i]);
+ 
+ 			if (cand && netif_running(cand)) {
+ 				dev = cand;
+-- 
+2.43.0
