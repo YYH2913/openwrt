@@ -1,0 +1,214 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 2 Aug 2026 15:20:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: harden direct-switch recovery
+
+Priority profiles select each wireless node's enqueue VP independently of
+the virtual port's default queue.  Restore a recovered node's flows even
+when another node kept a shared MLO virtual port active.
+
+Keep a flow row invalid while restoring a failed split priority-profile
+update.  The previous rollback could restore VALID after either profile
+word failed, exposing a mixed profile to live traffic.
+
+Finally, protect the exported EIP physical-port lookup from the lifetime of
+the global EDMA context itself.  Publish a dedicated RCU context only after
+EDMA setup, withdraw it before teardown, and do not return netdevices which
+have not completed registration.  Use IS_REACHABLE() for the public API so
+a built-in consumer cannot reference a modular provider.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe/-/tree/87bb9b326dfe7ddafb2cc8bc588e74d552a2a9b5
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/drivers/net/ethernet/qualcomm/ppe/edma.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma.c
+@@ -796,6 +796,8 @@ void edma_destroy(struct ppe_device *ppe
+ 	struct edma_ring_info *rx = hw_info->rx;
+ 	u32 i;
+ 
++	edma_port_dev_unpublish();
++
+ 	if (edma_ctx->rx_rps_ctl_table_hdr) {
+ 		unregister_sysctl_table(edma_ctx->rx_rps_ctl_table_hdr);
+ 		edma_ctx->rx_rps_ctl_table_hdr = NULL;
+@@ -918,6 +920,7 @@ int edma_setup(struct ppe_device *ppe_de
+ 	edma_enable_misc_interrupt();
+ 
+ 	dev_info(dev, "EDMA configuration successful\n");
++	edma_port_dev_publish();
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.c
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.c
+@@ -21,6 +21,8 @@
+ #include "ppe_flowtable.h"
+ #include "ppe_regs.h"
+ 
++static struct edma_context __rcu *edma_port_ctx;
++
+ /* Number of netdev queues. */
+ #define EDMA_NETDEV_QUEUE_NUM	4
+ 
+@@ -413,6 +415,17 @@ bool edma_port_dev_check(const struct ne
+ 	return dev->netdev_ops == &edma_port_netdev_ops;
+ }
+ 
++void edma_port_dev_publish(void)
++{
++	rcu_assign_pointer(edma_port_ctx, edma_ctx);
++}
++
++void edma_port_dev_unpublish(void)
++{
++	RCU_INIT_POINTER(edma_port_ctx, NULL);
++	synchronize_rcu();
++}
++
+ /**
+  * qcom_ppe_port_dev_get() - get the netdevice for a physical PPE port
+  * @port_num: PPE physical port number, starting at one
+@@ -425,16 +438,21 @@ bool edma_port_dev_check(const struct ne
+  */
+ struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
+ {
++	struct edma_context *ctx;
+ 	struct net_device *dev = NULL;
+ 
+-	if (unlikely(!edma_ctx || !edma_ctx->hw_info ||
+-		     port_num < 1 || port_num > edma_ctx->hw_info->max_ports))
+-		return NULL;
+-
+ 	rcu_read_lock();
+-	dev = rcu_dereference(edma_ctx->netdev_arr[port_num - 1]);
+-	if (dev)
++	ctx = rcu_dereference(edma_port_ctx);
++	if (unlikely(!ctx || !ctx->hw_info || !ctx->netdev_arr ||
++		     port_num < 1 || port_num > ctx->hw_info->max_ports))
++		goto out;
++
++	dev = rcu_dereference(ctx->netdev_arr[port_num - 1]);
++	if (dev && READ_ONCE(dev->reg_state) == NETREG_REGISTERED)
+ 		dev_hold(dev);
++	else
++		dev = NULL;
++out:
+ 	rcu_read_unlock();
+ 
+ 	return dev;
+@@ -566,7 +584,7 @@ int edma_port_setup(struct ppe_port *por
+ 	 * These begin from '1' and hence we subtract
+ 	 * one when using it as an array index.
+ 	 */
+-	edma_ctx->netdev_arr[port_id - 1] = netdev;
++	rcu_assign_pointer(edma_ctx->netdev_arr[port_id - 1], netdev);
+ 
+ 	edma_port_configure(netdev);
+ 
+@@ -591,7 +609,8 @@ register_netdev_fail:
+ 	ppe_port_phylink_destroy(port);
+ port_phylink_setup_fail:
+ 	edma_port_deconfigure(netdev);
+-	edma_ctx->netdev_arr[port_id - 1] = NULL;
++	RCU_INIT_POINTER(edma_ctx->netdev_arr[port_id - 1], NULL);
++	synchronize_rcu();
+ 	edma_port_stats_free(netdev);
+ l3_setup_fail:
+ 	ppe_port_l3_if_set(ppe_dev, port_id, -1);
+--- a/drivers/net/ethernet/qualcomm/ppe/edma_port.h
++++ b/drivers/net/ethernet/qualcomm/ppe/edma_port.h
+@@ -109,4 +109,6 @@ struct edma_port_priv {
+ void edma_port_destroy(struct ppe_port *port);
+ int edma_port_setup(struct ppe_port *port);
+ bool edma_port_dev_check(const struct net_device *dev);
++void edma_port_dev_publish(void);
++void edma_port_dev_unpublish(void);
+ #endif
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flow.c
+@@ -253,12 +253,42 @@ int ppe_flow_entry_enable(struct ppe_dev
+ 	return ret;
+ }
+ 
++static int
++ppe_flow_entry_profile_restore(struct ppe_device *ppe_dev, u32 reg,
++			       const u32 old[3])
++{
++	int err, ret;
++
++	/* Never expose a partially restored priority profile as a valid row. */
++	ret = regmap_write(ppe_dev->regmap, reg,
++			   old[0] & ~PPE_FLOW_W0_VALID);
++	err = ret;
++
++	ret = regmap_bulk_write(ppe_dev->regmap, reg + sizeof(u32),
++				old + 1, 2);
++	if (ret) {
++		if (!err)
++			err = ret;
++		ret = regmap_write(ppe_dev->regmap, reg,
++				   old[0] & ~PPE_FLOW_W0_VALID);
++		if (ret && !err)
++			err = ret;
++		return err;
++	}
++
++	ret = regmap_write(ppe_dev->regmap, reg, old[0]);
++	if (ret && !err)
++		err = ret;
++
++	return err;
++}
++
+ int ppe_flow_entry_profile_set(struct ppe_device *ppe_dev, int index,
+ 			       u8 profile, bool enable)
+ {
+ 	u32 reg = PPE_FLOW_TBL_ADDR + PPE_FLOW_TBL_INC * index;
+ 	u32 old[3], val[3], valid = enable ? PPE_FLOW_W0_VALID : 0;
+-	int ret;
++	int ret, rollback;
+ 
+ 	if (profile > (FIELD_MAX(PPE_FLOW_W2_PRI_PROFILE_HI) << 1 | 1))
+ 		return -ERANGE;
+@@ -302,9 +332,11 @@ int ppe_flow_entry_profile_set(struct pp
+ 		goto out;
+ 
+ rollback:
+-	regmap_write(ppe_dev->regmap, reg + 2 * sizeof(u32), old[2]);
+-	regmap_write(ppe_dev->regmap, reg + sizeof(u32), old[1]);
+-	regmap_write(ppe_dev->regmap, reg, old[0]);
++	rollback = ppe_flow_entry_profile_restore(ppe_dev, reg, old);
++	if (rollback)
++		dev_err(ppe_dev->dev,
++			"failed to restore flow %d priority profile: %d\n",
++			index, rollback);
+ out:
+ 	mutex_unlock(&ppe_dev->flow_lock);
+ 	return ret;
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_vp.c
+@@ -1120,8 +1120,10 @@ void ppe_vp_ds_node_state(struct ppe_dev
+ 			profile_down |= BIT_ULL(i);
+ 
+ 		if (up) {
+-			if (slot->ds_node != PPE_VP_DS_NODE_NONE)
++			if (slot->ds_node != PPE_VP_DS_NODE_NONE) {
++				profile_up[node] |= BIT_ULL(i);
+ 				continue;
++			}
+ 			ret = ppe_vp_ds_hw_set_queue(ppe_dev, port, true,
+ 						     slot->ds_queues[node]);
+ 			if (ret) {
+--- a/include/linux/soc/qcom/ppe.h
++++ b/include/linux/soc/qcom/ppe.h
+@@ -9,7 +9,7 @@
+ 
+ struct net_device;
+ 
+-#if IS_ENABLED(CONFIG_QCOM_PPE)
++#if IS_REACHABLE(CONFIG_QCOM_PPE)
+ struct net_device *qcom_ppe_port_dev_get(unsigned int port_num);
+ #else
+ static inline struct net_device *qcom_ppe_port_dev_get(unsigned int port_num)
+-- 
+2.43.0
