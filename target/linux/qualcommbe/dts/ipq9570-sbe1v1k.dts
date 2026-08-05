@@ -582,6 +582,7 @@
 		wifi@0 {
 			compatible = "pci17cb,1109";
 			reg = <0x0 0x0 0x0 0x0 0x0>;
+			qcom,ppe-ds;
 			qcom,calibration-variant = "Askey-SBE1V1K_1";
 
 			nvmem-cells = <&ethaddr (-3)>;
@@ -633,6 +634,7 @@
 		wifi@0 {
 			compatible = "pci17cb,1109";
 			reg = <0x0 0x0 0x0 0x0 0x0>;
+			qcom,ppe-ds;
 			qcom,calibration-variant = "Askey-SBE1V1K_4";
 			qcom,wsi-controller;
 
@@ -686,6 +688,7 @@
 
 			compatible = "pci17cb,1109";
 			reg = <0x0 0x0 0x0 0x0 0x0>;
+			qcom,ppe-ds;
 			qcom,calibration-variant = "Askey-SBE1V1K_2";
 
 			nvmem-cells = <&ethaddr (-2)>;
