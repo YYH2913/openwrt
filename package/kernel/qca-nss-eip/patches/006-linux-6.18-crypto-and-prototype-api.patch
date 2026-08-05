@@ -1,0 +1,181 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] qca-nss-eip: fix Linux 6.18 crypto API warnings
+
+Linux 6.18 removed the old integer-returning platform driver remove
+callback and no longer exposes strlcpy().  It also enables
+missing-prototype warnings for the standalone module build.  Update the
+EIP clients to current APIs and declare the DMA callbacks in their shared
+header.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- a/clients/crypto/eip_crypto.c
++++ b/clients/crypto/eip_crypto.c
+@@ -19,6 +19,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/crypto.h>
++#include <linux/string.h>
+ 
+ #include "eip_crypto.h"
+ 
+@@ -107,7 +108,7 @@ static int eip_crypto_probe(struct platf
+  * eip_crypto_remove()
+  *	Remove the eip crypto driver
+  */
+-static int eip_crypto_remove(struct platform_device *pdev)
++static void eip_crypto_remove(struct platform_device *pdev)
+ {
+ 	struct device_node *np;
+ 
+@@ -117,7 +118,7 @@ static int eip_crypto_remove(struct plat
+ 	np = of_node_get(pdev->dev.of_node);
+ 	if (!np) {
+ 		pr_warn("%px: Invalid driver.\n", pdev);
+-		return -EINVAL;
++		return;
+ 	}
+ 
+ 	/*
+@@ -136,7 +137,7 @@ static int eip_crypto_remove(struct plat
+ 	eip_crypto_aead_exit(np);
+ 
+ 	pr_info("%px: Crypto remove done.\n", pdev);
+-	return 0;
++	return;
+ }
+ 
+ /*
+@@ -157,7 +158,7 @@ static struct platform_driver eip_crypto
+  * eip_crypto_init()
+  *	Initialize crypto client.
+  */
+-int eip_crypto_init(void)
++static int eip_crypto_init(void)
+ {
+ 	int ret = 0;
+ 
+@@ -186,7 +187,7 @@ int eip_crypto_init(void)
+  * eip_crypto_exit()
+  *	De-initialize crypto client.
+  */
+-void eip_crypto_exit(void)
++static void eip_crypto_exit(void)
+ {
+ 	platform_driver_unregister(&eip_crypto);
+ 	pr_info("Crypto module unloaded.\n");
+--- a/clients/crypto/eip_crypto_aead.c
++++ b/clients/crypto/eip_crypto_aead.c
+@@ -17,6 +17,7 @@
+ #include <linux/version.h>
+ #include <linux/vmalloc.h>
+ #include <linux/of.h>
++#include <linux/string.h>
+ 
+ #include <crypto/aes.h>
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+@@ -662,7 +663,7 @@ static int eip_crypto_aead_setkey_noauth
+ 	/*
+ 	 * Fill info object.
+ 	 */
+-	strlcpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
+ 	base->cipher.key_data = key;
+ 	base->cipher.key_len = keylen;
+ 	base->nonce = nonce;
+@@ -744,7 +745,7 @@ static int eip_crypto_aead_setkey(struct
+ 	/*
+ 	 * Fill info object.
+ 	 */
+-	strlcpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
+ 	base->cipher.key_data = keys.enckey;
+ 	base->auth.key_data = keys.authkey;
+ 	base->auth.key_len = keys.authkeylen;
+--- a/clients/crypto/eip_crypto_ahash.c
++++ b/clients/crypto/eip_crypto_ahash.c
+@@ -17,6 +17,7 @@
+ #include <linux/version.h>
+ #include <linux/vmalloc.h>
+ #include <linux/crypto.h>
++#include <linux/string.h>
+ 
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+ #include <crypto/sha.h>
+@@ -652,7 +653,7 @@ static const struct file_operations file
+  * eip_crypto_ahash_done()
+  *	Hash request completion callback function
+  */
+-void eip_crypto_ahash_done(void *app_data, eip_req_t eip_req)
++static void eip_crypto_ahash_done(void *app_data, eip_req_t eip_req)
+ {
+ 	struct eip_crypto_ahash_tfm_ctx *actx = (struct eip_crypto_ahash_tfm_ctx *)app_data;
+ 	struct eip_crypto_tfm_ctx *tfm_ctx = &actx->ctx;
+@@ -715,7 +716,7 @@ void eip_crypto_ahash_done(void *app_dat
+  * eip_crypto_ahash_done()
+  *	Hash request completion callback function
+  */
+-void eip_crypto_ahash_err_done(void *app_data, eip_req_t eip_req, int err)
++static void eip_crypto_ahash_err_done(void *app_data, eip_req_t eip_req, int err)
+ {
+ 	struct eip_crypto_ahash_tfm_ctx *actx = (struct eip_crypto_ahash_tfm_ctx *)app_data;
+ 	struct eip_crypto_tfm_stats *tfm_stats = this_cpu_ptr(actx->ctx.stats);
+@@ -758,7 +759,7 @@ int eip_crypto_ahash_setkey(struct crypt
+ 	/*
+ 	 * Fill EIP crypto session data
+ 	 */
+-	strlcpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
+ 	base->auth.key_data = key;
+ 	base->auth.key_len = keylen;
+ 
+@@ -841,7 +842,7 @@ int eip_crypto_ahash_req_init(struct aha
+ 	/*
+ 	 * Fill EIP crypto session data
+ 	 */
+-	strlcpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
+ 	base->auth.key_data = NULL;
+ 
+ 	/*
+--- a/clients/crypto/eip_crypto_skcipher.c
++++ b/clients/crypto/eip_crypto_skcipher.c
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/version.h>
+ #include <linux/of.h>
++#include <linux/string.h>
+ 
+ #include <crypto/ctr.h>
+ #include <crypto/aes.h>
+@@ -353,7 +354,7 @@ static inline uint8_t *eip_crypto_skciph
+  * eip_crypto_skcipher_copy_iv()
+  *	Copy IV
+  */
+-void eip_crypto_skcipher_copy_iv(struct scatterlist *sg, uint8_t *iv, uint8_t iv_len)
++static void eip_crypto_skcipher_copy_iv(struct scatterlist *sg, uint8_t *iv, uint8_t iv_len)
+ {
+ 	struct scatterlist *last_sg;
+ 	uint8_t *iv_end = iv + iv_len;
+@@ -526,7 +527,7 @@ static int eip_crypto_skcipher_setkey(st
+ 	/*
+ 	 * Fill algo info data
+ 	 */
+-	strlcpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
++	strscpy(base->alg_name, alg_name, CRYPTO_MAX_ALG_NAME);
+ 	base->cipher.key_data = key;
+ 
+ 	/*
+--- a/driver/eip197/eip_dma.h
++++ b/driver/eip197/eip_dma.h
+@@ -135,6 +135,8 @@ extern struct file_operations dma_stats_
+ int eip_dma_tx_sg(struct eip_dma *dma, struct eip_sw_desc *sw, struct scatterlist *src, struct scatterlist *dst);
+ int eip_dma_tx_linear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ int eip_dma_tx_nonlinear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
++int eip_dma_hy_rx(struct eip_dma *dma, int budget);
++int eip_dma_hy_tx_comp(struct eip_dma *dma, int budget);
+ int eip_dma_hy_tx_linear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ int eip_dma_hy_tx_nonlinear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ 
