@@ -1,0 +1,35 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 27 Jul 2026 12:00:00 +0800
+Subject: [PATCH] wifi: ath12k: keep vdev usable when PPE attach fails
+
+PPE direct switching is an optional acceleration path. A transient PPE
+resource or firmware error must not tear down an otherwise valid AP/STA
+vdev; doing so makes every client fail to associate when the accelerator is
+busy.
+Leave the vdev on the normal ath12k datapath and report the error for
+diagnostics. A later wireless reload can retry PPE attachment.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 10 +++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -11131,3 +11131,3 @@
+-		ath12k_mac_vdev_stop(arvif);
+-		arvif->is_started = false;
+-		return ret;
++		/* Drop a stale/partially programmed endpoint before fallback. */
++		ath12k_ppe_ds_vif_detach(arvif);
++		/* PPE is acceleration only; keep the normal vdev datapath. */
+@@ -11620,3 +11620,4 @@
+-		ath12k_mac_vdev_stop(arvif);
+-		arvif->is_started = false;
+-		goto out;
++		/* Drop a stale/partially programmed endpoint before fallback. */
++		ath12k_ppe_ds_vif_detach(arvif);
++		/* PPE is acceleration only; keep the normal vdev datapath. */
++		ret = 0;
