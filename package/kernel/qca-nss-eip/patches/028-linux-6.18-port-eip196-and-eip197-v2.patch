@@ -1,0 +1,1011 @@
+From 14528dfe8fb5fd149213706b1cdadfde9a05c9d6 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 00:15:00 +0800
+Subject: [PATCH] qca-nss-eip: port alternate engines to Linux 6.18
+
+Bring the EIP196 and EIP197 v2 driver variants in line with the
+Linux 6.18 APIs already used by the primary EIP197 implementation.
+Select coherent DMA handling for IPQ95xx, include vmalloc declarations,
+update platform remove callbacks, allocate dummy NAPI devices, and use
+the upstream Qualcomm PPE port lookup.
+
+Preserve negative IRQ lookup errors, quiesce ring interrupts during
+teardown, free the original ring allocations and posted skbs, and
+provide the synchronous transform invalidation required by the shared
+IPsec clients. Scope internal callbacks and add missing prototypes so
+both variants build cleanly.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/Makefile
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/Makefile
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/Makefile
+@@ -8,6 +8,10 @@ NSS_EIP_DRIVER_INCLUDE = -I$(obj)/../exp
+ ccflags-y += $(NSS_EIP_DRIVER_INCLUDE)
+ 
+ ccflags-y += -Wall -Werror
++ifeq ($(SoC),ipq95xx)
++ccflags-y += -DEIP_DMA_COHERENT
++endif
++
+ ccflags-y += -DNSS_EIP_BUILD_ID=\"'Build_ID - $(shell date +'%m/%d/%y, %H:%M:%S') SoC=$(SoC)'\"
+ 
+ obj-m += $(NSS_EIP_MOD_NAME).o
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip.c
+@@ -183,7 +183,7 @@ fail_alloc:
+  * eip_device_remove()
+  *	Remove Device and free all linked resources.
+  */
+-static int eip_device_remove(struct platform_device *pdev)
++static void eip_device_remove(struct platform_device *pdev)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	struct eip_pdev *ep;
+@@ -209,7 +209,6 @@ static int eip_device_remove(struct plat
+ 	kfree(ep);
+ 	platform_set_drvdata(pdev, NULL);
+ 
+-	return 0;
+ }
+ 
+ /*
+@@ -252,7 +251,7 @@ EXPORT_SYMBOL(eip_feature_check);
+  * eip_init_module()
+  *	Initialize all the resources.
+  */
+-int __init eip_init_module(void)
++static int __init eip_init_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 
+@@ -299,7 +298,7 @@ int __init eip_init_module(void)
+  * eip_exit_module()
+  *	Cleanup during module exit.
+  */
+-void __exit eip_exit_module(void)
++static void __exit eip_exit_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	platform_driver_unregister(&eip_device);
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_ctx.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_ctx.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_ctx.c
+@@ -10,6 +10,7 @@
+ #include <linux/cache.h>
+ #include <linux/debugfs.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/rwlock_types.h>
+ 
+ #include "eip_priv.h"
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_dma.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_dma.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_dma.c
+@@ -13,6 +13,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ 
+@@ -846,6 +847,12 @@ int eip_dma_res_init(struct eip_dma *dma
+ 	return 0;
+ }
+ 
++static void eip_dma_la_irq_disable(struct eip_dma *dma)
++{
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->out.proc_thresh);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
++}
++
+ /*
+  * eip_dma_la_deinit()
+  *	De-Initialize the DMA HW ring.
+@@ -857,9 +864,13 @@ void eip_dma_la_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	eip_dma_la_irq_disable(dma);
++	irq_set_affinity_hint(dma->irq, NULL);
+ 	free_irq(dma->irq, dma);
+ 	napi_disable(&dma->out.napi);
++	eip_dma_la_irq_disable(dma);
+ 	netif_napi_del(&dma->out.napi);
++	free_netdev(dma->out.ndev);
+ 	kfree(dma->out.kaddr);
+ 	kfree(dma->in.kaddr);
+ 
+@@ -886,9 +897,10 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	dma->irq_mask = EIP_HW_RDR_PROC_IRQ_STATUS;
+ 	dma->irq_status = base_addr + EIP_HW_HIA_RDR_STAT(ring_id);
+ 	dma->irq = platform_get_irq(ep->pdev, rx_cpu);
+-	if (!dma->irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	if (dma->irq < 0) {
++		pr_err("%p: failed to get IRQ index(%u) for ring_id(%u): %d\n",
++		       dma, rx_cpu, ring_id, dma->irq);
++		return dma->irq;
+ 	}
+ 
+ 	/*
+@@ -913,16 +925,21 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	 */
+ 	status = request_irq(dma->irq, eip_dma_handle_irq, IRQF_SHARED, irq_name[ring_id], dma);
+ 	if (status < 0) {
+-		pr_err("%px: IRQ %u request failed\n", dma, dma->irq);
++		pr_err("%p: IRQ %d request failed\n", dma, dma->irq);
+ 		goto fail_irq;
+ 	}
+ 
+-	init_dummy_netdev(&dma->out.ndev);
++	dma->out.ndev = alloc_netdev_dummy(0);
++	if (!dma->out.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
++	netif_napi_add(dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll,
+-			eip_dma_rx_napi_weight);
++	netif_napi_add_weight(dma->out.ndev, &dma->out.napi,
++			      eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
+ #endif
+ 	napi_enable(&dma->out.napi);
+ 
+@@ -936,7 +953,11 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	pr_info("%px: DMA ring(%u) configured and Rx mapped to cpu(%u)\n", dma, ring_id, rx_cpu);
+ 	return 0;
+ 
++fail_netdev:
++	eip_dma_la_irq_disable(dma);
++	free_irq(dma->irq, dma);
+ fail_irq:
++	eip_dma_la_irq_disable(dma);
+ 	kfree(dma->out.kaddr);
+ fail_res:
+ 	kfree(dma->in.kaddr);
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_dma.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_dma.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_dma.h
+@@ -70,7 +70,7 @@ struct eip_hw_ring {
+ 	void __iomem *proc_thresh;	/* HW processed threshold register */
+ 	void __iomem *proc_status;	/* HW status register */
+ 
+-	struct net_device ndev;		/* Dummy_netdev for NAPI */
++	struct net_device *ndev;		/* Dummy netdev for NAPI */
+ 	struct napi_struct napi;	/* NAPI handler */
+ 
+ 	void *kaddr;			/* Pointer to allocated memory */
+@@ -104,7 +104,7 @@ struct eip_dma {
+ 	enum eip_dma_type type;		/* Ring type */
+ 	bool active;			/* DMA is configured */
+ 
+-	uint32_t irq;			/* IRQ number for DMA ring */
++	int irq;			/* IRQ number for DMA ring */
+ 	uint32_t ring_id;		/* CDR/RDR ring - ID */
+ 	uint32_t irq_mask;		/* IRQ mask for this ring */
+ 	void __iomem *irq_status;	/* HW status register */
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_priv.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_priv.h
+@@ -122,35 +122,35 @@ extern uint32_t eip_dma_rx_napi_weight;
+  */
+ static inline void eip_dmac_inv_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_inv_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_flush_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_flush_range_no_dsb(start, end);
+ #endif
+ }
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_dtls_dec.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_dtls_dec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_dtls_dec.c
+@@ -29,7 +29,9 @@
+  * eip_tr_dtls_dec_err()
+  *	Hardware error callback API for Decapsulation.
+  */
+-void eip_tr_dtls_dec_err(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
++static void eip_tr_dtls_dec_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++				struct eip_sw_desc *sw, uint16_t cle_err,
++				uint16_t tr_err)
+ {
+ 	struct eip_tr_dtls *dtls = &tr->dtls;
+ 	struct eip_ctx *ctx = tr->ctx;
+@@ -50,7 +52,7 @@ void eip_tr_dtls_dec_err(struct eip_tr *
+  * eip_tr_dtls_dec_done()
+  *	Hardware completion callback API for Decapsulation.
+  */
+-void eip_tr_dtls_dec_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
++static void eip_tr_dtls_dec_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+ 	uint16_t out_len = EIP_HW_RES_DATA_LEN(hw->token[0]);
+ 	struct eip_tr_dtls *dtls = &tr->dtls;
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_dtls_enc.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_dtls_enc.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_dtls_enc.c
+@@ -194,7 +194,9 @@ static void eip_tr_dtls_enc_v6(struct ei
+  * eip_tr_dtls_enc_err()
+  *	Hardware error callback API for Encapsulation.
+  */
+-void eip_tr_dtls_enc_err(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
++static void eip_tr_dtls_enc_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++				struct eip_sw_desc *sw, uint16_t cle_err,
++				uint16_t tr_err)
+ {
+ 	struct eip_tr_dtls *dtls = &tr->dtls;
+ 	struct eip_ctx *ctx = tr->ctx;
+@@ -215,7 +217,7 @@ void eip_tr_dtls_enc_err(struct eip_tr *
+  * eip_tr_dtls_enc_done()
+  *	Hardware completion callback API for Encapsulation.
+  */
+-void eip_tr_dtls_enc_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
++static void eip_tr_dtls_enc_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+ 	uint16_t out_len = EIP_HW_RES_DATA_LEN(hw->token[0]);
+ 	struct eip_tr_dtls *dtls = &tr->dtls;
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec_dec.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_ipsec_dec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec_dec.c
+@@ -86,7 +86,9 @@ static void eip_tr_ipsec_dec_trans6_post
+  * eip_tr_ipsec_dec_err()
+  *	Hardware error callback API for Decapsulation.
+  */
+-void eip_tr_ipsec_dec_err(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
++static void eip_tr_ipsec_dec_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++				 struct eip_sw_desc *sw, uint16_t cle_err,
++				 uint16_t tr_err)
+ {
+ 	struct eip_tr_ipsec *ipsec = &tr->ipsec;
+ 	struct eip_ctx *ctx = tr->ctx;
+@@ -107,7 +109,7 @@ void eip_tr_ipsec_dec_err(struct eip_tr
+  * eip_tr_ipsec_dec_done()
+  *	Hardware completion callback API for Decapsulation.
+  */
+-void eip_tr_ipsec_dec_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
++static void eip_tr_ipsec_dec_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+ 	uint16_t out_len = EIP_HW_RES_DATA_LEN(hw->token[0]);
+ 	bool tun = tr->tr_flags & EIP_TR_IPSEC_FLAG_TUNNEL;
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec_enc.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_ipsec_enc.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec_enc.c
+@@ -236,7 +236,9 @@ static void eip_tr_ipsec_enc_trans6(stru
+  * eip_tr_ipsec_enc_err()
+  *	Hardware error callback API for Encapsulation.
+  */
+-void eip_tr_ipsec_enc_err(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw, uint16_t cle_err, uint16_t tr_err)
++static void eip_tr_ipsec_enc_err(struct eip_tr *tr, struct eip_hw_desc *hw,
++				 struct eip_sw_desc *sw, uint16_t cle_err,
++				 uint16_t tr_err)
+ {
+ 	struct eip_tr_ipsec *ipsec = &tr->ipsec;
+ 	struct eip_ctx *ctx = tr->ctx;
+@@ -257,7 +259,7 @@ void eip_tr_ipsec_enc_err(struct eip_tr
+  * eip_tr_ipsec_enc_done()
+  *	Hardware completion callback API for Encapsulation.
+  */
+-void eip_tr_ipsec_enc_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
++static void eip_tr_ipsec_enc_done(struct eip_tr *tr, struct eip_hw_desc *hw, struct eip_sw_desc *sw)
+ {
+ 	uint16_t out_len = EIP_HW_RES_DATA_LEN(hw->token[0]);
+ 	struct eip_tr_ipsec *ipsec = &tr->ipsec;
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/Makefile
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/Makefile
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/Makefile
+@@ -8,6 +8,10 @@ NSS_EIP_DRIVER_INCLUDE = -I$(obj)/../exp
+ ccflags-y += $(NSS_EIP_DRIVER_INCLUDE)
+ 
+ ccflags-y += -Wall -Werror
++ifeq ($(SoC),ipq95xx)
++ccflags-y += -DEIP_DMA_COHERENT
++endif
++
+ ccflags-y += -DNSS_EIP_BUILD_ID=\"'Build_ID - $(shell date +'%m/%d/%y, %H:%M:%S') SoC=$(SoC)'\"
+ 
+ obj-m += $(NSS_EIP_MOD_NAME).o
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip.c
+@@ -173,7 +173,7 @@ fail_alloc:
+  * eip_device_remove()
+  *	Remove Device and free all linked resources.
+  */
+-static int eip_device_remove(struct platform_device *pdev)
++static void eip_device_remove(struct platform_device *pdev)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	struct eip_pdev *ep;
+@@ -199,7 +199,6 @@ static int eip_device_remove(struct plat
+ 	kfree(ep);
+ 	platform_set_drvdata(pdev, NULL);
+ 
+-	return 0;
+ }
+ 
+ /*
+@@ -241,7 +240,7 @@ EXPORT_SYMBOL(eip_feature_check);
+  * eip_init_module()
+  *	Initialize all the resources.
+  */
+-int __init eip_init_module(void)
++static int __init eip_init_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 
+@@ -325,7 +324,7 @@ int __init eip_init_module(void)
+  * eip_exit_module()
+  *	Cleanup during module exit.
+  */
+-void __exit eip_exit_module(void)
++static void __exit eip_exit_module(void)
+ {
+ 	struct eip_drv *drv = &eip_drv_g;
+ 	platform_driver_unregister(&eip_device);
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_ctx.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_ctx.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_ctx.c
+@@ -10,6 +10,7 @@
+ #include <linux/cache.h>
+ #include <linux/debugfs.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/rwlock_types.h>
+ 
+ #include "eip_priv.h"
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_dma.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma.c
+@@ -13,6 +13,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ 
+@@ -723,7 +724,7 @@ int eip_dma_cmd_init(struct eip_dma *dma
+ 	int ret = 0;
+ 	void *addr;
+ 
+-	if (!info->handler || !info->irq) {
++	if (!info->handler || info->irq < 0) {
+ 		pr_err("%px: Invalid initialization info for DMA Ring_ID(%u)\n", dma, ring_id);
+ 		return -EINVAL;
+ 	}
+@@ -793,7 +794,7 @@ int eip_dma_cmd_init(struct eip_dma *dma
+ 		 */
+ 		ret = request_irq(cmd->irq, info->handler, IRQF_SHARED, cdr_irq_name[ring_id], dma);
+ 		if (ret < 0) {
+-			pr_err("%px: IRQ %u request failed\n", dma, cmd->irq);
++			pr_err("%p: IRQ %d request failed\n", dma, cmd->irq);
+ 			goto fail_irq;
+ 		}
+ 
+@@ -802,6 +803,8 @@ int eip_dma_cmd_init(struct eip_dma *dma
+ 
+ 	return 0;
+ fail_irq:
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, cmd->proc_thresh);
++	iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, cmd->proc_status);
+ 	kfree(cmd->kaddr);
+ 	memset(cmd, 0, sizeof(*cmd));
+ 	return ret;
+@@ -821,7 +824,7 @@ int eip_dma_res_init(struct eip_dma *dma
+ 	int ret = 0;
+ 	void *addr;
+ 
+-	if (!info->handler || !info->irq) {
++	if (!info->handler || info->irq < 0) {
+ 		pr_err("%px: Invalid initialization info for DMA Ring_ID(%u)\n", dma, ring_id);
+ 		return -EINVAL;
+ 	}
+@@ -891,7 +894,7 @@ int eip_dma_res_init(struct eip_dma *dma
+ 		 */
+ 		ret = request_irq(res->irq, info->handler, IRQF_SHARED, rdr_irq_name[ring_id], dma);
+ 		if (ret < 0) {
+-			pr_err("%px: IRQ %u request failed\n", dma, res->irq);
++			pr_err("%p: IRQ %d request failed\n", dma, res->irq);
+ 			goto fail_irq;
+ 		}
+ 
+@@ -900,11 +903,19 @@ int eip_dma_res_init(struct eip_dma *dma
+ 
+ 	return 0;
+ fail_irq:
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, res->proc_thresh);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, res->proc_status);
+ 	kfree(res->kaddr);
+ 	memset(res, 0, sizeof(*res));
+ 	return ret;
+ }
+ 
++static void eip_dma_la_irq_disable(struct eip_dma *dma)
++{
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->out.proc_thresh);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
++}
++
+ /*
+  * eip_dma_la_deinit()
+  *	De-Initialize the DMA HW ring.
+@@ -916,10 +927,13 @@ void eip_dma_la_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	eip_dma_la_irq_disable(dma);
+ 	irq_set_affinity_hint(dma->out.irq, NULL);
+ 	free_irq(dma->out.irq, dma);
+ 	napi_disable(&dma->out.napi);
++	eip_dma_la_irq_disable(dma);
+ 	netif_napi_del(&dma->out.napi);
++	free_netdev(dma->out.ndev);
+ 	kfree(dma->out.kaddr);
+ 	kfree(dma->in.kaddr);
+ 
+@@ -951,15 +965,17 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	}
+ 
+ 	cmd_info.irq = of_irq_get_byname(child, "cdr_proc_irq");
+-	if (!cmd_info.irq) {
+-		pr_err("%px: CMD irq_of_parse_and_map() fail for cdr_proc_irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	if (cmd_info.irq < 0) {
++		pr_err("%p: failed to get cdr_proc_irq for ring_id(%u): %d\n",
++		       dma, ring_id, cmd_info.irq);
++		return cmd_info.irq;
+ 	}
+ 
+ 	res_info.irq = of_irq_get_byname(child, "rdr_proc_irq");
+-	if (!res_info.irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for rdr_proc_irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	if (res_info.irq < 0) {
++		pr_err("%p: failed to get rdr_proc_irq for ring_id(%u): %d\n",
++		       dma, ring_id, res_info.irq);
++		return res_info.irq;
+ 	}
+ 
+ 	dma->type = EIP_DMA_TYPE_LA;
+@@ -989,12 +1005,17 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	/*
+ 	 * Initialize the NAPI.
+ 	 */
+-	init_dummy_netdev(&dma->out.ndev);
++	dma->out.ndev = alloc_netdev_dummy(0);
++	if (!dma->out.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
++	netif_napi_add(dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->out.ndev, &dma->out.napi, eip_dma_napi_rx_poll,
+-			eip_dma_rx_napi_weight);
++	netif_napi_add_weight(dma->out.ndev, &dma->out.napi,
++			      eip_dma_napi_rx_poll, eip_dma_rx_napi_weight);
+ #endif
+ 	napi_enable(&dma->out.napi);
+ 
+@@ -1007,6 +1028,11 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	pr_info("%px: DMA ring(%u) configured and Rx mapped to cpu(%u)\n", dma, ring_id, cpu);
+ 	return 0;
+ 
++fail_netdev:
++	eip_dma_la_irq_disable(dma);
++	irq_set_affinity_hint(dma->out.irq, NULL);
++	free_irq(dma->out.irq, dma);
++	kfree(dma->out.kaddr);
+ fail_res:
+ 	kfree(dma->in.kaddr);
+ 	return status;
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_dma.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma.h
+@@ -59,8 +59,8 @@ struct eip_hw_ring {
+ 	void __iomem *proc_thresh;	/* HW processed threshold register */
+ 	void __iomem *proc_status;	/* HW status register */
+ 
+-	unsigned int irq;		/* IRQ number for DMA ring */
+-	struct net_device ndev;		/* Dummy_netdev for NAPI */
++	int irq;			/* IRQ number for DMA ring */
++	struct net_device *ndev;		/* Dummy netdev for NAPI */
+ 	struct napi_struct napi;	/* NAPI handler */
+ 
+ 	void *kaddr;			/* Pointer to allocated memory */
+@@ -131,6 +131,8 @@ extern const char *dma_name[];
+ extern struct file_operations dma_stats_ops;
+ 
+ int eip_dma_tx_sg(struct eip_dma *dma, struct eip_sw_desc *sw, struct scatterlist *src, struct scatterlist *dst);
++int eip_dma_hy_rx(struct eip_dma *dma, int budget);
++int eip_dma_hy_tx_comp(struct eip_dma *dma, int budget);
+ int eip_dma_hy_tx_linear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ int eip_dma_hy_tx_nonlinear_skb(struct eip_dma *dma, struct eip_sw_desc *sw, struct sk_buff *skb);
+ 
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma_hy.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_dma_hy.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_dma_hy.c
+@@ -15,9 +15,9 @@
+ #include <linux/slab.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <linux/soc/qcom/ppe.h>
+ #include <net/ip.h>
+ 
+-#include <ppe_drv_port.h>
+ #include "eip_priv.h"
+ 
+ /*
+@@ -244,7 +244,7 @@ static inline void eip_dma_hy_tr_deliver
+ static inline bool eip_dma_hy_deliver_linux(struct sk_buff *skb, struct eip_hw_desc *res)
+ {
+ 	uint16_t src_port = EIP_HW_RES_BYPASS_SRC_PORT(res->bypass[0]);
+-	struct net_device *dev = ppe_drv_port_num_to_dev(src_port);
++	struct net_device *dev = qcom_ppe_port_dev_get(src_port);
+ 	unsigned int ip_hdr_sz;
+ 	uint16_t proto;
+ 
+@@ -275,6 +275,7 @@ static inline bool eip_dma_hy_deliver_li
+ 
+ 	/* Inject into stack */
+ 	netif_receive_skb(skb);
++	dev_put(dev);
+ 
+ 	return true;
+ }
+@@ -677,14 +678,28 @@ static int eip_dma_hy_napi_rx_poll(struc
+ 
+ /*
+  * eip_dma_hy_free_skb()
+- *	Refill new SKB(s) in DMA output ring.
++ *	Free SKBs which are still owned by the DMA output ring.
+  */
+ static void eip_dma_hy_free_skb(struct eip_dma *dma)
+ {
+-	/*
+-	 * TODO: Fix
+-	 */
+-	BUG_ON(1);
++	struct eip_hw_ring *ring = &dma->out;
++	u32 cons_idx, count;
++
++	cons_idx = atomic_read(&ring->cons_idx);
++	count = EIP_DMA_AVAIL_COUNT(atomic_read(&ring->prod_idx), cons_idx);
++
++	while (count--) {
++		struct sk_buff *skb = (struct sk_buff *)ring->meta[cons_idx];
++
++		if (skb) {
++			ring->meta[cons_idx] = 0;
++			consume_skb(skb);
++		}
++
++		cons_idx = EIP_DMA_IDX_INC(cons_idx);
++	}
++
++	atomic_set(&ring->cons_idx, cons_idx);
+ }
+ 
+ /*
+@@ -835,6 +850,14 @@ int eip_dma_hy_tx_nonlinear_skb(struct e
+ 	return 0;
+ }
+ 
++static void eip_dma_hy_irq_disable(struct eip_dma *dma)
++{
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->in.proc_thresh);
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->out.proc_thresh);
++	iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, dma->in.proc_status);
++	iowrite32(EIP_HW_RDR_PROC_IRQ_STATUS, dma->out.proc_status);
++}
++
+ /*
+  * eip_dma_hy_deinit()
+  *	De-Initialize the DMA HW ring.
+@@ -846,17 +869,21 @@ void eip_dma_hy_deinit(struct eip_dma *d
+ 	}
+ 
+ 	debugfs_remove_recursive(dma->dentry);
++	eip_dma_hy_irq_disable(dma);
+ 	irq_set_affinity_hint(dma->in.irq, NULL);
+ 	free_irq(dma->in.irq, dma);
+ 	irq_set_affinity_hint(dma->out.irq, NULL);
+ 	free_irq(dma->out.irq, dma);
+ 	napi_disable(&dma->in.napi);
+ 	napi_disable(&dma->out.napi);
++	eip_dma_hy_irq_disable(dma);
+ 	netif_napi_del(&dma->in.napi);
+ 	netif_napi_del(&dma->out.napi);
+ 	eip_dma_hy_free_skb(dma);
+-	kfree(dma->out.desc);
+-	kfree(dma->in.desc);
++	free_netdev(dma->in.ndev);
++	free_netdev(dma->out.ndev);
++	kfree(dma->out.kaddr);
++	kfree(dma->in.kaddr);
+ 
+ 	memset(dma, 0, sizeof(*dma));
+ }
+@@ -886,15 +913,17 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	}
+ 
+ 	cmd_info.irq = of_irq_get_byname(child, "cdr_proc_irq");
+-	if (!cmd_info.irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	if (cmd_info.irq < 0) {
++		pr_err("%p: failed to get cdr_proc_irq for ring_id(%u): %d\n",
++		       dma, ring_id, cmd_info.irq);
++		return cmd_info.irq;
+ 	}
+ 
+ 	res_info.irq = of_irq_get_byname(child, "rdr_proc_irq");
+-	if (!res_info.irq) {
+-		pr_err("%px: irq_of_parse_and_map() fail for irq, ring_id(%u)\n", dma, ring_id);
+-		return -EINVAL;
++	if (res_info.irq < 0) {
++		pr_err("%p: failed to get rdr_proc_irq for ring_id(%u): %d\n",
++		       dma, ring_id, res_info.irq);
++		return res_info.irq;
+ 	}
+ 
+ 	dma->type = EIP_DMA_TYPE_HYBRID;
+@@ -924,24 +953,38 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	/*
+ 	 * Initialize NAPI for transmit completion for input ring.
+ 	 */
+-	init_dummy_netdev(&dma->in.ndev);
++	dma->in.ndev = alloc_netdev_dummy(0);
++	if (!dma->in.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev_in;
++	}
++
++	dma->out.ndev = alloc_netdev_dummy(0);
++	if (!dma->out.ndev) {
++		status = -ENOMEM;
++		goto fail_netdev_out;
++	}
++
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll, eip_dma_tx_compl_napi_weight);
++	netif_napi_add(dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll,
++		       eip_dma_tx_compl_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->in.ndev, &dma->in.napi, eip_dma_hy_napi_tx_poll,
+-			eip_dma_tx_compl_napi_weight);
++	netif_napi_add_weight(dma->in.ndev, &dma->in.napi,
++			      eip_dma_hy_napi_tx_poll,
++			      eip_dma_tx_compl_napi_weight);
+ #endif
+ 	napi_enable(&dma->in.napi);
+ 
+ 	/*
+ 	 * Initialize NAPI for receiving packet for output ring.
+ 	 */
+-	init_dummy_netdev(&dma->out.ndev);
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+-	netif_napi_add(&dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll, eip_dma_rx_napi_weight);
++	netif_napi_add(dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll,
++		       eip_dma_rx_napi_weight);
+ #else
+-	netif_napi_add_weight(&dma->out.ndev, &dma->out.napi, eip_dma_hy_napi_rx_poll,
+-			eip_dma_rx_napi_weight);
++	netif_napi_add_weight(dma->out.ndev, &dma->out.napi,
++			      eip_dma_hy_napi_rx_poll,
++			      eip_dma_rx_napi_weight);
+ #endif
+ 	napi_enable(&dma->out.napi);
+ 	ep->dma_refill_req = true;
+@@ -951,7 +994,16 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	pr_info("%px: DMA ring(%u) configured and Rx mapped to cpu(%u)\n", dma, ring_id, cpu);
+ 	return 0;
+ 
++fail_netdev_out:
++	free_netdev(dma->in.ndev);
++fail_netdev_in:
++	eip_dma_hy_irq_disable(dma);
++	irq_set_affinity_hint(dma->out.irq, NULL);
++	free_irq(dma->out.irq, dma);
++	kfree(dma->out.kaddr);
+ fail_res:
++	iowrite32(EIP_HW_HIA_IRQ_DISABLE, dma->in.proc_thresh);
++	iowrite32(EIP_HW_CDR_PROC_IRQ_STATUS, dma->in.proc_status);
+ 	irq_set_affinity_hint(dma->in.irq, NULL);
+ 	free_irq(dma->in.irq, dma);
+ 	kfree(dma->in.kaddr);
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_priv.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_priv.h
+@@ -135,35 +135,35 @@ extern uint32_t eip_dma_tx_compl_napi_we
+  */
+ static inline void eip_dmac_inv_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_inv_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_inv_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_clean_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_clean_range_no_dsb(start, end);
+ #endif
+ }
+ 
+ static inline void eip_dmac_flush_range_no_dsb(const void *start, const void *end)
+ {
+-#ifndef CONFIG_IO_COHERENCY
++#ifndef EIP_DMA_COHERENT
+ 	dmac_flush_range_no_dsb(start, end);
+ #endif
+ }
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr_dtls.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr_dtls.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr_dtls.c
+@@ -15,8 +15,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/errno.h>
+ 
+-struct eip_tr;
+-struct eip_svc_entry;
++#include "eip_priv.h"
+ 
+ /*
+  * eip_tr_dtls_enc()
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr.c
+@@ -18,6 +18,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/kref.h>
++#include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/crypto.h>
+ #include <linux/cache.h>
+@@ -78,9 +79,11 @@ static void eip_tr_inval_done(struct eip
+ {
+ 	struct eip_pdev *ep;
+ 	struct eip_ctx *ctx;
++	struct completion *free_done;
+ 
+ 	ctx = tr->ctx;
+ 	ep = ctx->ep;
++	free_done = READ_ONCE(tr->free_done);
+ 
+ 	/*
+ 	 * free the memory associated with the operation.
+@@ -97,6 +100,8 @@ static void eip_tr_inval_done(struct eip
+ 
+ 	free_percpu(tr->stats_pcpu);
+ 	kmem_cache_free(ep->tr_cache, tr);
++	if (free_done)
++		complete(free_done);
+ 	pr_debug("%px: TR freed successfully\n", tr);
+ }
+ 
+@@ -410,6 +415,24 @@ void eip_tr_free(struct eip_tr *tr)
+ EXPORT_SYMBOL(eip_tr_free);
+ 
+ /*
++ * eip_tr_free_sync()
++ *	Free a transform record and wait for the hardware invalidation to finish.
++ */
++void eip_tr_free_sync(struct eip_tr *tr)
++{
++	DECLARE_COMPLETION_ONSTACK(free_done);
++
++	might_sleep();
++	if (WARN_ON_ONCE(READ_ONCE(tr->free_done)))
++		return;
++
++	WRITE_ONCE(tr->free_done, &free_done);
++	eip_tr_free(tr);
++	wait_for_completion(&free_done);
++}
++EXPORT_SYMBOL(eip_tr_free_sync);
++
++/*
+  * eip_tr_classify_err()
+  *     API to classify hw errors to linux errors.
+  */
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr.h
+@@ -180,6 +180,7 @@ struct eip_tr {
+ 	enum eip_svc svc;			/* Service number */
+ 	uint32_t inval_dummy_buf;		/* Dummy 4 byte buffer for Invalidation. */
+ 	struct delayed_work inval_work;		/* Workqueue for Invalidation schedule */
++	struct completion *free_done;		/* Optional completion after final invalidation */
+ 
+ 	uint32_t hw_words[] __attribute__((aligned (L1_CACHE_BYTES)));
+ 						/* Hardware record words. Aligned it to exact L1 cache line boundary */
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_dma.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma.c
+@@ -810,7 +810,7 @@ int eip_dma_la_init(struct eip_dma *dma,
+ 	 */
+ 	status = request_irq(dma->irq, eip_dma_handle_irq, IRQF_SHARED, irq_name[ring_id], dma);
+ 	if (status < 0) {
+-		pr_err("%px: IRQ %u request failed\n", dma, dma->irq);
++		pr_err("%p: IRQ %d request failed\n", dma, dma->irq);
+ 		goto fail_irq;
+ 	}
+ 
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_dma.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma.h
+@@ -104,7 +104,7 @@ struct eip_dma {
+ 	enum eip_dma_type type;		/* Ring type */
+ 	bool active;			/* DMA is configured */
+ 
+-	uint32_t irq;			/* IRQ number for DMA ring */
++	int irq;			/* IRQ number for DMA ring */
+ 	uint32_t ring_id;		/* CDR/RDR ring - ID */
+ 	uint32_t irq_mask;		/* IRQ mask for this ring */
+ 	void __iomem *irq_status;	/* HW status register */
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma_hy.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_dma_hy.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_dma_hy.c
+@@ -991,7 +991,7 @@ int eip_dma_hy_init(struct eip_dma *dma,
+ 	 */
+ 	status = request_irq(dma->irq, eip_dma_hy_handle_irq, IRQF_SHARED, irq_name[ring_id], dma);
+ 	if (status < 0) {
+-		pr_err("%px: IRQ %u request failed\n", dma, dma->irq);
++		pr_err("%p: IRQ %d request failed\n", dma, dma->irq);
+ 		goto fail_irq;
+ 	}
+ 
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr.c
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr.c
+@@ -7,6 +7,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/kref.h>
++#include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/crypto.h>
+ #include <linux/cache.h>
+@@ -109,9 +110,11 @@ static void eip_tr_inval_n_free(struct e
+ {
+ 	struct eip_pdev *ep;
+ 	struct eip_ctx *ctx;
++	struct completion *free_done;
+ 
+ 	ctx = tr->ctx;
+ 	ep = ctx->ep;
++	free_done = READ_ONCE(tr->free_done);
+ 
+ 	/*
+ 	 * free the memory associated with the operation.
+@@ -128,6 +131,8 @@ static void eip_tr_inval_n_free(struct e
+ 
+ 	free_percpu(tr->stats_pcpu);
+ 	kmem_cache_free(ep->tr_cache, tr);
++	if (free_done)
++		complete(free_done);
+ 	pr_debug("TR freed successfully\n");
+ }
+ 
+@@ -476,6 +481,24 @@ void eip_tr_free(struct eip_tr *tr)
+ EXPORT_SYMBOL(eip_tr_free);
+ 
+ /*
++ * eip_tr_free_sync()
++ *	Free a transform record and wait for the hardware invalidation to finish.
++ */
++void eip_tr_free_sync(struct eip_tr *tr)
++{
++	DECLARE_COMPLETION_ONSTACK(free_done);
++
++	might_sleep();
++	if (WARN_ON_ONCE(READ_ONCE(tr->free_done)))
++		return;
++
++	WRITE_ONCE(tr->free_done, &free_done);
++	eip_tr_free(tr);
++	wait_for_completion(&free_done);
++}
++EXPORT_SYMBOL(eip_tr_free_sync);
++
++/*
+  * eip_tr_classify_err()
+  *     API to classify hw errors to linux errors.
+  */
+Index: nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr.h
+===================================================================
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr.h
+@@ -178,6 +178,7 @@ struct eip_tr {
+ 	enum eip_svc svc;			/* Service number */
+ 	uint32_t inval_dummy_buf;		/* Dummy 4 byte buffer for Invalidation. */
+ 	struct delayed_work inval_work;		/* Workqueue for Invalidation schedule */
++	struct completion *free_done;		/* Optional completion after final invalidation */
+ 	struct eip_hw_stats tr_stats;		/* Last readed TR stats */
+ 
+ 	uint32_t hw_words[] __attribute__((aligned (L1_CACHE_BYTES)));
