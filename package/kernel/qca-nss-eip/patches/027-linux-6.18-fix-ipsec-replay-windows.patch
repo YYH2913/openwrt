@@ -1,0 +1,902 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 6 Aug 2026 13:49:59 +0800
+Subject: [PATCH] qca-nss-eip: support EIP96 extended replay windows
+
+The vendor IPsec client rounds requested replay windows to hardware
+encodings and treats every window above 128 bits as a 384-bit
+record. EIP196 does not initialize those larger layouts, while
+EIP197 cannot distinguish native 256-bit support from the 384-bit
+fallback. This can silently weaken replay policy or produce an
+inconsistent transform record.
+
+Accept only exact EIP96 windows of 0, 32, 64, 128, 256, and 384
+bits. Read the EIP96 OPTIONS capabilities, use the native 256-bit
+layout when present, and otherwise reserve the 384-bit layout while
+retaining the logical 256-bit context-update length. Reject unsupported
+SAs before transform allocation.
+
+Preserve outbound ESN when anti-replay is disabled and keep XFRM
+eligibility aligned with low-level transform validation. The record
+encodings and fallback allocation follow the EIP DDK SA Builder and
+Linux 6.18 Safexcel definitions.
+
+Link: https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-eip/-/tree/10a89a95f814cd325e23105f102428644f45014f
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/clients/ipsec/eip_ipsec_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/clients/ipsec/eip_ipsec_priv.h
+@@ -88,6 +88,8 @@ int eip_ipsec_flow_sa_get(struct eip_ips
+ void eip_ipsec_flow_sa_put(struct eip_ipsec_sa *sa);
+ void eip_ipsec_flow_rekey(struct eip_ipsec_sa *new_sa);
+ void eip_ipsec_flow_dev_cleanup(struct eip_ipsec_dev *eid);
++bool eip_ipsec_replay_from_window(u32 replay_win,
++				  enum eip_ipsec_replay *replay);
+ 
+ /*
+  * Increment driver object reference
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/clients/ipsec/eip_ipsec_sa.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/clients/ipsec/eip_ipsec_sa.c
+@@ -30,12 +30,41 @@
+ #include <crypto/aes.h>
+ #include "eip_ipsec_priv.h"
+ 
++/* Convert only replay windows that EIP96 can represent exactly. */
++bool eip_ipsec_replay_from_window(u32 replay_win,
++				  enum eip_ipsec_replay *replay)
++{
++	switch (replay_win) {
++	case 0:
++		*replay = EIP_IPSEC_REPLAY_NONE;
++		return true;
++	case 32:
++		*replay = EIP_IPSEC_REPLAY_32;
++		return true;
++	case 64:
++		*replay = EIP_IPSEC_REPLAY_64;
++		return true;
++	case 128:
++		*replay = EIP_IPSEC_REPLAY_128;
++		return true;
++	case 256:
++		*replay = EIP_IPSEC_REPLAY_256;
++		return true;
++	case 384:
++		*replay = EIP_IPSEC_REPLAY_384;
++		return true;
++	default:
++		return false;
++	}
++}
++
+ /*
+  * eip_ipsec_sa_data_to_tr_info()
+  *	Fill TR infor using SA data passed by user.
+  */
+ static void eip_ipsec_sa_data_to_tr_info(struct eip_ipsec_data *data,
+ 		struct eip_ipsec_tuple *t, enum eip_svc svc,
++		enum eip_ipsec_replay replay,
+ 		struct eip_tr_info *tr_info)
+ {
+ 	struct eip_tr_info_ipsec *ipsec = &tr_info->ipsec;
+@@ -65,28 +94,7 @@ static void eip_ipsec_sa_data_to_tr_info
+ 	ipsec->ip_ttl = data->hop_limit;
+ 	ipsec->ip_df = (flags & EIP_IPSEC_FLAG_CP_DF) ? 0 : data->df;
+ 	ipsec->ip_dscp = (flags & EIP_IPSEC_FLAG_CP_TOS) ? 0 : data->dscp;
+-
+-	switch (data->replay_win) {
+-	case 0:
+-		ipsec->replay = EIP_IPSEC_REPLAY_NONE;
+-		ipsec->sa_flags &= ~EIP_IPSEC_FLAG_ESN;
+-		break;
+-	case 1 ... 32:
+-		ipsec->replay = EIP_IPSEC_REPLAY_32;
+-		break;
+-	case 33 ... 64:
+-		ipsec->replay = EIP_IPSEC_REPLAY_64;
+-		break;
+-	case 65 ... 128:
+-		ipsec->replay = EIP_IPSEC_REPLAY_128;
+-		break;
+-	case 129 ... 256:
+-		ipsec->replay = EIP_IPSEC_REPLAY_256;
+-		break;
+-	default:
+-		ipsec->replay = EIP_IPSEC_REPLAY_384;
+-		break;
+-	}
++	ipsec->replay = replay;
+ 
+ 	ipsec->spi_idx = htonl(t->esp_spi);
+ 	ipsec->src_port = htons(t->sport);
+@@ -479,7 +487,8 @@ static void eip_ipsec_sa_inline_rollback
+ }
+ 
+ static int eip_ipsec_sa_inline_setup(struct eip_ipsec_sa *sa,
+-				     struct eip_ipsec_data *data)
++				     struct eip_ipsec_data *data,
++				     enum eip_ipsec_replay replay)
+ {
+ 	struct eip_ipsec_drv *drv = &eip_ipsec_drv_g;
+ 	struct qcom_ppe_eip_tuple ppe_tuple;
+@@ -503,7 +512,8 @@ static int eip_ipsec_sa_inline_setup(str
+ 	}
+ 
+ 	eip_ipsec_sa_data_to_tr_info(data, &sa->tuple,
+-					 EIP_SVC_HYBRID_IPSEC, &tr_info);
++					 EIP_SVC_HYBRID_IPSEC, replay,
++					 &tr_info);
+ 	eip_ipsec_sa_set_callbacks(sa, &tr_info, false);
+ 	eip_ipsec_ppe_mdata_set(&tr_info, sa->ppe_vp);
+ 	sa->tr = eip_tr_alloc(drv->inline_ctx, &tr_info);
+@@ -954,6 +964,7 @@ int eip_ipsec_sa_add(struct net_device *
+ 	struct eip_ipsec_dev *eid = netdev_priv(ndev);
+ 	struct eip_tr_info tr_info;
+ 	struct eip_ipsec_sa *sa;
++	enum eip_ipsec_replay replay;
+ 	bool udp_encap;
+ 	bool encap;
+ 	int err;
+@@ -961,6 +972,24 @@ int eip_ipsec_sa_add(struct net_device *
+ 	encap = (data->base.flags & EIP_IPSEC_FLAG_ENC);
+ 	udp_encap = (data->base.flags & EIP_IPSEC_FLAG_UDP);
+ 
++	if (!eip_ipsec_replay_from_window(data->replay_win, &replay)) {
++		pr_warn("%p: replay window %u cannot be represented exactly by EIP\n",
++			ndev, data->replay_win);
++		return -EOPNOTSUPP;
++	}
++
++	if (!eip_ipsec_replay_supported(drv->ctx, replay)) {
++		pr_warn("%p: replay window %u is not supported by this EIP96 instance\n",
++			ndev, data->replay_win);
++		return -EOPNOTSUPP;
++	}
++
++	if (!encap && (data->base.flags & EIP_IPSEC_FLAG_ESN) &&
++	    replay == EIP_IPSEC_REPLAY_NONE) {
++		pr_warn("%p: inbound ESN requires anti-replay\n", ndev);
++		return -EINVAL;
++	}
++
+ 	pr_debug("%p: algo_name %s, icv_len %u, flags %u replay_win %u df %u dscp %u hop_limit %u\n",
+ 		ndev, data->base.algo_name, data->base.icv_len, data->base.flags, data->replay_win, data->df,
+ 		data->dscp, data->hop_limit);
+@@ -1047,7 +1076,7 @@ int eip_ipsec_sa_add(struct net_device *
+ 	 * topology failures are not fatal; retain the proven host lookaside path.
+ 	 */
+ 	if (!encap) {
+-		err = eip_ipsec_sa_inline_setup(sa, data);
++		err = eip_ipsec_sa_inline_setup(sa, data, replay);
+ 		if (err)
+ 			pr_debug("%p: inline decap unavailable for SPI 0x%x (%d), using host path\n",
+ 				 sa, t->esp_spi, err);
+@@ -1062,7 +1091,8 @@ int eip_ipsec_sa_add(struct net_device *
+ 
+ 		if (vp >= 0) {
+ 			eip_ipsec_sa_data_to_tr_info(data, t,
+-						     EIP_SVC_HYBRID_IPSEC, &tr_info);
++						     EIP_SVC_HYBRID_IPSEC,
++						     replay, &tr_info);
+ 			eip_ipsec_sa_set_callbacks(sa, &tr_info, true);
+ 			eip_ipsec_ppe_mdata_set(&tr_info, vp);
+ 			sa->tr = eip_tr_alloc(drv->inline_ctx, &tr_info);
+@@ -1080,8 +1110,7 @@ int eip_ipsec_sa_add(struct net_device *
+ 	}
+ 
+ 	if (!sa->inline_offload) {
+-		eip_ipsec_sa_data_to_tr_info(data, t, EIP_SVC_IPSEC,
+-						 &tr_info);
++		eip_ipsec_sa_data_to_tr_info(data, t, EIP_SVC_IPSEC, replay, &tr_info);
+ 		eip_ipsec_sa_set_callbacks(sa, &tr_info, encap);
+ 		sa->tr = eip_tr_alloc(drv->ctx, &tr_info);
+ 		if (!sa->tr) {
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/clients/ipsec/eip_ipsec_xfrm.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/clients/ipsec/eip_ipsec_xfrm.c
+@@ -329,6 +329,7 @@ static bool eip_ipsec_xfrm_verify_offloa
+ {
+ 	u32 replay_window = xs->replay_esn ? xs->replay_esn->replay_window :
+ 					       xs->props.replay_window;
++	enum eip_ipsec_replay replay;
+ 	unsigned int i;
+ 
+ 	if (xs_net(xs) != &init_net) {
+@@ -387,9 +388,15 @@ static bool eip_ipsec_xfrm_verify_offloa
+ 	if (xs->props.extra_flags & ~XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+ 		return false;
+ 
+-	if (replay_window > IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ) {
+-		pr_debug("%p: replay window %u exceeds EIP maximum %u\n", xs,
+-			 replay_window, IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ);
++	if (!eip_ipsec_replay_from_window(replay_window, &replay)) {
++		pr_debug("%p: replay window %u cannot be represented exactly by EIP\n",
++			 xs, replay_window);
++		return false;
++	}
++
++	if (!eip_ipsec_replay_supported(eip_ipsec_drv_g.ctx, replay)) {
++		pr_debug("%p: replay window %u is unsupported by this EIP96 instance\n",
++			 xs, replay_window);
+ 		return false;
+ 	}
+ 
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/clients/ipsec/eip_ipsec_xfrm.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/clients/ipsec/eip_ipsec_xfrm.h
+@@ -17,7 +17,6 @@
+ #ifndef __EIP_IPSEC_XFRM_H
+ #define __EIP_IPSEC_XFRM_H
+ 
+-#define IPSEC_XFRM_SA_MAX_REPLAY_WIN_SZ 384U
+ #define DEBUG_LEVEL 2U
+ 
+ #if (DEBUG_LEVEL < 1)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_ctx.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_ctx.c
+@@ -339,6 +339,34 @@ bool eip_ctx_algo_supported(struct eip_c
+ EXPORT_SYMBOL(eip_ctx_algo_supported);
+ 
+ /*
++ * eip_ipsec_replay_supported()
++ *	Check whether EIP96 supports the requested anti-replay window.
++ */
++bool eip_ipsec_replay_supported(struct eip_ctx *ctx,
++				enum eip_ipsec_replay replay)
++{
++	if (!ctx || !ctx->ep)
++		return false;
++
++	switch (replay) {
++	case EIP_IPSEC_REPLAY_NONE:
++	case EIP_IPSEC_REPLAY_32:
++	case EIP_IPSEC_REPLAY_64:
++	case EIP_IPSEC_REPLAY_128:
++		return true;
++	case EIP_IPSEC_REPLAY_256:
++		return ctx->ep->eip96_options &
++			(EIP_HW_PE_EIP96_SEQMASK_256 |
++			 EIP_HW_PE_EIP96_SEQMASK_384);
++	case EIP_IPSEC_REPLAY_384:
++		return ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384;
++	default:
++		return false;
++	}
++}
++EXPORT_SYMBOL(eip_ipsec_replay_supported);
++
++/*
+  * eip_tun_update()
+  *	Tunnel update
+  */
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_hw.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_hw.c
+@@ -501,6 +501,14 @@ int eip_hw_init(struct platform_device *
+ 	}
+ #endif
+ 	eip_hw_setup(base_addr);
++	ep->eip96_options = ioread32(base_addr + EIP_HW_PE_EIP96_OPTIONS);
++	dev_info(&pdev->dev,
++		 "EIP96 options 0x%08x, anti-replay 256: %s, 384: %s\n",
++		 ep->eip96_options,
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ? "native" :
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ?
++			"via 384-bit layout" : "no",
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ? "yes" : "no");
+ 
+ 	/*
+ 	 * Allow passing 16 bytes of metadata information from
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_hw.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_hw.h
+@@ -17,6 +17,7 @@
+ #ifndef __EIP_HW_H
+ #define __EIP_HW_H
+ 
++#include <linux/bits.h>
+ #include <linux/types.h>
+ 
+ /*
+@@ -268,7 +269,10 @@
+ #define EIP_HW_PE_EIP96_TOKEN_CTRL2 (EIP_HW_PE_EIP96_BASE + 0x2CU)
+ #define EIP_HW_PE_EIP96_LFSR_LO (EIP_HW_PE_EIP96_BASE + 0x70U)
+ #define EIP_HW_PE_EIP96_LFSR_HI (EIP_HW_PE_EIP96_BASE + 0x74U)
++#define EIP_HW_PE_EIP96_OPTIONS (EIP_HW_PE_EIP96_BASE + 0x3F8U)
+ #define EIP_HW_PE_EIP96_VERSION (EIP_HW_PE_EIP96_BASE + 0x3FCU)
++#define EIP_HW_PE_EIP96_SEQMASK_256 BIT(10)
++#define EIP_HW_PE_EIP96_SEQMASK_384 BIT(11)
+ #define EIP_HW_PE_EIP96_ECN_TABLE(x) (EIP_HW_PE_EIP96_BASE + 0x3E0U + ((x) * 4U))
+ 
+ #define EIP_HW_PE_IV0 (EIP_HW_PE_EIP96_BASE + 0x210U)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_priv.h
+@@ -110,6 +110,7 @@ struct eip_pdev {
+ 	struct dentry *dentry;			/* Driver debugfs dentry */
+ 	void __iomem *dev_vaddr;		/* starting virtual address of device */
+ 	dma_addr_t dev_paddr;			/* starting physical address of device */
++	u32 eip96_options;			/* EIP96 algorithm and replay capabilities */
+ 	eip_features_t flags;			/* EIP hardware-supported flags */
+ };
+ 
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr.h
+@@ -39,6 +39,7 @@ typedef void (*eip_tr_proc_t)(struct eip
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_32 (0x2U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_64 (0x1U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_128 (0x3U << 30)
++#define EIP_TR_IPSEC_SEQ_NUM_MASK_256 ((0x3U << 30) | (0x1U << 15))
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_384 ((0x2U << 30) | (0x1U << 15))
+ 
+ /*
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_ipsec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec.c
+@@ -162,6 +162,12 @@ static bool eip_tr_ipsec_verify(struct e
+ 	struct eip_tr_info_ipsec *ipsec = &info->ipsec;
+ 	bool enc;
+ 
++	if (!eip_ipsec_replay_supported(tr->ctx, ipsec->replay)) {
++		pr_warn("%p: Unsupported anti-replay mode %u.\n", tr,
++			ipsec->replay);
++		return false;
++	}
++
+ 	enc = ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ENC;
+ 	if (!enc && (ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ESN) && (ipsec->replay == EIP_IPSEC_REPLAY_NONE)) {
+ 		pr_warn("%px: Anti-replay should be enabled with ESN.\n", tr);
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip196/eip_tr_ipsec_dec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip196/eip_tr_ipsec_dec.c
+@@ -231,40 +231,59 @@ EXPORT_SYMBOL(eip_tr_ipsec_dec);
+  */
+ static uint32_t eip_tr_ipsec_get_replay_words(enum eip_ipsec_replay replay)
+ {
+-        switch (replay) {
+-        case EIP_IPSEC_REPLAY_NONE:
+-                return 0;
+-        case EIP_IPSEC_REPLAY_32:
+-                return 1;
+-        case EIP_IPSEC_REPLAY_64:
+-                return 2;
+-        case EIP_IPSEC_REPLAY_128:
+-                return 4;
+-	/* TODO: add support for larger replay window size */
+-        default:
+-		pr_warn("Unexpected replay window <%u>", replay);
+-                return 0;
+-        }
++	switch (replay) {
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return 1;
++	case EIP_IPSEC_REPLAY_64:
++		return 2;
++	case EIP_IPSEC_REPLAY_128:
++		return 4;
++	case EIP_IPSEC_REPLAY_256:
++		return 8;
++	case EIP_IPSEC_REPLAY_384:
++		return 12;
++	default:
++		return 0;
++	}
++}
++
++/* A 256-bit window uses a 384-bit record layout when only that is native. */
++static uint32_t eip_tr_ipsec_get_replay_alloc_words(struct eip_tr *tr,
++						    enum eip_ipsec_replay replay)
++{
++	if (replay == EIP_IPSEC_REPLAY_256 &&
++	    !(tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256))
++		return 12;
++
++	return eip_tr_ipsec_get_replay_words(replay);
+ }
+ 
+ /*
+  * eip_tr_ipsec_get_replay_seq_mask()
+  */
+-static uint32_t eip_tr_ipsec_get_replay_seq_mask(enum eip_ipsec_replay replay)
++static uint32_t eip_tr_ipsec_get_replay_seq_mask(struct eip_tr *tr,
++						 enum eip_ipsec_replay replay)
+ {
+-        switch (replay) {
+-        case EIP_IPSEC_REPLAY_NONE:
+-                return 0;
+-        case EIP_IPSEC_REPLAY_32:
+-                return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
+-        case EIP_IPSEC_REPLAY_64:
+-                return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
+-        case EIP_IPSEC_REPLAY_128:
+-                return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
+-        default:
+-		pr_warn("Unexpected replay window <%u>", replay);
+-                return 0;
+-        }
++	switch (replay) {
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
++	case EIP_IPSEC_REPLAY_64:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
++	case EIP_IPSEC_REPLAY_128:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
++	case EIP_IPSEC_REPLAY_256:
++		return tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ?
++			EIP_TR_IPSEC_SEQ_NUM_MASK_256 :
++			EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	case EIP_IPSEC_REPLAY_384:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	default:
++		return 0;
++	}
+ }
+ 
+ /*
+@@ -300,7 +319,7 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+          * Enable IPsec specific fields in control words 0.
+          */
+ 	tr_words[0] |= EIP_TK_CTRL_OP_HMAC_DEC;
+-        tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(ipsec->replay);
++	tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(tr, ipsec->replay);
+         tr_words[0] |= EIP_TR_IPSEC_EXT_SEQ_NUM(esn);
+         tr_words[1] |= EIP_TR_IPSEC_PAD_TYPE;
+ 
+@@ -342,8 +361,9 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 	 * For 32bit we need to set an extra word to '1', but its not included
+ 	 * in the context update length
+ 	 */
+-        mask_sz = eip_tr_ipsec_get_replay_words(ipsec->replay);
+-	ctx_num_words = mask_sz + EIP_TR_IPSEC_CTX_WORDS_ESN(esn);
++	ctx_num_words = eip_tr_ipsec_get_replay_words(ipsec->replay) +
++		EIP_TR_IPSEC_CTX_WORDS_ESN(esn);
++	mask_sz = eip_tr_ipsec_get_replay_alloc_words(tr, ipsec->replay);
+ 	mask_sz += (ipsec->replay == EIP_IPSEC_REPLAY_32) ? 1 : 0;
+ 
+ 	while (mask_sz--) {
+@@ -417,4 +437,3 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 		break;
+ 	}
+ }
+-
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_ctx.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_ctx.c
+@@ -312,6 +312,34 @@ bool eip_ctx_algo_supported(struct eip_c
+ EXPORT_SYMBOL(eip_ctx_algo_supported);
+ 
+ /*
++ * eip_ipsec_replay_supported()
++ *	Check whether EIP96 supports the requested anti-replay window.
++ */
++bool eip_ipsec_replay_supported(struct eip_ctx *ctx,
++				enum eip_ipsec_replay replay)
++{
++	if (!ctx || !ctx->ep)
++		return false;
++
++	switch (replay) {
++	case EIP_IPSEC_REPLAY_NONE:
++	case EIP_IPSEC_REPLAY_32:
++	case EIP_IPSEC_REPLAY_64:
++	case EIP_IPSEC_REPLAY_128:
++		return true;
++	case EIP_IPSEC_REPLAY_256:
++		return ctx->ep->eip96_options &
++			(EIP_HW_PE_EIP96_SEQMASK_256 |
++			 EIP_HW_PE_EIP96_SEQMASK_384);
++	case EIP_IPSEC_REPLAY_384:
++		return ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384;
++	default:
++		return false;
++	}
++}
++EXPORT_SYMBOL(eip_ipsec_replay_supported);
++
++/*
+  * eip_tun_update
+  *	Update Tunnel.
+  */
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_hw.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_hw.c
+@@ -757,6 +757,14 @@ int eip_hw_init(struct platform_device *
+ 	}
+ 
+ 	eip_hw_setup(base_addr);
++	ep->eip96_options = ioread32(base_addr + EIP_HW_PE_EIP96_OPTIONS);
++	dev_info(&pdev->dev,
++		 "EIP96 options 0x%08x, anti-replay 256: %s, 384: %s\n",
++		 ep->eip96_options,
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ? "native" :
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ?
++			"via 384-bit layout" : "no",
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ? "yes" : "no");
+ 
+ 	/*
+ 	 * load engine firmware;
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_hw.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_hw.h
+@@ -6,6 +6,7 @@
+ #ifndef __EIP_HW_H
+ #define __EIP_HW_H
+ 
++#include <linux/bits.h>
+ #include <linux/types.h>
+ 
+ /*
+@@ -377,7 +378,10 @@
+ #define EIP_HW_PE_EIP96_OUT_BUF_CTRL (EIP_HW_PE_EIP96_BASE + 0x1CU)
+ #define EIP_HW_PE_EIP96_LFSR_LO (EIP_HW_PE_EIP96_BASE + 0x70U)
+ #define EIP_HW_PE_EIP96_LFSR_HI (EIP_HW_PE_EIP96_BASE + 0x74U)
++#define EIP_HW_PE_EIP96_OPTIONS (EIP_HW_PE_EIP96_BASE + 0x3F8U)
+ #define EIP_HW_PE_EIP96_VERSION (EIP_HW_PE_EIP96_BASE + 0x3FCU)
++#define EIP_HW_PE_EIP96_SEQMASK_256 BIT(10)
++#define EIP_HW_PE_EIP96_SEQMASK_384 BIT(11)
+ #define EIP_HW_PE_EIP96_ECN_TABLE(x) (EIP_HW_PE_EIP96_BASE + 0x3E0U + ((x) * 4U))
+ 
+ #define EIP_HW_PE_IV0 (EIP_HW_PE_EIP96_BASE + 0x210U)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_priv.h
+@@ -111,6 +111,7 @@ struct eip_pdev {
+ 	struct dentry *dentry;			/* Driver debugfs dentry */
+ 	void __iomem *dev_vaddr;		/* starting virtual address of device */
+ 	dma_addr_t dev_paddr;			/* starting physical address of device */
++	u32 eip96_options;			/* EIP96 algorithm and replay capabilities */
+ 	dma_addr_t hwcache_paddr;		/* Physical address for HW flow */
+ 	bool redirect_en;			/* Redirection / Hybrid mode is configured */
+ 	bool dma_refill_req;			/* Hybrid DMA refill required */
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_tr.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_tr.h
+@@ -64,6 +64,7 @@ typedef bool (*eip_tr_init_t) (struct ei
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_32 (0x2U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_64 (0x1U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_128 (0x3U << 30)
++#define EIP_TR_IPSEC_SEQ_NUM_MASK_256 ((0x3U << 30) | (0x1U << 15))
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_384 ((0x2U << 30) | (0x1U << 15))
+ #define EIP_TR_IPSEC_DECAP_TOKEN_INST_SEQ_UPDATE(x) ((x) << 24)
+ #define EIP_TR_IPSEC_EXT_SEQ_NUM_PROC(x) ((x) << 29)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_tr_ipsec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_tr_ipsec.c
+@@ -213,6 +213,12 @@ static bool eip_tr_ipsec_verify(struct e
+ 	struct eip_tr_info_ipsec *ipsec = &info->ipsec;
+ 	bool enc;
+ 
++	if (!eip_ipsec_replay_supported(tr->ctx, ipsec->replay)) {
++		pr_warn("%p: Unsupported anti-replay mode %u.\n", tr,
++			ipsec->replay);
++		return false;
++	}
++
+ 	enc = ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ENC;
+ 	if (!enc && (ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ESN) && (ipsec->replay == EIP_IPSEC_REPLAY_NONE)) {
+ 		pr_warn("%px: Anti-replay should be enabled with ESN.\n", tr);
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197/eip_tr_ipsec_dec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197/eip_tr_ipsec_dec.c
+@@ -30,37 +30,57 @@
+ static uint32_t eip_tr_ipsec_get_replay_words(enum eip_ipsec_replay replay)
+ {
+ 	switch (replay) {
+-		case EIP_IPSEC_REPLAY_NONE:
+-			return 0;
+-		case EIP_IPSEC_REPLAY_32:
+-			return 1;
+-		case EIP_IPSEC_REPLAY_64:
+-			return 2;
+-		case EIP_IPSEC_REPLAY_128:
+-			return 4;
+-		case EIP_IPSEC_REPLAY_384:
+-		default:
+-			return 12;
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return 1;
++	case EIP_IPSEC_REPLAY_64:
++		return 2;
++	case EIP_IPSEC_REPLAY_128:
++		return 4;
++	case EIP_IPSEC_REPLAY_256:
++		return 8;
++	case EIP_IPSEC_REPLAY_384:
++		return 12;
++	default:
++		return 0;
+ 	}
+ }
+ 
++/* A 256-bit window uses a 384-bit record layout when only that is native. */
++static uint32_t eip_tr_ipsec_get_replay_alloc_words(struct eip_tr *tr,
++						    enum eip_ipsec_replay replay)
++{
++	if (replay == EIP_IPSEC_REPLAY_256 &&
++	    !(tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256))
++		return 12;
++
++	return eip_tr_ipsec_get_replay_words(replay);
++}
++
+ /*
+  * eip_tr_ipsec_get_replay_seq_mask()
+  */
+-static uint32_t eip_tr_ipsec_get_replay_seq_mask(enum eip_ipsec_replay replay)
++static uint32_t eip_tr_ipsec_get_replay_seq_mask(struct eip_tr *tr,
++						 enum eip_ipsec_replay replay)
+ {
+ 	switch (replay) {
+-		case EIP_IPSEC_REPLAY_NONE:
+-			return 0;
+-		case EIP_IPSEC_REPLAY_32:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
+-		case EIP_IPSEC_REPLAY_64:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
+-		case EIP_IPSEC_REPLAY_128:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
+-		case EIP_IPSEC_REPLAY_384:
+-		default:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
++	case EIP_IPSEC_REPLAY_64:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
++	case EIP_IPSEC_REPLAY_128:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
++	case EIP_IPSEC_REPLAY_256:
++		return tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ?
++			EIP_TR_IPSEC_SEQ_NUM_MASK_256 :
++			EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	case EIP_IPSEC_REPLAY_384:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	default:
++		return 0;
+ 	}
+ }
+ 
+@@ -92,7 +112,7 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 	/*
+ 	 * Enable IPsec specific fields in control words 0.
+ 	 */
+-	tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(ipsec->replay);
++	tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(tr, ipsec->replay);
+ 	tr_words[0] |= EIP_TR_IPSEC_EXT_SEQ_NUM(esn);
+ 	tr_words[1] |= EIP_TR_IPSEC_PAD_TYPE;
+ 
+@@ -131,7 +151,7 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 	/*
+ 	 * Set all bits to '1' in mask. For 32bit we need to set extra word to '1'.
+ 	 */
+-	mask_sz = eip_tr_ipsec_get_replay_words(ipsec->replay);
++	mask_sz = eip_tr_ipsec_get_replay_alloc_words(tr, ipsec->replay);
+ 	mask_sz += ipsec->replay == EIP_IPSEC_REPLAY_32 ? 1 : 0;
+ 	while (mask_sz--) {
+ 		*crypt_words++ = 0xFFFFFFFF;
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_ctx.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_ctx.c
+@@ -318,6 +318,34 @@ bool eip_ctx_algo_supported(struct eip_c
+ EXPORT_SYMBOL(eip_ctx_algo_supported);
+ 
+ /*
++ * eip_ipsec_replay_supported()
++ *	Check whether EIP96 supports the requested anti-replay window.
++ */
++bool eip_ipsec_replay_supported(struct eip_ctx *ctx,
++				enum eip_ipsec_replay replay)
++{
++	if (!ctx || !ctx->ep)
++		return false;
++
++	switch (replay) {
++	case EIP_IPSEC_REPLAY_NONE:
++	case EIP_IPSEC_REPLAY_32:
++	case EIP_IPSEC_REPLAY_64:
++	case EIP_IPSEC_REPLAY_128:
++		return true;
++	case EIP_IPSEC_REPLAY_256:
++		return ctx->ep->eip96_options &
++			(EIP_HW_PE_EIP96_SEQMASK_256 |
++			 EIP_HW_PE_EIP96_SEQMASK_384);
++	case EIP_IPSEC_REPLAY_384:
++		return ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384;
++	default:
++		return false;
++	}
++}
++EXPORT_SYMBOL(eip_ipsec_replay_supported);
++
++/*
+  * eip_tun_update
+  *	Update Tunnel.
+  */
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_hw.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_hw.c
+@@ -925,6 +925,14 @@ int eip_hw_init(struct platform_device *
+ #endif
+ 
+ 	eip_hw_setup(base_addr);
++	ep->eip96_options = ioread32(base_addr + EIP_HW_PE_EIP96_OPTIONS);
++	dev_info(&pdev->dev,
++		 "EIP96 options 0x%08x, anti-replay 256: %s, 384: %s\n",
++		 ep->eip96_options,
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ? "native" :
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ?
++			"via 384-bit layout" : "no",
++		 ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_384 ? "yes" : "no");
+ 
+ 	/*
+ 	 * load engine firmware;
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_hw.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_hw.h
+@@ -6,6 +6,7 @@
+ #ifndef __EIP_HW_H
+ #define __EIP_HW_H
+ 
++#include <linux/bits.h>
+ #include <linux/types.h>
+ 
+ /*
+@@ -377,7 +378,10 @@
+ #define EIP_HW_PE_EIP96_OUT_BUF_CTRL (EIP_HW_PE_EIP96_BASE + 0x1CU)
+ #define EIP_HW_PE_EIP96_LFSR_LO (EIP_HW_PE_EIP96_BASE + 0x70U)
+ #define EIP_HW_PE_EIP96_LFSR_HI (EIP_HW_PE_EIP96_BASE + 0x74U)
++#define EIP_HW_PE_EIP96_OPTIONS (EIP_HW_PE_EIP96_BASE + 0x3F8U)
+ #define EIP_HW_PE_EIP96_VERSION (EIP_HW_PE_EIP96_BASE + 0x3FCU)
++#define EIP_HW_PE_EIP96_SEQMASK_256 BIT(10)
++#define EIP_HW_PE_EIP96_SEQMASK_384 BIT(11)
+ #define EIP_HW_PE_EIP96_ECN_TABLE(x) (EIP_HW_PE_EIP96_BASE + 0x3E0U + ((x) * 4U))
+ 
+ #define EIP_HW_PE_IV0 (EIP_HW_PE_EIP96_BASE + 0x210U)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_priv.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_priv.h
+@@ -116,6 +116,7 @@ struct eip_pdev {
+ 	struct dentry *dentry;			/* Driver debugfs dentry */
+ 	void __iomem *dev_vaddr;		/* starting virtual address of device */
+ 	dma_addr_t dev_paddr;			/* starting physical address of device */
++	u32 eip96_options;			/* EIP96 algorithm and replay capabilities */
+ 	dma_addr_t hwcache_paddr;		/* Physical address for HW flow */
+ 	bool redirect_en;			/* Redirection / Hybrid mode is configured */
+ 	bool dma_refill_req;			/* Hybrid DMA refill required */
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr.h
+@@ -65,6 +65,7 @@ typedef bool (*eip_tr_init_t) (struct ei
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_32 (0x2U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_64 (0x1U << 30)
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_128 (0x3U << 30)
++#define EIP_TR_IPSEC_SEQ_NUM_MASK_256 ((0x3U << 30) | (0x1U << 15))
+ #define EIP_TR_IPSEC_SEQ_NUM_MASK_384 ((0x2U << 30) | (0x1U << 15))
+ #define EIP_TR_IPSEC_DECAP_TOKEN_INST_SEQ_UPDATE(x) ((x) << 24)
+ #define EIP_TR_IPSEC_EXT_SEQ_NUM_PROC(x) ((x) << 29)
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr_ipsec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr_ipsec.c
+@@ -202,6 +202,12 @@ static bool eip_tr_ipsec_verify(struct e
+ 	struct eip_tr_info_ipsec *ipsec = &info->ipsec;
+ 	bool enc;
+ 
++	if (!eip_ipsec_replay_supported(tr->ctx, ipsec->replay)) {
++		pr_warn("%p: Unsupported anti-replay mode %u.\n", tr,
++			ipsec->replay);
++		return false;
++	}
++
+ 	enc = ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ENC;
+ 	if (!enc && (ipsec->sa_flags & EIP_TR_IPSEC_FLAG_ESN) && (ipsec->replay == EIP_IPSEC_REPLAY_NONE)) {
+ 		pr_warn("%px: Anti-replay should be enabled with ESN.\n", tr);
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/eip197_v2/eip_tr_ipsec_dec.c
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/eip197_v2/eip_tr_ipsec_dec.c
+@@ -19,37 +19,57 @@
+ static uint32_t eip_tr_ipsec_get_replay_words(enum eip_ipsec_replay replay)
+ {
+ 	switch (replay) {
+-		case EIP_IPSEC_REPLAY_NONE:
+-			return 0;
+-		case EIP_IPSEC_REPLAY_32:
+-			return 1;
+-		case EIP_IPSEC_REPLAY_64:
+-			return 2;
+-		case EIP_IPSEC_REPLAY_128:
+-			return 4;
+-		case EIP_IPSEC_REPLAY_384:
+-		default:
+-			return 12;
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return 1;
++	case EIP_IPSEC_REPLAY_64:
++		return 2;
++	case EIP_IPSEC_REPLAY_128:
++		return 4;
++	case EIP_IPSEC_REPLAY_256:
++		return 8;
++	case EIP_IPSEC_REPLAY_384:
++		return 12;
++	default:
++		return 0;
+ 	}
+ }
+ 
++/* A 256-bit window uses a 384-bit record layout when only that is native. */
++static uint32_t eip_tr_ipsec_get_replay_alloc_words(struct eip_tr *tr,
++						    enum eip_ipsec_replay replay)
++{
++	if (replay == EIP_IPSEC_REPLAY_256 &&
++	    !(tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256))
++		return 12;
++
++	return eip_tr_ipsec_get_replay_words(replay);
++}
++
+ /*
+  * eip_tr_ipsec_get_replay_seq_mask()
+  */
+-static uint32_t eip_tr_ipsec_get_replay_seq_mask(enum eip_ipsec_replay replay)
++static uint32_t eip_tr_ipsec_get_replay_seq_mask(struct eip_tr *tr,
++						 enum eip_ipsec_replay replay)
+ {
+ 	switch (replay) {
+-		case EIP_IPSEC_REPLAY_NONE:
+-			return 0;
+-		case EIP_IPSEC_REPLAY_32:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
+-		case EIP_IPSEC_REPLAY_64:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
+-		case EIP_IPSEC_REPLAY_128:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
+-		case EIP_IPSEC_REPLAY_384:
+-		default:
+-			return EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	case EIP_IPSEC_REPLAY_NONE:
++		return 0;
++	case EIP_IPSEC_REPLAY_32:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_32;
++	case EIP_IPSEC_REPLAY_64:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_64;
++	case EIP_IPSEC_REPLAY_128:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_128;
++	case EIP_IPSEC_REPLAY_256:
++		return tr->ctx->ep->eip96_options & EIP_HW_PE_EIP96_SEQMASK_256 ?
++			EIP_TR_IPSEC_SEQ_NUM_MASK_256 :
++			EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	case EIP_IPSEC_REPLAY_384:
++		return EIP_TR_IPSEC_SEQ_NUM_MASK_384;
++	default:
++		return 0;
+ 	}
+ }
+ 
+@@ -81,7 +101,7 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 	/*
+ 	 * Enable IPsec specific fields in control words 0.
+ 	 */
+-	tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(ipsec->replay);
++	tr_words[0] |= eip_tr_ipsec_get_replay_seq_mask(tr, ipsec->replay);
+ 	tr_words[0] |= EIP_TR_IPSEC_EXT_SEQ_NUM(esn);
+ 	tr_words[1] |= EIP_TR_IPSEC_PAD_TYPE;
+ 
+@@ -120,7 +140,7 @@ void eip_tr_ipsec_dec_cmn_init(struct ei
+ 	/*
+ 	 * Set all bits to '1' in mask. For 32bit we need to set extra word to '1'.
+ 	 */
+-	mask_sz = eip_tr_ipsec_get_replay_words(ipsec->replay);
++	mask_sz = eip_tr_ipsec_get_replay_alloc_words(tr, ipsec->replay);
+ 	mask_sz += ipsec->replay == EIP_IPSEC_REPLAY_32 ? 1 : 0;
+ 	while (mask_sz--) {
+ 		*crypt_words++ = 0xFFFFFFFF;
+--- nss-eip-10a89a95f814cd325e23105f102428644f45014f.orig/driver/exports/eip.h
++++ nss-eip-10a89a95f814cd325e23105f102428644f45014f/driver/exports/eip.h
+@@ -652,6 +652,19 @@ void eip_tr_get_algo_info(struct eip_tr
+ bool eip_ctx_algo_supported(struct eip_ctx *dma_ctx, const char *algo_name);
+ 
+ /*
++ * eip_ipsec_replay_supported
++ *	Check whether the EIP96 instance can represent an IPsec replay window.
++ *
++ * @param[in] ctx	Driver context associated with the IPsec record.
++ * @param[in] replay	Replay window encoding to validate.
++ *
++ * @return
++ * True when the replay window is supported by hardware.
++ */
++bool eip_ipsec_replay_supported(struct eip_ctx *ctx,
++				enum eip_ipsec_replay replay);
++
++/*
+  * eip_is_inline_supported
+  * 	Check if inline port is supported in EIP.
+  *
