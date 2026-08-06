@@ -1,0 +1,813 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 6 Aug 2026 00:00:00 +0800
+Subject: [PATCH] net: ethernet: qualcomm: ppe: invalidate stale routes
+
+Retain each offloaded netfilter flow route generation and resolved
+neighbour, then reject publication when either changes during the hardware
+transaction. Register FIB and neighbour notifiers to disable installed PPE
+rows before marking their netfilter flows for teardown.
+
+Track the independently resolved underlay neighbour for IPIP6 tunnels and
+apply the same validation around tunnel-backed flow installation. Keep
+PPPoE and full-inline EIP paths exempt from an ordinary neighbour while
+limiting PPE flowtable offload to the initial network namespace.
+
+Expose route invalidation counters and state through debugfs so failed
+hardware disables and stale-install rejections are visible during runtime
+diagnosis.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/Documentation/networking/qualcomm-ppe-offload.rst
++++ b/Documentation/networking/qualcomm-ppe-offload.rst
+@@ -184,11 +184,13 @@ per-flow hit counters feed the flowtable
+ link-down port stop reporting activity so the flowtable expires and
+ re-offloads them: hardware-forwarded packets never revalidate the
+ route in software, and the hit counters count at ingress lookup
+-whether or not egress delivery works. A route or neighbor that changes
+-on the far side of a link that stays up is the remaining blind spot -
+-such a flow keeps forwarding to the stale destination until its
+-conntrack entry dies (the hardware flow aging engine, deliberately
+-unused, could serve as a periodic revalidation net; see below).
++whether or not egress delivery works. Each direct route therefore retains
++its resolved neighbour and FIB generation. A final check brackets hardware
++publication, while FIB and neighbour notifiers disable stale rows and mark
++their netfilter flows for teardown. Tunnel encap rows retain and validate the
++separate underlay neighbour; PPPoE and full-inline EIP paths have no ordinary
++neighbour requirement. Offload is limited to the initial network namespace,
++whose FIB notifier is registered by the PPE instance.
+ 
+ Datapath invariants worth knowing:
+ 
+--- a/drivers/net/ethernet/qualcomm/Kconfig
++++ b/drivers/net/ethernet/qualcomm/Kconfig
+@@ -66,6 +66,7 @@ config QCOM_PPE
+ 	depends on ARCH_QCOM || COMPILE_TEST
+ 	depends on BRIDGE || BRIDGE=n
+ 	depends on NETFILTER && NETFILTER_INGRESS && INET
++	depends on NF_FLOW_TABLE
+ 	select REGMAP_MMIO
+ 	select PHYLINK
+ 	select PCS_QCOM_IPQ9574
+--- a/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
++++ b/drivers/net/ethernet/qualcomm/ppe/ppe_flowtable.c
+@@ -33,6 +33,8 @@
+ #include <linux/seq_file.h>
+ #include <linux/soc/qcom/ppe.h>
+ #include <linux/tc_act/tc_csum.h>
++#include <linux/workqueue.h>
++#include <net/fib_notifier.h>
+ #include <net/flow_offload.h>
+ #include <net/ip6_tunnel.h>
+ #include <net/ip6_route.h>
+@@ -40,6 +42,9 @@
+ #include <net/ipv6.h>
+ #include <net/lwtunnel.h>
+ #include <net/neighbour.h>
++#include <net/netevent.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_flow_table.h>
+ #include <net/tcp.h>
+ 
+ #include "edma_port.h"
+@@ -159,7 +164,10 @@ struct ppe_flowtable;
+  * @zombie_node: Quarantine list node for an undeletable hardware flow.
+  * @rcu: RCU callback used to release a removed flow.
+  * @ft: Flowtable which owns this flow while its EIP callback is usable.
++ * @nf_flow: Netfilter flow which owns the callback cookie.
++ * @neigh: Resolved neighbour held for ordinary routed egress.
+  * @cookie: Flow cookie of the rule.
++ * @fib_seq: FIB generation used to construct the flow rule.
+  * @index: Hardware flow table index.
+  * @entry: The flow, kept for the delete command.
+  * @nexthop: Next hop index of the flow.
+@@ -180,13 +188,17 @@ struct ppe_flowtable;
+  * @eport: Egress PPE port of the flow.
+  * @packets: Hit packet count at the last stats read.
+  * @bytes: Hit byte count at the last stats read.
++ * @invalidated: Route invalidation disabled this row pending teardown.
+  */
+ struct ppe_ft_flow {
+ 	struct rhash_head node;
+ 	struct list_head zombie_node;
+ 	struct rcu_head rcu;
+ 	struct ppe_flowtable *ft;
++	struct flow_offload *nf_flow;
++	struct neighbour *neigh;
+ 	unsigned long cookie;
++	u32 fib_seq;
+ 	int index;
+ 	struct ppe_flow_entry entry;
+ 	u16 nexthop;
+@@ -207,6 +219,7 @@ struct ppe_ft_flow {
+ 	u8 eport;
+ 	u32 packets;
+ 	u64 bytes;
++	bool invalidated;
+ };
+ 
+ /* One PPE outer tuple can be shared by several inbound SAs during rekey;
+@@ -231,6 +244,8 @@ struct ppe_ft_tunnel {
+ 	struct ppe_ft_ref ref;
+ 	bool poisoned;
+ 	struct net_device *dev;
++	struct neighbour *neigh;
++	u32 fib_seq;
+ 	struct in6_addr local;
+ 	struct in6_addr remote;
+ 	u8 local_mac[ETH_ALEN];
+@@ -265,6 +280,11 @@ static_assert(offsetof(struct ppe_ft_tun
+ 
+ #define PPE_FT_HOST_HASH_BITS	8
+ 
++enum ppe_ft_route_event {
++	PPE_FT_ROUTE_EVENT_FIB,
++	PPE_FT_ROUTE_EVENT_NEIGH,
++};
++
+ /* Refcounted hardware host entry. Its hardware-selected index is
+  * carried explicitly by every flow which references it.
+  */
+@@ -295,6 +315,19 @@ struct ppe_ft_host {
+  * @replace_unsupported: Number of unsupported replace requests.
+  * @replace_failed: Replace requests which failed after validation.
+  * @destroy_calls: Number of flow destroy requests.
++ * @fib_events: FIB change notifications received after setup.
++ * @neigh_events: Neighbour change notifications received after setup.
++ * @stale_rejects: Flow installs rejected by final route validation.
++ * @fib_invalidations: Hardware rows invalidated after a FIB change.
++ * @neigh_invalidations: Hardware rows invalidated after a neighbour change.
++ * @disable_failures: Hardware rows which could not be disabled on invalidation.
++ * @route_generation: FIB and neighbour event generation gating installs.
++ * @route_events: Pending route-event bitmap consumed by @route_work.
++ * @route_work: Process-context flow invalidation worker.
++ * @fib_nb: FIB lifecycle notifier.
++ * @netevent_nb: Neighbour lifecycle notifier.
++ * @notifiers_ready: Ignore the initial FIB dump until registration completes.
++ * @stopping: Prevent notifier work from being queued during teardown.
+  * @hosts: Refcount of the flows sharing a source host entry.
+  * @nexthop_used: Allocation bitmap of the next hop entries.
+  * @my_macs: Refcounted router MAC slots.
+@@ -324,6 +357,19 @@ struct ppe_flowtable {
+ 	atomic_long_t replace_unsupported;
+ 	atomic_long_t replace_failed;
+ 	atomic_long_t destroy_calls;
++	atomic_long_t fib_events;
++	atomic_long_t neigh_events;
++	atomic_long_t stale_rejects;
++	atomic_long_t fib_invalidations;
++	atomic_long_t neigh_invalidations;
++	atomic_long_t disable_failures;
++	atomic_long_t route_generation;
++	unsigned long route_events;
++	struct work_struct route_work;
++	struct notifier_block fib_nb;
++	struct notifier_block netevent_nb;
++	bool notifiers_ready;
++	bool stopping;
+ 	DECLARE_HASHTABLE(hosts, PPE_FT_HOST_HASH_BITS);
+ 	DECLARE_BITMAP(nexthop_used, PPE_NEXTHOP_TBL_ENTRIES);
+ 	struct ppe_ft_my_mac my_macs[PPE_MY_MAC_TBL_ENTRIES];
+@@ -398,6 +444,182 @@ static const struct rhashtable_params pp
+ 	.automatic_shrinking = true,
+ };
+ 
++static void ppe_ft_flow_neigh_put(struct ppe_ft_flow *flow)
++{
++	if (!flow || !flow->neigh)
++		return;
++
++	neigh_release(flow->neigh);
++	flow->neigh = NULL;
++}
++
++static bool ppe_ft_neigh_valid(struct neighbour *neigh,
++			       const u8 *dmac)
++{
++	bool valid;
++
++	if (!neigh || READ_ONCE(neigh->dead))
++		return false;
++
++	read_lock_bh(&neigh->lock);
++	valid = neigh->nud_state & NUD_VALID;
++	valid = valid && is_valid_ether_addr(neigh->ha) &&
++		ether_addr_equal(neigh->ha, dmac);
++	read_unlock_bh(&neigh->lock);
++
++	return valid;
++}
++
++static bool ppe_ft_tunnel_route_valid(struct ppe_flowtable *ft,
++				      const struct ppe_ft_flow *flow)
++{
++	const struct ppe_ft_tunnel *tunnel;
++	struct net *net;
++
++	if (flow->tunnel < 0)
++		return true;
++	if (flow->tunnel >= PPE_FT_TUNNELS)
++		return false;
++
++	tunnel = &ft->tunnels[flow->tunnel];
++	if (!tunnel->ref.refcnt || tunnel->poisoned || !tunnel->dev)
++		return false;
++
++	net = dev_net(tunnel->dev);
++	if (net != &init_net ||
++	    tunnel->fib_seq != fib_notifier_seq_read(net))
++		return false;
++
++	if (tunnel->pppoe >= 0)
++		return true;
++
++	return ppe_ft_neigh_valid(tunnel->neigh, tunnel->remote_mac);
++}
++
++static bool ppe_ft_flow_route_valid(struct ppe_flowtable *ft,
++				    const struct ppe_ft_flow *flow)
++{
++	struct net *net;
++
++	if (!flow->nf_flow)
++		return false;
++
++	net = nf_ct_net(flow->nf_flow->ct);
++	if (net != &init_net || flow->fib_seq != fib_notifier_seq_read(net))
++		return false;
++	if (flow->neigh && !ppe_ft_neigh_valid(flow->neigh, flow->dmac))
++		return false;
++
++	return ppe_ft_tunnel_route_valid(ft, flow);
++}
++
++static bool ppe_ft_flow_neigh_stale(struct ppe_flowtable *ft,
++				    const struct ppe_ft_flow *flow)
++{
++	const struct ppe_ft_tunnel *tunnel;
++
++	if (flow->neigh && !ppe_ft_neigh_valid(flow->neigh, flow->dmac))
++		return true;
++	if (flow->tunnel < 0 || flow->tunnel >= PPE_FT_TUNNELS)
++		return false;
++
++	tunnel = &ft->tunnels[flow->tunnel];
++	return tunnel->pppoe < 0 &&
++	       !ppe_ft_neigh_valid(tunnel->neigh, tunnel->remote_mac);
++}
++
++static void ppe_ft_route_work(struct work_struct *work)
++{
++	struct ppe_flowtable *ft = container_of(work, struct ppe_flowtable,
++						      route_work);
++	unsigned long events;
++
++	while ((events = xchg(&ft->route_events, 0))) {
++		struct rhashtable_iter iter;
++		struct ppe_ft_flow *flow;
++
++		if (READ_ONCE(ft->stopping))
++			return;
++
++		mutex_lock(&ft->lock);
++		rhashtable_walk_enter(&ft->flows, &iter);
++		rhashtable_walk_start(&iter);
++		while ((flow = rhashtable_walk_next(&iter))) {
++			bool fib_stale = test_bit(PPE_FT_ROUTE_EVENT_FIB, &events);
++			bool neigh_stale;
++			int ret;
++
++			if (IS_ERR(flow)) {
++				if (PTR_ERR(flow) == -EAGAIN)
++					continue;
++				break;
++			}
++			if (flow->invalidated)
++				continue;
++
++			neigh_stale =
++				test_bit(PPE_FT_ROUTE_EVENT_NEIGH, &events) &&
++				ppe_ft_flow_neigh_stale(ft, flow);
++			if (!fib_stale && !neigh_stale)
++				continue;
++
++			flow->invalidated = true;
++			ret = ppe_flow_entry_enable(ft->ppe_dev, flow->index, false);
++			if (ret) {
++				atomic_long_inc(&ft->disable_failures);
++				dev_warn(ft->ppe_dev->dev,
++					 "failed to disable stale flow %d: %d\n",
++					 flow->index, ret);
++			}
++			if (fib_stale)
++				atomic_long_inc(&ft->fib_invalidations);
++			else
++				atomic_long_inc(&ft->neigh_invalidations);
++			flow_offload_teardown(flow->nf_flow);
++		}
++		rhashtable_walk_stop(&iter);
++		rhashtable_walk_exit(&iter);
++		mutex_unlock(&ft->lock);
++	}
++}
++
++static int ppe_ft_fib_event(struct notifier_block *nb, unsigned long event,
++			    void *ptr)
++{
++	struct ppe_flowtable *ft = container_of(nb, struct ppe_flowtable,
++						      fib_nb);
++
++	if (!READ_ONCE(ft->notifiers_ready) || READ_ONCE(ft->stopping))
++		return NOTIFY_DONE;
++
++	atomic_long_inc(&ft->fib_events);
++	atomic_long_inc(&ft->route_generation);
++	set_bit(PPE_FT_ROUTE_EVENT_FIB, &ft->route_events);
++	schedule_work(&ft->route_work);
++
++	return NOTIFY_DONE;
++}
++
++static int ppe_ft_netevent(struct notifier_block *nb, unsigned long event,
++			   void *ptr)
++{
++	struct ppe_flowtable *ft = container_of(nb, struct ppe_flowtable,
++						      netevent_nb);
++	struct neighbour *neigh = ptr;
++
++	if (event != NETEVENT_NEIGH_UPDATE ||
++	    !READ_ONCE(ft->notifiers_ready) || READ_ONCE(ft->stopping) ||
++	    !neigh->dev || dev_net(neigh->dev) != &init_net)
++		return NOTIFY_DONE;
++
++	atomic_long_inc(&ft->neigh_events);
++	atomic_long_inc(&ft->route_generation);
++	set_bit(PPE_FT_ROUTE_EVENT_NEIGH, &ft->route_events);
++	schedule_work(&ft->route_work);
++
++	return NOTIFY_DONE;
++}
++
+ /* The mangle words of an offloaded rule, collected before translation.
+  * The Ethernet buffer overlays the destination and source addresses as
+  * they appear in the header.
+@@ -1489,7 +1711,7 @@ err_ref:
+ }
+ 
+ static void ppe_ft_tunnel_underlay_put(struct ppe_flowtable *ft, int port,
+-				       int pppoe)
++					       int pppoe)
+ {
+ 	struct ppe_ft_tunnel_underlay *underlay;
+ 	int index = pppoe < 0 ? port : PPE_PORT_ID_COUNT + pppoe;
+@@ -1526,6 +1748,25 @@ static void ppe_ft_tunnel_underlay_put(s
+ 	memset(underlay, 0, sizeof(*underlay));
+ }
+ 
++static void ppe_ft_tunnel_neigh_put(struct ppe_ft_tunnel *tunnel)
++{
++	if (!tunnel->neigh)
++		return;
++
++	neigh_release(tunnel->neigh);
++	tunnel->neigh = NULL;
++}
++
++static void ppe_ft_tunnel_path_put(struct ppe_flowtable *ft,
++				   struct ppe_ft_tunnel *path)
++{
++	ppe_ft_tunnel_neigh_put(path);
++	if (path->pppoe >= 0)
++		ppe_ft_pppoe_put(ft, path->pppoe);
++	else
++		ppe_ft_vlan_put(ft, path->vlan);
++}
++
+ static int ppe_ft_tunnel_resolve(struct ppe_flowtable *ft,
+ 				 const struct net_device *tdev,
+ 				 int link,
+@@ -1533,6 +1774,8 @@ static int ppe_ft_tunnel_resolve(struct
+ 				 const struct in6_addr *remote,
+ 				 struct ppe_ft_tunnel *tunnel)
+ {
++	struct net *net = dev_net(tdev);
++	unsigned int fib_seq;
+ 	struct net_device_path_stack stack = {};
+ 	struct flowi6 fl6 = {
+ 		.flowi6_oif = link,
+@@ -1541,6 +1784,7 @@ static int ppe_ft_tunnel_resolve(struct
+ 	};
+ 	struct neighbour *neigh;
+ 	struct dst_entry *dst;
++	u32 dst_cookie;
+ 	u8 daddr[ETH_ALEN] = {};
+ 	u8 peer[ETH_ALEN] = {};
+ 	bool have_pppoe = false;
+@@ -1551,12 +1795,16 @@ static int ppe_ft_tunnel_resolve(struct
+ 
+ 	tunnel->vlan = -1;
+ 	tunnel->pppoe = -1;
++	if (net != &init_net)
++		return -EOPNOTSUPP;
+ 
+-	dst = ip6_route_output(dev_net(tdev), NULL, &fl6);
++	fib_seq = fib_notifier_seq_read(net);
++	dst = ip6_route_output(net, NULL, &fl6);
+ 	if (dst->error) {
+ 		ret = dst->error;
+ 		goto out_dst;
+ 	}
++	dst_cookie = rt6_get_cookie(dst_rt6_info(dst));
+ 	rcu_read_lock();
+ 	ret = dev_fill_forward_path(dst->dev, daddr, &stack);
+ 	if (ret)
+@@ -1638,9 +1886,11 @@ out_unlock:
+ 		else
+ 			ether_addr_copy(tunnel->remote_mac, neigh->ha);
+ 		read_unlock_bh(&neigh->lock);
+-		neigh_release(neigh);
+-		if (ret)
++		if (ret) {
++			neigh_release(neigh);
+ 			goto out_dst;
++		}
++		tunnel->neigh = neigh;
+ 
+ 		if (vid >= 0) {
+ 			tunnel->vlan = ppe_ft_vlan_get(ft,
+@@ -1658,7 +1908,15 @@ out_unlock:
+ 		tunnel->vlan_proto = htons(ETH_P_8021Q);
+ 		tunnel->vlan_id = vid;
+ 	}
++
++	if (fib_seq != fib_notifier_seq_read(net) ||
++	    !dst_check(dst, dst_cookie))
++		ret = -EAGAIN;
++	else
++		tunnel->fib_seq = fib_seq;
+ out_dst:
++	if (ret)
++		ppe_ft_tunnel_path_put(ft, tunnel);
+ 	dst_release(dst);
+ 	return ret;
+ }
+@@ -1676,6 +1934,7 @@ static bool ppe_ft_tunnel_match(const st
+ 				const struct ppe_ft_tunnel *path)
+ {
+ 	return tunnel->underlay_port == path->underlay_port &&
++	       tunnel->fib_seq == path->fib_seq &&
+ 	       tunnel->vlan_proto == path->vlan_proto &&
+ 	       tunnel->vlan_id == path->vlan_id &&
+ 	       tunnel->pppoe == path->pppoe &&
+@@ -1687,15 +1946,6 @@ static bool ppe_ft_tunnel_match(const st
+ 
+ static void ppe_ft_tunnel_put(struct ppe_flowtable *ft, int index);
+ 
+-static void ppe_ft_tunnel_path_put(struct ppe_flowtable *ft,
+-				   const struct ppe_ft_tunnel *path)
+-{
+-	if (path->pppoe >= 0)
+-		ppe_ft_pppoe_put(ft, path->pppoe);
+-	else
+-		ppe_ft_vlan_put(ft, path->vlan);
+-}
+-
+ static int ppe_ft_tunnel_get(struct ppe_flowtable *ft, struct net_device *dev,
+ 			     const struct in6_addr *local,
+ 			     const struct in6_addr *remote, int link,
+@@ -1826,6 +2076,7 @@ err_decap:
+ 	}
+ 	if (cleanup_ret) {
+ 		tunnel->poisoned = true;
++		ppe_ft_tunnel_neigh_put(tunnel);
+ 		dev_hold(dev);
+ 		WARN_ONCE(1, "quarantining a partial PPE tunnel\n");
+ 		return ret;
+@@ -1870,6 +2121,7 @@ static void ppe_ft_tunnel_put(struct ppe
+ 	if (ret) {
+ 		tunnel->poisoned = true;
+ 		tunnel->ref.refcnt = 1;
++		ppe_ft_tunnel_neigh_put(tunnel);
+ 		WARN_ONCE(1, "quarantining an undeletable PPE tunnel\n");
+ 		return;
+ 	}
+@@ -2308,7 +2560,7 @@ static bool ppe_ft_flow_hw_del(struct pp
+  * the table row was not proven reusable.
+  */
+ static void ppe_ft_flow_quarantine(struct ppe_flowtable *ft,
+-				   struct ppe_ft_flow *flow)
++					   struct ppe_ft_flow *flow)
+ {
+ 	int ret;
+ 
+@@ -2318,6 +2570,7 @@ static void ppe_ft_flow_quarantine(struc
+ 			"failed to disable quarantined flow %d: %d\n",
+ 			flow->index, ret);
+ 
++	ppe_ft_flow_neigh_put(flow);
+ 	list_add_tail(&flow->zombie_node, &ft->zombies);
+ }
+ 
+@@ -2339,6 +2592,10 @@ static int ppe_ft_eip_flow_mtu_set(void
+ 		ret = -ESHUTDOWN;
+ 		goto out;
+ 	}
++	if (flow->invalidated) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
+ 
+ 	/* The provider becomes visible before the PPE row is installed.  Cache an
+ 	 * early rekey's MTU now; once index is valid, update the live row while it
+@@ -2416,8 +2673,9 @@ out_module:
+ }
+ 
+ static int ppe_ft_flow_replace(struct ppe_flowtable *ft,
+-			       struct flow_cls_offload *f)
++				       struct flow_cls_offload *f)
+ {
++	struct flow_offload_tuple *tuple = (void *)f->cookie;
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+ 	struct edma_port_priv *port_priv;
+ 	struct flow_action_entry *act;
+@@ -2434,6 +2692,7 @@ static int ppe_ft_flow_replace(struct pp
+ 	bool tunnel_flow, tunnel_encap = false, lwt_tunnel = false;
+ 	bool eip_flow = false;
+ 	bool installed;
++	long route_generation;
+ 	int i, nexthop, ret, redirects = 0, vlan_pushes = 0;
+ 	int pppoe_pushes = 0, csums = 0;
+ 	int iport = -1, imtu = 0;
+@@ -2451,6 +2710,7 @@ static int ppe_ft_flow_replace(struct pp
+ 	rcu_read_unlock();
+ 	if (installed)
+ 		return 0;
++	route_generation = atomic_long_read(&ft->route_generation);
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+@@ -2487,6 +2747,8 @@ static int ppe_ft_flow_replace(struct pp
+ 		return -ENOMEM;
+ 
+ 	flow->ft = ft;
++	flow->nf_flow = flow_offload_tuple_to_flow(tuple);
++	flow->fib_seq = tuple->fib_seq;
+ 	flow->cookie = f->cookie;
+ 	flow->index = -1;
+ 	flow->my_mac = -1;
+@@ -2820,6 +3082,14 @@ static int ppe_ft_flow_replace(struct pp
+ 		ret = -EOPNOTSUPP;
+ 		goto err_tdev;
+ 	}
++	if (!eip_flow && !tunnel_encap && data.pppoe_sid < 0) {
++		if (!tuple->neigh) {
++			atomic_long_inc(&ft->stale_rejects);
++			ret = -EAGAIN;
++			goto err_tdev;
++		}
++		flow->neigh = neigh_clone(tuple->neigh);
++	}
+ 
+ 	if (!eip_flow)
+ 		flow->entry.pmtu = odev->mtu;
+@@ -3120,9 +3390,16 @@ static int ppe_ft_flow_replace(struct pp
+ 		goto err_host;
+ 	flow->index = ret;
+ 
++	if (route_generation != atomic_long_read(&ft->route_generation) ||
++	    !ppe_ft_flow_route_valid(ft, flow))
++		goto err_stale_hw_flow;
++
+ 	ret = ppe_flow_entry_enable(ft->ppe_dev, flow->index, true);
+ 	if (ret)
+ 		goto err_hw_flow;
++	if (route_generation != atomic_long_read(&ft->route_generation) ||
++	    !ppe_ft_flow_route_valid(ft, flow))
++		goto err_stale_enabled_flow;
+ 
+ 	ret = rhashtable_lookup_insert_fast(&ft->flows, &flow->node,
+ 					    ppe_ft_params);
+@@ -3146,6 +3423,17 @@ static int ppe_ft_flow_replace(struct pp
+ 
+ 	return 0;
+ 
++err_stale_enabled_flow:
++	ret = ppe_flow_entry_enable(ft->ppe_dev, flow->index, false);
++	if (ret) {
++		atomic_long_inc(&ft->disable_failures);
++		dev_warn(ft->ppe_dev->dev,
++			 "failed to disable rejected stale flow %d: %d\n",
++			 flow->index, ret);
++	}
++err_stale_hw_flow:
++	atomic_long_inc(&ft->stale_rejects);
++	ret = -EAGAIN;
+ err_hw_flow:
+ 	if (!ppe_ft_flow_hw_del(ft, flow)) {
+ 		/* The hardware flow could not be removed and keeps forwarding
+@@ -3189,6 +3477,7 @@ err_prelock_ivp:
+ 	if (tdev)
+ 		dev_put(tdev);
+ err_free:
++	ppe_ft_flow_neigh_put(flow);
+ 	ppe_ft_eip_provider_put(flow);
+ 	kfree_rcu(flow, rcu);
+ 
+@@ -3214,6 +3503,7 @@ static int ppe_ft_flow_destroy(struct pp
+ 	if (ppe_ft_flow_hw_del(ft, flow)) {
+ 		WRITE_ONCE(flow->ft, NULL);
+ 		flow->index = -1;
++		ppe_ft_flow_neigh_put(flow);
+ 		ppe_ft_host_put(ft, &flow->entry);
+ 		clear_bit(flow->nexthop, ft->nexthop_used);
+ 		ppe_ft_l3_my_mac_put(ft, flow->my_mac_l3_if,
+@@ -3290,6 +3580,10 @@ static int ppe_ft_flow_stats(struct ppe_
+ 		rcu_read_unlock();
+ 		return -ENOENT;
+ 	}
++	if (flow->invalidated) {
++		rcu_read_unlock();
++		return 0;
++	}
+ 
+ 	/* Hardware-forwarded packets never revalidate the route in
+ 	 * software, and the hit counter of a flow counts at ingress
+@@ -3417,6 +3711,17 @@ static int ppe_ft_reason_counters_show(s
+ 	struct ppe_flowtable *ft = seq->private;
+ 	int index;
+ 
++	seq_printf(seq,
++		   "route fib_events:%ld neigh_events:%ld stale_rejects:%ld fib_invalidations:%ld neigh_invalidations:%ld disable_failures:%ld generation:%ld pending:%lx\n",
++		   atomic_long_read(&ft->fib_events),
++		   atomic_long_read(&ft->neigh_events),
++		   atomic_long_read(&ft->stale_rejects),
++		   atomic_long_read(&ft->fib_invalidations),
++		   atomic_long_read(&ft->neigh_invalidations),
++		   atomic_long_read(&ft->disable_failures),
++		   atomic_long_read(&ft->route_generation),
++		   READ_ONCE(ft->route_events));
++
+ 	for (index = 0; index < PPE_DROP_CPU_CNT_TBL_ENTRIES; index++) {
+ 		u32 row[PPE_DROP_CPU_CNT_TBL_WORDS] = {};
+ 		u32 reg = PPE_DROP_CPU_CNT_TBL_ADDR +
+@@ -3918,12 +4223,18 @@ static int ppe_ft_flows_show(struct seq_
+ 	mutex_unlock(&ft->lock);
+ 
+ 	seq_printf(seq,
+-		   "bound:%d replace:%ld unsupported:%ld failed:%ld destroy:%ld zombies:%d\n",
++		   "bound:%d replace:%ld unsupported:%ld failed:%ld destroy:%ld zombies:%d fib_events:%ld neigh_events:%ld stale_rejects:%ld fib_invalidations:%ld neigh_invalidations:%ld disable_failures:%ld\n",
+ 		   !list_empty(&ft->block_cb_list),
+ 		   atomic_long_read(&ft->replace_calls),
+ 		   atomic_long_read(&ft->replace_unsupported),
+ 		   atomic_long_read(&ft->replace_failed),
+-		   atomic_long_read(&ft->destroy_calls), zombies);
++		   atomic_long_read(&ft->destroy_calls), zombies,
++		   atomic_long_read(&ft->fib_events),
++		   atomic_long_read(&ft->neigh_events),
++		   atomic_long_read(&ft->stale_rejects),
++		   atomic_long_read(&ft->fib_invalidations),
++		   atomic_long_read(&ft->neigh_invalidations),
++		   atomic_long_read(&ft->disable_failures));
+ 
+ 	rhashtable_walk_enter(&ft->flows, &iter);
+ 	rhashtable_walk_start(&iter);
+@@ -3955,10 +4266,11 @@ static int ppe_ft_flows_show(struct seq_
+ 				   &flow->entry.dip.ip4,
+ 				   be16_to_cpu(flow->entry.dport));
+ 		seq_printf(seq,
+-			   " proto:%u profile:%u service:%u index:%d valid:%u host:%u host_dst:%u nexthop:%u eip:%u eip_vp:%d packets:%u bytes:%llu\n",
++			   " proto:%u profile:%u service:%u index:%d valid:%u invalidated:%u fib_seq:%u neigh:%u host:%u host_dst:%u nexthop:%u eip:%u eip_vp:%d packets:%u bytes:%llu\n",
+ 			   flow->entry.proto, flow->entry.pri_profile,
+ 			   flow->entry.service_code, flow->index,
+-			   !!(w0 & PPE_FLOW_W0_VALID), flow->entry.host_index,
++			   !!(w0 & PPE_FLOW_W0_VALID), flow->invalidated,
++			   flow->fib_seq, !!flow->neigh, flow->entry.host_index,
+ 			   !!(w0 & PPE_FLOW_W0_HOST_INDEX_TYPE), flow->nexthop,
+ 			   !!flow->eip_ops, flow->eip_vp, packets,
+ 			   (unsigned long long)bytes);
+@@ -4101,6 +4413,8 @@ void ppe_flowtable_port_profile_state(st
+ 		}
+ 		if (flow->eport != port || flow->entry.pri_profile != profile)
+ 			continue;
++		if (flow->invalidated && up)
++			continue;
+ 
+ 		ret = ppe_flow_entry_enable(ppe_dev, flow->index, up);
+ 		if (ret) {
+@@ -4145,6 +4459,8 @@ void ppe_flowtable_port_peer_state(struc
+ 		if (flow->eport != port ||
+ 		    !ether_addr_equal(flow->dmac, addr))
+ 			continue;
++		if (flow->invalidated && enable)
++			continue;
+ 
+ 		ret = ppe_flow_entry_profile_set(ppe_dev, flow->index,
+ 						 profile, enable);
+@@ -4189,6 +4505,8 @@ void ppe_flowtable_port_peers_sync(struc
+ 		}
+ 		if (flow->eport != port)
+ 			continue;
++		if (flow->invalidated)
++			continue;
+ 
+ 		/* Do not use the single-node fallback here.  A detached peer may
+ 		 * no longer exist, while a peer retained by another MLO node has an
+@@ -4316,6 +4634,7 @@ int ppe_flowtable_setup(struct ppe_devic
+ 	}
+ 
+ 	mutex_init(&ft->lock);
++	INIT_WORK(&ft->route_work, ppe_ft_route_work);
+ 	INIT_LIST_HEAD(&ft->block_cb_list);
+ 	INIT_LIST_HEAD(&ft->zombies);
+ 	INIT_LIST_HEAD(&ft->eip_flows);
+@@ -4328,15 +4647,21 @@ int ppe_flowtable_setup(struct ppe_devic
+ 
+ 	hash_init(ft->hosts);
+ 	ft->ppp_nb.notifier_call = ppe_ft_ppp_event;
+-	ppe_dev->flowtable = ft;
++	ft->fib_nb.notifier_call = ppe_ft_fib_event;
++	ft->netevent_nb.notifier_call = ppe_ft_netevent;
+ 
++	ret = register_netevent_notifier(&ft->netevent_nb);
++	if (ret)
++		goto err_hash;
++	ret = register_fib_notifier(&init_net, &ft->fib_nb, NULL, NULL);
++	if (ret)
++		goto err_netevent;
+ 	ret = ppp_register_channel_notifier(&ft->ppp_nb);
+-	if (ret) {
+-		ppe_dev->flowtable = NULL;
+-		rhashtable_destroy(&ft->flows);
+-		kfree(ft);
+-		return ret;
+-	}
++	if (ret)
++		goto err_fib;
++
++	WRITE_ONCE(ft->notifiers_ready, true);
++	ppe_dev->flowtable = ft;
+ 
+ 	/* The notifier reports only future channel transitions; adopt the
+ 	 * PPP devices that connected before it was registered (probe
+@@ -4352,6 +4677,16 @@ int ppe_flowtable_setup(struct ppe_devic
+ 	rtnl_unlock();
+ 
+ 	return 0;
++
++err_fib:
++	unregister_fib_notifier(&init_net, &ft->fib_nb);
++err_netevent:
++	unregister_netevent_notifier(&ft->netevent_nb);
++err_hash:
++	cancel_work_sync(&ft->route_work);
++	rhashtable_destroy(&ft->flows);
++	kfree(ft);
++	return ret;
+ }
+ 
+ int ppe_flowtable_eip_start(struct ppe_device *ppe_dev)
+@@ -4397,7 +4732,10 @@ out:
+ 
+ static void ppe_ft_flow_free(void *ptr, void *arg)
+ {
+-	kfree(ptr);
++	struct ppe_ft_flow *flow = ptr;
++
++	ppe_ft_flow_neigh_put(flow);
++	kfree(flow);
+ }
+ 
+ /**
+@@ -4419,6 +4757,11 @@ void ppe_flowtable_destroy(struct ppe_de
+ 		return;
+ 
+ 	WARN_ON(!list_empty(&ft->block_cb_list));
++	WRITE_ONCE(ft->stopping, true);
++	WRITE_ONCE(ft->notifiers_ready, false);
++	unregister_fib_notifier(&init_net, &ft->fib_nb);
++	unregister_netevent_notifier(&ft->netevent_nb);
++	cancel_work_sync(&ft->route_work);
+ 	ppp_unregister_channel_notifier(&ft->ppp_nb);
+ 	ppe_ft_flow_drain(ft);
+ 
+@@ -4478,6 +4821,7 @@ void ppe_flowtable_destroy(struct ppe_de
+ 	rhashtable_free_and_destroy(&ft->flows, ppe_ft_flow_free, NULL);
+ 	list_for_each_entry_safe(flow, flow_tmp, &ft->zombies, zombie_node) {
+ 		list_del(&flow->zombie_node);
++		ppe_ft_flow_neigh_put(flow);
+ 		kfree(flow);
+ 	}
+ 
+@@ -4486,9 +4830,11 @@ void ppe_flowtable_destroy(struct ppe_de
+ 		kfree(host);
+ 	}
+ 
+-	for (i = 0; i < PPE_FT_TUNNELS; i++)
++	for (i = 0; i < PPE_FT_TUNNELS; i++) {
++		ppe_ft_tunnel_neigh_put(&ft->tunnels[i]);
+ 		if (ft->tunnels[i].dev)
+ 			dev_put(ft->tunnels[i].dev);
++	}
+ 
+ 	kfree(ft);
+ }

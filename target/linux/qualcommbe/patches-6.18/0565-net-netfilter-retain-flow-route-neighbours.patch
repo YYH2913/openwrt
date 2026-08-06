@@ -1,0 +1,487 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 6 Aug 2026 00:00:00 +0800
+Subject: [PATCH] net: netfilter: retain flow route neighbours
+
+Keep the resolved neighbour and FIB generation with each flowtable
+direction. Hardware offload drivers can then reject a stale install and
+invalidate rows after neighbour or route changes instead of forwarding
+indefinitely through an obsolete next hop.
+
+Apply the same ownership and route-generation checks to nftables and the
+legacy FLOWOFFLOAD target, including all allocation failure paths.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Index: b/include/net/fib_notifier.h
+===================================================================
+--- a/include/net/fib_notifier.h
++++ b/include/net/fib_notifier.h
+@@ -40,6 +40,7 @@ int call_fib_notifier(struct notifier_bl
+ 		      struct fib_notifier_info *info);
+ int call_fib_notifiers(struct net *net, enum fib_event_type event_type,
+ 		       struct fib_notifier_info *info);
++unsigned int fib_notifier_seq_read(const struct net *net);
+ int register_fib_notifier(struct net *net, struct notifier_block *nb,
+ 			  void (*cb)(struct notifier_block *nb),
+ 			  struct netlink_ext_ack *extack);
+Index: b/include/net/netfilter/nf_flow_table.h
+===================================================================
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -16,6 +16,7 @@
+ struct nf_flowtable;
+ struct nf_flow_rule;
+ struct flow_offload;
++struct neighbour;
+ enum flow_offload_tuple_dir;
+ 
+ struct nf_flow_key {
+@@ -133,6 +134,8 @@ struct flow_offload_tuple {
+ 	/* All members above are keys for lookups, see flow_offload_hash(). */
+ 	struct { }			__hash;
+ 
++	struct neighbour		*neigh;
++	u32				fib_seq;
+ 	u8				dir:2,
+ 					xmit_type:3,
+ 					encap_num:2,
+@@ -187,6 +190,16 @@ struct flow_offload {
+ 	struct rcu_head				rcu_head;
+ };
+ 
++static inline struct flow_offload *
++flow_offload_tuple_to_flow(struct flow_offload_tuple *tuple)
++{
++	struct flow_offload_tuple_rhash *tuplehash;
++
++	tuplehash = container_of(tuple, struct flow_offload_tuple_rhash, tuple);
++	return container_of(tuplehash, struct flow_offload,
++			    tuplehash[tuple->dir]);
++}
++
+ #define NF_FLOW_TIMEOUT (30 * HZ)
+ #define nf_flowtable_time_stamp	(u32)jiffies
+ 
+@@ -200,6 +213,8 @@ static inline __s32 nf_flow_timeout_delt
+ struct nf_flow_route {
+ 	struct {
+ 		struct dst_entry		*dst;
++		struct neighbour		*neigh;
++		u32				fib_seq;
+ 		struct {
+ 			u32			ifindex;
+ 			struct {
+@@ -219,6 +234,8 @@ struct nf_flow_route {
+ 	} tuple[FLOW_OFFLOAD_DIR_MAX];
+ };
+ 
++void nf_flow_route_release(struct nf_flow_route *route);
++
+ struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
+ void flow_offload_free(struct flow_offload *flow);
+ 
+Index: b/net/core/fib_notifier.c
+===================================================================
+--- a/net/core/fib_notifier.c
++++ b/net/core/fib_notifier.c
+@@ -37,7 +37,7 @@ int call_fib_notifiers(struct net *net,
+ }
+ EXPORT_SYMBOL(call_fib_notifiers);
+ 
+-static unsigned int fib_seq_sum(struct net *net)
++unsigned int fib_notifier_seq_read(const struct net *net)
+ {
+ 	struct fib_notifier_net *fn_net = net_generic(net, fib_notifier_net_id);
+ 	struct fib_notifier_ops *ops;
+@@ -54,6 +54,7 @@ static unsigned int fib_seq_sum(struct n
+ 
+ 	return fib_seq;
+ }
++EXPORT_SYMBOL_GPL(fib_notifier_seq_read);
+ 
+ static int fib_net_dump(struct net *net, struct notifier_block *nb,
+ 			struct netlink_ext_ack *extack)
+@@ -85,7 +86,7 @@ static bool fib_dump_is_consistent(struc
+ 	struct fib_notifier_net *fn_net = net_generic(net, fib_notifier_net_id);
+ 
+ 	atomic_notifier_chain_register(&fn_net->fib_chain, nb);
+-	if (fib_seq == fib_seq_sum(net))
++	if (fib_seq == fib_notifier_seq_read(net))
+ 		return true;
+ 	atomic_notifier_chain_unregister(&fn_net->fib_chain, nb);
+ 	if (cb)
+@@ -102,7 +103,7 @@ int register_fib_notifier(struct net *ne
+ 	int err;
+ 
+ 	do {
+-		unsigned int fib_seq = fib_seq_sum(net);
++		unsigned int fib_seq = fib_notifier_seq_read(net);
+ 
+ 		err = fib_net_dump(net, nb, extack);
+ 		if (err)
+Index: b/net/netfilter/nf_flow_table_core.c
+===================================================================
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -7,6 +7,7 @@
+ #include <linux/netdevice.h>
+ #include <net/ip.h>
+ #include <net/ip6_route.h>
++#include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -92,6 +93,17 @@ static struct dst_entry *nft_route_dst_f
+ 	return dst;
+ }
+ 
++static struct neighbour *
++nft_route_neigh_fetch(struct nf_flow_route *route,
++		      enum flow_offload_tuple_dir dir)
++{
++	struct neighbour *neigh = route->tuple[dir].neigh;
++
++	route->tuple[dir].neigh = NULL;
++
++	return neigh;
++}
++
+ static int flow_offload_fill_route(struct flow_offload *flow,
+ 				   struct nf_flow_route *route,
+ 				   enum flow_offload_tuple_dir dir)
+@@ -100,6 +112,9 @@ static int flow_offload_fill_route(struc
+ 	struct dst_entry *dst = nft_route_dst_fetch(route, dir);
+ 	int i, j = 0;
+ 
++	flow_tuple->neigh = nft_route_neigh_fetch(route, dir);
++	flow_tuple->fib_seq = route->tuple[dir].fib_seq;
++
+ 	switch (flow_tuple->l3proto) {
+ 	case NFPROTO_IPV4:
+ 		flow_tuple->mtu = ip_dst_mtu_maybe_forward(dst, true);
+@@ -146,11 +161,31 @@ static int flow_offload_fill_route(struc
+ static void nft_flow_dst_release(struct flow_offload *flow,
+ 				 enum flow_offload_tuple_dir dir)
+ {
++	if (flow->tuplehash[dir].tuple.neigh)
++		neigh_release(flow->tuplehash[dir].tuple.neigh);
++
+ 	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
+ 	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
+ 		dst_release(flow->tuplehash[dir].tuple.dst_cache);
+ }
+ 
++void nf_flow_route_release(struct nf_flow_route *route)
++{
++	int dir;
++
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		if (route->tuple[dir].neigh) {
++			neigh_release(route->tuple[dir].neigh);
++			route->tuple[dir].neigh = NULL;
++		}
++		if (route->tuple[dir].dst) {
++			dst_release(route->tuple[dir].dst);
++			route->tuple[dir].dst = NULL;
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(nf_flow_route_release);
++
+ void flow_offload_route_init(struct flow_offload *flow,
+ 			     struct nf_flow_route *route)
+ {
+@@ -393,15 +428,13 @@ flow_offload_lookup(struct nf_flowtable
+ {
+ 	struct flow_offload_tuple_rhash *tuplehash;
+ 	struct flow_offload *flow;
+-	int dir;
+ 
+ 	tuplehash = rhashtable_lookup(&flow_table->rhashtable, tuple,
+ 				      nf_flow_offload_rhash_params);
+ 	if (!tuplehash)
+ 		return NULL;
+ 
+-	dir = tuplehash->tuple.dir;
+-	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	flow = flow_offload_tuple_to_flow(&tuplehash->tuple);
+ 	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		return NULL;
+ 
+Index: b/net/netfilter/nf_flow_table_path.c
+===================================================================
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -8,7 +8,9 @@
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
+ #include <net/inet_dscp.h>
++#include <net/fib_notifier.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -23,6 +25,14 @@ static enum flow_offload_xmit_type nft_x
+ 	return FLOW_OFFLOAD_XMIT_NEIGH;
+ }
+ 
++static u32 nft_flow_dst_cookie(const struct dst_entry *dst, int family)
++{
++	if (family == NFPROTO_IPV6)
++		return rt6_get_cookie(dst_rt6_info(dst));
++
++	return 0;
++}
++
+ static void nft_default_forward_path(struct nf_flow_route *route,
+ 				     struct dst_entry *dst_cache,
+ 				     enum ip_conntrack_dir dir)
+@@ -45,6 +55,7 @@ static int nft_dev_fill_forward_path(con
+ 				     const struct dst_entry *dst_cache,
+ 				     const struct nf_conn *ct,
+ 				     enum ip_conntrack_dir dir, u8 *ha,
++				     struct neighbour **neigh,
+ 				     struct net_device_path_stack *stack)
+ {
+ 	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
+@@ -65,10 +76,12 @@ static int nft_dev_fill_forward_path(con
+ 	nud_state = n->nud_state;
+ 	ether_addr_copy(ha, n->ha);
+ 	read_unlock_bh(&n->lock);
+-	neigh_release(n);
+-
+-	if (!(nud_state & NUD_VALID))
++	if (!(nud_state & NUD_VALID)) {
++		neigh_release(n);
+ 		return -1;
++	}
++
++	*neigh = n;
+ 
+ out:
+ 	return dev_fill_forward_path(dev, ha, stack);
+@@ -197,14 +210,16 @@ static void nft_dev_forward_path(struct
+ 	const struct dst_entry *dst = route->tuple[dir].dst;
+ 	struct net_device_path_stack stack;
+ 	struct nft_forward_info info = {};
++	struct neighbour *neigh = NULL;
+ 	unsigned char ha[ETH_ALEN];
+ 	int i;
+ 
+-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
++	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &neigh,
++				      &stack) >= 0)
+ 		nft_dev_path_info(&stack, &info, ha, &ft->data);
+ 
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+-		return;
++		goto out;
+ 
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
+@@ -220,14 +235,22 @@ static void nft_dev_forward_path(struct
+ 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
++		route->tuple[dir].neigh = neigh;
++		neigh = NULL;
+ 	}
++out:
++	if (neigh)
++		neigh_release(neigh);
+ }
+ 
+ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+ 		   struct nf_flow_route *route, enum ip_conntrack_dir dir,
+ 		   struct nft_flowtable *ft)
+ {
++	struct net *net = nft_net(pkt);
++	unsigned int fib_seq = fib_notifier_seq_read(net);
+ 	struct dst_entry *this_dst = skb_dst(pkt->skb);
++	u32 dst_cookie = nft_flow_dst_cookie(this_dst, nft_pf(pkt));
+ 	struct dst_entry *other_dst = NULL;
+ 	struct flowi fl;
+ 
+@@ -256,7 +279,7 @@ int nft_flow_route(const struct nft_pkti
+ 	if (!dst_hold_safe(this_dst))
+ 		return -ENOENT;
+ 
+-	nf_route(nft_net(pkt), &other_dst, &fl, false, nft_pf(pkt));
++	nf_route(net, &other_dst, &fl, false, nft_pf(pkt));
+ 	if (!other_dst) {
+ 		dst_release(this_dst);
+ 		return -ENOENT;
+@@ -271,6 +294,15 @@ int nft_flow_route(const struct nft_pkti
+ 		nft_dev_forward_path(route, ct, !dir, ft);
+ 	}
+ 
++	if (fib_seq != fib_notifier_seq_read(net) ||
++	    !dst_check(this_dst, dst_cookie)) {
++		nf_flow_route_release(route);
++		return -EAGAIN;
++	}
++
++	route->tuple[dir].fib_seq = fib_seq;
++	route->tuple[!dir].fib_seq = fib_seq;
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(nft_flow_route);
+Index: b/net/netfilter/nft_flow_offload.c
+===================================================================
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -126,8 +126,7 @@ static void nft_flow_offload_eval(const
+ err_flow_add:
+ 	flow_offload_free(flow);
+ err_flow_alloc:
+-	dst_release(route.tuple[dir].dst);
+-	dst_release(route.tuple[!dir].dst);
++	nf_flow_route_release(&route);
+ err_flow_route:
+ 	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
+ out:
+Index: b/net/netfilter/xt_FLOWOFFLOAD.c
+===================================================================
+--- a/net/netfilter/xt_FLOWOFFLOAD.c
++++ b/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -11,6 +11,8 @@
+ #include <linux/netfilter/xt_FLOWOFFLOAD.h>
+ #include <linux/if_vlan.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
++#include <net/fib_notifier.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+@@ -261,6 +263,14 @@ static enum flow_offload_xmit_type nf_xm
+ 	return FLOW_OFFLOAD_XMIT_NEIGH;
+ }
+ 
++static u32 nf_flow_dst_cookie(const struct dst_entry *dst, int family)
++{
++	if (family == NFPROTO_IPV6)
++		return rt6_get_cookie(dst_rt6_info(dst));
++
++	return 0;
++}
++
+ static void nf_default_forward_path(struct nf_flow_route *route,
+ 				    struct dst_entry *dst_cache,
+ 				    enum ip_conntrack_dir dir,
+@@ -359,6 +369,7 @@ static int nf_dev_fill_forward_path(cons
+ 				     const struct dst_entry *dst_cache,
+ 				     const struct nf_conn *ct,
+ 				     enum ip_conntrack_dir dir, u8 *ha,
++				     struct neighbour **neigh,
+ 				     struct net_device_path_stack *stack)
+ {
+ 	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
+@@ -366,8 +377,10 @@ static int nf_dev_fill_forward_path(cons
+ 	struct neighbour *n;
+ 	u8 nud_state;
+ 
+-	if (!nf_is_valid_ether_device(dev))
++	if (!nf_is_valid_ether_device(dev)) {
++		eth_zero_addr(ha);
+ 		goto out;
++	}
+ 
+ 	n = dst_neigh_lookup(dst_cache, daddr);
+ 	if (!n)
+@@ -377,10 +390,12 @@ static int nf_dev_fill_forward_path(cons
+ 	nud_state = n->nud_state;
+ 	ether_addr_copy(ha, n->ha);
+ 	read_unlock_bh(&n->lock);
+-	neigh_release(n);
+-
+-	if (!(nud_state & NUD_VALID))
++	if (!(nud_state & NUD_VALID)) {
++		neigh_release(n);
+ 		return -1;
++	}
++
++	*neigh = n;
+ 
+ out:
+ 	return dev_fill_forward_path(dev, ha, stack);
+@@ -394,15 +409,17 @@ static void nf_dev_forward_path(struct n
+ 	const struct dst_entry *dst = route->tuple[dir].dst;
+ 	struct net_device_path_stack stack;
+ 	struct nf_forward_info info = {};
++	struct neighbour *neigh = NULL;
+ 	unsigned char ha[ETH_ALEN];
+ 	int i;
+ 
+-	if (nf_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
++	if (nf_dev_fill_forward_path(route, dst, ct, dir, ha, &neigh,
++				     &stack) >= 0)
+ 		nf_dev_path_info(&stack, &info, ha);
+ 
+ 	devs[!dir] = (struct net_device *)info.indev;
+ 	if (!info.indev)
+-		return;
++		goto out;
+ 
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
+@@ -418,7 +435,12 @@ static void nf_dev_forward_path(struct n
+ 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
++		route->tuple[dir].neigh = neigh;
++		neigh = NULL;
+ 	}
++out:
++	if (neigh)
++		neigh_release(neigh);
+ }
+ 
+ static int
+@@ -427,7 +449,10 @@ xt_flowoffload_route(struct sk_buff *skb
+ 		     struct nf_flow_route *route, enum ip_conntrack_dir dir,
+ 		     struct net_device **devs)
+ {
++	struct net *net = xt_net(par);
++	unsigned int fib_seq = fib_notifier_seq_read(net);
+ 	struct dst_entry *this_dst = skb_dst(skb);
++	u32 dst_cookie = nf_flow_dst_cookie(this_dst, xt_family(par));
+ 	struct dst_entry *other_dst = NULL;
+ 	struct flowi fl;
+ 
+@@ -447,7 +472,7 @@ xt_flowoffload_route(struct sk_buff *skb
+ 	if (!dst_hold_safe(this_dst))
+ 		return -ENOENT;
+ 
+-	nf_route(xt_net(par), &other_dst, &fl, false, xt_family(par));
++	nf_route(net, &other_dst, &fl, false, xt_family(par));
+ 	if (!other_dst) {
+ 		dst_release(this_dst);
+ 		return -ENOENT;
+@@ -462,6 +487,15 @@ xt_flowoffload_route(struct sk_buff *skb
+ 		nf_dev_forward_path(route, ct, !dir, devs);
+ 	}
+ 
++	if (fib_seq != fib_notifier_seq_read(net) ||
++	    !dst_check(this_dst, dst_cookie)) {
++		nf_flow_route_release(route);
++		return -EAGAIN;
++	}
++
++	route->tuple[dir].fib_seq = fib_seq;
++	route->tuple[!dir].fib_seq = fib_seq;
++
+ 	return 0;
+ }
+ 
+@@ -552,8 +586,7 @@ flowoffload_tg(struct sk_buff *skb, cons
+ err_flow_add:
+ 	flow_offload_free(flow);
+ err_flow_alloc:
+-	dst_release(route.tuple[dir].dst);
+-	dst_release(route.tuple[!dir].dst);
++	nf_flow_route_release(&route);
+ err_flow_route:
+ 	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
+ 
