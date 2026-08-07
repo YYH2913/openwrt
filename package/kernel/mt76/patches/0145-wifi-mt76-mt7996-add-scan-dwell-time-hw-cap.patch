@@ -1,0 +1,30 @@
+From d8eb7952fa1e35a350037aa351ff3c637285c735 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Mon, 27 Jul 2026 15:04:33 +0000
+Subject: [PATCH] wifi: mt76: mt7996: add scan dwell time hw cap
+
+Add NL80211_EXT_FEATURE_SET_SCAN_DWELL support in driver.
+This allows user to specify channel dwell time during scanning.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Link: https://patch.msgid.link/20260727150434.1778520-14-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ mt7996/init.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mt7996/init.c b/mt7996/init.c
+index ee1f7a9f4851..70902395bc96 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -527,6 +527,7 @@ mt7996_init_wiphy(struct ieee80211_hw *hw, struct mtk_wed_device *wed)
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
++	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
+ 
+ 	if (mt7996_eeprom_has_background_radar(dev) &&
+ 	    (!mdev->dev->of_node ||
+-- 
+2.43.0
+
