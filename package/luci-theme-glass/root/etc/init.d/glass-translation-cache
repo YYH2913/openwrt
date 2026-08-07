@@ -1,9 +1,11 @@
 #!/bin/sh /etc/rc.common
 
-START=51
+START=99
 
 CACHE_DIR=/www/luci-static/resources/translations
 TMP_DIR=/tmp/glass-translations
+MAX_ATTEMPTS=15
+RETRY_DELAY=1
 
 add_language() {
 	case " $languages " in
@@ -18,7 +20,7 @@ cache_language() {
 	local dest="$CACHE_DIR/$lang.js"
 	local attempt=1
 
-	while [ "$attempt" -le 3 ]; do
+	while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
 		if wget -q -T 15 -O "$tmp" \
 			"http://127.0.0.1/cgi-bin/luci/admin/translations/$lang" &&
 			[ "$(tail -c 2 "$tmp" 2>/dev/null)" = '};' ]; then
@@ -33,6 +35,7 @@ cache_language() {
 
 		rm -f "$tmp"
 		attempt=$((attempt + 1))
+		[ "$attempt" -le "$MAX_ATTEMPTS" ] && sleep "$RETRY_DELAY"
 	done
 
 	logger -t glass-theme "failed to cache LuCI translations for $lang"

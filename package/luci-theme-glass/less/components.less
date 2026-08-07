@@ -226,6 +226,81 @@ select {
   }
 }
 
+input[type="color"].glass-color-input {
+  width: 4rem;
+  height: 2.5rem;
+  padding: 2px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  cursor: pointer;
+}
+
+.glass-range-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  width: min(100%, 400px);
+}
+
+input[type="range"].glass-range {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 1;
+  min-width: 120px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+
+  &::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: var(--radius-full);
+    background: var(--color-bg-secondary);
+  }
+
+  &::-webkit-slider-thumb {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    margin-top: -7px;
+    border: 2px solid var(--color-bg-elevated);
+    border-radius: 50%;
+    background: var(--color-primary);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+  }
+
+  &::-moz-range-track {
+    height: 4px;
+    border: none;
+    border-radius: var(--radius-full);
+    background: var(--color-bg-secondary);
+  }
+
+  &::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--color-bg-elevated);
+    border-radius: 50%;
+    background: var(--color-primary);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+  }
+}
+
+.glass-range-value {
+  min-width: 4.5ch;
+  padding: 2px var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 /* ---- Buttons — glass-ui pattern ---- */
 .btn,
 .cbi-button {
@@ -233,6 +308,7 @@ select {
   align-items: center;
   justify-content: center;
   padding: var(--space-sm) var(--space-lg);
+  min-height: 34px;
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-medium);
   border-radius: var(--radius-md);
@@ -252,11 +328,13 @@ select {
     0 1px 2px rgba(0, 0, 0, 0.04),
     inset 0 1px 0 rgba(255, 255, 255, 0.40),
     inset 0 0 6px rgba(255, 255, 255, 0.10);
-  backdrop-filter: blur(10px) saturate(180%);
-  -webkit-backdrop-filter: blur(10px) saturate(180%);
+  backdrop-filter: var(--glass-detail-filter);
+  -webkit-backdrop-filter: var(--glass-detail-filter);
   color: var(--color-text);
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: color var(--transition-fast), background-color var(--transition-fast),
+    border-color var(--transition-fast), box-shadow var(--transition-fast),
+    opacity var(--transition-fast), transform var(--transition-fast);
   text-decoration: none;
   white-space: nowrap;
   gap: var(--space-xs);
@@ -429,8 +507,8 @@ select {
     rgba(230, 240, 255, 0.12) 100%
   );
   background-color: transparent;
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: var(--glass-panel-filter);
+  -webkit-backdrop-filter: var(--glass-panel-filter);
   border: 0.5px solid rgba(255, 255, 255, 0.35);
   box-shadow:
     0 2px 16px rgba(0, 0, 0, 0.06),
@@ -554,7 +632,7 @@ table.cbi-section-table {
       white-space: nowrap;
       word-break: break-word;
       line-height: 1.5em;
-      color: var(--color-text-primary);
+      color: var(--color-text);
       border: 0.5px solid var(--color-border);
       border-radius: var(--radius-sm) 0 0 var(--radius-sm);
       border-right: none;
@@ -580,7 +658,7 @@ table.cbi-section-table {
       white-space: nowrap;
       font-size: var(--font-size-sm);
       line-height: 1.5rem;
-      color: var(--color-text-primary);
+      color: var(--color-text);
       border: 0.5px solid var(--color-border);
       border-radius: var(--radius-sm) 0 0 var(--radius-sm);
       border-right-width: 0;
@@ -706,8 +784,8 @@ table.cbi-section-table {
     padding: var(--space-xs);
     color: var(--color-text);
     background: var(--glass-bg-strong, rgba(255, 255, 255, 0.85));
-    backdrop-filter: blur(30px) saturate(var(--glass-saturate));
-    -webkit-backdrop-filter: blur(30px) saturate(var(--glass-saturate));
+    backdrop-filter: var(--glass-chrome-filter);
+    -webkit-backdrop-filter: var(--glass-chrome-filter);
     border: 0.5px solid var(--glass-border);
     box-shadow:
       0 12px 40px rgba(0, 0, 0, 0.18),
@@ -793,8 +871,8 @@ table.cbi-section-table {
     rgba(230, 240, 255, 0.12) 100%
   );
   background-color: transparent;
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: var(--glass-panel-filter);
+  -webkit-backdrop-filter: var(--glass-panel-filter);
   border: 0.5px solid rgba(255, 255, 255, 0.12);
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.08),
@@ -810,7 +888,8 @@ table.cbi-section-table {
       font-size: var(--font-size-sm);
       font-weight: var(--font-weight-medium);
       color: var(--color-text-secondary);
-      transition: all var(--transition-fast);
+      transition: color var(--transition-fast), background-color var(--transition-fast),
+        box-shadow var(--transition-fast);
       text-decoration: none;
 
       &:hover {
@@ -822,8 +901,8 @@ table.cbi-section-table {
     &.cbi-tab a {
       background: rgba(255, 255, 255, 0.45);
       color: var(--color-text);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
+      backdrop-filter: var(--glass-detail-filter);
+      -webkit-backdrop-filter: var(--glass-detail-filter);
       box-shadow:
         0 1px 3px rgba(0, 0, 0, 0.08),
         inset 0 1px 1px rgba(255, 255, 255, 0.60),
@@ -857,8 +936,8 @@ table.cbi-section-table {
   background: rgba(90, 200, 250, 0.08);
   border: 0.5px solid rgba(90, 200, 250, 0.20);
   border-left: 3px solid var(--color-info);
-  backdrop-filter: blur(10px) saturate(180%);
-  -webkit-backdrop-filter: blur(10px) saturate(180%);
+  backdrop-filter: var(--glass-panel-filter);
+  -webkit-backdrop-filter: var(--glass-panel-filter);
   box-shadow:
     0 2px 8px rgba(0, 0, 0, 0.04),
     inset 0 1px 0 rgba(255, 255, 255, 0.30),
@@ -927,8 +1006,8 @@ table.cbi-section-table {
       rgba(var(--color-primary-rgb), 0.60) 50%,
       rgba(var(--color-primary-rgb), 0.70) 100%
     );
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: var(--glass-detail-filter);
+    -webkit-backdrop-filter: var(--glass-detail-filter);
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.30),
       inset 0 0 6px rgba(255, 255, 255, 0.10);
@@ -998,6 +1077,7 @@ input[type="radio"] {
     min-width: 270px;
     width: calc(100% - var(--space-2xl) * 2);
     max-height: calc(100vh - 4em);
+    max-height: calc(100dvh - 4em);
     overflow-y: auto;
     z-index: calc(var(--z-modal) + 1);
 

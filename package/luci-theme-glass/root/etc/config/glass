@@ -1,5 +1,6 @@
 config global 'global'
 	option mode 'normal'
+	option effects 'balanced'
 	option primary '#007AFF'
 	option dark_primary '#0A84FF'
 	option blur '20'

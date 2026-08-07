@@ -2,6 +2,7 @@
 'require baseclass';
 'require rpc';
 'require fs';
+'require poll';
 
 var callSystemInfo = rpc.declare({
 	object: 'system',
@@ -25,18 +26,28 @@ return baseclass.extend({
 	prevTime: null,
 	netDevice: null,
 	netLabel: null,
-	netChecked: false,
+	netResolving: false,
 	linkSpeed: null,
 	numCores: 1,
+	pollFn: null,
 
 	__init__: function() {
 		var self = this;
+
+		this.setupIndicators();
+		if (!this.container)
+			return;
+
 		/* Detect core count once so load average can be converted to %. */
 		L.resolveDefault(fs.read('/proc/cpuinfo'), '').then(function(text) {
 			var m = text.match(/^processor\s*:/gm);
 			self.numCores = (m && m.length) || 1;
 		});
-		this.setupIndicators();
+
+		/* LuCI.poll waits for the returned promise before scheduling this
+		 * function again, preventing slow RPC calls from piling up. */
+		this.pollFn = L.bind(this.fetchAndUpdate, this);
+		poll.add(this.pollFn);
 	},
 
 	icons: {
@@ -56,6 +67,9 @@ return baseclass.extend({
 	createIndicator: function(name, title) {
 		var el = document.createElement('span');
 		el.setAttribute('data-indicator', name);
+		el.setAttribute('role', 'status');
+		el.setAttribute('aria-live', 'off');
+		el.setAttribute('aria-label', title);
 		el.title = title;
 		el.appendChild(this.makeIcon(name));
 		var val = document.createElement('span');
@@ -69,64 +83,100 @@ return baseclass.extend({
 	},
 
 	setLevel: function(el, level) {
-		el.setAttribute('data-level', level);
+		if (el.getAttribute('data-level') !== level)
+			el.setAttribute('data-level', level);
+	},
+
+	setIndicator: function(el, value, title, level) {
+		if (!el)
+			return;
+
+		var valueEl = el.querySelector('.indicator-value');
+		if (valueEl && valueEl.textContent !== value) {
+			valueEl.textContent = value;
+			try { sessionStorage.setItem('glass-status-' + el.getAttribute('data-indicator'), value); } catch(e) {}
+		}
+
+		if (el.title !== title) {
+			el.title = title;
+			el.setAttribute('aria-label', title);
+		}
+
+		this.setLevel(el, level);
 	},
 
 	setupIndicators: function() {
 		this.container = document.getElementById('status-indicators');
 		if (!this.container) return;
 
-		this.cpuEl = this.createIndicator('cpu', 'CPU Load');
-		this.ramEl = this.createIndicator('ram', 'Memory Usage');
-		this.uptimeEl = this.createIndicator('uptime', 'Uptime');
+		this.cpuEl = this.createIndicator('cpu', _('CPU usage (%)'));
+		this.ramEl = this.createIndicator('ram', _('Memory usage (%)'));
+		this.uptimeEl = this.createIndicator('uptime', _('Uptime'));
 
 		this.container.appendChild(this.cpuEl);
 		this.container.appendChild(this.ramEl);
 		this.container.appendChild(this.uptimeEl);
-
-		this.fetchAndUpdate();
-		setInterval(L.bind(this.fetchAndUpdate, this), 5000);
 	},
 
 	fetchAndUpdate: function() {
 		var self = this;
+		var requests = [];
 
-		L.resolveDefault(callSystemInfo(), {}).then(function(info) {
-			self.updateSystem(info);
-		});
+		if (!this.container || document.hidden)
+			return Promise.resolve();
 
-		if (!this.netChecked) {
-			this.netChecked = true;
-			L.resolveDefault(callInterfaceDump(), []).then(function(ifaces) {
-				/* Find WAN device — prefer 'wan' over 'wan6' */
-				var wanDev = null;
-				for (var i = 0; i < ifaces.length; i++) {
-					var iface = ifaces[i];
-					if (iface.interface === 'wan') {
-						wanDev = iface.l3_device || iface.device || null;
+		requests.push(L.resolveDefault(callSystemInfo(), null).then(function(info) {
+			if (info)
+				self.updateSystem(info);
+		}));
+
+		if (this.netDevice)
+			requests.push(this.pollNetwork());
+		else if (!this.netResolving)
+			requests.push(this.resolveNetworkDevice());
+
+		return Promise.all(requests);
+	},
+
+	resolveNetworkDevice: function() {
+		var self = this;
+		this.netResolving = true;
+
+		return L.resolveDefault(callInterfaceDump(), null).then(function(ifaces) {
+			if (!Array.isArray(ifaces))
+				return null;
+
+			/* Find WAN device - prefer 'wan' over 'wan6'. */
+			var wanDev = null;
+			for (var i = 0; i < ifaces.length; i++) {
+				var iface = ifaces[i];
+				if (iface.interface === 'wan') {
+					wanDev = iface.l3_device || iface.device || null;
+					break;
+				}
+			}
+
+			if (!wanDev) {
+				for (var j = 0; j < ifaces.length; j++) {
+					if (ifaces[j].interface === 'wan6') {
+						wanDev = ifaces[j].l3_device || ifaces[j].device || null;
 						break;
 					}
 				}
-				if (!wanDev) {
-					for (var i = 0; i < ifaces.length; i++) {
-						if (ifaces[i].interface === 'wan6') {
-							wanDev = ifaces[i].l3_device || ifaces[i].device || null;
-							break;
-						}
-					}
-				}
+			}
 
-				self.resolvePhysicalDevice(wanDev || 'wan');
-			});
-		} else if (this.netDevice) {
-			this.pollNetwork();
-		}
+			return self.resolvePhysicalDevice(wanDev || 'wan');
+		}).finally(function() {
+			self.netResolving = false;
+		});
 	},
 
 	resolvePhysicalDevice: function(devName) {
 		var self = this;
-		L.resolveDefault(callDeviceStatus(devName), {}).then(function(dev) {
-			if (!dev) return;
+		return L.resolveDefault(callDeviceStatus(devName), null).then(function(dev) {
+			if (!dev)
+				return null;
+
 			var members = dev['bridge-members'];
 			if (dev.type === 'bridge' && members && members.length > 0) {
 				/* Bridge stats only count management traffic;
@@ -135,10 +185,11 @@ return baseclass.extend({
 			} else if (dev.statistics) {
 				self.netDevice = devName;
 			}
-			if (!self.netDevice) return;
+			if (!self.netDevice)
+				return null;
 
 			/* Query physical port for link speed and DSA info */
-			L.resolveDefault(callDeviceStatus(self.netDevice), {}).then(function(phys) {
+			return L.resolveDefault(callDeviceStatus(self.netDevice), null).then(function(phys) {
 				if (phys && phys.speed) {
 					var m = String(phys.speed).match(/^(\d+)/);
 					if (m) self.linkSpeed = parseInt(m[1], 10);
@@ -149,16 +200,33 @@ return baseclass.extend({
 					self.netLabel = self.netDevice;
 					self.netDevice = phys.conduit;
 				}
-				self.netEl = self.createIndicator('net', 'Throughput');
-				self.container.insertBefore(self.netEl, self.uptimeEl);
-				self.pollNetwork();
+				if (!self.netEl) {
+					self.netEl = self.createIndicator('net', _('Network'));
+					self.container.insertBefore(self.netEl, self.uptimeEl);
+				}
+
+				return self.pollNetwork();
 			});
 		});
 	},
 
 	pollNetwork: function() {
 		var self = this;
-		L.resolveDefault(callDeviceStatus(this.netDevice), {}).then(function(dev) {
+		if (!this.netDevice)
+			return Promise.resolve();
+
+		return L.resolveDefault(callDeviceStatus(this.netDevice), null).then(function(dev) {
+			if (!dev || !dev.statistics) {
+				/* WAN devices can be recreated on reconnect. Resolve the current
+				 * device again on the next poll instead of showing stale data. */
+				self.netDevice = null;
+				self.netLabel = null;
+				self.linkSpeed = null;
+				self.prevStats = null;
+				self.prevTime = null;
+				return;
+			}
+
 			self.updateNetwork(dev);
 		});
 	},
@@ -173,33 +241,33 @@ return baseclass.extend({
 			var pct = Math.min(load1 / this.numCores, 1) * 100;
 			var pctStr = pct.toFixed(0) + '%';
 
-			this.cpuEl.querySelector('.indicator-value').textContent = pctStr;
-			try { sessionStorage.setItem('glass-status-cpu', pctStr); } catch(e) {}
-			this.cpuEl.title = 'CPU: ' + pctStr + ' (load ' + load1.toFixed(2) +
-				' / ' + load5 + ' / ' + load15 + ' on ' + this.numCores +
-				(this.numCores === 1 ? ' core)' : ' cores)');
+			var title = _('CPU usage (%)') + ': ' + pctStr + ' (' + load1.toFixed(2) +
+				' / ' + load5 + ' / ' + load15 + ', ' + this.numCores + ' ' +
+				(this.numCores === 1 ? _('core') : _('cores')) + ')';
 
 			var level = pct < 60 ? 'ok' : pct < 85 ? 'warn' : 'crit';
-			this.setLevel(this.cpuEl, level);
+			this.setIndicator(this.cpuEl, pctStr, title, level);
 		}
 
-		if (info.memory) {
+		if (info.memory && info.memory.total) {
 			var total = info.memory.total;
-			var avail = info.memory.available || info.memory.free;
-			var used = total - avail;
-			var pct = (used / total * 100).toFixed(0);
-			this.ramEl.querySelector('.indicator-value').textContent = pct + '%';
-			try { sessionStorage.setItem('glass-status-ram', pct + '%'); } catch(e) {}
-			this.ramEl.title = 'RAM: ' + this.formatBytes(used) + ' / ' + this.formatBytes(total) + ' (' + pct + '% used)';
+			var avail = info.memory.available;
+			if (avail == null)
+				avail = info.memory.free;
+			if (avail != null) {
+				var used = total - avail;
+				var pct = (used / total * 100).toFixed(0);
+				var title = _('Memory usage (%)') + ': ' + this.formatBytes(used) + ' / ' + this.formatBytes(total) + ' (' + pct + '%)';
 
-			var level = pct < 60 ? 'ok' : pct < 85 ? 'warn' : 'crit';
-			this.setLevel(this.ramEl, level);
+				var level = pct < 60 ? 'ok' : pct < 85 ? 'warn' : 'crit';
+				this.setIndicator(this.ramEl, pct + '%', title, level);
+			}
 		}
 
-		if (info.uptime) {
-			this.uptimeEl.querySelector('.indicator-value').textContent = this.formatUptime(info.uptime);
-			try { sessionStorage.setItem('glass-status-uptime', this.formatUptime(info.uptime)); } catch(e) {}
-			this.uptimeEl.title = 'Uptime: ' + this.formatUptimeFull(info.uptime);
+		if (info.uptime != null) {
+			var uptime = this.formatUptime(info.uptime);
+			this.setIndicator(this.uptimeEl, uptime,
+				_('Uptime') + ': ' + this.formatUptimeFull(info.uptime), 'ok');
 		}
 	},
 
@@ -218,16 +286,13 @@ return baseclass.extend({
 				if (rxSpeed < 0) rxSpeed = 0;
 				if (txSpeed < 0) txSpeed = 0;
 				var netText = '\u2193' + this.formatSpeed(rxSpeed) + ' \u2191' + this.formatSpeed(txSpeed);
-				this.netEl.querySelector('.indicator-value').textContent = netText;
-				try { sessionStorage.setItem('glass-status-net', netText); } catch(e) {}
 				var tip = (this.netLabel || this.netDevice) + ': \u2193 ' + this.formatSpeedFull(rxSpeed) + ' / \u2191 ' + this.formatSpeedFull(txSpeed);
 				if (this.linkSpeed)
-					tip += ' (Link: ' + (this.linkSpeed >= 1000 ? (this.linkSpeed / 1000) + ' Gbps' : this.linkSpeed + ' Mbps') + ')';
-				this.netEl.title = tip;
+					tip += ' (' + _('Link Speed') + ': ' + (this.linkSpeed >= 1000 ? (this.linkSpeed / 1000) + ' Gbps' : this.linkSpeed + ' Mbps') + ')';
 
 				var peak = Math.max(rxSpeed, txSpeed);
 				var level = peak < 1048576 ? 'ok' : peak < 52428800 ? 'active' : 'busy';
-				this.setLevel(this.netEl, level);
+				this.setIndicator(this.netEl, netText, tip, level);
 			}
 		}
 
@@ -239,8 +304,8 @@ return baseclass.extend({
 		var d = Math.floor(s / 86400);
 		var h = Math.floor((s % 86400) / 3600);
 		var m = Math.floor((s % 3600) / 60);
-		if (d > 0) return d + 'd ' + h + 'h';
-		return h + 'h ' + m + 'm';
+		if (d > 0) return _('%dd %dh').format(d, h);
+		return _('%dh %dm').format(h, m);
 	},
 
 	formatUptimeFull: function(s) {
@@ -248,10 +313,10 @@ return baseclass.extend({
 		var h = Math.floor((s % 86400) / 3600);
 		var m = Math.floor((s % 3600) / 60);
 		var parts = [];
-		if (d > 0) parts.push(d + (d === 1 ? ' day' : ' days'));
-		if (h > 0) parts.push(h + (h === 1 ? ' hour' : ' hours'));
-		if (m > 0) parts.push(m + (m === 1 ? ' min' : ' mins'));
-		return parts.join(', ') || '< 1 min';
+		if (d > 0) parts.push(d + ' ' + (d === 1 ? _('day') : _('days')));
+		if (h > 0) parts.push(h + ' ' + (h === 1 ? _('hour') : _('hours')));
+		if (m > 0) parts.push(m + ' ' + (m === 1 ? _('minute') : _('minutes')));
+		return parts.join(' ') || _('less than a minute');
 	},
 
 	formatBytes: function(bytes) {

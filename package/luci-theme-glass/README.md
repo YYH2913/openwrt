@@ -6,7 +6,7 @@ A glassmorphism theme for OpenWrt LuCI, inspired by Apple's visionOS and macOS. 
 
 ![License](https://img.shields.io/badge/license-GPL--3.0%20%2F%20Commercial-blue.svg)
 ![OpenWrt](https://img.shields.io/badge/OpenWrt-23.05%2B-brightgreen.svg)
-![Version](https://img.shields.io/badge/version-1.1.6-orange.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-orange.svg)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/rchen14b)
 
 ## Screenshots
@@ -29,11 +29,12 @@ A glassmorphism theme for OpenWrt LuCI, inspired by Apple's visionOS and macOS. 
 ## Features
 
 ### Design
-- **Glassmorphism everywhere** — `backdrop-filter: blur() saturate()` with multi-stop gradients, translucent backgrounds, 0.5px glass borders, and inset glow highlights on all panels
-- **Glass buttons** — Neutral buttons are translucent glass, primary buttons are blue-tinted, danger buttons are red-tinted. No solid-color buttons
-- **Frosted sidebar** — Fixed sidebar with 30px blur and inset light diffusion
+- **Selective glassmorphism** — The default balanced profile keeps backdrop blur on primary chrome and overlays while using stable translucent surfaces for dense content
+- **Glass buttons** — Neutral buttons are restrained translucent controls, with distinct primary, success, and danger states
+- **Frosted sidebar** — Fixed sidebar with configurable blur and inset light diffusion
 - **Glass header** — Top nav bar with glass pill badges for page title and status indicators
 - **Live status indicators** — CPU load, RAM %, uptime, and WAN throughput in the header bar. Auto-detects WAN interface, resolves bridges, handles DSA hardware offloading. MikroTik-style speed formatting. Color-coded levels and detailed tooltips
+- **Serialized polling** — Status RPCs use LuCI's polling lifecycle and never overlap when the router or network is slow
 - **Glass login card** — Frosted login page with translucent inputs
 
 ### Theming
@@ -41,10 +42,12 @@ A glassmorphism theme for OpenWrt LuCI, inspired by Apple's visionOS and macOS. 
 - **Dark mode glass** — Lower-opacity gradients (`rgba(255,255,255,0.05-0.08)`) with adjusted shadows
 - **Server-side default** — Set default mode via UCI config (`option mode 'dark'`, `'light'`, or `'normal'` for auto). The client-side toggle overrides this per browser
 - **Accent color config** — Primary color, blur radius, and glass transparency are adjustable via UCI
+- **Effect profiles** — Balanced, Full, and Reduced profiles adapt compositing cost without changing the working layout
 - **Custom wallpapers** — Drop an image or video into the background folder. It shows through all glass panels
 
 ### Layout
 - **Responsive** — Sidebar collapses to a slide-out drawer on mobile with hamburger toggle
+- **Accessible interaction** — Keyboard focus, Escape-to-close, browser zoom, reduced motion, and high-contrast preferences are supported
 - **Sub-navigation bar** — CBI tab menus get moved into a secondary glass bar below the header
 - **Sticky header** — Fixed header with smooth transitions
 
@@ -129,23 +132,29 @@ Create `/etc/config/glass` on the router:
 ```
 config global
     option mode 'normal'
+    option effects 'balanced'
     option primary '#007AFF'
     option dark_primary '#0A84FF'
     option blur '20'
     option transparency '0.72'
     option blur_dark '25'
     option transparency_dark '0.30'
+    option status_bar '1'
+    option font_size '14'
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `mode` | `normal` | `normal` (auto), `dark`, or `light` |
+| `effects` | `balanced` | `balanced`, `full`, or `reduced` compositing profile |
 | `primary` | `#007AFF` | Accent color (light mode) |
 | `dark_primary` | `#0A84FF` | Accent color (dark mode) |
 | `blur` | `20` | Backdrop blur in px (light mode) |
 | `transparency` | `0.72` | Glass panel opacity 0-1 (light mode) |
 | `blur_dark` | `25` | Backdrop blur in px (dark mode) |
 | `transparency_dark` | `0.30` | Glass panel opacity 0-1 (dark mode) |
+| `status_bar` | `1` | Enable live header status indicators |
+| `font_size` | `14` | Base interface font size in pixels |
 
 ### Custom wallpapers
 
