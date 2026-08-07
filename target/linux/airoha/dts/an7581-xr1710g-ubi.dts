@@ -334,9 +334,11 @@
 
 &gdm1 {
 	status = "okay";
+	airoha,lan-port;
 
 	nvmem-cells = <&lan_mac 0>;
 	nvmem-cell-names = "mac-address";
+	openwrt,netdev-name = "eth1";
 };
 
 &gdm2 {
@@ -348,7 +350,7 @@
 
 	nvmem-cells = <&wan_mac 0>;
 	nvmem-cell-names = "mac-address";
-	openwrt,netdev-name = "wan";
+	openwrt,netdev-name = "eth0";
 };
 
 &eth_pcs {

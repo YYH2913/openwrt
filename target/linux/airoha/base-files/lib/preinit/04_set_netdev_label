@@ -1,28 +1,35 @@
 set_netdev_labels() {
 	local dir
+	local index=0
 	local label
 	local netdev
-	local phase
+	local pending=""
+	local tmp
 
-	# park: move every mislabelled interface to a temporary name first,
-	# so that swaps (e.g. eth0 <-> eth1) cannot collide
-	# rename: give every interface its final name
-	for phase in park rename; do
-		for dir in /sys/class/net/*; do
-			label=
-			[ -r "$dir/of_node/openwrt,netdev-name" ] && \
-				read -r label < "$dir/of_node/openwrt,netdev-name"
-			[ -n "$label" ] || continue
+	for dir in /sys/class/net/*; do
+		[ -r "$dir/of_node/openwrt,netdev-name" ] || continue
+		read -r label < "$dir/of_node/openwrt,netdev-name"
+		netdev="${dir##*/}"
+		[ "$netdev" = "$label" ] && continue
 
-			netdev="${dir##*/}"
-			[ "$netdev" = "$label" ] && continue
-
-			if [ "$phase" = "park" ]; then
-				ip link set "$netdev" name "tmp%d"
-			else
-				ip link set "$netdev" name "$label"
-			fi
+		# Move every labelled interface aside first so name swaps such as
+		# eth0 <-> eth1 do not fail because the destination is still busy.
+		tmp="owrt-tmp$index"
+		while [ -e "/sys/class/net/$tmp" ]; do
+			index=$((index + 1))
+			tmp="owrt-tmp$index"
 		done
+
+		if ip link set "$netdev" name "$tmp"; then
+			pending="$pending$tmp $netdev $label
+"
+			index=$((index + 1))
+		fi
+	done
+
+	printf '%s' "$pending" | while read -r tmp netdev label; do
+		[ -n "$tmp" ] || continue
+		ip link set "$tmp" name "$label" || ip link set "$tmp" name "$netdev"
 	done
 }
 
