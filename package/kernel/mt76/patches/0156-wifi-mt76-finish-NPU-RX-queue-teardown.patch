@@ -1,0 +1,214 @@
+From da0fe04100036365dc25e4ad6ef5016c42d13d80 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 14:02:31 +0800
+Subject: [PATCH] wifi: mt76: finish NPU RX queue teardown
+
+The NPU teardown frees its IRQs and synchronizes active NAPI polls, but
+leaves the NAPI instances, queued buffers, and page pools for the generic
+DMA cleanup. An allocation failure can also leave q->ndesc set before
+NAPI has been registered, causing the generic cleanup to disable an
+uninitialized NAPI instance.
+
+Track NPU NAPI registration separately and fully release each NPU RX
+queue while the provider is still available. Mask and free the IRQ,
+disable and delete NAPI, return queued buffers, destroy the page pool,
+and clear q->ndesc so the later generic cleanup skips the queue. Recheck
+the provider mask after disabling NAPI because a poll completion may
+have raced the first mask operation.
+
+Also unwind partially allocated queues and reject IRQ scheduling once
+teardown starts.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+---
+ mt76.h |   1 +
+ npu.c  | 108 ++++++++++++++++++++++++++++-----------------------------
+ 2 files changed, 55 insertions(+), 54 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index fcfe494..89980b8 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -265,6 +265,7 @@ struct mt76_queue {
+ 	int npu_irq;
+ 	bool stopped;
+ 	bool blocked;
++	bool npu_napi_registered;
+ 	bool npu_irq_registered;
+ 
+ 	u8 buf_offset;
+diff --git a/npu.c b/npu.c
+index 7afb450..8b68127 100644
+--- a/npu.c
++++ b/npu.c
+@@ -186,6 +186,9 @@ static irqreturn_t mt76_npu_irq_handler(int irq, void *q_instance)
+ 	struct airoha_npu *npu;
+ 	u32 status;
+ 
++	if (!READ_ONCE(q->npu_irq_registered))
++		return IRQ_HANDLED;
++
+ 	rcu_read_lock();
+ 
+ 	npu = rcu_dereference(dev->mmio.npu);
+@@ -277,7 +280,7 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ 	err = dev->queue_ops->alloc(dev, q, 0, size,
+ 				    MT76_NPU_RX_BUF_SIZE, 0);
+ 	if (err)
+-		goto out;
++		goto error_queue;
+ 
+ 	name = devm_kasprintf(dev->dev, GFP_KERNEL, "mt76-npu.%d", index);
+ 	if (!name) {
+@@ -286,25 +289,34 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ 	}
+ 
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
++	WRITE_ONCE(q->npu_napi_registered, true);
+ 	mt76_npu_fill_rx_queue(dev, q);
+ 	napi_enable(&dev->napi[qid]);
+ 
++	q->npu_irq = irq;
++	WRITE_ONCE(q->npu_irq_registered, true);
+ 	err = devm_request_irq(dev->dev, irq, mt76_npu_irq_handler,
+ 			       IRQF_SHARED, name, q);
+ 	if (err) {
+-		napi_disable(&dev->napi[qid]);
+-		netif_napi_del(&dev->napi[qid]);
++		WRITE_ONCE(q->npu_irq_registered, false);
++		q->npu_irq = -1;
+ 		goto error_queue;
+ 	}
+ 
+-	q->npu_irq = irq;
+-	WRITE_ONCE(q->npu_irq_registered, true);
+ 	goto out;
+ 
+ error_queue:
+-	mt76_npu_queue_cleanup(dev, q);
+-	page_pool_destroy(q->page_pool);
+-	q->page_pool = NULL;
++	if (READ_ONCE(q->npu_napi_registered)) {
++		napi_disable(&dev->napi[qid]);
++		netif_napi_del(&dev->napi[qid]);
++		WRITE_ONCE(q->npu_napi_registered, false);
++	}
++	if (q->page_pool) {
++		mt76_npu_queue_cleanup(dev, q);
++		page_pool_destroy(q->page_pool);
++		q->page_pool = NULL;
++	}
++	q->npu_irq = -1;
+ 	q->ndesc = 0;
+ out:
+ 	mutex_unlock(&dev->mutex);
+@@ -315,8 +327,6 @@ EXPORT_SYMBOL_GPL(mt76_npu_rx_queue_init);
+ 
+ void mt76_npu_rx_queues_deinit(struct mt76_dev *dev)
+ {
+-	bool registered[2] = {};
+-	int irqs[2] = {};
+ 	struct airoha_npu *npu;
+ 	int i;
+ 
+@@ -324,53 +334,45 @@ void mt76_npu_rx_queues_deinit(struct mt76_dev *dev)
+ 	npu = rcu_dereference_protected(dev->mmio.npu,
+ 					lockdep_is_held(&dev->mutex));
+ 
+-	for (i = 0; i < ARRAY_SIZE(registered); i++) {
+-		struct mt76_queue *q = &dev->q_rx[MT_RXQ_NPU0 + i];
++	for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
++		struct mt76_queue *q = &dev->q_rx[i];
++		bool irq_registered, napi_registered;
++		int index = i - MT_RXQ_NPU0;
+ 		u32 status;
+ 
+-		if (!READ_ONCE(q->npu_irq_registered))
+-			continue;
+-
+-		registered[i] = true;
+-		irqs[i] = q->npu_irq;
+-		WRITE_ONCE(q->npu_irq_registered, false);
+-
+-		if (!npu)
+-			continue;
+-
+-		status = airoha_npu_wlan_get_irq_status(npu, i);
+-		airoha_npu_wlan_set_irq_status(npu, status);
+-		airoha_npu_wlan_disable_irq(npu, i);
+-	}
+-	mutex_unlock(&dev->mutex);
+-
+-	for (i = 0; i < ARRAY_SIZE(registered); i++) {
+-		struct mt76_queue *q = &dev->q_rx[MT_RXQ_NPU0 + i];
+-
+-		if (!registered[i])
+-			continue;
+-
+-		devm_free_irq(dev->dev, irqs[i], q);
+-		napi_synchronize(&dev->napi[MT_RXQ_NPU0 + i]);
+-	}
+-
+-	mutex_lock(&dev->mutex);
+-	npu = rcu_dereference_protected(dev->mmio.npu,
+-					lockdep_is_held(&dev->mutex));
+-	for (i = 0; i < ARRAY_SIZE(registered); i++) {
+-		struct mt76_queue *q = &dev->q_rx[MT_RXQ_NPU0 + i];
+-		u32 status;
++		irq_registered = READ_ONCE(q->npu_irq_registered);
++		napi_registered = READ_ONCE(q->npu_napi_registered);
++		if (irq_registered) {
++			WRITE_ONCE(q->npu_irq_registered, false);
++			if (npu) {
++				status = airoha_npu_wlan_get_irq_status(npu, index);
++				airoha_npu_wlan_set_irq_status(npu, status);
++				airoha_npu_wlan_disable_irq(npu, index);
++			}
++
++			devm_free_irq(dev->dev, q->npu_irq, q);
++			q->npu_irq = -1;
++		}
+ 
+-		if (!registered[i])
+-			continue;
++		if (napi_registered) {
++			napi_disable(&dev->napi[i]);
++			netif_napi_del(&dev->napi[i]);
++			WRITE_ONCE(q->npu_napi_registered, false);
++		}
+ 
+-		q->npu_irq = -1;
+-		if (!npu)
+-			continue;
++		/* A poll already completing can race the first IRQ mask. */
++		if (npu && (irq_registered || napi_registered)) {
++			status = airoha_npu_wlan_get_irq_status(npu, index);
++			airoha_npu_wlan_set_irq_status(npu, status);
++			airoha_npu_wlan_disable_irq(npu, index);
++		}
+ 
+-		status = airoha_npu_wlan_get_irq_status(npu, i);
+-		airoha_npu_wlan_set_irq_status(npu, status);
+-		airoha_npu_wlan_disable_irq(npu, i);
++		if (q->page_pool) {
++			mt76_npu_queue_cleanup(dev, q);
++			page_pool_destroy(q->page_pool);
++			q->page_pool = NULL;
++		}
++		q->ndesc = 0;
+ 	}
+ 	mutex_unlock(&dev->mutex);
+ }
+@@ -615,8 +617,6 @@ void mt76_npu_deinit(struct mt76_dev *dev)
+ 	mutex_unlock(&dev->mutex);
+ 	synchronize_rcu();
+ 
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU1]);
+ 	dev->dma_dev = dev->dev;
+ 
+ 	if (npu)
+-- 
+2.43.0
+

@@ -1,0 +1,154 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 18 Aug 2026 02:00:00 +0800
+Subject: [PATCH] wifi: mt76: stop NPU before unregistering device
+
+The NPU stop handshake was issued after unregistering the mac80211 device
+and the secondary PHYs. At that point the normal driver stop callbacks had
+already dismantled state needed by the firmware to quiesce its Wi-Fi rings.
+The stop handshake then timed out, and the attempted NPU core recovery left
+the firmware mailbox unresponsive across subsequent module reloads.
+
+Issue the handshake while all PHY and mac80211 state is still registered,
+matching the ordering used by the existing SER path. Do not restart the NPU
+core when this normal teardown handshake times out: the request has already
+been published, and restarting the core here destroys a working mailbox.
+Keep timeout recovery enabled for SER and probe-error cleanup, where the
+driver remains active and can safely retry the handshake.
+
+Add phase-specific warnings so pause, drain, and detach failures can be
+distinguished on real hardware.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Origin: other
+Link: https://github.com/openwrt/mt76/commit/647d11bb17e059140aa390c98768baf66714a41f
+Forwarded: not-needed
+--- mt76-2026.07.01~59676919.orig/mt7996/init.c
++++ mt76-2026.07.01~59676919/mt7996/init.c
+@@ -1837,14 +1837,14 @@ void mt7996_unregister_device(struct mt7
+ 	cancel_work_sync(&dev->wed_rro.work);
+ 	cancel_work_sync(&dev->reset_work);
+ 	cancel_work_sync(&dev->rc_work);
++	err = mt7996_npu_hw_stop_teardown(dev);
++	if (err)
++		dev_warn(dev->mt76.dev, "failed to stop NPU: %d\n", err);
+ 	mt7996_unregister_phy(mt7996_phy3(dev));
+ 	mt7996_unregister_phy(mt7996_phy2(dev));
+ 	mt7996_unregister_thermal(&dev->phy);
+ 	mt7996_coredump_unregister(dev);
+ 	mt76_unregister_device(&dev->mt76);
+-	err = mt7996_npu_hw_stop(dev);
+-	if (err)
+-		dev_warn(dev->mt76.dev, "failed to stop NPU: %d\n", err);
+ 	mt76_npu_rx_queues_deinit(&dev->mt76);
+ 	mt7996_wed_rro_free(dev);
+ 	mt7996_mcu_exit(dev);
+--- mt76-2026.07.01~59676919.orig/mt7996/npu.c
++++ mt76-2026.07.01~59676919/mt7996/npu.c
+@@ -640,35 +640,48 @@ int mt7996_npu_hw_init(struct mt7996_dev
+ 	return err;
+ }
+ 
+-static int mt7996_npu_hw_stop_once(struct airoha_npu *npu)
++static int mt7996_npu_hw_stop_once(struct mt7996_dev *dev,
++				   struct airoha_npu *npu)
+ {
+ 	int i, err;
+ 	u32 info;
+ 
+ 	err = mt76_npu_send_msg(npu, 4, WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+ 				0, GFP_KERNEL);
+-	if (err)
++	if (err) {
++		dev_warn(dev->mt76.dev, "NPU pause request failed: %d\n", err);
+ 		return err;
++	}
+ 
+ 	for (i = 0; i < 10; i++) {
+ 		err = mt76_npu_get_msg(npu, 3, WLAN_FUNC_GET_WAIT_NPU_INFO,
+ 				       &info, GFP_KERNEL);
+-		if (err)
++		if (err) {
++			dev_warn(dev->mt76.dev,
++				 "NPU drain status request failed: %d\n", err);
+ 			return err;
++		}
+ 		if (!info)
+ 			break;
+ 
+ 		usleep_range(10000, 15000);
+ 	}
+-	if (i == 10)
++	if (i == 10) {
++		dev_warn(dev->mt76.dev,
++			 "NPU drain did not complete, status: %#x\n", info);
+ 		return -ETIMEDOUT;
++	}
++
++	err = mt76_npu_send_msg(npu, 6,
++				WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++				0, GFP_KERNEL);
++	if (err)
++		dev_warn(dev->mt76.dev, "NPU detach request failed: %d\n", err);
+ 
+-	return mt76_npu_send_msg(npu, 6,
+-				 WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+-				 0, GFP_KERNEL);
++	return err;
+ }
+ 
+-int mt7996_npu_hw_stop(struct mt7996_dev *dev)
++static int __mt7996_npu_hw_stop(struct mt7996_dev *dev, bool recover)
+ {
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+@@ -679,14 +692,24 @@ int mt7996_npu_hw_stop(struct mt7996_dev
+ 	if (!npu)
+ 		goto unlock;
+ 
+-	err = mt7996_npu_hw_stop_once(npu);
+-	if (err == -ETIMEDOUT || err == -EAGAIN) {
++	err = mt7996_npu_hw_stop_once(dev, npu);
++	if (recover && (err == -ETIMEDOUT || err == -EAGAIN)) {
+ 		err = mt7996_npu_prepare_retry(dev, npu, err, "NPU stop");
+ 		if (!err)
+-			err = mt7996_npu_hw_stop_once(npu);
++			err = mt7996_npu_hw_stop_once(dev, npu);
+ 	}
+ unlock:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return err;
+ }
++
++int mt7996_npu_hw_stop(struct mt7996_dev *dev)
++{
++	return __mt7996_npu_hw_stop(dev, true);
++}
++
++int mt7996_npu_hw_stop_teardown(struct mt7996_dev *dev)
++{
++	return __mt7996_npu_hw_stop(dev, false);
++}
+--- mt76-2026.07.01~59676919.orig/mt7996/mt7996.h
++++ mt76-2026.07.01~59676919/mt7996/mt7996.h
+@@ -1018,6 +1018,7 @@ void mt7996_dma_rro_start(struct mt7996_
+ int __mt7996_npu_hw_init(struct mt7996_dev *dev);
+ int mt7996_npu_hw_init(struct mt7996_dev *dev);
+ int mt7996_npu_hw_stop(struct mt7996_dev *dev);
++int mt7996_npu_hw_stop_teardown(struct mt7996_dev *dev);
+ int mt7996_npu_rx_queues_init(struct mt7996_dev *dev);
+ #else
+ static inline int __mt7996_npu_hw_init(struct mt7996_dev *dev)
+@@ -1034,6 +1035,11 @@ static inline int mt7996_npu_hw_stop(str
+ {
+ 	return 0;
+ }
++
++static inline int mt7996_npu_hw_stop_teardown(struct mt7996_dev *dev)
++{
++	return 0;
++}
+ 
+ static inline int mt7996_npu_rx_queues_init(struct mt7996_dev *dev)
+ {

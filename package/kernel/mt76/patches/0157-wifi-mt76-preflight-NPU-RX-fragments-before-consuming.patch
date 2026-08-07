@@ -1,0 +1,83 @@
+From 49b55907d90a7cb20e78b7733937be136a101728 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 18:10:54 +0800
+Subject: [PATCH 1/3] wifi: mt76: preflight NPU RX fragments before consuming
+
+The NPU marks the fragments of a packet independently. Building the
+skb while checking descriptors one at a time can transfer early
+page-pool pages to the network stack before a later descriptor is
+ready. Freeing that partial skb then recycles pages which are still
+referenced by live ring entries.
+
+Check ownership for the complete fragment set before synchronizing or
+attaching any buffer. Read the producer-owned fields with READ_ONCE()
+and use DMA read barriers after observing the done bits so descriptor
+metadata is not consumed before ownership transfers.
+
+Fixes: 141a81557070 ("wifi: mt76: Introduce the NPU generic layer")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+---
+ npu.c | 33 +++++++++++++++++++++++++--------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/npu.c b/npu.c
+index 8b68127..c031ef4 100644
+--- a/npu.c
++++ b/npu.c
+@@ -66,19 +66,36 @@ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, index = q->tail;
+ 	struct sk_buff *skb = NULL;
++	u32 ctrl;
+ 
+-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
++	if (!q->queued)
++		return NULL;
++
++	ctrl = READ_ONCE(desc[index].ctrl);
++	if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++		return NULL;
++
++	dma_rmb();
++	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK,
++			    READ_ONCE(desc[index].info));
+ 	nframes = max_t(int, nframes, 1);
++	if (nframes > q->queued)
++		return NULL;
++
++	for (i = 1; i < nframes; i++) {
++		index = (index + 1) % q->ndesc;
++		ctrl = READ_ONCE(desc[index].ctrl);
++		if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++			return NULL;
++	}
++	dma_rmb();
++
++	index = q->tail;
+ 
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+ 		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
+-				    desc[index].ctrl);
+-
+-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, desc[index].ctrl)) {
+-			dev_kfree_skb(skb);
+-			return NULL;
+-		}
++				    READ_ONCE(desc[index].ctrl));
+ 
+ 		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+ 					e->dma_len[0],
+@@ -103,7 +120,7 @@ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 						len, q->buf_size);
+ 		}
+ 
+-		*info = desc[index].info;
++		*info = READ_ONCE(desc[index].info);
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;
+-- 
+2.43.0
+

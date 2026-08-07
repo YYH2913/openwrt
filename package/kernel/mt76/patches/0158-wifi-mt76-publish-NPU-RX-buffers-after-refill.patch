@@ -1,0 +1,63 @@
+From b56c55fbaa2ae00262c3c2c7c370296a37e0c09f Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 18:11:03 +0800
+Subject: [PATCH 2/3] wifi: mt76: publish NPU RX buffers after refill
+
+The NPU RX ring uses descriptor ownership bits and, unlike the generic
+WFDMA ring, supports all descriptors being populated. The Airoha SDK
+replaces a consumed buffer and clears its done bit before advancing the
+host index.
+
+mt76 currently reserves an empty descriptor and advances q->tail before
+refill. This can make a consumed descriptor visible to the NPU while its
+page is already owned by an skb. It also publishes beyond the buffers
+actually replaced when page allocation is partial.
+
+Populate the complete NPU ring and move index publication into the
+refill path. A DMA write barrier makes the replacement descriptors
+visible first, and q->head exposes only the contiguous boundary that
+was successfully replenished.
+
+Fixes: 141a81557070 ("wifi: mt76: Introduce the NPU generic layer")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+---
+ npu.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/npu.c b/npu.c
+index c031ef4..f49ef9c 100644
+--- a/npu.c
++++ b/npu.c
+@@ -18,7 +18,7 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int nframes = 0;
+ 
+-	while (q->queued < q->ndesc - 1) {
++	while (q->queued < q->ndesc) {
+ 		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 		struct mt76_queue_entry *e = &q->entry[q->head];
+ 		struct page *page;
+@@ -40,6 +40,11 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ 		nframes++;
+ 	}
+ 
++	if (nframes) {
++		dma_wmb();
++		Q_WRITE(q, dma_idx, q->head);
++	}
++
+ 	return nframes;
+ }
+ 
+@@ -125,7 +130,6 @@ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 	}
+ 	q->tail = index;
+ 	q->queued -= i;
+-	Q_WRITE(q, dma_idx, q->tail);
+ 
+ 	return skb;
+ }
+-- 
+2.43.0
+

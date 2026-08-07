@@ -1,0 +1,131 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 15 Aug 2026 11:38:00 +0800
+Subject: [PATCH] wifi: mt76: mt7996: quiesce device before system restart
+
+MT7990 may remain powered while the host restarts. If firmware, NPU,
+WED, or WFDMA are still able to issue transactions when the PCIe host
+asserts PERST, one or both HIF functions may fail to enumerate on the
+next boot.
+
+A normal remove is unsuitable for the reboot callback. The NPU mailbox
+stop handshake is not reliable once mac80211 teardown has started, and
+freeing WED-owned page pools and NAPI contexts during shutdown triggers
+kernel warnings without providing any benefit before reset.
+
+Add a dedicated shutdown path which stops both WED instances, masks NPU
+and device interrupts, disables and resets both WFDMA engines, and then
+asserts the MT7990 whole-path reset. Finally clear PCI bus mastering on
+both HIFs so neither function can access host memory during restart.
+
+Keep the complete unregister path unchanged for module removal.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -234,6 +234,11 @@ static void mt7996_hif_remove(struct pci
+ 	list_del(&hif->list);
+ }
+ 
++static void mt7996_hif_shutdown(struct pci_dev *pdev)
++{
++	pci_clear_master(pdev);
++}
++
+ static void mt7996_pci_remove(struct pci_dev *pdev)
+ {
+ 	struct mt76_dev *mdev;
+@@ -245,11 +250,32 @@ static void mt7996_pci_remove(struct pci
+ 	mt7996_unregister_device(dev);
+ }
+ 
++static void mt7996_pci_shutdown(struct pci_dev *pdev)
++{
++	struct mt76_dev *mdev = pci_get_drvdata(pdev);
++	struct mt7996_dev *dev;
++	struct pci_dev *hif2_dev = NULL;
++
++	dev = container_of(mdev, struct mt7996_dev, mt76);
++	if (dev->hif2)
++		hif2_dev = pci_dev_get(to_pci_dev(dev->hif2->dev));
++
++	mt7996_put_hif2(dev->hif2);
++	mt7996_shutdown_device(dev);
++	pci_clear_master(pdev);
++
++	if (hif2_dev) {
++		pci_clear_master(hif2_dev);
++		pci_dev_put(hif2_dev);
++	}
++}
++
+ struct pci_driver mt7996_hif_driver = {
+ 	.name		= KBUILD_MODNAME "_hif",
+ 	.id_table	= mt7996_hif_device_table,
+ 	.probe		= mt7996_pci_probe,
+ 	.remove		= mt7996_hif_remove,
++	.shutdown	= mt7996_hif_shutdown,
+ };
+ 
+ struct pci_driver mt7996_pci_driver = {
+@@ -257,6 +283,7 @@ struct pci_driver mt7996_pci_driver = {
+ 	.id_table	= mt7996_pci_device_table,
+ 	.probe		= mt7996_pci_probe,
+ 	.remove		= mt7996_pci_remove,
++	.shutdown	= mt7996_pci_shutdown,
+ };
+ 
+ MODULE_DEVICE_TABLE(pci, mt7996_pci_device_table);
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1857,3 +1857,21 @@ void mt7996_unregister_device(struct mt7
+ 
+ 	mt76_free_device(&dev->mt76);
+ }
++
++void mt7996_shutdown_device(struct mt7996_dev *dev)
++{
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
++		mtk_wed_device_stop(&dev->mt76.mmio.wed_hif2);
++
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
++		mtk_wed_device_stop(&dev->mt76.mmio.wed);
++
++	mt76_npu_disable_irqs(&dev->mt76);
++	mt7996_irq_disable(dev, ~0);
++	mt7996_dma_disable(dev, true);
++
++	if (is_mt7990(&dev->mt76)) {
++		dev->recovery.hw_full_reset = true;
++		mt7996_wfsys_reset(dev);
++	}
++}
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -728,6 +728,7 @@ irqreturn_t mt7996_irq_handler(int irq,
+ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link);
+ int mt7996_register_device(struct mt7996_dev *dev);
+ void mt7996_unregister_device(struct mt7996_dev *dev);
++void mt7996_shutdown_device(struct mt7996_dev *dev);
+ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+ 			struct ieee80211_bss_conf *link_conf,
+ 			struct mt76_vif_link *mlink);
+@@ -743,6 +744,7 @@ bool mt7996_eeprom_has_background_radar(
+ int mt7996_dma_init(struct mt7996_dev *dev);
+ void mt7996_dma_reset(struct mt7996_dev *dev, bool force);
+ void mt7996_dma_prefetch(struct mt7996_dev *dev);
++void mt7996_dma_disable(struct mt7996_dev *dev, bool reset);
+ void mt7996_dma_cleanup(struct mt7996_dev *dev);
+ void mt7996_dma_start(struct mt7996_dev *dev, bool reset, bool wed_reset);
+ int mt7996_init_tx_queues(struct mt7996_phy *phy, int idx,
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -258,7 +258,7 @@ void mt7996_dma_prefetch(struct mt7996_d
+ 		__mt7996_dma_prefetch(dev, MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0));
+ }
+ 
+-static void mt7996_dma_disable(struct mt7996_dev *dev, bool reset)
++void mt7996_dma_disable(struct mt7996_dev *dev, bool reset)
+ {
+ 	u32 hif1_ofs = 0;
+ 

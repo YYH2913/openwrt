@@ -1,0 +1,96 @@
+From c81059705b31d48d52db92a3f73634877340f992 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 7 Aug 2026 18:11:13 +0800
+Subject: [PATCH 3/3] wifi: mt76: preserve NPU TX ring headroom
+
+The Airoha SDK submits a TX descriptor only while more than five entries
+remain between the producer and consumer, and only after confirming that
+the producer descriptor is host-owned. mt76 currently relies on its
+generic queue limit, which leaves less headroom and does not verify the
+NPU done bit before reuse.
+
+Apply the NPU-specific availability rule before allocating a TXWI or
+mapping the skb. This preserves the firmware prefetch margin and
+prevents a live descriptor from being overwritten if software queue
+accounting and descriptor ownership disagree.
+
+Fixes: 141a81557070 ("wifi: mt76: Introduce the NPU generic layer")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+---
+ dma.c  |  3 +++
+ mt76.h |  6 ++++++
+ npu.c  | 12 ++++++++++++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/dma.c b/dma.c
+index d934b30..29ea67b 100644
+--- a/dma.c
++++ b/dma.c
+@@ -662,6 +662,9 @@ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 	if (test_bit(MT76_RESET, &phy->state))
+ 		goto free_skb;
+ 
++	if (mt76_queue_is_npu_tx(q) && !mt76_npu_tx_queue_available(q))
++		goto free_skb;
++
+ 	/* TODO: Take into account unlinear skbs */
+ 	if (mt76_npu_device_active(dev) && skb_linearize(skb))
+ 		goto free_skb;
+diff --git a/mt76.h b/mt76.h
+index 89980b8..3f8c9cc 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1674,6 +1674,7 @@ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
+ 			 struct sk_buff *skb, struct mt76_queue_buf *buf,
+ 			 void *txwi_ptr);
++bool mt76_npu_tx_queue_available(struct mt76_queue *q);
+ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q);
+ void mt76_npu_rx_queues_deinit(struct mt76_dev *dev);
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q);
+@@ -1704,6 +1705,11 @@ static inline int mt76_npu_dma_add_buf(struct mt76_phy *phy,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline bool mt76_npu_tx_queue_available(struct mt76_queue *q)
++{
++	return false;
++}
++
+ static inline int mt76_npu_fill_rx_queue(struct mt76_dev *dev,
+ 					 struct mt76_queue *q)
+ {
+diff --git a/npu.c b/npu.c
+index f49ef9c..374b1ed 100644
+--- a/npu.c
++++ b/npu.c
+@@ -13,6 +13,7 @@
+ 
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++#define MT76_NPU_TX_RESERVED_DESC	5
+ 
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+@@ -227,6 +228,17 @@ out:
+ 	return IRQ_HANDLED;
+ }
+ 
++bool mt76_npu_tx_queue_available(struct mt76_queue *q)
++{
++	struct airoha_npu_tx_dma_desc *desc = (void *)q->desc;
++
++	if (q->ndesc <= MT76_NPU_TX_RESERVED_DESC ||
++	    q->queued >= q->ndesc - MT76_NPU_TX_RESERVED_DESC)
++		return false;
++
++	return !(READ_ONCE(desc[q->head].ctrl) & NPU_TX_DMA_DESC_DONE_MASK);
++}
++
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
+ 			 struct sk_buff *skb, struct mt76_queue_buf *buf,
+ 			 void *txwi_ptr)
+-- 
+2.43.0
+

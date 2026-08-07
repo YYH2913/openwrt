@@ -1,0 +1,166 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 18 Aug 2026 00:01:30 +0800
+Subject: [PATCH] wifi: mt76: track RX NAPI registration
+
+mt76_dma_init() skips WED RRO queues because hardware-offloaded queues do
+not use NAPI. When WED is inactive, however, mt7996_dma_rro_start() later
+registers NAPI for those same software-handled queues.
+
+Cleanup currently checks only the WED RRO flag and leaves those NAPI
+instances enabled and registered. It also iterates only queues with active
+descriptors, although an earlier teardown stage can release a queue before
+the dummy netdev is freed. This triggers warnings when free_netdev() removes
+the remaining NAPI instances.
+
+Track RX NAPI registration in the device independently of queue allocation
+state. Walk the complete RX NAPI array during final cleanup, and destroy each
+page pool before deleting its NAPI instance so the association remains valid
+throughout teardown. Reuse the same registration state for the NPU RX queues.
+
+Disable registered RX NAPI instances in mt7996_dma_cleanup(), not in the shared
+mt76_dma_cleanup(). Other drivers, including mt7921 and mt7925, already disable
+them in their own remove paths; disabling twice can hang indefinitely. This
+retains the upstream revert 6d1c6a758a4c while preserving MT7996-specific cleanup.
+
+Fixes: 332bbe9b2784 ("wifi: mt76: Disable napi when removing device")
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/dma.c
++++ b/dma.c
+@@ -1184,8 +1184,11 @@ static void
+ mt76_dma_rx_queue_init(struct mt76_dev *dev, enum mt76_rxq_id qid,
+ 		       int (*poll)(struct napi_struct *napi, int budget))
+ {
++	struct mt76_queue *q = &dev->q_rx[qid];
++
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll);
+-	mt76_dma_rx_fill_buf(dev, &dev->q_rx[qid], false);
++	set_bit(qid, &dev->napi_registered);
++	mt76_dma_rx_fill_buf(dev, q, false);
+ 	napi_enable(&dev->napi[qid]);
+ }
+ 
+@@ -1271,13 +1274,22 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
+ 		mt76_dma_tx_cleanup(dev, dev->q_mcu[i], true);
+ 
+-	mt76_for_each_q_rx(dev, i) {
++	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
++		bool napi_registered = test_bit(i, &dev->napi_registered);
+ 
+-		netif_napi_del(&dev->napi[i]);
+-		mt76_dma_rx_cleanup(dev, q);
++		if (q->ndesc)
++			mt76_dma_rx_cleanup(dev, q);
+ 
+-		page_pool_destroy(q->page_pool);
++		if (q->page_pool) {
++			page_pool_destroy(q->page_pool);
++			q->page_pool = NULL;
++		}
++
++		if (napi_registered) {
++			netif_napi_del(&dev->napi[i]);
++			clear_bit(i, &dev->napi_registered);
++		}
+ 	}
+ 
+ 	if (mtk_wed_device_active(&dev->mmio.wed))
+--- a/mt76.h
++++ b/mt76.h
+@@ -261,7 +261,6 @@ struct mt76_queue {
+ 	int npu_irq;
+ 	bool stopped;
+ 	bool blocked;
+-	bool npu_napi_registered;
+ 	bool npu_irq_registered;
+ 
+ 	u8 buf_offset;
+@@ -974,6 +973,7 @@ struct mt76_dev {
+ 	struct net_device *tx_napi_dev;
+ 	spinlock_t rx_lock;
+ 	struct napi_struct napi[__MT_RXQ_MAX];
++	unsigned long napi_registered;
+ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
+ 	struct tasklet_struct irq_tasklet;
+ 
+--- a/npu.c
++++ b/npu.c
+@@ -322,7 +322,7 @@ int mt76_npu_rx_queue_init(struct mt76_d
+ 	}
+ 
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+-	WRITE_ONCE(q->npu_napi_registered, true);
++	set_bit(qid, &dev->napi_registered);
+ 	mt76_npu_fill_rx_queue(dev, q);
+ 	napi_enable(&dev->napi[qid]);
+ 
+@@ -339,16 +339,17 @@ int mt76_npu_rx_queue_init(struct mt76_d
+ 	goto out;
+ 
+ error_queue:
+-	if (READ_ONCE(q->npu_napi_registered)) {
++	if (test_bit(qid, &dev->napi_registered))
+ 		napi_disable(&dev->napi[qid]);
+-		netif_napi_del(&dev->napi[qid]);
+-		WRITE_ONCE(q->npu_napi_registered, false);
+-	}
+ 	if (q->page_pool) {
+ 		mt76_npu_queue_cleanup(dev, q);
+ 		page_pool_destroy(q->page_pool);
+ 		q->page_pool = NULL;
+ 	}
++	if (test_bit(qid, &dev->napi_registered)) {
++		netif_napi_del(&dev->napi[qid]);
++		clear_bit(qid, &dev->napi_registered);
++	}
+ 	q->npu_irq = -1;
+ 	q->ndesc = 0;
+ out:
+@@ -374,7 +375,7 @@ void mt76_npu_rx_queues_deinit(struct mt
+ 		u32 status;
+ 
+ 		irq_registered = READ_ONCE(q->npu_irq_registered);
+-		napi_registered = READ_ONCE(q->npu_napi_registered);
++		napi_registered = test_bit(i, &dev->napi_registered);
+ 		if (irq_registered) {
+ 			WRITE_ONCE(q->npu_irq_registered, false);
+ 			if (npu) {
+@@ -389,8 +390,6 @@ void mt76_npu_rx_queues_deinit(struct mt
+ 
+ 		if (napi_registered) {
+ 			napi_disable(&dev->napi[i]);
+-			netif_napi_del(&dev->napi[i]);
+-			WRITE_ONCE(q->npu_napi_registered, false);
+ 		}
+ 
+ 		/* A poll already completing can race the first IRQ mask. */
+@@ -405,6 +404,10 @@ void mt76_npu_rx_queues_deinit(struct mt
+ 			page_pool_destroy(q->page_pool);
+ 			q->page_pool = NULL;
+ 		}
++		if (napi_registered) {
++			netif_napi_del(&dev->napi[i]);
++			clear_bit(i, &dev->napi_registered);
++		}
+ 		q->ndesc = 0;
+ 	}
+ 	mutex_unlock(&dev->mutex);
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -1051,7 +1051,14 @@ void mt7996_dma_reset(struct mt7996_dev
+ 
+ void mt7996_dma_cleanup(struct mt7996_dev *dev)
+ {
++	int i;
++
+ 	mt7996_dma_disable(dev, true);
+ 
++	/* Other mt76 drivers quiesce RX NAPI in their own remove paths. */
++	for (i = 0; i < ARRAY_SIZE(dev->mt76.napi); i++)
++		if (test_bit(i, &dev->mt76.napi_registered))
++			napi_disable(&dev->mt76.napi[i]);
++
+ 	mt76_dma_cleanup(&dev->mt76);
+ }
