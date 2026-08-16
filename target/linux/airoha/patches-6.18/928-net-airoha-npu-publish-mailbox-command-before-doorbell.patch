@@ -1,0 +1,35 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 9 Aug 2026 20:47:52 +0800
+Subject: [PATCH] net: airoha: npu: publish mailbox command before doorbell
+
+airoha_npu_send_msg() currently increments MBQ0_CTRL2 before writing the
+command flags to MBQ0_CTRL3. The firmware treats the CTRL2 producer index
+update as a doorbell, so it can consume the previous CTRL3 contents before
+the host publishes the new function ID and WAIT_RSP bit.
+
+This can make a request complete with stale status and response data. On
+AN7581 with the MT7996 firmware it is visible during probe as firmware
+version 0.0, followed by rejected PPE and WLAN offload setup requests.
+
+Match the Airoha SDK mailbox protocol and write CTRL3 before incrementing
+CTRL2. Ordered MMIO writes then make the complete request visible before
+the firmware is notified.
+
+Fixes: 23290c7bc190 ("net: airoha: Introduce Airoha NPU support")
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -198,10 +198,10 @@ static int __airoha_npu_send_msg(struct
+ 
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
+-	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+ 	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
++	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
++	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+ 
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,

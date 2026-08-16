@@ -35,7 +35,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
 ---
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -24,6 +24,12 @@
+@@ -23,6 +23,12 @@
  #define NPU_EN7581_FIRMWARE_RV32_MAX_SIZE	0x200000
  #define NPU_EN7581_FIRMWARE_DATA_MAX_SIZE	0x10000
  #define NPU_DUMP_SIZE				512
@@ -48,7 +48,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  
  #define REG_NPU_LOCAL_SRAM		0x0
  
-@@ -161,23 +167,34 @@ struct wlan_mbox_data {
+@@ -160,27 +166,38 @@ struct wlan_mbox_data {
  	DECLARE_FLEX_ARRAY(u8, d);
  };
  
@@ -71,13 +71,11 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
 -		return ret;
 +	if (len > AIROHA_NPU_MBOX_SIZE)
 +		return -EINVAL;
- 
--	spin_lock_bh(&npu->cores[core].lock);
++
 +	if (reply && reply_len > len)
 +		return -EINVAL;
  
--	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, dma_addr);
--	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, size);
+-	spin_lock_bh(&npu->cores[core].lock);
 +	/*
 +	 * Mailbox payloads are bidirectional (CPU request, NPU response).
 +	 * On EN7581+MT7996, streaming DMA_BIDIRECTIONAL against the
@@ -87,7 +85,13 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
 +	 * foe_commit under atomic context).
 +	 */
 +	spin_lock_bh(&core->lock);
-+
+ 	if (npu->recovering) {
+ 		ret = -EAGAIN;
+ 		goto unlock;
+ 	}
+ 
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, dma_addr);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, size);
 +	memcpy(core->buf, data, len);
 +
 +	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
@@ -95,16 +99,18 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
  	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
  	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
-@@ -190,13 +207,21 @@ static int airoha_npu_send_msg(struct ai
+@@ -193,14 +210,22 @@ static int airoha_npu_send_msg(struct ai
  	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
  		ret = -EINVAL;
  
+-unlock:
 -	spin_unlock_bh(&npu->cores[core].lock);
 +	/* Copy the trailing reply_len bytes of the response. */
 +	if (!ret && reply)
 +		memcpy(reply, core->buf + len - reply_len, reply_len);
  
 -	dma_unmap_single(npu->dev, dma_addr, size, DMA_BIDIRECTIONAL);
++unlock:
 +	spin_unlock_bh(&core->lock);
  
  	return ret;
@@ -119,7 +125,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
  				    const char *fw_name, int fw_max_size)
  {
-@@ -500,9 +525,8 @@ static int airoha_npu_wlan_msg_get(struc
+@@ -499,9 +524,8 @@ static int airoha_npu_wlan_msg_get(struc
  	wlan_data->func_type = NPU_OP_GET;
  	wlan_data->func_id = func_id;
  
@@ -131,7 +137,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  	kfree(wlan_data);
  
  	return err;
-@@ -776,6 +800,15 @@ static int airoha_npu_probe(struct platf
+@@ -772,6 +796,15 @@ static int airoha_npu_probe(struct platf
  	if (err)
  		return err;
  
@@ -149,7 +155,7 @@ Signed-off-by: Daniel Pawlik <pawlik.dan@gmail.com>
  		return err;
 --- a/include/linux/soc/airoha/airoha_offload.h
 +++ b/include/linux/soc/airoha/airoha_offload.h
-@@ -173,6 +173,9 @@ struct airoha_npu {
+@@ -178,6 +178,9 @@ struct airoha_npu {
  		/* protect concurrent npu memory accesses */
  		spinlock_t lock;
  		struct work_struct wdt_work;

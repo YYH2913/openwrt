@@ -18,18 +18,15 @@ Serialize recovery and reject mailbox requests while it is running. Always
 attempt recovery after a watchdog interrupt even if coredump allocation
 fails, and expose a synchronous core 0 recovery helper to NPU consumers.
 
-Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_npu.c  | 77 ++++++++++++++++++++---
  include/linux/soc/airoha/airoha_offload.h | 10 +++
  2 files changed, 77 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
-index b58e478..63f3b2d 100644
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -174,6 +174,10 @@ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+@@ -175,6 +175,10 @@ static int airoha_npu_send_msg(struct ai
  		return ret;
  
  	spin_lock_bh(&npu->cores[core].lock);
@@ -40,7 +37,7 @@ index b58e478..63f3b2d 100644
  
  	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, dma_addr);
  	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, size);
-@@ -189,6 +193,7 @@ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+@@ -190,6 +194,7 @@ static int airoha_npu_send_msg(struct ai
  	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
  		ret = -EINVAL;
  
@@ -48,7 +45,7 @@ index b58e478..63f3b2d 100644
  	spin_unlock_bh(&npu->cores[core].lock);
  
  	dma_unmap_single(npu->dev, dma_addr, size, DMA_BIDIRECTIONAL);
-@@ -290,6 +295,54 @@ static irqreturn_t airoha_npu_mbox_handler(int irq, void *npu_instance)
+@@ -293,6 +298,54 @@ static irqreturn_t airoha_npu_mbox_handl
  	return IRQ_HANDLED;
  }
  
@@ -103,7 +100,7 @@ index b58e478..63f3b2d 100644
  static void airoha_npu_wdt_work(struct work_struct *work)
  {
  	struct airoha_npu_core *core;
-@@ -301,16 +354,20 @@ static void airoha_npu_wdt_work(struct work_struct *work)
+@@ -304,16 +357,20 @@ static void airoha_npu_wdt_work(struct w
  	core = container_of(work, struct airoha_npu_core, wdt_work);
  	npu = core->npu;
  
@@ -132,7 +129,7 @@ index b58e478..63f3b2d 100644
  }
  
  static irqreturn_t airoha_npu_wdt_handler(int irq, void *core_instance)
-@@ -708,6 +765,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -711,6 +768,7 @@ static int airoha_npu_probe(struct platf
  		return -ENOMEM;
  
  	npu->dev = dev;
@@ -140,25 +137,6 @@ index b58e478..63f3b2d 100644
  	npu->ops.ppe_init = airoha_npu_ppe_init;
  	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
  	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
-@@ -744,6 +802,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
- 
- 		spin_lock_init(&core->lock);
- 		core->npu = npu;
-+		INIT_WORK(&core->wdt_work, airoha_npu_wdt_work);
- 
- 		irq = platform_get_irq(pdev, i + 1);
- 		if (irq < 0)
-@@ -753,8 +812,6 @@ static int airoha_npu_probe(struct platform_device *pdev)
- 				       IRQF_SHARED, "airoha-npu-wdt", core);
- 		if (err)
- 			return err;
--
--		INIT_WORK(&core->wdt_work, airoha_npu_wdt_work);
- 	}
- 
- 	/* wlan IRQ lines */
-diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
-index 7589fcc..b601096 100644
 --- a/include/linux/soc/airoha/airoha_offload.h
 +++ b/include/linux/soc/airoha/airoha_offload.h
 @@ -6,6 +6,7 @@
@@ -187,7 +165,7 @@ index 7589fcc..b601096 100644
  
  static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
  {
-@@ -268,6 +273,11 @@ static inline void airoha_npu_put(struct airoha_npu *npu)
+@@ -268,6 +273,11 @@ static inline void airoha_npu_put(struct
  {
  }
  
@@ -199,6 +177,3 @@ index 7589fcc..b601096 100644
  static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
  {
  	return -EOPNOTSUPP;
--- 
-2.43.0
-

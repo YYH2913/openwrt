@@ -13,27 +13,24 @@ every core lock to drain requests which already passed the check. New
 requests then fail with -EAGAIN until the restart sequence and recovery
 status update are complete.
 
-Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_npu.c  | 19 ++++++++++---------
  include/linux/soc/airoha/airoha_offload.h |  3 ++-
  2 files changed, 12 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
-index e96d754..68a6667 100644
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -174,7 +174,7 @@ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
- 		return ret;
- 
- 	spin_lock_bh(&npu->cores[core].lock);
+@@ -189,7 +189,7 @@ static int __airoha_npu_send_msg(struct
+ 	 * foe_commit under atomic context).
+ 	 */
+ 	spin_lock_bh(&core->lock);
 -	if (npu->recovering) {
 +	if (atomic_read(&npu->recovering)) {
  		ret = -EAGAIN;
  		goto unlock;
  	}
-@@ -304,24 +304,26 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+@@ -329,24 +329,26 @@ static int airoha_npu_restart_core(struc
  		return -EINVAL;
  
  	mutex_lock(&npu->recovery_lock);
@@ -65,7 +62,7 @@ index e96d754..68a6667 100644
  		if (err)
  			break;
  
-@@ -329,10 +331,8 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+@@ -354,10 +356,8 @@ static int airoha_npu_restart_core(struc
  	}
  
  out:
@@ -77,7 +74,7 @@ index e96d754..68a6667 100644
  	mutex_unlock(&npu->recovery_lock);
  
  	return err;
-@@ -786,6 +786,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -810,6 +810,7 @@ static int airoha_npu_probe(struct platf
  
  	npu->dev = dev;
  	mutex_init(&npu->recovery_lock);
@@ -85,8 +82,6 @@ index e96d754..68a6667 100644
  	npu->ops.ppe_init = airoha_npu_ppe_init;
  	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
  	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
-diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
-index 4810185..be53f4f 100644
 --- a/include/linux/soc/airoha/airoha_offload.h
 +++ b/include/linux/soc/airoha/airoha_offload.h
 @@ -6,6 +6,7 @@
@@ -97,7 +92,7 @@ index 4810185..be53f4f 100644
  #include <linux/mutex.h>
  #include <linux/skbuff.h>
  #include <linux/spinlock.h>
-@@ -175,7 +176,7 @@ struct airoha_npu {
+@@ -170,7 +171,7 @@ struct airoha_npu {
  	struct regmap *regmap;
  	/* serialize NPU core recovery */
  	struct mutex recovery_lock;
@@ -106,6 +101,3 @@ index 4810185..be53f4f 100644
  	int recovery_err;
  
  	struct airoha_npu_core {
--- 
-2.43.0
-

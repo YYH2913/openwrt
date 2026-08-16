@@ -1,0 +1,136 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 09 Aug 2026 23:23:55 +0800
+Subject: [PATCH] net: airoha: npu: use a reserved coherent mailbox pool
+
+The AN7581 NPU can only access DRAM up to 0xbfffffff. The coherent
+mailbox implementation uses the generic 32-bit DMA domain, which can
+still allocate buffers beyond that limit on a 2 GiB system. Firmware can
+then receive an inaccessible mailbox address and complete commands with
+stale or zero response data.
+
+The Airoha SDK avoids this by allocating coherent mailbox buffers from its
+low-address DMA domain. A 0xbfffffff DMA mask cannot model that domain in
+mainline because DMA masks describe an addressing width; dma-direct rejects
+it when ZONE_DMA spans the full 32-bit range.
+
+Use a named, DT-backed coherent DMA pool below the NPU address limit.
+Increase the per-core mailbox buffer to 4 KiB, reject oversized messages,
+verify every allocated address, and add DMA barriers around the firmware
+doorbell and completion.
+
+Keep the upstream per-core core->buf and core->addr storage so the shared
+struct airoha_npu layout remains compatible with the coherent mailbox
+implementation this patch extends.
+
+Fixes: 23290c7bc190 ("net: airoha: Introduce Airoha NPU support")
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/devcoredump.h>
++#include <linux/sizes.h>
++#include <linux/dma-mapping.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/firmware.h>
+ #include <linux/platform_device.h>
+@@ -24,12 +26,8 @@
+ #define NPU_EN7581_FIRMWARE_RV32_MAX_SIZE	0x200000
+ #define NPU_EN7581_FIRMWARE_DATA_MAX_SIZE	0x10000
+ #define NPU_DUMP_SIZE				512
+-/*
+- * Mailbox DMA payload size. Covers sizeof(struct ppe_mbox_data) (28) and
+- * WLAN TLV messages (header + payload); largest in-tree WLAN payload today
+- * is 16 bytes (INODE_TXRX_REG_ADDR). Keep headroom for future commands.
+- */
+-#define AIROHA_NPU_MBOX_SIZE			256
++#define NPU_MBOX_SIZE				SZ_4K
++#define NPU_DMA_ADDR_MAX			0xbfffffffULL
+ 
+ #define REG_NPU_LOCAL_SRAM		0x0
+ 
+@@ -175,8 +173,8 @@ static int __airoha_npu_send_msg(struct
+ 	u32 val, offset = 0;
+ 	int ret;
+ 
+-	if (len > AIROHA_NPU_MBOX_SIZE)
+-		return -EINVAL;
++	if ((size_t)len > NPU_MBOX_SIZE)
++		return -EMSGSIZE;
+ 
+ 	if (reply && reply_len > len)
+ 		return -EINVAL;
+@@ -196,6 +194,7 @@ static int __airoha_npu_send_msg(struct
+ 	}
+ 
+ 	memcpy(core->buf, data, len);
++	dma_wmb();
+ 
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
+@@ -208,12 +207,13 @@ static int __airoha_npu_send_msg(struct
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+ 					      val, (val & MBOX_MSG_DONE),
+ 					      100, 100 * MSEC_PER_SEC);
+-	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
+-		ret = -EINVAL;
+-
+-	/* Copy the trailing reply_len bytes of the response. */
+-	if (!ret && reply)
+-		memcpy(reply, core->buf + len - reply_len, reply_len);
++	if (!ret) {
++		dma_rmb();
++		if (FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
++			ret = -EINVAL;
++		else if (reply)
++			memcpy(reply, core->buf + len - reply_len, reply_len);
++	}
+ 
+ unlock:
+ 	spin_unlock_bh(&core->lock);
+@@ -787,6 +787,11 @@ static const struct regmap_config regmap
+ 	.disable_locking	= true,
+ };
+ 
++static void airoha_npu_release_mbox_pool(void *data)
++{
++	of_reserved_mem_device_release(data);
++}
++
+ static int airoha_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -872,13 +877,29 @@ static int airoha_npu_probe(struct platf
+ 	if (err)
+ 		return err;
+ 
++	err = of_reserved_mem_device_init_by_name(dev, dev->of_node, "mbox");
++	if (err)
++		return dev_err_probe(dev, err,
++				     "failed to initialize NPU mailbox pool\n");
++
++	err = devm_add_action_or_reset(dev, airoha_npu_release_mbox_pool, dev);
++	if (err)
++		return err;
++
+ 	for (i = 0; i < ARRAY_SIZE(npu->cores); i++) {
+ 		struct airoha_npu_core *core = &npu->cores[i];
+ 
+-		core->buf = dmam_alloc_coherent(dev, AIROHA_NPU_MBOX_SIZE,
++		core->buf = dmam_alloc_coherent(dev, NPU_MBOX_SIZE,
+ 						&core->addr, GFP_KERNEL);
+ 		if (!core->buf)
+-			return -ENOMEM;
++			return dev_err_probe(dev, -ENOMEM,
++					     "failed to allocate NPU core %d mailbox\n",
++					     i);
++
++		if (core->addr + NPU_MBOX_SIZE - 1 > NPU_DMA_ADDR_MAX)
++			return dev_err_probe(dev, -ERANGE,
++					     "NPU core %d mailbox address %pad is out of range\n",
++					     i, &core->addr);
+ 	}
+ 
+ 	err = airoha_npu_run_firmware(dev, base, &res);
