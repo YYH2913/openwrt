@@ -19,11 +19,9 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  drivers/net/bonding/bond_options.c | 57 ++++++++++++++++++++++++++++++
  2 files changed, 104 insertions(+), 4 deletions(-)
 
-diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
-index 09ee7dfdc2cd..d1b149cc9011 100644
 --- a/drivers/net/bonding/bond_main.c
 +++ b/drivers/net/bonding/bond_main.c
-@@ -787,6 +787,12 @@ static void bond_ipsec_lag_remove_slave(struct bonding *bond,
+@@ -791,6 +791,12 @@ static void bond_ipsec_lag_remove_slave(
  			if (inst->real_dev != real_dev)
  				continue;
  
@@ -36,7 +34,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  			WRITE_ONCE(inst->added, false);
  			removed = true;
  		}
-@@ -3114,6 +3120,18 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+@@ -3246,6 +3252,18 @@ skip_mac_set:
  			bpf_prog_inc(bond->xdp_prog);
  	}
  
@@ -55,7 +53,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  	/* broadcast mode uses the all_slaves to loop through slaves. */
  	if (bond_mode_can_use_xmit_hash(bond) ||
  	    BOND_MODE(bond) == BOND_MODE_BROADCAST)
-@@ -3232,6 +3250,9 @@ static int __bond_release_one(struct net_device *bond_dev,
+@@ -3364,6 +3382,9 @@ static int __bond_release_one(struct net
  	}
  
  	bond_set_slave_inactive_flags(slave, BOND_SLAVE_NOTIFY_NOW);
@@ -65,7 +63,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  
  	bond_sysfs_slave_del(slave);
  
-@@ -3249,8 +3270,10 @@ static int __bond_release_one(struct net_device *bond_dev,
+@@ -3381,8 +3402,10 @@ static int __bond_release_one(struct net
  			slave_warn(bond_dev, slave_dev, "failed to unload XDP program\n");
  	}
  
@@ -78,7 +76,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  	 */
  	netdev_rx_handler_unregister(slave_dev);
  
-@@ -4768,8 +4791,13 @@ static int bond_slave_netdev_event(unsigned long event,
+@@ -4910,8 +4933,13 @@ static int bond_slave_netdev_event(unsig
  
  		if (BOND_MODE(bond) == BOND_MODE_8023AD)
  			bond_3ad_adapter_speed_duplex_changed(slave);
@@ -94,7 +92,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  		/* Refresh slave-array if applicable!
  		 * If the setup does not use miimon or arpmon (mode-specific!),
  		 * then these events will not cause the slave-array to be
-@@ -4781,6 +4809,19 @@ static int bond_slave_netdev_event(unsigned long event,
+@@ -4923,6 +4951,19 @@ static int bond_slave_netdev_event(unsig
  		if (bond_mode_can_use_xmit_hash(bond))
  			bond_update_slave_arr(bond, NULL);
  		break;
@@ -114,7 +112,7 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  	case NETDEV_CHANGEMTU:
  		/* TODO: Should slaves be allowed to
  		 * independently alter their MTU?  For
-@@ -4819,10 +4860,12 @@ static int bond_slave_netdev_event(unsigned long event,
+@@ -4961,10 +5002,12 @@ static int bond_slave_netdev_event(unsig
  		break;
  	case NETDEV_FEAT_CHANGE:
  		if (!bond->notifier_ctx) {
@@ -127,11 +125,9 @@ index 09ee7dfdc2cd..d1b149cc9011 100644
  		break;
  	case NETDEV_RESEND_IGMP:
  		/* Propagate to master device */
-diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
-index 946621b20359..9d977e220ca2 100644
 --- a/drivers/net/bonding/bond_options.c
 +++ b/drivers/net/bonding/bond_options.c
-@@ -17,6 +17,7 @@
+@@ -16,6 +16,7 @@
  
  #include <net/bonding.h>
  #include <net/ndisc.h>
@@ -139,7 +135,7 @@ index 946621b20359..9d977e220ca2 100644
  
  static int bond_option_active_slave_set(struct bonding *bond,
  					const struct bond_opt_value *newval);
-@@ -900,6 +901,13 @@ static bool bond_set_xfrm_features(struct bonding *bond)
+@@ -915,6 +916,13 @@ static bool bond_set_xfrm_features(struc
  static int bond_option_mode_set(struct bonding *bond,
  				const struct bond_opt_value *newval)
  {
@@ -153,7 +149,7 @@ index 946621b20359..9d977e220ca2 100644
  	if (bond->xdp_prog && !bond_xdp_check(bond, newval->value))
  		return -EOPNOTSUPP;
  
-@@ -924,8 +932,26 @@ static int bond_option_mode_set(struct bonding *bond,
+@@ -939,8 +947,26 @@ static int bond_option_mode_set(struct b
  
  	/* don't cache arp_validate between modes */
  	bond->params.arp_validate = BOND_ARP_VALIDATE_NONE;
@@ -180,7 +176,7 @@ index 946621b20359..9d977e220ca2 100644
  	/* When changing mode, the bond device is down, we may reduce
  	 * the bond_bcast_neigh_enabled in bond_close() if broadcast_neighbor
  	 * enabled in 8023ad mode. Therefore, only clear broadcast_neighbor
-@@ -1581,12 +1607,43 @@ static int bond_option_fail_over_mac_set(struct bonding *bond,
+@@ -1596,12 +1622,43 @@ static int bond_option_fail_over_mac_set
  static int bond_option_xmit_hash_policy_set(struct bonding *bond,
  					    const struct bond_opt_value *newval)
  {
@@ -224,5 +220,3 @@ index 946621b20359..9d977e220ca2 100644
  	return 0;
  }
  
--- 
-2.53.0

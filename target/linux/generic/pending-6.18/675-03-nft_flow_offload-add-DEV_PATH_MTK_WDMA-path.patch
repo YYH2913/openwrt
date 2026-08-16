@@ -1,5 +1,5 @@
-From: Ryan Chen <rchen14b@gmail.com>
-Date: Sun, 16 Mar 2026 13:00:00 -0500
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Mon, 30 Jun 2025 11:48:38 +0800
 Subject: [PATCH 3/4] netfilter: nft_flow_offload: add DEV_PATH_MTK_WDMA path
 
 Without this patch, nft_dev_path_info will populate an incorrect source
@@ -8,16 +8,20 @@ through the MT7996 WiFi device, the DEV_PATH_MTK_WDMA step in the
 device path does not set h_source, causing the PPE entry to get a zero
 source MAC and packets stall in both software fastpath and hardware path.
 
-Based on MediaTek SDK patch by Bo-Cun Chen <bc-bocun.chen@mediatek.com>.
+Ryan Chen split this handling from MediaTek's combined hardware offload
+patch. The local version is adapted to Linux 6.18.41's
+nf_flow_table_path.c split.
 
+Origin: backport, https://git01.mediatek.com/plugins/gitiles/openwrt/feeds/mtk-openwrt-feeds/+/2812cb84/21.02/files/target/linux/mediatek/patches-5.4/999-1718-v6.6-net-netfilter-add-nft-hw-offload.patch
+Link: https://github.com/rchen14b/openwrt_rchen14b/commit/c7abf1928e3af8628697a4abb767193fb2f33366
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
 Signed-off-by: Ryan Chen <rchen14b@gmail.com>
-Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
-diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
-@@ -217,6 +217,10 @@
+@@ -217,6 +217,10 @@ static void nft_dev_path_info(const stru
  			}
  			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
@@ -28,5 +32,3 @@ diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_pa
  		default:
  			break;
  		}
--- 
-2.43.0

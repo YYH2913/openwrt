@@ -11,23 +11,13 @@ the `airoha,raw-mode` DT property. Use quality 900 only in DRBG mode.
 
 Derived from OpenWRT-fanboy/OpenW1700k PR #1 patch 18/18.
 Link: https://github.com/OpenWRT-fanboy/OpenW1700k/pull/1
-Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
- drivers/char/hw_random/airoha-trng.c | 58 ++++++++++++++++++++++++++++++--------
- 1 file changed, 49 insertions(+), 9 deletions(-)
+ drivers/char/hw_random/airoha-trng.c | 55 ++++++++++++++++++++++++++++-------
+ 1 file changed, 45 insertions(+), 10 deletions(-)
 
 --- a/drivers/char/hw_random/airoha-trng.c
 +++ b/drivers/char/hw_random/airoha-trng.c
-@@ -1,63 +1,79 @@
- // SPDX-License-Identifier: GPL-2.0
- /* Copyright (C) 2024 Christian Marangi */
- 
- #include <linux/kernel.h>
- #include <linux/module.h>
- #include <linux/mod_devicetable.h>
- #include <linux/bitfield.h>
- #include <linux/delay.h>
- #include <linux/hw_random.h>
+@@ -10,7 +10,10 @@
  #include <linux/interrupt.h>
  #include <linux/io.h>
  #include <linux/iopoll.h>
@@ -38,7 +28,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  #define TRNG_IP_RDY			0x800
  #define   CNT_TRANS			GENMASK(15, 8)
- #define   SAMPLE_RDY			BIT(0)
+@@ -18,6 +21,7 @@
  #define TRNG_NS_SEK_AND_DAT_EN		0x804
  #define	  RNG_EN			BIT(31) /* referenced as ring_en */
  #define	  RAW_DATA_EN			BIT(16)
@@ -46,20 +36,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  #define TRNG_HEALTH_TEST_SW_RST		0x808
  #define   SW_RST			BIT(0) /* Active High */
  #define TRNG_INTR_EN			0x818
- #define   INTR_MASK			BIT(16)
- #define   CONTINUOUS_HEALTH_INITR_EN	BIT(2)
- #define   SW_STARTUP_INITR_EN		BIT(1)
- #define   RST_STARTUP_INITR_EN		BIT(0)
- /* Notice that Health Test are done only out of Reset and with RNG_EN */
- #define TRNG_HEALTH_TEST_STATUS		0x824
- #define   CONTINUOUS_HEALTH_AP_TEST_FAIL BIT(23)
- #define   CONTINUOUS_HEALTH_RC_TEST_FAIL BIT(22)
- #define   SW_STARTUP_TEST_DONE		BIT(21)
- #define   SW_STARTUP_AP_TEST_FAIL	BIT(20)
- #define   SW_STARTUP_RC_TEST_FAIL	BIT(19)
- #define   RST_STARTUP_TEST_DONE		BIT(18)
- #define   RST_STARTUP_AP_TEST_FAIL	BIT(17)
- #define   RST_STARTUP_RC_TEST_FAIL	BIT(16)
+@@ -38,6 +42,16 @@
  #define   RAW_DATA_VALID		BIT(7)
  
  #define TRNG_RAW_DATA_OUT		0x828
@@ -76,11 +53,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  #define TRNG_CNT_TRANS_VALID		0x80
  #define BUSY_LOOP_SLEEP			10
- #define BUSY_LOOP_TIMEOUT		(BUSY_LOOP_SLEEP * 10000)
- 
- struct airoha_trng {
- 	void __iomem *base;
- 	struct hwrng rng;
+@@ -49,6 +63,8 @@ struct airoha_trng {
  	struct device *dev;
  
  	struct completion rng_op_done;
@@ -89,25 +62,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  };
  
  static int airoha_trng_irq_mask(struct airoha_trng *trng)
- {
- 	u32 val;
- 
- 	val = readl(trng->base + TRNG_INTR_EN);
- 	val |= INTR_MASK;
- 	writel(val, trng->base + TRNG_INTR_EN);
- 
- 	return 0;
- }
-@@ -71,27 +87,33 @@
- 	writel(val, trng->base + TRNG_INTR_EN);
- 
- 	return 0;
- }
- 
- static int airoha_trng_init(struct hwrng *rng)
- {
- 	struct airoha_trng *trng = container_of(rng, struct airoha_trng, rng);
- 	int ret;
+@@ -80,9 +96,15 @@ static int airoha_trng_init(struct hwrng
  	u32 val;
  
  	val = readl(trng->base + TRNG_NS_SEK_AND_DAT_EN);
@@ -124,25 +79,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	/* Set out of SW Reset */
  	airoha_trng_irq_unmask(trng);
  	writel(0, trng->base + TRNG_HEALTH_TEST_SW_RST);
- 
- 	ret = wait_for_completion_timeout(&trng->rng_op_done, BUSY_LOOP_TIMEOUT);
- 	if (ret <= 0) {
- 		dev_err(trng->dev, "Timeout waiting for Health Check\n");
- 		airoha_trng_irq_mask(trng);
- 		return -ENODEV;
- 	}
- 
- 	/* Check if Health Test Failed */
-@@ -130,35 +152,45 @@
- 	val = readl(trng->base + TRNG_NS_SEK_AND_DAT_EN);
- 	val &= ~RNG_EN;
- 	writel(val, trng->base + TRNG_NS_SEK_AND_DAT_EN);
- 
- 	/* Put it in SW Reset */
- 	writel(SW_RST, trng->base + TRNG_HEALTH_TEST_SW_RST);
- }
- 
- static int airoha_trng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
+@@ -139,17 +161,27 @@ static int airoha_trng_read(struct hwrng
  {
  	struct airoha_trng *trng = container_of(rng, struct airoha_trng, rng);
  	u32 *data = buf;
@@ -175,25 +112,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  	return 4;
  }
- 
- static irqreturn_t airoha_trng_irq(int irq, void *priv)
- {
- 	struct airoha_trng *trng = (struct airoha_trng *)priv;
- 
- 	airoha_trng_irq_mask(trng);
- 	/* Just complete the task, we will read the value later */
- 	complete(&trng->rng_op_done);
- 
-@@ -171,57 +203,65 @@
- 	struct airoha_trng *trng;
- 	int irq, ret;
- 	u32 val;
- 
- 	trng = devm_kzalloc(dev, sizeof(*trng), GFP_KERNEL);
- 	if (!trng)
- 		return -ENOMEM;
- 
- 	trng->base = devm_platform_ioremap_resource(pdev, 0);
+@@ -180,6 +212,11 @@ static int airoha_trng_probe(struct plat
  	if (IS_ERR(trng->base))
  		return PTR_ERR(trng->base);
  
@@ -205,19 +124,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	irq = platform_get_irq(pdev, 0);
  	if (irq < 0)
  		return irq;
- 
- 	airoha_trng_irq_mask(trng);
- 	ret = devm_request_irq(&pdev->dev, irq, airoha_trng_irq, 0,
- 			       pdev->name, (void *)trng);
- 	if (ret) {
- 		dev_err(dev, "Can't get interrupt working.\n");
- 		return ret;
- 	}
- 
- 	init_completion(&trng->rng_op_done);
- 
- 	/* Enable interrupt for SW reset Health Check */
- 	val = readl(trng->base + TRNG_INTR_EN);
+@@ -199,9 +236,12 @@ static int airoha_trng_probe(struct plat
  	val |= RST_STARTUP_INITR_EN;
  	writel(val, trng->base + TRNG_INTR_EN);
  
@@ -232,10 +139,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	writel(val, trng->base + TRNG_NS_SEK_AND_DAT_EN);
  
  	/* Put it in SW Reset */
- 	writel(SW_RST, trng->base + TRNG_HEALTH_TEST_SW_RST);
- 
- 	trng->dev = dev;
- 	trng->rng.name = pdev->name;
+@@ -212,7 +252,7 @@ static int airoha_trng_probe(struct plat
  	trng->rng.init = airoha_trng_init;
  	trng->rng.cleanup = airoha_trng_cleanup;
  	trng->rng.read = airoha_trng_read;
@@ -244,12 +148,3 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  	ret = devm_hwrng_register(dev, &trng->rng);
  	if (ret) {
- 		dev_err(dev, "failed to register rng device: %d\n", ret);
- 		return ret;
- 	}
- 
- 	return 0;
- }
- 
- static const struct of_device_id airoha_trng_of_match[] = {
- 	{ .compatible = "airoha,en7581-trng", },

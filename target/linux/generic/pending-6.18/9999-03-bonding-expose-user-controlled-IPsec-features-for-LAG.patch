@@ -25,11 +25,9 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  drivers/net/bonding/bond_options.c |  10 +-
  2 files changed, 219 insertions(+), 2 deletions(-)
 
-diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
-index fcfe7a65f41d..09ee7dfdc2cd 100644
 --- a/drivers/net/bonding/bond_main.c
 +++ b/drivers/net/bonding/bond_main.c
-@@ -2052,6 +2052,13 @@ static netdev_features_t bond_fix_features(struct net_device *dev,
+@@ -2214,6 +2214,13 @@ static netdev_features_t bond_fix_featur
  	struct list_head *iter;
  	netdev_features_t mask;
  	struct slave *slave;
@@ -43,7 +41,7 @@ index fcfe7a65f41d..09ee7dfdc2cd 100644
  
  	mask = features;
  	features = netdev_base_features(features);
-@@ -2060,12 +2067,203 @@ static netdev_features_t bond_fix_features(struct net_device *dev,
+@@ -2222,12 +2229,203 @@ static netdev_features_t bond_fix_featur
  		features = netdev_increment_features(features,
  						     slave->dev->features,
  						     mask);
@@ -247,7 +245,7 @@ index fcfe7a65f41d..09ee7dfdc2cd 100644
  static int bond_header_create(struct sk_buff *skb, struct net_device *bond_dev,
  			      unsigned short type, const void *daddr,
  			      const void *saddr, unsigned int len)
-@@ -6520,6 +6718,9 @@ static const struct net_device_ops bond_netdev_ops = {
+@@ -6755,6 +6953,9 @@ static const struct net_device_ops bond_
  	.ndo_add_slave		= bond_enslave,
  	.ndo_del_slave		= bond_release,
  	.ndo_fix_features	= bond_fix_features,
@@ -257,11 +255,9 @@ index fcfe7a65f41d..09ee7dfdc2cd 100644
  	.ndo_features_check	= passthru_features_check,
  	.ndo_get_xmit_slave	= bond_xmit_get_slave,
  	.ndo_sk_get_lower_dev	= bond_sk_get_lower_dev,
-diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
-index 7380cc4ee75a..946621b20359 100644
 --- a/drivers/net/bonding/bond_options.c
 +++ b/drivers/net/bonding/bond_options.c
-@@ -880,15 +880,21 @@ const struct bond_option *bond_opt_get(unsigned int option)
+@@ -895,6 +895,9 @@ const struct bond_option *bond_opt_get(u
  
  static bool bond_set_xfrm_features(struct bonding *bond)
  {
@@ -271,8 +267,7 @@ index 7380cc4ee75a..946621b20359 100644
  	if (!IS_ENABLED(CONFIG_XFRM_OFFLOAD))
  		return false;
  
- 	if (BOND_MODE(bond) == BOND_MODE_ACTIVEBACKUP)
- 		bond->dev->wanted_features |= BOND_XFRM_FEATURES;
+@@ -903,7 +906,10 @@ static bool bond_set_xfrm_features(struc
  	else
  		bond->dev->wanted_features &= ~BOND_XFRM_FEATURES;
  
@@ -284,5 +279,3 @@ index 7380cc4ee75a..946621b20359 100644
  }
  
  static int bond_option_mode_set(struct bonding *bond,
--- 
-2.53.0

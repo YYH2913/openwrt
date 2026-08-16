@@ -27,11 +27,9 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  net/xfrm/xfrm_state.c           |  26 +-
  5 files changed, 831 insertions(+), 14 deletions(-)
 
-diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
-index 82e779f7916b..fcfe7a65f41d 100644
 --- a/drivers/net/bonding/bond_main.c
 +++ b/drivers/net/bonding/bond_main.c
-@@ -455,6 +455,438 @@ static struct net_device *bond_ipsec_dev(struct xfrm_state *xs)
+@@ -457,6 +457,438 @@ static struct net_device *bond_ipsec_dev
  	return slave->dev;
  }
  
@@ -470,7 +468,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  /**
   * bond_ipsec_add_sa - program device with a security association
   * @bond_dev: pointer to the bond net device
-@@ -475,8 +907,15 @@ static int bond_ipsec_add_sa(struct net_device *bond_dev,
+@@ -477,8 +909,15 @@ static int bond_ipsec_add_sa(struct net_
  	if (!bond_dev)
  		return -EINVAL;
  
@@ -487,7 +485,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  	slave = rcu_dereference(bond->curr_active_slave);
  	real_dev = slave ? slave->dev : NULL;
  	netdev_hold(real_dev, &tracker, GFP_ATOMIC);
-@@ -504,7 +943,9 @@ static int bond_ipsec_add_sa(struct net_device *bond_dev,
+@@ -506,7 +945,9 @@ static int bond_ipsec_add_sa(struct net_
  	if (!err) {
  		xs->xso.real_dev = real_dev;
  		ipsec->xs = xs;
@@ -497,7 +495,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  		mutex_lock(&bond->ipsec_lock);
  		list_add(&ipsec->list, &bond->ipsec_list);
  		mutex_unlock(&bond->ipsec_lock);
-@@ -523,6 +964,9 @@ static void bond_ipsec_add_sa_all(struct bonding *bond)
+@@ -525,6 +966,9 @@ static void bond_ipsec_add_sa_all(struct
  	struct bond_ipsec *ipsec;
  	struct slave *slave;
  
@@ -507,7 +505,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  	slave = rtnl_dereference(bond->curr_active_slave);
  	real_dev = slave ? slave->dev : NULL;
  	if (!real_dev)
-@@ -540,6 +984,9 @@ static void bond_ipsec_add_sa_all(struct bonding *bond)
+@@ -542,6 +986,9 @@ static void bond_ipsec_add_sa_all(struct
  	}
  
  	list_for_each_entry(ipsec, &bond->ipsec_list, list) {
@@ -517,7 +515,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  		/* If new state is added before ipsec_lock acquired */
  		if (ipsec->xs->xso.real_dev == real_dev)
  			continue;
-@@ -568,6 +1015,19 @@ static void bond_ipsec_add_sa_all(struct bonding *bond)
+@@ -570,6 +1017,19 @@ out:
  	mutex_unlock(&bond->ipsec_lock);
  }
  
@@ -537,7 +535,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  /**
   * bond_ipsec_del_sa - clear out this specific SA
   * @bond_dev: pointer to the bond net device
-@@ -577,8 +1037,24 @@ static void bond_ipsec_del_sa(struct net_device *bond_dev,
+@@ -579,8 +1039,24 @@ static void bond_ipsec_del_sa(struct net
  			      struct xfrm_state *xs)
  {
  	struct net_device *real_dev;
@@ -563,7 +561,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  		return;
  
  	real_dev = xs->xso.real_dev;
-@@ -600,6 +1076,9 @@ static void bond_ipsec_del_sa_all(struct bonding *bond)
+@@ -602,6 +1078,9 @@ static void bond_ipsec_del_sa_all(struct
  	struct bond_ipsec *ipsec;
  	struct slave *slave;
  
@@ -573,7 +571,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  	slave = rtnl_dereference(bond->curr_active_slave);
  	real_dev = slave ? slave->dev : NULL;
  	if (!real_dev)
-@@ -607,6 +1086,9 @@ static void bond_ipsec_del_sa_all(struct bonding *bond)
+@@ -609,6 +1088,9 @@ static void bond_ipsec_del_sa_all(struct
  
  	mutex_lock(&bond->ipsec_lock);
  	list_for_each_entry(ipsec, &bond->ipsec_list, list) {
@@ -583,7 +581,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  		if (!ipsec->xs->xso.real_dev)
  			continue;
  
-@@ -647,23 +1129,33 @@ static void bond_ipsec_free_sa(struct net_device *bond_dev,
+@@ -649,23 +1131,33 @@ static void bond_ipsec_free_sa(struct ne
  	bond = netdev_priv(bond_dev);
  
  	mutex_lock(&bond->ipsec_lock);
@@ -625,7 +623,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  	mutex_unlock(&bond->ipsec_lock);
  }
  
-@@ -674,7 +1166,18 @@ static void bond_ipsec_free_sa(struct net_device *bond_dev,
+@@ -676,7 +1168,18 @@ out:
   **/
  static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
  {
@@ -644,7 +642,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  
  	rcu_read_lock();
  	real_dev = bond_ipsec_dev(xs);
-@@ -735,6 +1238,234 @@ static void bond_xfrm_update_stats(struct xfrm_state *xs)
+@@ -737,6 +1240,234 @@ out:
  	rcu_read_unlock();
  }
  
@@ -879,7 +877,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  static const struct xfrmdev_ops bond_xfrmdev_ops = {
  	.xdo_dev_state_add = bond_ipsec_add_sa,
  	.xdo_dev_state_delete = bond_ipsec_del_sa,
-@@ -742,7 +1473,28 @@ static const struct xfrmdev_ops bond_xfrmdev_ops = {
+@@ -744,7 +1475,28 @@ static const struct xfrmdev_ops bond_xfr
  	.xdo_dev_offload_ok = bond_ipsec_offload_ok,
  	.xdo_dev_state_advance_esn = bond_advance_esn_state,
  	.xdo_dev_state_update_stats = bond_xfrm_update_stats,
@@ -908,7 +906,7 @@ index 82e779f7916b..fcfe7a65f41d 100644
  #endif /* CONFIG_XFRM_OFFLOAD */
  
  /*------------------------------- Link status -------------------------------*/
-@@ -6012,10 +6764,11 @@ void bond_setup(struct net_device *bond_dev)
+@@ -6055,10 +6807,11 @@ void bond_setup(struct net_device *bond_
  	bond_dev->priv_flags &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
  
  #ifdef CONFIG_XFRM_OFFLOAD
@@ -921,8 +919,6 @@ index 82e779f7916b..fcfe7a65f41d 100644
  #endif /* CONFIG_XFRM_OFFLOAD */
  
  	/* don't acquire bond device's netif_tx_lock when transmitting */
-diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index b4e844e90db8..6d12f71c5067 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -1061,6 +1061,14 @@ struct xfrmdev_ops {
@@ -940,11 +936,9 @@ index b4e844e90db8..6d12f71c5067 100644
  	u32	flags;
  	/* Optional packet-offload TX path. The driver consumes skb. */
  	int	(*xdo_dev_packet_xmit)(struct sk_buff *skb,
-diff --git a/include/net/bonding.h b/include/net/bonding.h
-index edd1942dcd73..a581252b5b06 100644
 --- a/include/net/bonding.h
 +++ b/include/net/bonding.h
-@@ -203,9 +203,24 @@ struct bond_up_slave {
+@@ -207,9 +207,24 @@ struct bond_up_slave {
   */
  #define BOND_LINK_NOCHANGE -1
  
@@ -969,7 +963,7 @@ index edd1942dcd73..a581252b5b06 100644
  };
  
  /*
-@@ -259,8 +274,9 @@ struct bonding {
+@@ -262,8 +277,9 @@ struct bonding {
  	struct rtnl_link_stats64 bond_stats;
  #ifdef CONFIG_XFRM_OFFLOAD
  	struct list_head ipsec_list;
@@ -980,7 +974,7 @@ index edd1942dcd73..a581252b5b06 100644
  #endif /* CONFIG_XFRM_OFFLOAD */
  	struct bpf_prog *xdp_prog;
  };
-@@ -325,6 +341,13 @@ static inline bool bond_mode_can_use_xmit_hash(const struct bonding *bond)
+@@ -328,6 +344,13 @@ static inline bool bond_mode_can_use_xmi
  		BOND_MODE(bond) == BOND_MODE_ALB);
  }
  
@@ -994,8 +988,8 @@ index edd1942dcd73..a581252b5b06 100644
  static inline bool bond_mode_uses_xmit_hash(const struct bonding *bond)
  {
  	return (BOND_MODE(bond) == BOND_MODE_8023AD ||
-@@ -712,6 +735,10 @@ void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay);
- void bond_peer_notify_work_rearm(struct bonding *bond, unsigned long delay);
+@@ -714,6 +737,10 @@ int bond_update_slave_arr(struct bonding
+ void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay);
  void bond_work_init_all(struct bonding *bond);
  void bond_work_cancel_all(struct bonding *bond);
 +#if IS_ENABLED(CONFIG_XFRM_OFFLOAD)
@@ -1005,11 +999,9 @@ index edd1942dcd73..a581252b5b06 100644
  
  #ifdef CONFIG_PROC_FS
  void bond_create_proc_entry(struct bonding *bond);
-diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 69a33da10a6a..708c9f67e221 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -1737,6 +1737,22 @@ xfrm_dev_state_lower_handle(struct xfrm_state *x, struct net_device *lower_dev)
+@@ -1746,6 +1746,22 @@ xfrm_dev_state_lower_handle(struct xfrm_
  	return 0;
  }
  
@@ -1032,7 +1024,7 @@ index 69a33da10a6a..708c9f67e221 100644
  static inline void xfrm_dev_state_update_stats(struct xfrm_state *x)
  {
  	struct xfrm_dev_offload *xdo = &x->xso;
-@@ -1753,6 +1769,11 @@ xfrm_dev_state_lower_handle(struct xfrm_state *x, struct net_device *lower_dev)
+@@ -1762,6 +1778,11 @@ xfrm_dev_state_lower_handle(struct xfrm_
  {
  	return 0;
  }
@@ -1044,11 +1036,9 @@ index 69a33da10a6a..708c9f67e221 100644
  
  static inline void xfrm_dev_state_update_stats(struct xfrm_state *x) {}
  #endif
-diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 90785e9ba159..2aa07b6614a7 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
-@@ -1786,14 +1786,25 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
+@@ -1795,14 +1795,25 @@ static void __xfrm_state_bump_genids(str
  	}
  }
  
@@ -1075,7 +1065,7 @@ index 90785e9ba159..2aa07b6614a7 100644
  }
  EXPORT_SYMBOL(xfrm_state_insert);
  
-@@ -1896,9 +1907,14 @@ int xfrm_state_add(struct xfrm_state *x)
+@@ -1903,9 +1914,14 @@ int xfrm_state_add(struct xfrm_state *x)
  
  	family = x->props.family;
  
@@ -1090,7 +1080,7 @@ index 90785e9ba159..2aa07b6614a7 100644
  
  	x1 = __xfrm_state_locate(x, use_spi, family);
  	if (x1) {
-@@ -2157,7 +2173,8 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+@@ -2165,7 +2181,8 @@ struct xfrm_state *xfrm_state_migrate(st
  	if (xfrm_addr_equal(&x->id.daddr, &m->new_daddr, m->new_family)) {
  		/* a care is needed when the destination address of the
  		   state is to be updated as it is a part of triplet */
@@ -1100,7 +1090,7 @@ index 90785e9ba159..2aa07b6614a7 100644
  	} else {
  		if (xfrm_state_add(xc) < 0)
  			goto error_add;
-@@ -2185,6 +2202,11 @@ int xfrm_state_update(struct xfrm_state *x)
+@@ -2193,6 +2210,11 @@ int xfrm_state_update(struct xfrm_state
  	to_put = NULL;
  
  	spin_lock_bh(&net->xfrm.xfrm_state_lock);
@@ -1112,5 +1102,3 @@ index 90785e9ba159..2aa07b6614a7 100644
  	x1 = __xfrm_state_locate(x, use_spi, x->props.family);
  
  	err = -ESRCH;
--- 
-2.53.0

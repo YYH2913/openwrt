@@ -27,12 +27,12 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -3079,7 +3079,7 @@ static int airoha_alloc_gdm_port(struct
- 			   NETIF_F_HW_TC;
- 	dev->features |= dev->hw_features;
- 	dev->vlan_features = dev->hw_features;
--	dev->dev.of_node = np;
-+	device_set_node(&dev->dev, of_fwnode_handle(np));
- 	SET_NETDEV_DEV(dev, eth->dev);
+@@ -3441,7 +3441,7 @@ static int airoha_alloc_gdm_device(struc
+ 		return -EINVAL;
+ 	}
  
- 	/* reserve hw queues for HTB offloading */
+-	netdev->dev.of_node = of_node_get(np);
++	device_set_node(&netdev->dev, of_fwnode_handle(of_node_get(np)));
+ 	dev = netdev_priv(netdev);
+ 	u64_stats_init(&dev->stats.syncp);
+ 	dev->port = port;
