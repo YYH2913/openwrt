@@ -1,0 +1,81 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 08 Aug 2026 22:18:53 +0800
+Subject: [PATCH] net: pcs: airoha: AN7581: avoid resetting TXPCS on link up
+
+The AN7581 SDK does not reset PCS logic from its normal link-up path.
+It performs the global PCS/PMA reset during PHY initialization and only
+resets the CDR when signal detection reports a signal while the PCS is
+not locked.
+
+The Linux driver instead unconditionally toggles HSG_TXPCS_RST_N after
+phylink has reported link up.  This can disturb a freshly negotiated
+link and does not match the SDK state machine, especially for USXGMII
+where link-up follows in-band autonegotiation.
+
+Remove the AN7581 link-up callback.  Keep the initialization reset and
+the existing SigDet/CDR recovery workaround unchanged.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c |  2 --
+ drivers/net/pcs/airoha/pcs-airoha.h        |  5 -----
+ drivers/net/pcs/airoha/pcs-an7581.c        | 12 ------------
+ 3 files changed, 19 deletions(-)
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1030,6 +1030,5 @@ static const struct airoha_pcs_match_dat
+ 	.usxgmii_ber_time_fixup = true,
+ 	.bringup = an7581_pcs_bringup,
+-	.link_up = an7581_pcs_phya_link_up,
+ 	.rxlock_workaround = an7581_pcs_rxlock_workaround,
+ };
+ 
+@@ -1040,6 +1039,5 @@ static const struct airoha_pcs_match_dat
+ 	.usxgmii_ber_time_fixup = true,
+ 	.bringup = an7581_pcs_bringup,
+-	.link_up = an7581_pcs_phya_link_up,
+ };
+ 
+ static const struct airoha_pcs_match_data an7583_pcs_eth = {
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1214,6 +1214,5 @@ int an7581_pcs_bringup(struct airoha_pcs
+ 		       phy_interface_t interface);
+ 
+-void an7581_pcs_phya_link_up(struct airoha_pcs_priv *priv);
+ int an7581_pcs_rxlock_workaround(struct airoha_pcs_priv *priv);
+ #else
+ static inline int an7581_pcs_bringup(struct airoha_pcs_priv *priv,
+@@ -1225,10 +1224,6 @@ static inline int an7581_pcs_bringup(str
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline void an7581_pcs_phya_link_up(struct airoha_pcs_priv *priv)
+-{
+-}
+-
+ static inline int an7581_pcs_rxlock_workaround(struct airoha_pcs_priv *priv)
+ {
+ 	return 0;
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -1363,18 +1363,6 @@ int an7581_pcs_bringup(struct airoha_pcs
+ 	return an7581_pcs_phya_bringup(priv, interface);
+ }
+ 
+-void an7581_pcs_phya_link_up(struct airoha_pcs_priv *priv)
+-{
+-	/* Reset TXPCS on link up */
+-	regmap_clear_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
+-			  AIROHA_PCS_PMA_SW_HSG_TXPCS_RST_N);
+-
+-	usleep_range(100, 200);
+-
+-	regmap_set_bits(priv->xfi_pma, AIROHA_PCS_PMA_SW_RST_SET,
+-			AIROHA_PCS_PMA_SW_HSG_TXPCS_RST_N);
+-}
+-
+ static bool an7581_pcs_have_rx_signal(struct airoha_pcs_priv *priv)
+ {
+ 	unsigned int count = 0;

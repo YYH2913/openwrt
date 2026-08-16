@@ -23,20 +23,20 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 
 --- a/drivers/net/pcs/airoha/pcs-airoha-common.c
 +++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
-@@ -635,64 +635,69 @@
-
+@@ -747,63 +747,66 @@ static void airoha_pcs_link_up(struct ph
+ 	maps = &priv->maps[port->index];
  	data = priv->data;
-
+ 
 -	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED) {
 -		if (interface == PHY_INTERFACE_MODE_SGMII) {
--			regmap_update_bits(priv->hsgmii_rate_adp,
+-			regmap_update_bits(maps->hsgmii_rate_adp,
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_1,
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR |
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR,
 -					   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR, 0x0) |
 -					   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR, 0x0));
 -			udelay(1);
--			regmap_update_bits(priv->hsgmii_rate_adp,
+-			regmap_update_bits(maps->hsgmii_rate_adp,
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_1,
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR |
 -					   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR,
@@ -72,27 +72,26 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 -				break;
 -			}
 -
--			/* Trigger USXGMII change mode and force selected speed */
--			regmap_update_bits(priv->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
--					   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE |
--					   AIROHA_PCS_USXGMII_MODE,
--					   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE | mode);
+-			/* Force USXGMII to selected speed */
+-			regmap_update_bits(maps->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
+-					   AIROHA_PCS_USXGMII_MODE, mode);
 -
--			regmap_update_bits(priv->hsgmii_rate_adp, AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
--					   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
--					   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
--					   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
--					   rate_adapt);
+-			if (interface == PHY_INTERFACE_MODE_10GBASER)
+-				regmap_update_bits(maps->hsgmii_rate_adp, AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
+-						   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
+-						   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
+-						   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
+-						   rate_adapt);
 +	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED &&
 +	    interface == PHY_INTERFACE_MODE_SGMII) {
-+		regmap_update_bits(priv->hsgmii_rate_adp,
++		regmap_update_bits(maps->hsgmii_rate_adp,
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_1,
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR |
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR,
 +				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR, 0x0) |
 +				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR, 0x0));
 +		udelay(1);
-+		regmap_update_bits(priv->hsgmii_rate_adp,
++		regmap_update_bits(maps->hsgmii_rate_adp,
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_1,
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR |
 +				   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR,
@@ -100,11 +99,6 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 +				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR, 0x5));
 +	}
 +
-+	/* Update USXGMII rate adaptation for the current speed.
-+	 * This must run regardless of negotiation mode because USXGMII
-+	 * uses in-band autoneg but still requires the rate adaptation
-+	 * registers to be updated when the link speed changes.
-+	 */
 +	if (interface == PHY_INTERFACE_MODE_USXGMII ||
 +	    interface == PHY_INTERFACE_MODE_10GBASER) {
 +		u32 mode;
@@ -132,13 +126,15 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 +			mode = AIROHA_PCS_USXGMII_MODE_100;
 +			break;
  		}
-
-+		regmap_update_bits(priv->usxgmii_pcs, AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
+ 
++		regmap_update_bits(maps->usxgmii_pcs,
++				   AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
 +				   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE |
 +				   AIROHA_PCS_USXGMII_MODE,
 +				   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE | mode);
 +
-+		regmap_update_bits(priv->hsgmii_rate_adp, AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
++		regmap_update_bits(maps->hsgmii_rate_adp,
++				   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
 +				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
 +				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
 +				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
