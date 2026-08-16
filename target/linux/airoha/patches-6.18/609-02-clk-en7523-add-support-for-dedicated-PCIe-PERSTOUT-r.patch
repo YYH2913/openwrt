@@ -15,12 +15,11 @@ PCI enable/disable are updated to drop PERSTOUT bits in favor dedicated
 reset handling.
 
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
-Assisted-by: Codex:gpt-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
 ---
  drivers/clk/clk-en7523.c | 39 ++++++++++++++++++++++++++++-----------
  1 file changed, 28 insertions(+), 11 deletions(-)
-
 --- a/drivers/clk/clk-en7523.c
 +++ b/drivers/clk/clk-en7523.c
 @@ -451,6 +451,7 @@ static const struct en_clk_desc an7583_b

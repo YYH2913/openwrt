@@ -10,15 +10,14 @@ Mirror the PCIe2 PHY sequence from the vendor SDK. The four analog
 settings are shared with USB3 initialization, while PCIe uses distinct
 GPIO control values for power-on and power-off.
 
-Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
  drivers/phy/airoha/phy-airoha-usb.c | 57 ++++++++++++++++++++++++++++-------
  1 file changed, 45 insertions(+), 12 deletions(-)
-
 --- a/drivers/phy/airoha/phy-airoha-usb.c
 +++ b/drivers/phy/airoha/phy-airoha-usb.c
-@@ -245,11 +245,8 @@ static void airoha_usb_phy_u2_init(struct
+@@ -245,11 +245,8 @@ static void airoha_usb_phy_u2_init(struc
  	usleep_range(1000, 1500);
  }
  
@@ -32,10 +31,10 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  {
  	regmap_update_bits(priv->regmap, AIROHA_USB_PHY_U3_PHYA_REG8,
  			   AIROHA_USB_PHY_SSUSB_CDR_RST_DLY,
-@@ -266,6 +263,15 @@ static void airoha_usb_phy_u3_init(struct
+@@ -265,6 +262,15 @@ static void airoha_usb_phy_u3_init(struc
+ 
  	regmap_set_bits(priv->regmap, AIROHA_USB_PHY_U3_PHYA_REG1,
  			FIELD_PREP(AIROHA_USB_PHY_SSUSB_XTAL_TOP_RESERVE, 0x600));
--
 +}
 +
 +/*
@@ -45,11 +44,10 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +static void airoha_usb_phy_u3_init(struct airoha_usb_phy_priv *priv)
 +{
 +	airoha_usb_phy_u3_serdes_init(priv);
-+
+ 
  	regmap_update_bits(priv->regmap, AIROHA_USB_PHY_U3_PHYA_DA_REG19,
  			   AIROHA_USB_PHY_SSUSB_PLL_SSC_DELTA1_U3,
- 			   FIELD_PREP(AIROHA_USB_PHY_SSUSB_PLL_SSC_DELTA1_U3, 0x43));
-@@ -281,8 +287,10 @@ static int airoha_usb_phy_init(struct phy
+@@ -281,8 +287,10 @@ static int airoha_usb_phy_init(struct ph
  		airoha_usb_phy_u2_init(priv);
  		break;
  	case PHY_TYPE_USB3:
@@ -62,7 +60,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  		airoha_usb_phy_u3_init(priv);
  		break;
-@@ -316,6 +324,16 @@ static int airoha_usb_phy_u3_power_on(str
+@@ -316,6 +324,16 @@ static int airoha_usb_phy_u3_power_on(st
  	return 0;
  }
  
@@ -79,7 +77,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  static int airoha_usb_phy_power_on(struct phy *phy)
  {
  	struct airoha_usb_phy_instance *instance = phy_get_drvdata(phy);
-@@ -326,8 +344,10 @@ static int airoha_usb_phy_power_on(struct
+@@ -326,8 +344,10 @@ static int airoha_usb_phy_power_on(struc
  		airoha_usb_phy_u2_power_on(priv);
  		break;
  	case PHY_TYPE_USB3:
@@ -92,7 +90,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  		airoha_usb_phy_u3_power_on(priv);
  		break;
-@@ -359,6 +379,17 @@ static int airoha_usb_phy_u3_power_off(st
+@@ -359,6 +379,17 @@ static int airoha_usb_phy_u3_power_off(s
  	return 0;
  }
  
@@ -110,7 +108,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  static int airoha_usb_phy_power_off(struct phy *phy)
  {
  	struct airoha_usb_phy_instance *instance = phy_get_drvdata(phy);
-@@ -369,8 +400,10 @@ static int airoha_usb_phy_power_off(struc
+@@ -369,8 +400,10 @@ static int airoha_usb_phy_power_off(stru
  		airoha_usb_phy_u2_power_off(priv);
  		break;
  	case PHY_TYPE_USB3:

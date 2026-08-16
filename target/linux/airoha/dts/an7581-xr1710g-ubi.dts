@@ -84,13 +84,23 @@
 	};
 
 	pcie0_rst_pins: pcie0-rst-pins {
+		mux {
+			function = "pcie_reset";
+			groups = "pcie_reset0", "pcie_reset1";
+		};
+
 		conf {
-			pins = "pcie_reset0";
+			pins = "pcie_reset0", "pcie_reset1";
 			drive-open-drain = <1>;
 		};
 	};
 
 	pcie2_rst_pins: pcie2-rst-pins {
+		mux {
+			function = "pcie_reset";
+			groups = "pcie_reset2";
+		};
+
 		conf {
 			pins = "pcie_reset2";
 			drive-open-drain = <1>;
@@ -305,9 +315,6 @@
 	max-link-speed = <2>;
 	airoha,wait-for-pcie0-perst;
 	airoha,scu = <&scuclk>;
-	resets = <&scuclk EN7581_PCIE2_RST>,
-		 <&scuclk EN7581_PCIC_PERSTOUT2_RST>;
-	reset-names = "phy-lane2", "perstout";
 
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_rst_pins>;
