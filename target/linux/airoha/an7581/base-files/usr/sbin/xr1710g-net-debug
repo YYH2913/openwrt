@@ -120,7 +120,7 @@ snapshot() {
 	done
 
 	if [ "$#" -eq 0 ]; then
-		set -- eth0 eth1 lan1 lan2 lan3
+		set -- eth0 eth1 eth2 lan2 lan3
 	fi
 	for iface in "$@"; do
 		show_interface "$iface"
@@ -140,7 +140,7 @@ snapshot() {
 }
 
 watch_link() {
-	iface=${1:-eth0}
+	iface=${1:-eth1}
 	interval=${2:-1}
 	[ -d "/sys/class/net/$iface" ] || {
 		printf 'Interface %s does not exist\n' "$iface" >&2

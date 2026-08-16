@@ -38,7 +38,7 @@ platform_do_upgrade() {
 		quantum,q1000k-ubi)
 			fit_do_upgrade "$1"
 			;;
-		econet,xr1710g-ubi)
+		gemtek,xr1710g-ubi)
 			fit_do_upgrade "$1"
 			;;
 		*)

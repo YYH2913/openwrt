@@ -8,7 +8,7 @@ board=$(board_name)
 
 case "$board" in
 gemtek,w1700k-ubi|\
-econet,xr1710g-ubi|\
+gemtek,xr1710g-ubi|\
 nokia,xg-040g-md-ubi)
 	if [ -e /etc/config/ubootenv ] && [ -e /etc/fw_env.config ] &&
 		grep -Eq '^/dev/ubi[0-9]+_[0-9]+[[:space:]]' /etc/fw_env.config; then
@@ -28,7 +28,7 @@ touch /etc/config/ubootenv
 
 case "$board" in
 gemtek,w1700k-ubi|\
-econet,xr1710g-ubi|\
+gemtek,xr1710g-ubi|\
 nokia,xg-040g-md-ubi)
 	ubootenv_add_ubi_default
 	;;

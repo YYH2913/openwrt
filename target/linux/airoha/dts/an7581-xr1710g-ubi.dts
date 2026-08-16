@@ -9,10 +9,9 @@
 #include "an7581.dtsi"
 
 / {
-	model = "XR1710G";
-	compatible = "econet,xr1710g-ubi", "gemtek,xr1710g-ubi",
-		     "econet,xr1710g", "gemtek,xr1710g",
-		     "airoha,an7581", "airoha,en7581";
+	model = "Gemtek XR1710G";
+	compatible = "gemtek,xr1710g-ubi", "airoha,an7581",
+		     "airoha,en7581";
 
 	aliases {
 		serial0 = &uart1;
@@ -334,11 +333,9 @@
 
 &gdm1 {
 	status = "okay";
-	airoha,lan-port;
 
 	nvmem-cells = <&lan_mac 0>;
 	nvmem-cell-names = "mac-address";
-	openwrt,netdev-name = "eth1";
 };
 
 &gdm2 {
@@ -350,7 +347,6 @@
 
 	nvmem-cells = <&wan_mac 0>;
 	nvmem-cell-names = "mac-address";
-	openwrt,netdev-name = "eth0";
 };
 
 &eth_pcs {
@@ -359,7 +355,6 @@
 
 &gdm4 {
 	status = "okay";
-	airoha,lan-port;
 
 	managed = "in-band-status";
 	phy-handle = <&phy5>;
@@ -367,7 +362,6 @@
 
 	nvmem-cells = <&lan_mac 0>;
 	nvmem-cell-names = "mac-address";
-	openwrt,netdev-name = "lan1";
 };
 
 &switch {

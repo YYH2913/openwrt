@@ -2,7 +2,7 @@
 
 . /lib/functions/system.sh
 
-[ "$(board_name)" = "econet,xr1710g-ubi" ] || exit 0
+[ "$(board_name)" = "gemtek,xr1710g-ubi" ] || exit 0
 
 uci -q set luci.languages.zh_cn='简体中文 (Simplified Chinese)'
 uci -q set luci.main.lang='zh_cn'

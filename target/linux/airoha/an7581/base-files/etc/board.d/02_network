@@ -17,8 +17,8 @@ an7581_setup_interfaces()
 	gemtek,w1700k-ubi)
 		ucidef_set_interfaces_lan_wan "lan2 lan3 lan4" "wan"
 		;;
-	econet,xr1710g-ubi)
-		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "eth0"
+	gemtek,xr1710g-ubi)
+		ucidef_set_interfaces_lan_wan "eth2 lan2 lan3" "eth1"
 		ucidef_set_country "US"
 		ucidef_set_wireless "2g" "XR1710G"
 		ucidef_set_wireless "5g" "XR1710G-5G"

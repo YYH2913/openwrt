@@ -1,35 +1,14 @@
 set_netdev_labels() {
 	local dir
-	local index=0
 	local label
 	local netdev
-	local pending=""
-	local tmp
 
 	for dir in /sys/class/net/*; do
 		[ -r "$dir/of_node/openwrt,netdev-name" ] || continue
 		read -r label < "$dir/of_node/openwrt,netdev-name"
 		netdev="${dir##*/}"
 		[ "$netdev" = "$label" ] && continue
-
-		# Move every labelled interface aside first so name swaps such as
-		# eth0 <-> eth1 do not fail because the destination is still busy.
-		tmp="owrt-tmp$index"
-		while [ -e "/sys/class/net/$tmp" ]; do
-			index=$((index + 1))
-			tmp="owrt-tmp$index"
-		done
-
-		if ip link set "$netdev" name "$tmp"; then
-			pending="$pending$tmp $netdev $label
-"
-			index=$((index + 1))
-		fi
-	done
-
-	printf '%s' "$pending" | while read -r tmp netdev label; do
-		[ -n "$tmp" ] || continue
-		ip link set "$tmp" name "$label" || ip link set "$tmp" name "$netdev"
+		ip link set "$netdev" name "$label"
 	done
 }
 
