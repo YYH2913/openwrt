@@ -1,0 +1,36 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: rpcd: exec: observe EOF before invalidating pipe fds
+
+Commit 26dba5206e17 moved the stdout and stderr descriptor
+invalidation before the final ustream polls. Once the descriptor is set
+to -1, ustream_poll() cannot observe EOF and the exec plugin request
+remains deferred until its timeout despite the child having exited.
+
+Poll both streams after closing their descriptors, then invalidate the
+stored descriptor numbers. The deferred reply cannot run until the
+callback returns, so this preserves the double-close protection while
+allowing the stream state callbacks to complete the request.
+
+Fixes: 26dba5206e17 ("exec: prevent double close() of exec pipe descriptors")
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/exec.c
++++ b/exec.c
+@@ -196,14 +196,14 @@
+ 	close(c->opipe.fd.fd);
+ 	close(c->epipe.fd.fd);
+ 
++	ustream_poll(&c->opipe.stream);
++	ustream_poll(&c->epipe.stream);
++
+ 	/* ustream_free() does not reset the fd, and rpc_exec_reply() closes it
+ 	 * again later.  Mark the descriptors as consumed so that the second
+ 	 * close() cannot accidentally close an unrelated, meanwhile reused fd. */
+ 	c->opipe.fd.fd = -1;
+ 	c->epipe.fd.fd = -1;
+-
+-	ustream_poll(&c->opipe.stream);
+-	ustream_poll(&c->epipe.stream);
+ }
+ 
+ static void
