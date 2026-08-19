@@ -238,8 +238,6 @@
 &gdm4 {
 	status = "okay";
 
-	openwrt,netdev-name = "lan1";
-
 	phy-handle = <&en8811>;
 	phy-mode = "2500base-x";
 

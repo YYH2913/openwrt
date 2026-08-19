@@ -484,8 +484,6 @@
 
 	nvmem-cells = <&mac_factory_2c0000 4>;
 	nvmem-cell-names = "mac-address";
-
-	openwrt,netdev-name = "wan";
 };
 
 &eth_pcs {
@@ -502,8 +500,6 @@
 
 	nvmem-cells = <&mac_factory_2c0000 5>;
 	nvmem-cell-names = "mac-address";
-
-	openwrt,netdev-name = "10g";
 };
 
 &gsw_port1 {
