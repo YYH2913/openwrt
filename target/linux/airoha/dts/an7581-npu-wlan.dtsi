@@ -34,7 +34,7 @@
 
 &npu {
 	memory-region = <&npu_binary>, <&npu_pkt>, <&npu_txpkt>,
-			<&npu_txbufid>, <&npu_ba>;
+			<&npu_txbufid>, <&npu_ba>, <&npu_mbox>;
 	memory-region-names = "binary", "pkt", "tx-pkt",
-			      "tx-bufid", "ba";
+			      "tx-bufid", "ba", "mbox";
 };

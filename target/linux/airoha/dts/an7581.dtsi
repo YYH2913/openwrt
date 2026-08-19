@@ -899,10 +899,8 @@
 				     <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 122 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
-			memory-region = <&npu_binary>, <&npu_pkt>, <&npu_txpkt>,
-					<&npu_txbufid>, <&npu_ba>, <&npu_mbox>;
-			memory-region-names = "binary", "pkt", "tx-pkt",
-					      "tx-bufid", "ba", "mbox";
+			memory-region = <&npu_binary>, <&npu_mbox>;
+			memory-region-names = "binary", "mbox";
 			status = "disabled";
 		};
 
