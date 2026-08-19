@@ -9,7 +9,7 @@ SOE ESP encapsulation or decapsulation.
 
 Assisted-by: Codex:gpt-5.5 <codex@openai.invalid>
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
-Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Codex:GPT-5.6-sol
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 --- a/net/netfilter/nf_flow_table_ip.c
@@ -43,7 +43,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  
  	return 0;
  }
-@@ -387,7 +397,7 @@ static int nf_flow_offload_forward(struc
+@@ -396,7 +406,7 @@ static int nf_flow_offload_forward(struc
  
  	iph = (struct iphdr *)(skb_network_header(skb) + ctx->offset);
  	thoff = (iph->ihl * 4) + ctx->offset;
@@ -52,7 +52,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  		return 0;
  
  	if (!nf_flow_dst_check(&tuplehash->tuple)) {
-@@ -673,7 +683,7 @@ static int nf_flow_offload_ipv6_forward(
+@@ -692,7 +702,7 @@ static int nf_flow_offload_ipv6_forward(
  
  	ip6h = (struct ipv6hdr *)(skb_network_header(skb) + ctx->offset);
  	thoff = sizeof(*ip6h) + ctx->offset;
@@ -93,9 +93,9 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  static void nft_default_forward_path(struct nf_flow_route *route,
  				     struct dst_entry *dst_cache,
  				     enum ip_conntrack_dir dir)
-@@ -375,7 +391,8 @@ static int nft_dev_forward_path(const st
- 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
- 		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+@@ -370,7 +386,8 @@ static int nft_dev_forward_path(const st
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
 -		route->tuple[dir].xmit_type = info.xmit_type;
 +		if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
@@ -103,7 +103,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	}
  
  	return 0;
-@@ -389,6 +406,9 @@ static int nft_flow_route_routing(const
+@@ -384,6 +401,9 @@ static int nft_flow_route_routing(const
  {
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
@@ -113,7 +113,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	struct flowi fl;
  
  	memset(&fl, 0, sizeof(fl));
-@@ -413,7 +433,53 @@ static int nft_flow_route_routing(const
+@@ -408,7 +428,53 @@ static int nft_flow_route_routing(const
  		break;
  	}
  
@@ -168,24 +168,23 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  		return -ENOENT;
  
  	nf_route(nft_net(pkt), &other_dst, &fl, false, nft_pf(pkt));
-@@ -421,18 +487,32 @@ static int nft_flow_route_routing(const
- 		dst_release(this_dst);
+@@ -417,16 +483,34 @@ static int nft_flow_route_routing(const
  		return -ENOENT;
  	}
+ 
 +	other_dst = xfrm_lookup(nft_net(pkt), other_dst, &fl, NULL, 0);
 +	if (IS_ERR(other_dst)) {
 +		dst_release(this_dst);
 +		return -ENOENT;
 +	}
- 
++
  	nft_default_forward_path(route, this_dst, dir);
  	nft_default_forward_path(route, other_dst, !dir);
  
--	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
--	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
--		if (nft_dev_forward_path(pkt, route, ct, dir, ft) ||
--		    nft_dev_forward_path(pkt, route, ct, !dir, ft))
--			return -ENOENT;
+-	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH)
+-		nft_dev_forward_path(pkt, route, ct, dir, ft);
+-	if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
+-		nft_dev_forward_path(pkt, route, ct, !dir, ft);
 +	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
 +	    route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
 +		if (nft_dev_forward_path(pkt, route, ct, dir, ft))
@@ -195,7 +194,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
 +		if (nft_dev_forward_path(pkt, route, ct, !dir, ft))
 +			goto err_release;
- 	}
++	}
  
  	return 0;
 +
@@ -204,8 +203,10 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +	dst_release(route->tuple[!dir].dst);
 +	return -ENOENT;
  }
- 
++
  static int nft_flow_route_dir(const struct nft_pktinfo *pkt,
+ 			      const struct nf_conn *ct,
+ 			      struct nf_flow_route *route,
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -11,6 +11,7 @@
