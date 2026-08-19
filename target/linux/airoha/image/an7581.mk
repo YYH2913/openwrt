@@ -125,7 +125,7 @@ define Device/gemtek_xr1710g-ubi
 		    -kmod-pwm-airoha \
 		    airoha-en7581-mt7996-npu-firmware \
 		    apk-mbedtls ethtool-full fitblk \
-		    ip-bridge ip-full iperf3 mdio-tools phytool tcpdump \
+		    ip-bridge ip-full iperf3 mdio-tools openssh-sftp-server phytool tcpdump \
 		    kmod-i2c-an7581 kmod-hwmon-nct7802 \
 		    kmod-mt7996-firmware kmod-phy-realtek \
 		    kmod-airoha-net-debug rtl826x-firmware \
@@ -141,7 +141,7 @@ define Device/gemtek_xr1710g-ubi
 		    luci-i18n-w1700k-fancontrol-zh-cn \
 		    luci-mod-admin-full \
 		    luci-proto-ppp luci-theme-bootstrap luci-theme-glass \
-		    rpcd-mod-rrdns uhttpd uhttpd-mod-ubus \
+		    rpcd-mod-rrdns px5g-mbedtls uhttpd uhttpd-mod-ubus \
 		    wpad-basic-mbedtls
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
