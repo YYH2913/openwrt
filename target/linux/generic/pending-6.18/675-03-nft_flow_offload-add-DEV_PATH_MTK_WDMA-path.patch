@@ -11,6 +11,7 @@ source MAC and packets stall in both software fastpath and hardware path.
 Ryan Chen split this handling from MediaTek's combined hardware offload
 patch. The local version is adapted to Linux 6.18.41's
 nf_flow_table_path.c split.
+The 6.18 version is adapted to nf_flow_table_path.c in this tree.
 
 Origin: backport, https://git01.mediatek.com/plugins/gitiles/openwrt/feeds/mtk-openwrt-feeds/+/2812cb84/21.02/files/target/linux/mediatek/patches-5.4/999-1718-v6.6-net-netfilter-add-nft-hw-offload.patch
 Link: https://github.com/rchen14b/openwrt_rchen14b/commit/c7abf1928e3af8628697a4abb767193fb2f33366

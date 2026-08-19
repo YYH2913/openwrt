@@ -15,6 +15,8 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
  net/netfilter/nft_flow_offload.c | 4 ++++
  1 file changed, 4 insertions(+)
 
+Origin: backport, https://git01.mediatek.com/plugins/gitiles/openwrt/feeds/mtk-openwrt-feeds/+/2812cb84/21.02/files/target/linux/mediatek/patches-5.4/999-1718-v6.6-net-netfilter-add-nft-hw-offload.patch
+Link: https://github.com/rchen14b/openwrt_rchen14b/commit/c7abf1928e3af8628697a4abb767193fb2f33366
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c

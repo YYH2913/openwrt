@@ -17,6 +17,9 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
  net/core/dev.c            | 32 ++++++++++++++++++--------------
  3 files changed, 21 insertions(+), 14 deletions(-)
 
+Based on MediaTek SDK patch by Bo-Cun Chen <cb-bocun.chen@mediatek.com> (cdd9927bc37f650d2634f4635f83eb2a8baf2ddd).
+Origin: backport, https://git01.mediatek.com/plugins/gitiles/openwrt/feeds/mtk-openwrt-feeds/+/2812cb84/21.02/files/target/linux/mediatek/patches-5.4/999-1718-v6.6-net-netfilter-add-nft-hw-offload.patch
+Link: https://github.com/rchen14b/openwrt_rchen14b/commit/c7abf1928e3af8628697a4abb767193fb2f33366
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -3089,6 +3089,8 @@

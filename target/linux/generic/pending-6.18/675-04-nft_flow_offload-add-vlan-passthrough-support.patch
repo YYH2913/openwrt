@@ -13,7 +13,10 @@ because the VLAN encap information is missing from the flow entry.
 Enable with: echo 1 > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged
 
 Based on MediaTek SDK patch by chak-kei.lam <chak-kei.lam@mediatek.com>.
+Adapted to Linux 6.18's nf_flow_table_path.c split in this tree.
 
+Origin: backport, https://git01.mediatek.com/plugins/gitiles/openwrt/feeds/mtk-openwrt-feeds/+/2812cb84/21.02/files/target/linux/mediatek/patches-5.4/999-1718-v6.6-net-netfilter-add-nft-hw-offload.patch
+Link: https://github.com/rchen14b/openwrt_rchen14b/commit/c7abf1928e3af8628697a4abb767193fb2f33366
 Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 Assisted-by: Codex:GPT-5.6-sol
