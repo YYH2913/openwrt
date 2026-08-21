@@ -573,7 +573,7 @@ return view.extend({
 		const config = status.config || {};
 
 		this.formData = { main: {
-			pon_mode: config.pon_mode || 'gpon',
+			pon_mode: config.pon_mode || 'xgspon',
 			serial_number: config.serial_number || '',
 			password: '',
 			clear_password: '0',
@@ -609,7 +609,7 @@ return view.extend({
 		o.value('xgspon', _('XGS-PON (10G/10G)'));
 		o.value('epon-10g-1g', _('10G-EPON (10G/1G)'));
 		o.value('epon-10g-10g', _('10G-EPON (10G/10G)'));
-		o.default = 'gpon';
+		o.default = 'xgspon';
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'serial_number', _('ONU serial number'));

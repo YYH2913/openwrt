@@ -54,7 +54,7 @@ function read_config() {
 	let registration_id = uci.get('airoha-gpon', 'main', 'registration_id') || '';
 	let epon_password = uci.get('airoha-epon', 'main', 'password') || '';
 	let config = {
-		pon_mode: uci.get('airoha-gpon', 'main', 'pon_mode') || 'gpon',
+		pon_mode: uci.get('airoha-gpon', 'main', 'pon_mode') || 'xgspon',
 		serial_number: uci.get('airoha-gpon', 'main', 'serial_number') || '',
 		enabled: uci.get('airoha-gpon', 'main', 'enabled') || '0',
 		omci_mode: uci.get('airoha-gpon', 'main', 'omci_mode') || 'auto',

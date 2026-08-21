@@ -19,7 +19,7 @@ start_service() {
 	config_get_bool enabled main enabled 0
 	enabled="${AIROHA_OMCI_ENABLED_OVERRIDE:-$enabled}"
 	config_get serial_number main serial_number
-	config_get pon_mode main pon_mode gpon
+	config_get pon_mode main pon_mode xgspon
 	pon_mode="${AIROHA_OMCI_PON_MODE_OVERRIDE:-$pon_mode}"
 	config_get omci_mode main omci_mode auto
 	omci_mode="${AIROHA_OMCI_MODE_OVERRIDE:-$omci_mode}"

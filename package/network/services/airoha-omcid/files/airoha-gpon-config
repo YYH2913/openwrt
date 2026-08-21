@@ -75,7 +75,7 @@ find_xpon() {
 read_config() {
 	config_load airoha-gpon
 	config_get_bool enabled main enabled 0
-	config_get pon_mode main pon_mode gpon
+	config_get pon_mode main pon_mode xgspon
 	config_get serial_number main serial_number
 	config_get password main password
 	config_get registration_id main registration_id

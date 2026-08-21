@@ -11,7 +11,7 @@ start_service() {
 
 	config_load airoha-gpon
 	config_get_bool enabled main enabled 0
-	config_get pon_mode main pon_mode gpon
+	config_get pon_mode main pon_mode xgspon
 	enabled="${AIROHA_EPON_ENABLED_OVERRIDE:-$enabled}"
 	pon_mode="${AIROHA_EPON_PON_MODE_OVERRIDE:-$pon_mode}"
 	config_load airoha-epon
