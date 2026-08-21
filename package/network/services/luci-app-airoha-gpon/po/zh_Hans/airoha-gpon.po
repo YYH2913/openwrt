@@ -1,0 +1,562 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-airoha-gpon\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "PON Optical Port"
+msgstr "PON 光口"
+
+msgid "PON protocol"
+msgstr "PON 协议"
+
+msgid "XGS-PON"
+msgstr "XGS-PON"
+
+msgid "XGS-PON readiness"
+msgstr "XGS-PON 就绪状态"
+
+msgid "XGS-PON blockers"
+msgstr "XGS-PON 阻塞项"
+
+msgid "XGS key derivation"
+msgstr "XGS 密钥派生"
+
+msgid "XGS activation evidence"
+msgstr "XGS 激活证据"
+
+msgid "Fault"
+msgstr "故障"
+
+msgid "Recovering"
+msgstr "恢复中"
+
+msgid "State %s; PHYA %s, RX %s (state %s), TX sync %s, PHY IRQ %s; recovery attempt %s, successes %s, failures %s"
+msgstr "状态 %s；PHYA %s，RX %s（状态 %s），TX 同步 %s，PHY IRQ %s；当前恢复尝试 %s，成功 %s 次，失败 %s 次"
+
+msgid "MAC O%s, optical TX %s, TX sync %s, PLOAM key %s, OMCI key %s, upstream IRQ %s, unexpected events %s"
+msgstr "MAC O%s，光发射%s，TX 同步%s，PLOAM 密钥槽 %s，OMCI 密钥槽 %s，上行中断 %s，异常事件 %s"
+
+msgid "ready"
+msgstr "就绪"
+
+msgid "enabled"
+msgstr "已启用"
+
+msgid "disabled"
+msgstr "已禁用"
+
+msgid "not ready"
+msgstr "未就绪"
+
+msgid "MSK not established"
+msgstr "尚未建立 MSK"
+
+msgid "MSK ready, awaiting authenticated PON tag"
+msgstr "MSK 已就绪，正在等待已认证的 PON tag"
+
+msgid "Session keys ready, awaiting secure hardware paths"
+msgstr "会话密钥已就绪，正在等待安全硬件通路"
+
+msgid "Session keys loaded, optical transmission remains disabled"
+msgstr "会话密钥已装入硬件，光发射仍保持关闭"
+
+msgid "Session keys loaded, awaiting ONU-ID; optical transmission remains disabled"
+msgstr "会话密钥已装入硬件，正在等待 ONU-ID；光发射仍保持关闭"
+
+msgid "ONU-ID assigned, awaiting Registration completion"
+msgstr "ONU-ID 已分配，正在等待 Registration 完成"
+
+msgid "Registered, secure OMCC ready"
+msgstr "已注册，安全 OMCC 已就绪"
+
+msgid "Hardware state uncertain; optical transmission remains disabled"
+msgstr "硬件状态不确定；光发射仍保持关闭"
+
+msgid "XGS control ABI"
+msgstr "XGS 控制 ABI"
+
+msgid "Secure OMCC"
+msgstr "安全 OMCC"
+
+msgid "Blocked"
+msgstr "已阻塞"
+
+msgid "Ready"
+msgstr "就绪"
+
+msgid "Partial"
+msgstr "部分可用"
+
+msgid "PHY/PCS"
+msgstr "PHY/PCS"
+
+msgid "Calibration"
+msgstr "校准"
+
+msgid "TC/PLOAM"
+msgstr "TC/PLOAM"
+
+msgid "XGEM/T-CONT"
+msgstr "XGEM/T-CONT"
+
+msgid "Live Status"
+msgstr "实时状态"
+
+msgid "Activation state"
+msgstr "激活状态"
+
+msgid "Optical transmitter"
+msgstr "光发射器"
+
+msgid "GPON PHY state"
+msgstr "GPON PHY 状态"
+
+msgid "Latest BER interval"
+msgstr "最近 BER 采样窗口"
+
+msgid "LOS"
+msgstr "光信号丢失（LOS）"
+
+msgid "LOF"
+msgstr "帧同步丢失（LOF）"
+
+msgid "Synchronized"
+msgstr "已同步"
+
+msgid "Not synchronized"
+msgstr "未同步"
+
+msgid "%s BIP errors / %s ms (sample %s)"
+msgstr "%s 个 BIP 错误 / %s 毫秒（样本 %s）"
+
+msgid "PON link"
+msgstr "PON 链路"
+
+msgid "Safety chain"
+msgstr "安全链"
+
+msgid "ONU ID"
+msgstr "ONU ID"
+
+msgid "OMCC GEM ID"
+msgstr "OMCC GEM ID"
+
+msgid "T-CONTs"
+msgstr "T-CONT"
+
+msgid "Data GEM"
+msgstr "数据 GEM"
+
+msgid "Equalization delay"
+msgstr "均衡时延"
+
+msgid "OMCI control plane"
+msgstr "OMCI 控制面"
+
+msgid "OMCI daemon"
+msgstr "OMCI 服务"
+
+msgid "MIB data sync"
+msgstr "MIB 数据同步值"
+
+msgid "Managed entities"
+msgstr "受管实体"
+
+msgid "OMCI frames"
+msgstr "OMCI 帧"
+
+msgid "OMCI errors"
+msgstr "OMCI 错误"
+
+msgid "Autonomous notifications"
+msgstr "自主通知"
+
+msgid "Last OMCI transaction"
+msgstr "最近 OMCI 事务"
+
+msgid "Software image state"
+msgstr "软件镜像状态"
+
+msgid "Software download"
+msgstr "软件下载"
+
+msgid "Software image MD5"
+msgstr "软件镜像 MD5"
+
+msgid "Idle"
+msgstr "空闲"
+
+msgid "Downloading"
+msgstr "正在下载"
+
+msgid "Ready to activate"
+msgstr "可激活"
+
+msgid "Activating image"
+msgstr "正在激活镜像"
+
+msgid "Committed"
+msgstr "已提交"
+
+msgid "Failed"
+msgstr "失败"
+
+msgid "Image %s: %s / %s bytes"
+msgstr "镜像 %s：%s / %s 字节"
+
+msgid "Service apply state"
+msgstr "业务应用状态"
+
+msgid "Service GEM"
+msgstr "业务 GEM"
+
+msgid "Single-GEM data path limit"
+msgstr "单 GEM 数据面限制"
+
+msgid "Calibration source"
+msgstr "校准数据来源"
+
+msgid "BOSA firmware"
+msgstr "BOSA 固件"
+
+msgid "Optical temperature"
+msgstr "光模块温度"
+
+msgid "Optical supply voltage"
+msgstr "光模块供电电压"
+
+msgid "Laser bias current"
+msgstr "激光偏置电流"
+
+msgid "Transmit optical power"
+msgstr "发送光功率"
+
+msgid "Receive optical power"
+msgstr "接收光功率"
+
+msgid "%s C"
+msgstr "%s C"
+
+msgid "%s V"
+msgstr "%s V"
+
+msgid "%s mA"
+msgstr "%s mA"
+
+msgid "%s dBm"
+msgstr "%s dBm"
+
+msgid "No optical signal"
+msgstr "无光信号"
+
+msgid "Received bytes"
+msgstr "接收字节"
+
+msgid "Transmitted bytes"
+msgstr "发送字节"
+
+msgid "ONU Registration"
+msgstr "ONU 注册"
+
+msgid "ONU serial number"
+msgstr "ONU 序列号"
+
+msgid "PLOAM password"
+msgstr "PLOAM 密码"
+
+msgid "Clear PLOAM password"
+msgstr "清除 PLOAM 密码"
+
+msgid "Registration-ID"
+msgstr "Registration-ID"
+
+msgid "Clear Registration-ID"
+msgstr "清除 Registration-ID"
+
+msgid "Use at most 36 printable ASCII characters or hex: followed by 72 hexadecimal digits."
+msgstr "最多输入 36 个可打印 ASCII 字符，或输入 hex: 后跟 72 个十六进制数字。"
+
+msgid "Configured"
+msgstr "已配置"
+
+msgid "Not configured"
+msgstr "未配置"
+
+msgid "Failed to save PON configuration."
+msgstr "保存 PON 配置失败。"
+
+msgid "PON configuration has been applied."
+msgstr "PON 配置已应用。"
+
+msgid "Enable PON activation"
+msgstr "启用 PON 激活"
+
+msgid "Service provisioning"
+msgstr "业务配置方式"
+
+msgid "Automatic (OMCI)"
+msgstr "自动（OMCI）"
+
+msgid "Manual"
+msgstr "手动"
+
+msgid "Manual Service Channel"
+msgstr "手工业务通道"
+
+msgid "Enable manual data GEM"
+msgstr "启用手工数据 GEM"
+
+msgid "GEM port ID"
+msgstr "GEM 端口 ID"
+
+msgid "T-CONT channel"
+msgstr "T-CONT 通道"
+
+msgid "Encrypted downstream"
+msgstr "下行加密"
+
+msgid "Driver unavailable"
+msgstr "驱动不可用"
+
+msgid "Hardware mode not selected"
+msgstr "未选择对应硬件模式"
+
+msgid "Hardware mode"
+msgstr "硬件模式"
+
+msgid "Disabled"
+msgstr "已禁用"
+
+msgid "Activating"
+msgstr "正在激活"
+
+msgid "BOSA unavailable"
+msgstr "BOSA 不可用"
+
+msgid "Locked by rogue-ONU protection"
+msgstr "已被 rogue-ONU 保护锁定"
+
+msgid "Loss of signal"
+msgstr "光信号丢失"
+
+msgid "Laser disabled"
+msgstr "激光已关闭"
+
+msgid "Laser active"
+msgstr "激光已启用"
+
+msgid "Automatic"
+msgstr "自动"
+
+msgid "Unavailable"
+msgstr "不可用"
+
+msgid "%s received / %s sent"
+msgstr "接收 %s / 发送 %s"
+
+msgid "%s decode / %s transport / %s event"
+msgstr "解码 %s / 传输 %s / 事件 %s"
+
+msgid "%s sent, last message 0x%s"
+msgstr "已发送 %s，最近消息 0x%s"
+
+msgid "TCI %s, message 0x%s"
+msgstr "TCI %s，消息 0x%s"
+
+msgid "GEM %s on channel %s"
+msgstr "GEM %s，通道 %s"
+
+msgid "Multiple GEMs requested; current data path exposes one"
+msgstr "OLT 配置了多个 GEM；当前数据面仅暴露一个"
+
+msgid "No"
+msgstr "否"
+
+msgid "Ready: %s, fault: %s, OLT disabled: %s"
+msgstr "就绪：%s，故障：%s，OLT 禁用：%s"
+
+msgid "yes"
+msgstr "是"
+
+msgid "Data GEMs"
+msgstr "数据 GEM"
+
+msgid "Applied GEM mapping"
+msgstr "已应用的 GEM 映射"
+
+msgid "Provisioned GEMs"
+msgstr "已配置的 GEM 数量"
+
+msgid "OLT Provisioned Service"
+msgstr "OLT 下发业务"
+
+msgid "GEM channels"
+msgstr "GEM 通道"
+
+msgid "GEM port"
+msgstr "GEM 端口"
+
+msgid "Alloc-ID"
+msgstr "Alloc-ID"
+
+msgid "Direction"
+msgstr "方向"
+
+msgid "Downstream"
+msgstr "下行"
+
+msgid "Upstream"
+msgstr "上行"
+
+msgid "Bidirectional"
+msgstr "双向"
+
+msgid "Upstream queue"
+msgstr "上行队列"
+
+msgid "Downstream queue"
+msgstr "下行队列"
+
+msgid "Priority mapping"
+msgstr "优先级映射"
+
+msgid "Mapper"
+msgstr "映射器"
+
+msgid "P-bit"
+msgstr "P-bit"
+
+msgid "Interworking TP"
+msgstr "互通终结点"
+
+msgid "Bridge attachments"
+msgstr "网桥连接"
+
+msgid "Bridge"
+msgstr "网桥"
+
+msgid "Port"
+msgstr "端口"
+
+msgid "Termination type"
+msgstr "终结点类型"
+
+msgid "Termination point"
+msgstr "终结点"
+
+msgid "Ethernet UNI"
+msgstr "以太网 UNI"
+
+msgid "802.1p mapper"
+msgstr "802.1p 映射器"
+
+msgid "GEM interworking"
+msgstr "GEM 互通"
+
+msgid "VLAN policies"
+msgstr "VLAN 策略"
+
+msgid "Entity"
+msgstr "实体"
+
+msgid "Association"
+msgstr "关联类型"
+
+msgid "Target"
+msgstr "关联对象"
+
+msgid "Mode"
+msgstr "模式"
+
+msgid "Classic"
+msgstr "经典"
+
+msgid "Enhanced"
+msgstr "增强"
+
+msgid "Rules"
+msgstr "规则数"
+
+msgid "Downstream mode"
+msgstr "下行模式"
+
+msgid "MAC bridge port"
+msgstr "MAC 网桥端口"
+
+msgid "Not provisioned"
+msgstr "未下发"
+
+msgid "no"
+msgstr "否"
+
+msgid "Use four vendor characters followed by eight hexadecimal digits."
+msgstr "请输入 4 个厂商字符和紧随其后的 8 个十六进制数字。"
+
+msgid "Use at most ten printable ASCII characters or hex: followed by twenty hexadecimal digits."
+msgstr "最多输入 10 个可打印 ASCII 字符，或输入 hex: 后跟 20 个十六进制数字。"
+
+msgid "Applied"
+msgstr "已应用"
+
+msgid "Waiting for OLT provisioning"
+msgstr "等待 OLT 下发业务"
+
+msgid "Waiting for O5 activation"
+msgstr "等待进入 O5 激活状态"
+
+msgid "Waiting for T-CONT allocation"
+msgstr "等待 T-CONT 分配"
+
+msgid "PON driver unavailable"
+msgstr "PON 驱动不可用"
+
+msgid "OLT service graph rejected"
+msgstr "OLT 业务图被拒绝"
+
+msgid "LAN or PON already belongs to another bridge"
+msgstr "LAN 或 PON 已属于其他网桥"
+
+msgid "MAC bridge apply failed"
+msgstr "MAC 网桥应用失败"
+
+msgid "GEM mapping apply failed"
+msgstr "GEM 映射应用失败"
+
+msgid "Ethernet UNI apply failed"
+msgstr "以太网 UNI 应用失败"
+
+msgid "VLAN or GEM classifier apply failed"
+msgstr "VLAN 或 GEM 分类器应用失败"
+
+msgid "Applied service bridges"
+msgstr "已应用业务网桥"
+
+msgid "Installed traffic classifiers"
+msgstr "已安装流量分类器"
+msgid "XGS PHY evidence"
+msgstr "XGS PHY 证据"
+
+msgid "LOS, PHYA %s, RX sync state %s, TX sync %s"
+msgstr "LOS，PHYA %s，RX 同步状态 %s，TX 同步 %s"
+
+msgid "PHYA %s, RX %s (state %s), TX sync %s, PHY IRQ %s"
+msgstr "PHYA %s，RX %s（状态 %s），TX 同步 %s，PHY IRQ %s"
+
+msgid "observation only"
+msgstr "仅观测"
+
+msgid "owned"
+msgstr "已接管"
+
+msgid "synchronized"
+msgstr "已同步"
+
+msgid "not synchronized"
+msgstr "未同步"
+
+msgid "Use at most 12 characters."
+msgstr "最多使用 12 个字符。"

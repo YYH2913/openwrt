@@ -188,3 +188,65 @@ define Device/nokia_xg-040g-md-ubi
   ARTIFACTS := bl31-uboot.fip preloader.bin
 endef
 TARGET_DEVICES += nokia_xg-040g-md-ubi
+
+define Device/axon_xg2010g-ubi
+	DEVICE_VENDOR := Axon Networks
+	DEVICE_MODEL := XG2010G
+	DEVICE_VARIANT := UBI
+	DEVICE_DTS := an7581-axon-xg2010g-ubi
+	SUPPORTED_DEVICES := axon,xg2010g axon,xg2010g-xgspon econet,xg2010g
+	DEVICE_COMPAT_VERSION := 1.0
+	DEVICE_COMPAT_MESSAGE := XG2010G uses the stock 512 MiB NAND boundaries; ART and the final BMT/BBT area are preserved.
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	UBINIZE_OPTS := -E 5
+	UBOOTENV_IN_UBI := 1
+	KERNEL_IN_UBI := 1
+	KERNEL := kernel-bin | gzip
+	KERNEL_INITRAMFS := kernel-bin | lzma | \
+		fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+	KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+	IMAGES := sysupgrade.itb
+	IMAGE/sysupgrade.itb := append-kernel | \
+		fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
+		append-metadata
+	DEVICE_PACKAGES := airoha-en7581-npu-firmware fitblk \
+		kmod-airoha-en7572 kmod-airoha-gpon kmod-airoha-xgspon \
+		kmod-airoha-epon \
+		airoha-en7572-firmware \
+		airoha-epon-oamd luci-light luci-app-airoha-gpon \
+		kmod-phy-realtek rtl826x-firmware kmod-phy-airoha-en8811h
+	SOC := an7581
+endef
+TARGET_DEVICES += axon_xg2010g-ubi
+
+define Device/axon_xg2010g-xgspon-ubi
+	DEVICE_VENDOR := Axon Networks
+	DEVICE_MODEL := XG2010G
+	DEVICE_VARIANT := XGS-PON UBI
+	DEVICE_DTS := an7581-axon-xg2010g-xgspon-ubi
+	SUPPORTED_DEVICES := axon,xg2010g-xgspon axon,xg2010g econet,xg2010g
+	DEVICE_COMPAT_VERSION := 1.0
+	DEVICE_COMPAT_MESSAGE := XG2010G uses the stock 512 MiB NAND boundaries; ART and the final BMT/BBT area are preserved.
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	UBINIZE_OPTS := -E 5
+	UBOOTENV_IN_UBI := 1
+	KERNEL_IN_UBI := 1
+	KERNEL := kernel-bin | gzip
+	KERNEL_INITRAMFS := kernel-bin | lzma | \
+		fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+	KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+	IMAGES := sysupgrade.itb
+	IMAGE/sysupgrade.itb := append-kernel | \
+		fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
+		append-metadata
+	DEVICE_PACKAGES := airoha-en7581-npu-firmware fitblk \
+		kmod-airoha-en7572 kmod-airoha-gpon kmod-airoha-xgspon \
+		kmod-airoha-epon \
+		airoha-en7572-firmware \
+		airoha-epon-oamd luci-light luci-app-airoha-gpon \
+		kmod-phy-realtek rtl826x-firmware kmod-phy-airoha-en8811h
+	SOC := an7581
+endef
+TARGET_DEVICES += axon_xg2010g-xgspon-ubi

@@ -1,0 +1,101 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 15:15:00 +0800
+Subject: [PATCH] tc: vlan: add partial tag treatment
+
+Add parsing and output for the kernel VLAN action's optional DEI attribute.
+Keep the VID mandatory for PUSH, but allow MODIFY to specify any non-empty
+combination of VID, protocol, priority, and DEI.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/tc_act/tc_vlan.h
++++ b/include/uapi/linux/tc_act/tc_vlan.h
+@@ -29,6 +29,7 @@
+ 	TCA_VLAN_PUSH_VLAN_PRIORITY,
+ 	TCA_VLAN_PUSH_ETH_DST,
+ 	TCA_VLAN_PUSH_ETH_SRC,
++	TCA_VLAN_PUSH_VLAN_DEI,
+ 	__TCA_VLAN_MAX,
+ };
+ #define TCA_VLAN_MAX (__TCA_VLAN_MAX - 1)
+--- a/tc/m_vlan.c
++++ b/tc/m_vlan.c
+@@ -27,8 +27,8 @@
+ {
+ 	fprintf(stderr,
+ 		"Usage: vlan pop [CONTROL]\n"
+-		"       vlan push [ protocol VLANPROTO ] id VLANID [ priority VLANPRIO ] [CONTROL]\n"
+-		"       vlan modify [ protocol VLANPROTO ] id VLANID [ priority VLANPRIO ] [CONTROL]\n"
++		"       vlan push [ protocol VLANPROTO ] id VLANID [ priority VLANPRIO ] [ dei VLANDEI ] [CONTROL]\n"
++		"       vlan modify [ protocol VLANPROTO ] [ id VLANID ] [ priority VLANPRIO ] [ dei VLANDEI ] [CONTROL]\n"
+ 		"       vlan pop_eth [CONTROL]\n"
+ 		"       vlan push_eth dst_mac LLADDR src_mac LLADDR [CONTROL]\n"
+ 		"       VLANPROTO is one of 802.1Q or 802.1AD\n"
+@@ -73,6 +73,8 @@
+ 	int proto_set = 0;
+ 	__u8 prio;
+ 	int prio_set = 0;
++	__u8 dei;
++	int dei_set = 0;
+ 	struct tc_vlan parm = {};
+ 
+ 	if (matches(*argv, "vlan") != 0)
+@@ -135,6 +137,14 @@
+ 			if (get_u8(&prio, *argv, 0) || (prio & ~0x7))
+ 				invarg("prio is invalid", *argv);
+ 			prio_set = 1;
++		} else if (matches(*argv, "dei") == 0) {
++			if (!has_push_attribs(action))
++				invarg("only valid for push/modify", *argv);
++
++			NEXT_ARG();
++			if (get_u8(&dei, *argv, 0) || (dei & ~0x1))
++				invarg("dei is invalid", *argv);
++			dei_set = 1;
+ 		} else if (matches(*argv, "dst_mac") == 0) {
+ 			if (action != TCA_VLAN_ACT_PUSH_ETH)
+ 				invarg("only valid for push_eth", *argv);
+@@ -175,12 +185,19 @@
+ 		}
+ 	}
+ 
+-	if (has_push_attribs(action) && !id_set) {
++	if (action == TCA_VLAN_ACT_PUSH && !id_set) {
+ 		fprintf(stderr, "id needs to be set for %s\n",
+ 			action_names[action]);
+ 		explain();
+ 		return -1;
+ 	}
++	if (action == TCA_VLAN_ACT_MODIFY &&
++	    !id_set && !proto_set && !prio_set && !dei_set) {
++		fprintf(stderr, "at least one VLAN field needs to be set for %s\n",
++			action_names[action]);
++		explain();
++		return -1;
++	}
+ 
+ 	if (action == TCA_VLAN_ACT_PUSH_ETH) {
+ 		if (!dst_mac_set) {
+@@ -213,6 +230,8 @@
+ 	}
+ 	if (prio_set)
+ 		addattr8(n, MAX_MSG, TCA_VLAN_PUSH_VLAN_PRIORITY, prio);
++	if (dei_set)
++		addattr8(n, MAX_MSG, TCA_VLAN_PUSH_VLAN_DEI, dei);
+ 	if (dst_mac_set)
+ 		addattr_l(n, MAX_MSG, TCA_VLAN_PUSH_ETH_DST, dst_mac,
+ 			  sizeof(dst_mac));
+@@ -267,6 +286,10 @@
+ 			val = rta_getattr_u8(tb[TCA_VLAN_PUSH_VLAN_PRIORITY]);
+ 			print_uint(PRINT_ANY, "priority", " priority %u", val);
+ 		}
++		if (tb[TCA_VLAN_PUSH_VLAN_DEI]) {
++			val = rta_getattr_u8(tb[TCA_VLAN_PUSH_VLAN_DEI]);
++			print_uint(PRINT_ANY, "dei", " dei %u", val);
++		}
+ 		break;
+ 	case TCA_VLAN_ACT_PUSH_ETH:
+ 		if (tb[TCA_VLAN_PUSH_ETH_DST] &&
+-- 
+2.51.0
+

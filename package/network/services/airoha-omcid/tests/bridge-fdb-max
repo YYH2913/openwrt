@@ -1,0 +1,9 @@
+#!/bin/sh
+
+if [ "$#" -eq 6 ] && [ "$1" = link ] && [ "$2" = set ] && [ "$3" = dev ] &&
+	[ "$5" = fdb_max_learned ]; then
+	printf '%s\n' "$*" >> "${AIROHA_OMCI_BRIDGE_LOG:?}"
+	exit 0
+fi
+
+exec /usr/sbin/bridge "$@"

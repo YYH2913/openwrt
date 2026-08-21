@@ -1,0 +1,380 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 20:10:00 +0800
+Subject: [PATCH] net: sched: act_vlan: add atomic tag transform
+
+G.988 extended VLAN operations may copy fields from either of the two
+received tags after removing them.  A sequence of POP, MODIFY and PUSH
+actions cannot retain both original tags, and therefore cannot implement
+these operations without changing packet-dependent values.
+
+Add a software-only TRANSFORM action which snapshots the first two received
+tags, removes up to two tags, and pushes up to two tags atomically.  Each
+protocol, VID, PCP and DEI field can be fixed or copied from the original
+outer or inner tag.  Reject malformed reserved data and references to tags
+which are absent at run time.  The flow action ABI cannot represent this
+operation, so always reject offload.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/tc_act/tc_vlan.h
++++ b/include/uapi/linux/tc_act/tc_vlan.h
+@@ -13,6 +13,37 @@
+ #define TCA_VLAN_ACT_MODIFY	3
+ #define TCA_VLAN_ACT_POP_ETH	4
+ #define TCA_VLAN_ACT_PUSH_ETH	5
++#define TCA_VLAN_ACT_TRANSFORM	6
++
++#define TC_VLAN_TRANSFORM_MAX_TAGS	2
++
++enum tc_vlan_transform_source {
++	TC_VLAN_TRANSFORM_FIXED,
++	TC_VLAN_TRANSFORM_OUTER,
++	TC_VLAN_TRANSFORM_INNER,
++	__TC_VLAN_TRANSFORM_SOURCE_MAX,
++};
++#define TC_VLAN_TRANSFORM_SOURCE_MAX \
++	(__TC_VLAN_TRANSFORM_SOURCE_MAX - 1)
++
++struct tc_vlan_transform_tag {
++	__be16 protocol;
++	__u16 id;
++	__u8 priority;
++	__u8 dei;
++	__u8 protocol_source;
++	__u8 id_source;
++	__u8 priority_source;
++	__u8 dei_source;
++	__u8 reserved[2];
++};
++
++struct tc_vlan_transform {
++	__u8 pop_tags;
++	__u8 push_tags;
++	__u8 reserved[2];
++	struct tc_vlan_transform_tag tag[TC_VLAN_TRANSFORM_MAX_TAGS];
++};
+ 
+ struct tc_vlan {
+ 	tc_gen;
+@@ -30,6 +61,7 @@ enum {
+ 	TCA_VLAN_PUSH_ETH_DST,
+ 	TCA_VLAN_PUSH_ETH_SRC,
+ 	TCA_VLAN_PUSH_VLAN_DEI,
++	TCA_VLAN_TRANSFORM,
+ 	__TCA_VLAN_MAX,
+ };
+ #define TCA_VLAN_MAX (__TCA_VLAN_MAX - 1)
+--- a/include/net/tc_act/tc_vlan.h
++++ b/include/net/tc_act/tc_vlan.h
+@@ -23,6 +23,7 @@ struct tcf_vlan_params {
+ 	bool              tcfv_push_prio_exists;
+ 	u8                tcfv_push_dei;
+ 	bool              tcfv_push_dei_exists;
++	struct tc_vlan_transform tcfv_transform;
+ 	struct rcu_head   rcu;
+ };
+ 
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -17,6 +17,169 @@
+ 
+ static struct tc_action_ops act_vlan_ops;
+ 
++struct tcf_vlan_tag_state {
++	__be16 protocol;
++	u16 tci;
++};
++
++static const struct tcf_vlan_tag_state *
++tcf_vlan_transform_source(const struct tcf_vlan_tag_state *tag, int count,
++			  u8 source)
++{
++	switch (source) {
++	case TC_VLAN_TRANSFORM_OUTER:
++		return count > 0 ? &tag[0] : NULL;
++	case TC_VLAN_TRANSFORM_INNER:
++		return count > 1 ? &tag[1] : NULL;
++	default:
++		return NULL;
++	}
++}
++
++static int tcf_vlan_snapshot(struct sk_buff *skb,
++			     struct tcf_vlan_tag_state *tag)
++{
++	struct vlan_hdr *header;
++	unsigned int offset = ETH_HLEN;
++	__be16 protocol = skb->protocol;
++	int count = 0;
++
++	if (skb_vlan_tag_present(skb)) {
++		tag[count].protocol = skb->vlan_proto;
++		tag[count].tci = skb_vlan_tag_get(skb);
++		count++;
++	}
++
++	while (count < TC_VLAN_TRANSFORM_MAX_TAGS &&
++	       eth_type_vlan(protocol)) {
++		if (!pskb_may_pull(skb, offset + VLAN_HLEN))
++			return -ENOMEM;
++		header = (struct vlan_hdr *)(skb->data + offset);
++		tag[count].protocol = protocol;
++		tag[count].tci = ntohs(header->h_vlan_TCI);
++		protocol = header->h_vlan_encapsulated_proto;
++		offset += VLAN_HLEN;
++		count++;
++	}
++
++	return count;
++}
++
++static int
++tcf_vlan_resolve_tag(const struct tc_vlan_transform_tag *config,
++		     const struct tcf_vlan_tag_state *original, int count,
++		     struct tcf_vlan_tag_state *result)
++{
++	const struct tcf_vlan_tag_state *source;
++	u16 tci = 0;
++
++	if (config->protocol_source == TC_VLAN_TRANSFORM_FIXED) {
++		result->protocol = config->protocol;
++	} else {
++		source = tcf_vlan_transform_source(original, count,
++						   config->protocol_source);
++		if (!source)
++			return -ENODATA;
++		result->protocol = source->protocol;
++	}
++
++	if (config->id_source == TC_VLAN_TRANSFORM_FIXED) {
++		tci |= config->id;
++	} else {
++		source = tcf_vlan_transform_source(original, count,
++						   config->id_source);
++		if (!source)
++			return -ENODATA;
++		tci |= source->tci & VLAN_VID_MASK;
++	}
++
++	if (config->priority_source == TC_VLAN_TRANSFORM_FIXED) {
++		tci |= config->priority << VLAN_PRIO_SHIFT;
++	} else {
++		source = tcf_vlan_transform_source(original, count,
++						   config->priority_source);
++		if (!source)
++			return -ENODATA;
++		tci |= source->tci & VLAN_PRIO_MASK;
++	}
++
++	if (config->dei_source == TC_VLAN_TRANSFORM_FIXED) {
++		if (config->dei)
++			tci |= VLAN_CFI_MASK;
++	} else {
++		source = tcf_vlan_transform_source(original, count,
++						   config->dei_source);
++		if (!source)
++			return -ENODATA;
++		tci |= source->tci & VLAN_CFI_MASK;
++	}
++
++	result->tci = tci;
++	return 0;
++}
++
++static int
++tcf_vlan_validate_transform_tag(const struct tc_vlan_transform_tag *tag)
++{
++	if (tag->reserved[0] || tag->reserved[1] ||
++	    tag->protocol_source > TC_VLAN_TRANSFORM_SOURCE_MAX ||
++	    tag->id_source > TC_VLAN_TRANSFORM_SOURCE_MAX ||
++	    tag->priority_source > TC_VLAN_TRANSFORM_SOURCE_MAX ||
++	    tag->dei_source > TC_VLAN_TRANSFORM_SOURCE_MAX)
++		return -EINVAL;
++
++	if (tag->protocol_source == TC_VLAN_TRANSFORM_FIXED) {
++		if (tag->protocol != htons(ETH_P_8021Q) &&
++		    tag->protocol != htons(ETH_P_8021AD))
++			return -EPROTONOSUPPORT;
++	} else if (tag->protocol) {
++		return -EINVAL;
++	}
++	if (tag->id_source == TC_VLAN_TRANSFORM_FIXED) {
++		if (tag->id >= VLAN_VID_MASK)
++			return -ERANGE;
++	} else if (tag->id) {
++		return -EINVAL;
++	}
++	if (tag->priority_source == TC_VLAN_TRANSFORM_FIXED) {
++		if (tag->priority > 7)
++			return -ERANGE;
++	} else if (tag->priority) {
++		return -EINVAL;
++	}
++	if (tag->dei_source == TC_VLAN_TRANSFORM_FIXED) {
++		if (tag->dei > 1)
++			return -ERANGE;
++	} else if (tag->dei) {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int tcf_vlan_validate_transform(const struct tc_vlan_transform *transform)
++{
++	int i, err;
++
++	if (transform->reserved[0] || transform->reserved[1] ||
++	    transform->pop_tags > TC_VLAN_TRANSFORM_MAX_TAGS ||
++	    transform->push_tags > TC_VLAN_TRANSFORM_MAX_TAGS ||
++	    (!transform->pop_tags && !transform->push_tags))
++		return -EINVAL;
++
++	for (i = 0; i < transform->push_tags; i++) {
++		err = tcf_vlan_validate_transform_tag(&transform->tag[i]);
++		if (err)
++			return err;
++	}
++	for (; i < TC_VLAN_TRANSFORM_MAX_TAGS; i++)
++		if (memchr_inv(&transform->tag[i], 0,
++			       sizeof(transform->tag[i])))
++			return -EINVAL;
++
++	return 0;
++}
++
+ TC_INDIRECT_SCOPE int tcf_vlan_act(struct sk_buff *skb,
+ 				   const struct tc_action *a,
+ 				   struct tcf_result *res)
+@@ -25,8 +170,11 @@ TC_INDIRECT_SCOPE int tcf_vlan_act(struct
+ 	struct tcf_vlan *v = to_vlan(a);
+ 	struct tcf_vlan_params *p;
+ 	int err;
++	int count, i;
+ 	__be16 proto;
+ 	u16 tci;
++	struct tcf_vlan_tag_state original[TC_VLAN_TRANSFORM_MAX_TAGS];
++	struct tcf_vlan_tag_state result[TC_VLAN_TRANSFORM_MAX_TAGS];
+ 
+ 	tcf_lastuse_update(&v->tcf_tm);
+ 	tcf_action_update_bstats(&v->common, skb);
+@@ -87,6 +235,28 @@ TC_INDIRECT_SCOPE int tcf_vlan_act(struct
+ 			proto = p->tcfv_push_proto;
+ 		__vlan_hwaccel_put_tag(skb, proto, tci);
+ 		break;
++	case TCA_VLAN_ACT_TRANSFORM:
++		count = tcf_vlan_snapshot(skb, original);
++		if (count < 0 || p->tcfv_transform.pop_tags > count)
++			goto drop;
++		for (i = 0; i < p->tcfv_transform.push_tags; i++) {
++			err = tcf_vlan_resolve_tag(&p->tcfv_transform.tag[i],
++						   original, count, &result[i]);
++			if (err)
++				goto drop;
++		}
++		for (i = 0; i < p->tcfv_transform.pop_tags; i++) {
++			err = skb_vlan_pop(skb);
++			if (err)
++				goto drop;
++		}
++		for (i = p->tcfv_transform.push_tags - 1; i >= 0; i--) {
++			err = skb_vlan_push(skb, result[i].protocol,
++					    result[i].tci);
++			if (err)
++				goto drop;
++		}
++		break;
+ 	case TCA_VLAN_ACT_POP_ETH:
+ 		err = skb_eth_pop(skb);
+ 		if (err)
+@@ -124,6 +293,8 @@ static const struct nla_policy vlan_poli
+ 	[TCA_VLAN_PUSH_VLAN_DEI]	= { .type = NLA_U8 },
+ 	[TCA_VLAN_PUSH_ETH_DST]		= NLA_POLICY_ETH_ADDR,
+ 	[TCA_VLAN_PUSH_ETH_SRC]		= NLA_POLICY_ETH_ADDR,
++	[TCA_VLAN_TRANSFORM]		=
++		NLA_POLICY_EXACT_LEN(sizeof(struct tc_vlan_transform)),
+ };
+ 
+ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+@@ -143,6 +314,7 @@ static int tcf_vlan_init(struct net *net
+ 	u8 push_dei = 0;
+ 	u8 push_prio = 0;
+ 	bool exists = false;
++	struct tc_vlan_transform transform = {};
+ 	int ret = 0, err;
+ 	u32 index;
+ 
+@@ -159,6 +331,23 @@ static int tcf_vlan_init(struct net *net
+ 	if (!tb[TCA_VLAN_PARMS])
+ 		return -EINVAL;
+ 	parm = nla_data(tb[TCA_VLAN_PARMS]);
++	if (parm->v_action == TCA_VLAN_ACT_TRANSFORM) {
++		if (!tb[TCA_VLAN_TRANSFORM] ||
++		    tb[TCA_VLAN_PUSH_VLAN_ID] ||
++		    tb[TCA_VLAN_PUSH_VLAN_PROTOCOL] ||
++		    tb[TCA_VLAN_PUSH_VLAN_PRIORITY] ||
++		    tb[TCA_VLAN_PUSH_VLAN_DEI] ||
++		    tb[TCA_VLAN_PUSH_ETH_DST] || tb[TCA_VLAN_PUSH_ETH_SRC])
++			return -EINVAL;
++		nla_memcpy(&transform, tb[TCA_VLAN_TRANSFORM],
++			   sizeof(transform));
++		err = tcf_vlan_validate_transform(&transform);
++		if (err)
++			return err;
++	} else if (tb[TCA_VLAN_TRANSFORM]) {
++		return -EINVAL;
++	}
++
+ 	index = parm->index;
+ 	err = tcf_idr_check_alloc(tn, &index, a, bind);
+ 	if (err < 0)
+@@ -237,6 +428,7 @@ static int tcf_vlan_init(struct net *net
+ 		}
+ 		break;
+ 	case TCA_VLAN_ACT_POP_ETH:
++	case TCA_VLAN_ACT_TRANSFORM:
+ 		break;
+ 	case TCA_VLAN_ACT_PUSH_ETH:
+ 		if (!tb[TCA_VLAN_PUSH_ETH_DST] || !tb[TCA_VLAN_PUSH_ETH_SRC]) {
+@@ -293,6 +485,7 @@ static int tcf_vlan_init(struct net *net
+ 	p->tcfv_push_dei_exists = push_dei_exists || action == TCA_VLAN_ACT_PUSH;
+ 	p->tcfv_push_proto = push_proto;
+ 	p->tcfv_push_proto_exists = push_proto_exists || action == TCA_VLAN_ACT_PUSH;
++	p->tcfv_transform = transform;
+ 
+ 	if (action == TCA_VLAN_ACT_PUSH_ETH) {
+ 		nla_memcpy(&p->tcfv_push_dst, tb[TCA_VLAN_PUSH_ETH_DST],
+@@ -363,5 +556,10 @@ static int tcf_vlan_dump(struct sk_buff
+ 		goto nla_put_failure;
+ 
++	if (p->tcfv_action == TCA_VLAN_ACT_TRANSFORM &&
++	    nla_put(skb, TCA_VLAN_TRANSFORM, sizeof(p->tcfv_transform),
++		    &p->tcfv_transform))
++		goto nla_put_failure;
++
+ 	if (p->tcfv_action == TCA_VLAN_ACT_PUSH_ETH) {
+ 		if (nla_put(skb, TCA_VLAN_PUSH_ETH_DST, ETH_ALEN,
+ 			    p->tcfv_push_dst))
+@@ -404,6 +602,7 @@ static size_t tcf_vlan_get_fill_size(con
+ 		+ nla_total_size(sizeof(u16)) /* TCA_VLAN_PUSH_VLAN_PROTOCOL */
+ 		+ nla_total_size(sizeof(u8)) /* TCA_VLAN_PUSH_VLAN_PRIORITY */
+-		+ nla_total_size(sizeof(u8)); /* TCA_VLAN_PUSH_VLAN_DEI */
++		+ nla_total_size(sizeof(u8)) /* TCA_VLAN_PUSH_VLAN_DEI */
++		+ nla_total_size(sizeof(struct tc_vlan_transform));
+ }
+ 
+ static int tcf_vlan_offload_act_setup(struct tc_action *act, void *entry_data,
+@@ -412,6 +611,11 @@ static int tcf_vlan_offload_act_setup(st
+ {
+ 	u32 action = tcf_vlan_action(act);
+ 
++	if (action == TCA_VLAN_ACT_TRANSFORM) {
++		NL_SET_ERR_MSG_MOD(extack, "Atomic VLAN transform is software-only");
++		return -EOPNOTSUPP;
++	}
++
+ 	if (tcf_vlan_push_dei_exists(act) &&
+ 	    (action == TCA_VLAN_ACT_MODIFY || tcf_vlan_push_dei(act))) {
+ 		NL_SET_ERR_MSG_MOD(extack, "VLAN DEI treatment is not representable for offload");
+-- 
+2.51.0

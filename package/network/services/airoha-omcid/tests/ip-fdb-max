@@ -1,0 +1,9 @@
+#!/bin/sh
+
+if [ "$#" -eq 8 ] && [ "$1" = link ] && [ "$2" = set ] && [ "$3" = dev ] &&
+	[ "$5" = type ] && [ "$6" = bridge ] && [ "$7" = fdb_max_learned ]; then
+	printf '%s\n' "$*" >> "${AIROHA_OMCI_IP_LOG:?}"
+	exit 0
+fi
+
+exec /sbin/ip "$@"

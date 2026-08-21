@@ -1,0 +1,117 @@
+#!/bin/sh
+
+set -eu
+
+state_dir="${AIROHA_OMCI_STATE_DIR:-/var/run/airoha-omcid}"
+platform="${AIROHA_OMCI_PLATFORM:-/usr/libexec/airoha-omci-platform}"
+multicast="${AIROHA_OMCI_MULTICAST:-/usr/sbin/airoha-mcastd}"
+desired="$state_dir/desired.json"
+onu3_state="${AIROHA_OMCI_ONU3_STATE:-$state_dir/onu3-state.json}"
+mode="${1:-apply}"
+candidate=
+persistent_candidate=
+desired_backup=
+
+cleanup() {
+	[ -z "$candidate" ] || rm -f "$candidate"
+	[ -z "$persistent_candidate" ] || rm -f "$persistent_candidate"
+	[ -z "$desired_backup" ] || rm -f "$desired_backup"
+}
+
+restore_desired() {
+	if [ "$desired_existed" -eq 1 ]; then
+		if mv -f "$desired_backup" "$desired"; then
+			desired_backup=
+			return 0
+		fi
+	else
+		rm -f "$desired" && return 0
+	fi
+	echo "airoha-omci-apply: failed to restore runtime state" >&2
+	return 1
+}
+
+record_state() {
+	local persistent_dir desired_existed=0
+
+	[ "$onu3_state" != "$desired" ] || {
+		echo "airoha-omci-apply: persistent and runtime paths must differ" >&2
+		return 1
+	}
+	[ ! -d "$onu3_state" ] || {
+		echo "airoha-omci-apply: persistent state path is a directory" >&2
+		return 1
+	}
+	persistent_dir="${onu3_state%/*}"
+	[ "$persistent_dir" != "$onu3_state" ] || persistent_dir=.
+	mkdir -p "$persistent_dir" || return 1
+	persistent_candidate="$(mktemp "$persistent_dir/.onu3-state.XXXXXX")" || return 1
+	if ! cp "$candidate" "$persistent_candidate"; then
+		return 1
+	fi
+
+	if [ -e "$desired" ]; then
+		desired_backup="$(mktemp "$state_dir/.desired-backup.XXXXXX")" || return 1
+		if ! cp "$desired" "$desired_backup"; then
+			return 1
+		fi
+		desired_existed=1
+	fi
+	if ! mv -f "$candidate" "$desired"; then
+		return 1
+	fi
+	candidate=
+	if ! mv -f "$persistent_candidate" "$onu3_state"; then
+		restore_desired || true
+		return 1
+	fi
+	persistent_candidate=
+	[ -z "$desired_backup" ] || rm -f "$desired_backup"
+	desired_backup=
+}
+
+[ "$#" -le 1 ] || {
+	echo "usage: airoha-omci-apply [record]" >&2
+	exit 2
+}
+case "$mode" in
+	apply|record) ;;
+	*)
+		echo "airoha-omci-apply: invalid mode $mode" >&2
+		exit 2
+		;;
+esac
+
+mkdir -p "$state_dir"
+umask 077
+candidate="$(mktemp "$state_dir/.candidate.XXXXXX")"
+trap cleanup EXIT INT TERM
+cat > "$candidate"
+
+"$multicast" -validate "$candidate"
+
+if [ "$mode" = record ]; then
+	record_state
+	trap - EXIT INT TERM
+	exit 0
+fi
+
+rollback() {
+	if [ -s "$desired" ]; then
+		"$platform" apply "$desired" || return 1
+	else
+		"$platform" clear || return 1
+	fi
+}
+
+if ! "$platform" apply "$candidate"; then
+	rollback || echo "airoha-omci-apply: candidate and rollback both failed" >&2
+	exit 1
+fi
+
+if ! mv -f "$candidate" "$desired"; then
+	rollback || echo "airoha-omci-apply: persistence and rollback both failed" >&2
+	exit 1
+fi
+candidate=
+trap - EXIT INT TERM

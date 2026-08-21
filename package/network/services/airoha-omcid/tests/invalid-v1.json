@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "operation": "set",
+  "mib_data_sync": 8,
+  "service_graph": {}
+}

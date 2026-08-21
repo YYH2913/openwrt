@@ -1,0 +1,120 @@
+#!/bin/sh
+
+# Read-only target evidence collector. It never changes PON state or prints
+# registration credentials, derived keys, or OMCI payloads.
+set -eu
+
+sysfs_root="${AIROHA_XGSPON_EVIDENCE_SYSFS_ROOT:-/sys}"
+procfs_root="${AIROHA_XGSPON_EVIDENCE_PROCFS_ROOT:-/proc}"
+control="${AIROHA_XGSPON_EVIDENCE_CONTROL:-/usr/libexec/airoha-omci-control}"
+ani_entity_id="${AIROHA_XGSPON_EVIDENCE_ANI_ENTITY_ID:-32769}"
+
+find_xgspon() {
+	local path
+
+	if [ -n "${AIROHA_XGSPON_EVIDENCE_XGSPON_PATH:-}" ]; then
+		[ -r "$AIROHA_XGSPON_EVIDENCE_XGSPON_PATH/pon_mode" ] || return 1
+		printf '%s\n' "$AIROHA_XGSPON_EVIDENCE_XGSPON_PATH"
+		return 0
+	fi
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-xgspon/*; do
+		[ -r "$path/pon_mode" ] || continue
+		printf '%s\n' "$path"
+		return 0
+	done
+	return 1
+}
+
+find_bosa() {
+	local path
+
+	if [ -n "${AIROHA_XGSPON_EVIDENCE_BOSA_PATH:-}" ]; then
+		[ -r "$AIROHA_XGSPON_EVIDENCE_BOSA_PATH/pon_mode" ] || return 1
+		printf '%s\n' "$AIROHA_XGSPON_EVIDENCE_BOSA_PATH"
+		return 0
+	fi
+	for path in "$sysfs_root"/bus/i2c/drivers/airoha-en7572/*; do
+		[ -r "$path/pon_mode" ] || continue
+		printf '%s\n' "$path"
+		return 0
+	done
+	return 1
+}
+
+emit_file() {
+	local prefix="$1" path="$2" name="$3" value
+
+	if [ -r "$path/$name" ]; then
+		value="$(cat "$path/$name")"
+	else
+		value=unavailable
+	fi
+	printf '%s_%s=%s\n' "$prefix" "$name" "$value"
+}
+
+emit_control_evidence() {
+	local name="$1" action="$2" value
+
+	if [ -x "$control" ]; then
+		value="$(printf '{"action":"%s","ani_entity_id":%s}\n' \
+			"$action" "$ani_entity_id" | "$control" 2>/dev/null)" || value=unavailable
+	else
+		value=unavailable
+	fi
+	case "$value" in
+		''|*'
+'*) value=unavailable ;;
+	esac
+	printf 'xgspon_%s=%s\n' "$name" "$value"
+}
+
+xgspon="$(find_xgspon)" || {
+	echo 'error=xgspon-driver-not-found' >&2
+	exit 1
+}
+bosa="$(find_bosa)" || {
+	echo 'error=en7572-bosa-not-found' >&2
+	exit 1
+}
+
+printf 'version=1\n'
+printf 'semantics=read-only-target-evidence-not-acceptance\n'
+printf 'collected_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'kernel_release=%s\n' "$(uname -r)"
+if [ -r "$procfs_root/sys/kernel/random/boot_id" ]; then
+	printf 'boot_id=%s\n' "$(cat "$procfs_root/sys/kernel/random/boot_id")"
+else
+	printf 'boot_id=unavailable\n'
+fi
+if [ -r "$procfs_root/uptime" ]; then
+	read -r uptime_seconds _ < "$procfs_root/uptime"
+	printf 'uptime_seconds=%s\n' "$uptime_seconds"
+else
+	printf 'uptime_seconds=unavailable\n'
+fi
+emit_file bosa "$bosa" pon_mode
+emit_file bosa "$bosa" initialized
+emit_file bosa "$bosa" calibration_source
+emit_file bosa "$bosa" vendor
+emit_file bosa "$bosa" part_number
+emit_file bosa "$bosa" firmware_version
+emit_file bosa "$bosa" mcu_idle
+emit_file bosa "$bosa" los
+emit_file bosa "$bosa" tx_disable
+emit_file bosa "$bosa" optical_diagnostics
+emit_file xgspon "$xgspon" pon_mode
+emit_file xgspon "$xgspon" control_abi_version
+emit_file xgspon "$xgspon" activation_ready
+emit_file xgspon "$xgspon" ready
+emit_file xgspon "$xgspon" state
+emit_file xgspon "$xgspon" activation_blockers
+emit_file xgspon "$xgspon" mac_initialization
+emit_file xgspon "$xgspon" phy_evidence
+emit_file xgspon "$xgspon" activation_evidence
+emit_file xgspon "$xgspon" service_state
+emit_file xgspon "$xgspon" omcc_rx_evidence
+emit_file xgspon "$xgspon" xgs_counter_evidence
+emit_file xgspon "$xgspon" xgs_ploam_evidence
+emit_file xgspon "$xgspon" xgs_pm_snapshot
+emit_control_evidence xgs_omci_evidence xgs-omci-evidence
+emit_control_evidence xgs_pm_evidence xgs-pm-evidence

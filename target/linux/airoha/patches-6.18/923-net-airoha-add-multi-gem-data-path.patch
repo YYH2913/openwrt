@@ -1,0 +1,215 @@
+Subject: [PATCH] net: airoha: support multiple GPON data GEMs
+
+Replace the single data-GEM selector with an atomic GEM/channel/direction
+table. Tag received Ethernet skbs with a reserved mark containing the GEM
+port and use the same mark on transmit to select a provisioned upstream GEM.
+An unmarked packet remains valid when exactly one upstream GEM is configured.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -555,6 +555,10 @@ enum airoha_priv_flags {
+ 	AIROHA_PRIV_F_QOS = BIT(1),
+ };
+ 
++#define AIROHA_GPON_MAX_GEMS		4096
++#define AIROHA_GPON_MARK_MASK		GENMASK(31, 12)
++#define AIROHA_GPON_MARK_KEY		0xa1700000
++
+ struct airoha_gdm_dev {
+ 	struct airoha_qdma __rcu *qdma;
+ 	struct airoha_gdm_port *port;
+@@ -565,9 +569,13 @@ struct airoha_gdm_dev {
+ 	bool gpon_mode;
+ 	bool gpon_tx_ready;
+ 	bool gpon_omcc_ready;
+-	u16 gpon_gem;
+ 	u16 gpon_omcc_gem;
+-	u8 gpon_channel;
++	u16 gpon_default_gem;
++	u16 gpon_gem_count;
++	u8 gpon_default_channel;
++	DECLARE_BITMAP(gpon_gems, AIROHA_GPON_MAX_GEMS);
++	u8 gpon_channels[AIROHA_GPON_MAX_GEMS];
++	u8 gpon_directions[AIROHA_GPON_MAX_GEMS];
+ 
+ 	DECLARE_BITMAP(qos_sq_bmap, AIROHA_NUM_QOS_CHANNELS);
+ 	/* qos stats counters */
+@@ -719,6 +727,9 @@ bool airoha_is_valid_gdm_dev(struct airo
+ 
+ int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
+ 			bool valid);
++int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
++			 const u8 *channels, const u8 *directions,
++			 unsigned int count);
+ int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid);
+ extern struct mutex flow_offload_mutex;
+ 
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -912,6 +912,7 @@ static int airoha_qdma_rx_process(struct
+ 		int data_len, len;
+ 		struct page *page;
+ 		u32 msg0;
++		u16 gpon_gem = 0;
+ 
+ 		desc_ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
+ 		if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
+@@ -940,22 +941,23 @@ static int airoha_qdma_rx_process(struct
+ 		if (dev->gpon_mode) {
+ 			unsigned long flags;
+ 			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
+-			u16 configured_gem;
+ 			bool ready;
+ 
+ 			spin_lock_irqsave(&dev->gpon_lock, flags);
+ 			if (msg0 & QDMA_ETH_TXMSG_OAM_MASK) {
+ 				ready = dev->gpon_omcc_ready;
+-				configured_gem = dev->gpon_omcc_gem;
++				ready = ready && gem == dev->gpon_omcc_gem;
+ 				omci = true;
+ 			} else {
+-				ready = dev->gpon_tx_ready;
+-				configured_gem = dev->gpon_gem;
++				ready = dev->gpon_tx_ready &&
++					gem < AIROHA_GPON_MAX_GEMS &&
++					test_bit(gem, dev->gpon_gems) &&
++					(dev->gpon_directions[gem] & BIT(0));
++				gpon_gem = gem;
+ 			}
+ 			spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 
+-			if (!ready || gem != configured_gem ||
+-			    (omci && !dev->omci_dev))
++			if (!ready || (omci && !dev->omci_dev))
+ 				goto free_frag;
+ 			if (omci)
+ 				netdev = dev->omci_dev;
+@@ -966,6 +969,8 @@ static int airoha_qdma_rx_process(struct
+ 							  netdev, omci);
+ 			if (!q->skb)
+ 				goto free_frag;
++			if (dev->gpon_mode && !omci)
++				q->skb->mark = AIROHA_GPON_MARK_KEY | gpon_gem;
+ 		} else { /* scattered frame */
+ 			struct skb_shared_info *shinfo = skb_shinfo(q->skb);
+ 			int nr_frags = shinfo->nr_frags;
+@@ -2622,12 +2627,33 @@ static netdev_tx_t airoha_dev_xmit_commo
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&dev->gpon_lock, flags);
+-		if (omci ? !dev->gpon_omcc_ready : !dev->gpon_tx_ready) {
+-			spin_unlock_irqrestore(&dev->gpon_lock, flags);
+-			goto error;
++		if (omci) {
++			if (!dev->gpon_omcc_ready) {
++				spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				goto error;
++			}
++			gpon_gem = dev->gpon_omcc_gem;
++		} else {
++			if (!dev->gpon_tx_ready) {
++				spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				goto error;
++			}
++			if ((skb->mark & AIROHA_GPON_MARK_MASK) ==
++			    AIROHA_GPON_MARK_KEY)
++				gpon_gem = skb->mark & GENMASK(11, 0);
++			else if (dev->gpon_gem_count == 1)
++				gpon_gem = dev->gpon_default_gem;
++			else {
++				spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				goto error;
++			}
++			if (!test_bit(gpon_gem, dev->gpon_gems) ||
++			    !(dev->gpon_directions[gpon_gem] & BIT(1))) {
++				spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				goto error;
++			}
++			gpon_channel = dev->gpon_channels[gpon_gem];
+ 		}
+-		gpon_gem = omci ? dev->gpon_omcc_gem : dev->gpon_gem;
+-		gpon_channel = omci ? 0 : dev->gpon_channel;
+ 		spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 	}
+ 
+@@ -4014,6 +4037,7 @@ static int airoha_alloc_gdm_device(struc
+ 	spin_lock_init(&dev->gpon_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
++	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
+ 	dev->gpon_omcc_ready = false;
+ 	port->devs[index] = dev;
+ 	if (dev->gpon_mode) {
+@@ -4323,8 +4347,9 @@ static void airoha_remove(struct platform
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
+-int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
+-			bool valid)
++int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
++			 const u8 *channels, const u8 *directions,
++			 unsigned int count)
+ {
+ 	struct airoha_gdm_dev *dev;
+ 	struct net_device *netdev;
+@@ -4333,8 +4357,17 @@ int airoha_gpon_set_gem(struct device_no
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+-	if (!np || gem > 0xfff || channel > 0x1f)
++	if (!np || count > AIROHA_GPON_MAX_GEMS ||
++	    (count && (!gems || !channels || !directions)))
+ 		return -EINVAL;
++	for (unsigned int i = 0; i < count; i++) {
++		if (gems[i] >= AIROHA_GPON_MAX_GEMS || channels[i] > 0x1f ||
++		    directions[i] < 1 || directions[i] > 3)
++			return -ERANGE;
++		for (unsigned int j = 0; j < i; j++)
++			if (gems[i] == gems[j])
++				return -EEXIST;
++	}
+ 
+ 	netdev = of_find_net_device_by_node(np);
+ 	if (!netdev)
+@@ -4345,15 +4378,37 @@ int airoha_gpon_set_gem(struct device_no
+ 
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	dev->gpon_tx_ready = false;
+-	dev->gpon_gem = gem;
+-	dev->gpon_channel = channel;
+-	dev->gpon_tx_ready = valid;
++	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
++	memset(dev->gpon_channels, 0, sizeof(dev->gpon_channels));
++	memset(dev->gpon_directions, 0, sizeof(dev->gpon_directions));
++	for (unsigned int i = 0; i < count; i++) {
++		__set_bit(gems[i], dev->gpon_gems);
++		dev->gpon_channels[gems[i]] = channels[i];
++		dev->gpon_directions[gems[i]] = directions[i];
++	}
++	dev->gpon_gem_count = count;
++	if (count == 1) {
++		dev->gpon_default_gem = gems[0];
++		dev->gpon_default_channel = channels[0];
++	}
++	dev->gpon_tx_ready = count != 0;
+ 	spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 
+ out:
+ 	put_device(&netdev->dev);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(airoha_gpon_set_gems);
++
++int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
++			bool valid)
++{
++	u8 direction = 3;
++
++	if (!valid)
++		return airoha_gpon_set_gems(np, NULL, NULL, NULL, 0);
++	return airoha_gpon_set_gems(np, &gem, &channel, &direction, 1);
++}
+ EXPORT_SYMBOL_GPL(airoha_gpon_set_gem);
+ 
+ int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid)

@@ -15,6 +15,12 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
+	axon,xg2010g-xgspon|\
+	axon,xg2010g|\
+	econet,xg2010g)
+		fit_check_image "$1"
+		return $?
+		;;
 	nokia,xg-040g-md)
 		nand_do_platform_check "$board" "$1"
 		return $?
@@ -32,6 +38,9 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
+	axon,xg2010g-xgspon|\
+	axon,xg2010g|\
+	econet,xg2010g|\
 		gemtek,w1700k-ubi|\
 		nokia,xg-040g-md-ubi)
 			fit_do_upgrade "$1"

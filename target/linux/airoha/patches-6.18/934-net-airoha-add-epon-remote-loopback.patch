@@ -1,0 +1,185 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Sun, 16 Aug 2026 12:00:00 +0800
+Subject: [PATCH] net: airoha: add per-LLID EPON remote loopback
+
+Match the vendor SDK RX_LOOPBACK/TX_DISCARD contract.  A downstream data
+frame on a looped LLID is returned as a complete Ethernet frame through the
+same QDMA channel, while locally originated data for that LLID is discarded.
+OAM uses its dedicated transmit path and remains available to disable the
+loopback.  Remove loopback state whenever its LLID is removed.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -106,6 +106,41 @@ static void airoha_epon_oam_receive(stru
+ 	rcu_read_unlock();
+ }
+ 
++static bool airoha_epon_loopback_receive(struct airoha_gdm_dev *dev,
++					  struct sk_buff *skb, u8 llid_index)
++{
++	struct net_device *netdev = netdev_from_priv(dev);
++	unsigned long flags;
++	bool enabled;
++
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	enabled = (dev->epon_llid_mask & dev->epon_loopback_mask) &
++		  BIT(llid_index);
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (!enabled)
++		return false;
++
++	/* eth_type_trans() pulled this header on RX; QDMA TX needs it back. */
++	if (unlikely(skb_headroom(skb) < ETH_HLEN)) {
++		netdev->stats.rx_dropped++;
++		dev_kfree_skb_any(skb);
++		return true;
++	}
++	skb_push(skb, ETH_HLEN);
++	skb_reset_mac_header(skb);
++	skb->dev = netdev;
++	skb->pkt_type = PACKET_OUTGOING;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb_set_queue_mapping(skb, 0);
++	skb_clear_hash(skb);
++	skb_dst_drop(skb);
++	skb->mark = AIROHA_EPON_LOOPBACK_MARK_KEY | llid_index;
++	if (net_xmit_eval(dev_queue_xmit(skb)))
++		netdev->stats.tx_dropped++;
++
++	return true;
++}
++
+ static void airoha_xgs_omcc_detach(struct airoha_gdm_dev *dev)
+ {
+ 	struct airoha_xgs_omcc_consumer *consumer;
+@@ -1236,6 +1271,10 @@ static int airoha_qdma_rx_process(struct
+ 			netdev->stats.rx_packets++;
+ 			netdev->stats.rx_bytes += q->skb->len;
+ 			netif_receive_skb(q->skb);
++		} else if (epon_data &&
++			   airoha_epon_loopback_receive(dev, q->skb,
++				AIROHA_PON_RX_CB(q->skb)->channel)) {
++			/* Loopback consumes the skb and bypasses normal LAN delivery. */
+ 		} else {
+ 			napi_gro_receive(&q->napi, q->skb);
+ 		}
+@@ -2848,10 +2888,12 @@ static netdev_tx_t airoha_dev_xmit_commo
+ 		unsigned long flags;
+ 		struct airoha_xgs_service_xgem xgem;
+ 		const struct airoha_xgs_service_xgem *entry;
+-		u32 epon_mask;
++		u32 epon_loopback_mask, epon_mark, epon_mask;
+ 
+ 		spin_lock_irqsave(&dev->epon_service_state_lock, flags);
+ 		epon_mask = dev->epon_llid_mask;
++		epon_loopback_mask = dev->epon_loopback_mask;
++		epon_mark = skb->mark & AIROHA_EPON_MARK_MASK;
+ 		if (epon_mask) {
+ 			if (omci) {
+ 				spin_unlock_irqrestore(
+@@ -2859,8 +2901,8 @@ static netdev_tx_t airoha_dev_xmit_commo
+ 					&dev->epon_service_state_lock, flags);
+ 				goto error;
+ 			}
+-			if ((skb->mark & AIROHA_EPON_MARK_MASK) ==
+-			    AIROHA_EPON_MARK_KEY)
++			if (epon_mark == AIROHA_EPON_MARK_KEY ||
++			    epon_mark == AIROHA_EPON_LOOPBACK_MARK_KEY)
+ 				gpon_channel = skb->mark & GENMASK(4, 0);
+ 			else if (hweight32(epon_mask) == 1)
+ 				gpon_channel = __ffs(epon_mask);
+@@ -2874,6 +2916,15 @@ static netdev_tx_t airoha_dev_xmit_commo
+ 					&dev->epon_service_state_lock, flags);
+ 				goto error;
+ 			}
++			/* SDK RX_LOOPBACK pairs with TX_DISCARD.  Only frames
++			 * reinjected by the RX loopback path may use this LLID.
++			 */
++			if (!!(epon_loopback_mask & BIT(gpon_channel)) !=
++			    (epon_mark == AIROHA_EPON_LOOPBACK_MARK_KEY)) {
++				spin_unlock_irqrestore(
++					&dev->epon_service_state_lock, flags);
++				goto error;
++			}
+ 			epon_data = true;
+ 		}
+ 		spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
+@@ -5626,6 +5675,7 @@ int airoha_epon_qdma_llids_apply(struct
+ 	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
+ 	dev->epon_llid_mask = llid_mask;
+ 	dev->epon_report_fec_mask = report_fec_mask;
++	dev->epon_loopback_mask &= llid_mask;
+ 	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
+ 	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++)
+ 		if ((old_mask & BIT(channel)) && !(llid_mask & BIT(channel)))
+@@ -5663,6 +5713,42 @@ int airoha_epon_qdma_llids_clear(struct
+ }
+ EXPORT_SYMBOL_GPL(airoha_epon_qdma_llids_clear);
+ 
++int airoha_epon_loopback_set(struct device_node *np, u8 llid_index,
++			     bool enabled)
++{
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!np || llid_index >= AIROHA_EPON_LLID_COUNT)
++		return -EINVAL;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	mutex_lock(&dev->epon_service_lock);
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (enabled && !(dev->epon_llid_mask & BIT(llid_index))) {
++		ret = -ENOENT;
++	} else if (enabled) {
++		dev->epon_loopback_mask |= BIT(llid_index);
++	} else {
++		dev->epon_loopback_mask &= ~BIT(llid_index);
++	}
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	mutex_unlock(&dev->epon_service_lock);
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_epon_loopback_set);
++
+ int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
+ 			 const u8 *channels, const u8 *directions,
+ 			 unsigned int count)
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -582,6 +582,7 @@
+ 
+ #define AIROHA_EPON_MARK_MASK		GENMASK(31, 5)
+ #define AIROHA_EPON_MARK_KEY		0xa1720000
++#define AIROHA_EPON_LOOPBACK_MARK_KEY	0xa1730000
+ #define AIROHA_EPON_LLID_COUNT		32
+ 
+ struct airoha_xgs_service_tcont {
+@@ -701,6 +702,7 @@ struct airoha_gdm_dev {
+ 	struct airoha_epon_oam_consumer __rcu *epon_oam_consumer;
+ 	u32 epon_llid_mask;
+ 	u32 epon_report_fec_mask;
++	u32 epon_loopback_mask;
+ 	bool epon_resource_baseline_valid;
+ 	u32 epon_gdm2_txchn_baseline;
+ 	u16 epon_pse_rsv_baseline[AIROHA_EPON_LLID_COUNT];
+@@ -891,6 +893,8 @@ int airoha_epon_qdma_llids_apply(struct
+ 				 u32 report_fec_mask);
+ int airoha_epon_qdma_llids_clear(struct device_node *np);
++int airoha_epon_loopback_set(struct device_node *np, u8 llid_index,
++			     bool enabled);
+ int airoha_epon_oam_register(struct device_node *np,
+ 			     const struct airoha_epon_oam_ops *ops,
+ 			     void *context);

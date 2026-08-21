@@ -1,0 +1,815 @@
+#!/bin/sh
+
+. "${AIROHA_GPON_FUNCTIONS:-/lib/functions.sh}"
+
+sysfs_root="${AIROHA_GPON_SYSFS_ROOT:-/sys}"
+state_dir="${AIROHA_GPON_STATE_DIR:-/var/run/airoha-gpon-config}"
+manual_gem_file="$state_dir/manual-gem"
+service_root="${AIROHA_GPON_SERVICE_ROOT:-/etc/init.d}"
+epon_oam_ready="${AIROHA_GPON_EPON_OAM_READY:-/var/run/airoha-epon-oamd/ready}"
+omci_status="${AIROHA_GPON_OMCI_STATUS:-/var/run/airoha-omcid/status.json}"
+manage_control_planes="${AIROHA_GPON_MANAGE_CONTROL_PLANES:-1}"
+control_plane_ready_attempts="${AIROHA_GPON_READY_ATTEMPTS:-50}"
+defer_runtime_rollback=0
+mode_changed=0
+previous_pon_mode=
+previous_omci_running=0
+previous_epon_oam_running=0
+previous_protocol_enabled=0
+epon_snapshot_valid=0
+previous_epon_enabled=
+previous_epon_onu_mac=
+previous_epon_llid_mask=
+previous_epon_silent_time=
+epon_prepared=0
+epon_rollback_fail_closed=0
+
+find_gpon() {
+	local path
+
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-gpon/*; do
+		[ -f "$path/enabled" ] || continue
+		echo "$path"
+		return 0
+	done
+
+	return 1
+}
+
+find_xgspon() {
+	local path
+
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-xgspon/*; do
+		[ -f "$path/enabled" ] || continue
+		echo "$path"
+		return 0
+	done
+
+	return 1
+}
+
+find_epon() {
+	local path
+
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-en7581-epon/*; do
+		[ -f "$path/enabled" ] || continue
+		echo "$path"
+		return 0
+	done
+
+	return 1
+}
+
+find_xpon() {
+	local path
+
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-xpon-core/*; do
+		[ -f "$path/mode" ] || continue
+		echo "$path"
+		return 0
+	done
+
+	return 1
+}
+
+read_config() {
+	config_load airoha-gpon
+	config_get_bool enabled main enabled 0
+	config_get pon_mode main pon_mode gpon
+	config_get serial_number main serial_number
+	config_get password main password
+	config_get registration_id main registration_id
+	config_get omci_mode main omci_mode auto
+	config_get_bool manual_gem main manual_gem 0
+	config_get gem_id main gem_id 0
+	config_get tcont main tcont 0
+	config_get_bool encrypted main encrypted 0
+	config_get epon_onu_mac main epon_onu_mac
+	config_get epon_llid_mask main epon_llid_mask 0x1
+	config_get epon_silent_time main epon_silent_time 60
+}
+
+valid_pon_mode() {
+	case "$pon_mode" in
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+epon_mode() {
+	case "$1" in epon-10g-1g|epon-10g-10g) return 0 ;; *) return 1 ;; esac
+}
+
+itu_mode() {
+	case "$1" in gpon|xgpon|xgspon) return 0 ;; *) return 1 ;; esac
+}
+
+service_action() {
+	local service="$1" action="$2"
+
+	[ "$manage_control_planes" -eq 1 ] || return 0
+	[ -x "$service_root/$service" ] || {
+		echo "airoha-xpon: required $service service is unavailable" >&2
+		return 1
+	}
+	"$service_root/$service" "$action"
+}
+
+service_running() {
+	local service="$1"
+
+	[ "$manage_control_planes" -eq 1 ] || return 1
+	[ -x "$service_root/$service" ] || return 1
+	"$service_root/$service" running >/dev/null 2>&1
+}
+
+stop_service_if_running() {
+	local service="$1"
+
+	service_running "$service" || return 0
+	service_action "$service" stop
+}
+
+snapshot_control_planes() {
+	service_running airoha-omcid && previous_omci_running=1
+	service_running airoha-epon-oamd && previous_epon_oam_running=1
+}
+
+snapshot_previous_protocol() {
+	local path value
+
+	case "$previous_pon_mode" in
+		gpon) path="$(find_gpon)" || return 1 ;;
+		xgpon|xgspon) path="$(find_xgspon)" || return 1 ;;
+		epon-10g-1g|epon-10g-10g) path="$(find_epon)" || return 1 ;;
+		*) return 1 ;;
+	esac
+	value="$(cat "$path/enabled" 2>/dev/null)" || return 1
+	case "$value" in 0|1) previous_protocol_enabled="$value" ;; *) return 1 ;; esac
+}
+
+wait_omci_ready() {
+	local attempt
+
+	[ "$manage_control_planes" -eq 1 ] || return 0
+	for attempt in $(seq 1 "$control_plane_ready_attempts"); do
+		[ -r "$omci_status" ] &&
+			grep -Eq '"state"[[:space:]]*:[[:space:]]*"online"' "$omci_status" &&
+			grep -Eq '"pon_mode"[[:space:]]*:[[:space:]]*"'"$1"'"' "$omci_status" &&
+			return 0
+		sleep 0.1
+	done
+	echo "airoha-omci: control plane did not become ready for $1" >&2
+	return 1
+}
+
+wait_epon_oam_ready() {
+	local mode="$1" attempt
+
+	[ "$manage_control_planes" -eq 1 ] || return 0
+	for attempt in $(seq 1 "$control_plane_ready_attempts"); do
+		[ -r "$epon_oam_ready" ] &&
+			grep -Eq '(^|[[:space:]])control_plane=epon-oam([[:space:]]|$)' \
+				"$epon_oam_ready" &&
+			grep -Eq '(^|[[:space:]])pon_mode='"$mode"'([[:space:]]|$)' \
+				"$epon_oam_ready" &&
+			grep -Eq '(^|[[:space:]])omci=0([[:space:]]|$)' \
+				"$epon_oam_ready" &&
+			return 0
+		sleep 0.1
+	done
+	echo "airoha-epon: OAM control plane did not become ready" >&2
+	return 1
+}
+
+start_target_control_plane() {
+	[ "$enabled" -eq 1 ] || return 0
+	if epon_mode "$pon_mode"; then
+		rm -f "$epon_oam_ready"
+		service_action airoha-epon-oamd restart || return 1
+		wait_epon_oam_ready "$pon_mode"
+		return
+	fi
+	if [ "$pon_mode" = xgpon ] || [ "$pon_mode" = xgspon ]; then
+		[ "$(cat "$xgspon/activation_ready" 2>/dev/null)" = 1 ] || {
+			echo "airoha-xgspon: control path is not ready" >&2
+			return 1
+		}
+	fi
+	[ "$omci_mode" = auto ] || return 0
+	rm -f "$omci_status"
+	service_action airoha-omcid restart || return 1
+	wait_omci_ready "$pon_mode"
+}
+
+quiesce_previous_control_plane() {
+	local ret=0
+
+	# Stop every owner observed at the snapshot. This also repairs a stale
+	# dual-owner state and guarantees that no userspace endpoint remains open
+	# while the kernel detaches and reinitializes a protocol backend.
+	[ "$previous_omci_running" -eq 0 ] ||
+		service_action airoha-omcid stop || ret=1
+	[ "$previous_epon_oam_running" -eq 0 ] ||
+		service_action airoha-epon-oamd stop || ret=1
+	return "$ret"
+}
+
+disable_previous_protocol_before_switch() {
+	local path
+
+	[ "$previous_pon_mode" != "$pon_mode" ] || return 0
+	case "$previous_pon_mode" in
+		gpon) path="$(find_gpon)" || return 1 ;;
+		xgpon|xgspon) path="$(find_xgspon)" || return 1 ;;
+		epon-10g-1g|epon-10g-10g) path="$(find_epon)" || return 1 ;;
+		*) return 1 ;;
+	esac
+	[ "$(cat "$path/enabled" 2>/dev/null)" = 0 ] ||
+		printf '0\n' > "$path/enabled"
+}
+
+stop_inactive_control_plane() {
+	if [ "$enabled" -eq 0 ]; then
+		stop_service_if_running airoha-omcid || return 1
+		stop_service_if_running airoha-epon-oamd
+		return
+	fi
+	if epon_mode "$pon_mode"; then
+		stop_service_if_running airoha-omcid
+	else
+		stop_service_if_running airoha-epon-oamd || return 1
+		[ "$omci_mode" = auto ] || stop_service_if_running airoha-omcid
+	fi
+}
+
+restore_previous_control_plane() {
+	local ret=0
+
+	[ "$manage_control_planes" -eq 1 ] || return 0
+	if [ "$previous_omci_running" -eq 1 ]; then
+		rm -f "$omci_status"
+		[ -x "$service_root/airoha-omcid" ] &&
+			env AIROHA_OMCI_ENABLED_OVERRIDE=1 \
+			AIROHA_OMCI_MODE_OVERRIDE=auto \
+			AIROHA_OMCI_PON_MODE_OVERRIDE="$previous_pon_mode" \
+				"$service_root/airoha-omcid" restart &&
+			wait_omci_ready "$previous_pon_mode" || ret=1
+	fi
+	if [ "$previous_epon_oam_running" -eq 1 ]; then
+		# The daemon obtains LOID/password directly from UCI. A plain sync has
+		# no snapshot proving that the currently committed credentials belong
+		# to the previous runtime, so restarting the old rate here could pair
+		# old PCS/MAC state with candidate credentials. LuCI avoids this path
+		# with sync-deferred, restores old UCI, then performs a fresh sync.
+		stop_service_if_running airoha-epon-oamd || ret=1
+		epon_rollback_fail_closed=1
+		echo "airoha-epon: previous OAM credentials are unavailable; leaving rollback disabled" >&2
+		ret=1
+	fi
+	return "$ret"
+}
+
+restore_previous_protocol() {
+	local path
+
+	[ "$(cat "$xpon/mode" 2>/dev/null)" = "$previous_pon_mode" ] || return 1
+	case "$previous_pon_mode" in
+		gpon) path="$(find_gpon)" || return 1 ;;
+		xgpon|xgspon) path="$(find_xgspon)" || return 1 ;;
+		epon-10g-1g|epon-10g-10g) path="$(find_epon)" || return 1 ;;
+		*) return 1 ;;
+	esac
+	if [ "$epon_rollback_fail_closed" -eq 1 ] && epon_mode "$previous_pon_mode"; then
+		printf '0\n' > "$path/enabled" || return 1
+		return 1
+	fi
+	[ "$(cat "$path/enabled" 2>/dev/null)" = "$previous_protocol_enabled" ] ||
+		printf '%s\n' "$previous_protocol_enabled" > "$path/enabled"
+}
+
+stop_target_control_plane() {
+	[ "$manage_control_planes" -eq 1 ] || return 0
+	if epon_mode "$pon_mode"; then
+		stop_service_if_running airoha-epon-oamd
+	elif itu_mode "$pon_mode" && [ "$omci_mode" = auto ]; then
+		stop_service_if_running airoha-omcid
+	fi
+}
+
+rollback_runtime() {
+	local ret=0
+
+	stop_target_control_plane || ret=1
+	restore_epon_configuration || ret=1
+	rollback_pon_mode || ret=1
+	restore_previous_control_plane || ret=1
+	restore_previous_protocol || ret=1
+	finish_epon_restore || ret=1
+	[ "$ret" -eq 0 ] ||
+		echo "airoha-xpon: runtime rollback was incomplete" >&2
+	return "$ret"
+}
+
+disable_protocol_path() {
+	local path="$1" current
+
+	[ -n "$path" ] || return 0
+	current="$(cat "$path/enabled" 2>/dev/null)" || return 1
+	[ "$current" = 0 ] || printf '0\n' > "$path/enabled"
+}
+
+quiesce_for_config_restore() {
+	local ret=0 path
+
+	# The RPC still has the target UCI committed at this point. Do not restart
+	# an old owner until it has restored both UCI packages, since OMCI and EPON
+	# OAM read credentials directly from them. Leave every backend fail-closed
+	# for the following ordinary sync transaction.
+	stop_service_if_running airoha-omcid || ret=1
+	stop_service_if_running airoha-epon-oamd || ret=1
+	path="$(find_gpon 2>/dev/null || true)"
+	disable_protocol_path "$path" || ret=1
+	path="$(find_xgspon 2>/dev/null || true)"
+	disable_protocol_path "$path" || ret=1
+	path="$(find_epon 2>/dev/null || true)"
+	disable_protocol_path "$path" || ret=1
+	[ "$ret" -eq 0 ] ||
+		echo "airoha-xpon: failed to quiesce runtime for configuration restore" >&2
+	return "$ret"
+}
+
+handle_runtime_failure() {
+	if [ "$defer_runtime_rollback" -eq 1 ]; then
+		quiesce_for_config_restore
+	else
+		rollback_runtime
+	fi
+}
+
+valid_serial() {
+	[ "${#serial_number}" -eq 12 ] || return 1
+	printf '%s\n' "$serial_number" | grep -Eq '^[[:alnum:]]{4}[[:xdigit:]]{8}$'
+}
+
+valid_password() {
+	case "$password" in
+		'') return 0 ;;
+		hex:*) printf '%s\n' "$password" | LC_ALL=C \
+			grep -Eq '^hex:[[:xdigit:]]{20}$' ;;
+		*) [ "${#password}" -le 10 ] &&
+			printf '%s\n' "$password" | LC_ALL=C \
+				grep -Eq '^[!-~]{1,10}$' ;;
+	esac
+}
+
+valid_registration_id() {
+	case "$registration_id" in
+		'') return 0 ;;
+		hex:*) printf '%s\n' "$registration_id" | LC_ALL=C \
+			grep -Eq '^hex:[[:xdigit:]]{72}$' ;;
+		*) [ "${#registration_id}" -le 36 ] &&
+			printf '%s\n' "$registration_id" | LC_ALL=C \
+				grep -Eq '^[!-~]{1,36}$' ;;
+	esac
+}
+
+valid_epon_onu_mac() {
+	local first
+
+	printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+		'^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$' || return 1
+	[ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" != \
+		'00:00:00:00:00:00' ] || return 1
+	first="${1%%:*}"
+	[ $((0x$first & 1)) -eq 0 ]
+}
+
+valid_epon_settings() {
+	local mask
+
+	valid_epon_onu_mac "$epon_onu_mac" || return 1
+	printf '%s\n' "$epon_llid_mask" | LC_ALL=C \
+		grep -Eq '^(0[xX][[:xdigit:]]+|[0-9]+)$' || return 1
+	mask=$((epon_llid_mask)) 2>/dev/null || return 1
+	[ "$mask" -ge 1 ] && [ "$mask" -le 4294967295 ] || return 1
+	case "$epon_silent_time" in *[!0-9]*|'') return 1 ;; esac
+	[ "$epon_silent_time" -ge 1 ] && [ "$epon_silent_time" -le 3600 ]
+}
+
+switch_pon_mode() {
+	local current state
+
+	xpon="$(find_xpon)" || {
+		echo "airoha-xpon: runtime owner sysfs device not found" >&2
+		return 1
+	}
+	current="$(cat "$xpon/mode" 2>/dev/null)"
+	[ "$current" = "$previous_pon_mode" ] || return 1
+	[ "$current" = "$pon_mode" ] && return 0
+	printf '%s\n' "$pon_mode" > "$xpon/mode" || {
+		echo "airoha-xpon: failed to switch from $current to $pon_mode" >&2
+		return 1
+	}
+	[ "$(cat "$xpon/mode" 2>/dev/null)" = "$pon_mode" ] || return 1
+	mode_changed=1
+	state="$(cat "$xpon/switch_state" 2>/dev/null)"
+	case " $state " in *' switching=0 '*) ;; *) return 1 ;; esac
+	case " $state " in *' error=0 '*) ;; *) return 1 ;; esac
+	case " $state " in *' committed=1 '*) ;; *) return 1 ;; esac
+	case " $state " in *' rollback_failed=0 '*) ;; *) return 1 ;; esac
+}
+
+rollback_pon_mode() {
+	local state
+
+	[ "$mode_changed" -eq 1 ] || return 0
+	case "$previous_pon_mode" in
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) ;;
+		*) return 1 ;;
+	esac
+	printf '%s\n' "$previous_pon_mode" > "$xpon/mode" || return 1
+	[ "$(cat "$xpon/mode" 2>/dev/null)" = "$previous_pon_mode" ] || return 1
+	state="$(cat "$xpon/switch_state" 2>/dev/null)"
+	case " $state " in *' switching=0 '*) ;; *) return 1 ;; esac
+	case " $state " in *' error=0 '*) ;; *) return 1 ;; esac
+	case " $state " in *' committed=1 '*) ;; *) return 1 ;; esac
+	case " $state " in *' rollback_failed=0 '*) ;; *) return 1 ;; esac
+	mode_changed=0
+}
+
+snapshot_epon_configuration() {
+	previous_epon_enabled="$(cat "$epon/enabled" 2>/dev/null)" || return 1
+	previous_epon_onu_mac="$(cat "$epon/onu_mac" 2>/dev/null)" || return 1
+	previous_epon_llid_mask="$(cat "$epon/llid_mask" 2>/dev/null)" || return 1
+	previous_epon_silent_time="$(cat "$epon/silent_time" 2>/dev/null)" || return 1
+	case "$previous_epon_enabled" in 0|1) ;; *) return 1 ;; esac
+	epon_snapshot_valid=1
+}
+
+restore_epon_configuration() {
+	local ret=0
+
+	[ "$epon_snapshot_valid" -eq 1 ] || return 0
+	printf '0\n' > "$epon/enabled" || ret=1
+	printf '%s\n' "$previous_epon_onu_mac" > "$epon/onu_mac" || ret=1
+	printf '%s\n' "$previous_epon_llid_mask" > "$epon/llid_mask" || ret=1
+	printf '%s\n' "$previous_epon_silent_time" > "$epon/silent_time" || ret=1
+	return "$ret"
+}
+
+finish_epon_restore() {
+	local ret=0
+
+	[ "$epon_snapshot_valid" -eq 1 ] || return 0
+	if ! epon_mode "$previous_pon_mode"; then
+		printf '%s\n' "$previous_epon_enabled" > "$epon/enabled" || ret=1
+	fi
+	epon_snapshot_valid=0
+	return "$ret"
+}
+
+prepare_epon() {
+	epon="$(find_epon)" || {
+		echo "airoha-epon: EPON sysfs device not found" >&2
+		return 1
+	}
+	valid_epon_settings || {
+		echo "airoha-epon: valid unicast ONU MAC, LLID mask and silent time are required" >&2
+		return 1
+	}
+	snapshot_epon_configuration || return 1
+	if ! { printf '0\n' > "$epon/enabled" &&
+		printf '%s\n' "$epon_onu_mac" > "$epon/onu_mac" &&
+		printf '%s\n' "$epon_llid_mask" > "$epon/llid_mask" &&
+		printf '%s\n' "$epon_silent_time" > "$epon/silent_time"; }; then
+		restore_epon_configuration || true
+		return 1
+	fi
+}
+
+valid_manual_gem() {
+	valid_manual_values "$gem_id" "$tcont" "$encrypted"
+}
+
+valid_manual_values() {
+	local candidate_gem="$1" candidate_tcont="$2" candidate_encrypted="$3"
+
+	case "$candidate_gem" in *[!0-9]*|'') return 1 ;; esac
+	case "$candidate_tcont" in *[!0-9]*|'') return 1 ;; esac
+	case "$candidate_encrypted" in 0|1) ;; *) return 1 ;; esac
+
+	[ "$candidate_gem" -ge 0 ] 2>/dev/null &&
+		[ "$candidate_gem" -le 4095 ] &&
+		[ "$candidate_tcont" -ge 0 ] &&
+		[ "$candidate_tcont" -le 15 ]
+}
+
+disable_inactive_mode() {
+	local current path paths=
+
+	case "$pon_mode" in
+		gpon)
+			paths="$(find_xgspon 2>/dev/null || true) $(find_epon 2>/dev/null || true)"
+			;;
+		xgpon|xgspon)
+			paths="$(find_gpon 2>/dev/null || true) $(find_epon 2>/dev/null || true)"
+			;;
+		epon-10g-1g|epon-10g-10g)
+			paths="$(find_gpon 2>/dev/null || true) $(find_xgspon 2>/dev/null || true)"
+			;;
+	esac
+	for path in $paths; do
+		current="$(cat "$path/enabled" 2>/dev/null)"
+		[ "$current" = 0 ] || printf '0\n' > "$path/enabled" || return 1
+	done
+}
+
+prepare_gpon_registration() {
+	local current
+
+	current="$(cat "$gpon/enabled" 2>/dev/null)"
+	if [ "$enabled" -eq 0 ]; then
+		[ "$current" = 0 ] || printf '0\n' > "$gpon/enabled"
+		return 0
+	fi
+	valid_serial || {
+		echo "airoha-gpon: refusing activation without a valid serial number" >&2
+		return 1
+	}
+	valid_password || {
+		echo "airoha-gpon: refusing activation with an invalid PLOAM password" >&2
+		return 1
+	}
+
+	[ "$current" = 0 ] || printf '0\n' > "$gpon/enabled"
+	printf '%s\n' "$serial_number" > "$gpon/serial_number" || return 1
+	printf '%s\n' "$password" > "$gpon/password" || return 1
+}
+
+apply_gpon_registration() {
+	printf '%s\n' "$enabled" > "$gpon/enabled"
+}
+
+stage_xgspon_registration() {
+	if valid_serial; then
+		printf '%s\n' "$serial_number" > "$xgspon/serial_number" || return 1
+	fi
+	if [ -n "$registration_id" ]; then
+		valid_registration_id || {
+			echo "airoha-xgspon: invalid Registration-ID" >&2
+			return 1
+		}
+		printf '%s\n' "$registration_id" > "$xgspon/registration_id" || return 1
+	elif [ "$(cat "$xgspon/registration_id_configured" 2>/dev/null)" = 1 ]; then
+		printf 'clear\n' > "$xgspon/registration_id" || return 1
+	fi
+}
+
+prepare_xgspon_registration() {
+	local current
+
+	if [ "$enabled" -eq 1 ]; then
+		valid_serial || {
+			echo "airoha-xgspon: refusing activation without a valid serial number" >&2
+			return 1
+		}
+	fi
+	[ -z "$registration_id" ] || valid_registration_id || {
+		echo "airoha-xgspon: invalid Registration-ID" >&2
+		return 1
+	}
+	current="$(cat "$xgspon/enabled" 2>/dev/null)" || return 1
+	case "$current" in 0|1) ;; *) return 1 ;; esac
+
+	# Identity writes invalidate the current XG/XGS session keys. Never issue
+	# them while the protocol instance can still transmit or process PLOAM.
+	[ "$current" = 0 ] || printf '0\n' > "$xgspon/enabled" || return 1
+	stage_xgspon_registration
+}
+
+apply_xgspon_registration() {
+	local current
+
+	current="$(cat "$xgspon/enabled" 2>/dev/null)"
+	if [ "$enabled" -eq 0 ]; then
+		[ "$current" = 0 ] || printf '0\n' > "$xgspon/enabled"
+		return 0
+	fi
+	[ "$current" = 0 ] || printf '0\n' > "$xgspon/enabled"
+	if [ "$(cat "$xgspon/activation_ready" 2>/dev/null)" != 1 ]; then
+		echo "airoha-xgspon: activation blocked: $(cat "$xgspon/activation_blockers" 2>/dev/null)" >&2
+		return 1
+	fi
+
+	# The kernel rejects this write until every reported blocker is cleared.
+	printf '1\n' > "$xgspon/enabled"
+}
+
+apply_epon_registration() {
+	printf '%s\n' "$enabled" > "$epon/enabled"
+}
+
+apply_registration() {
+	local ret
+
+	read_config
+	valid_pon_mode || {
+		echo "airoha-xpon: invalid PON mode" >&2
+		return 1
+	}
+	xpon="$(find_xpon)" || {
+		echo "airoha-xpon: runtime owner sysfs device not found" >&2
+		return 1
+	}
+	previous_pon_mode="$(cat "$xpon/mode" 2>/dev/null)" || return 1
+	case "$previous_pon_mode" in
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) ;;
+		*) return 1 ;;
+	esac
+	snapshot_control_planes
+	snapshot_previous_protocol || return 1
+	if ! quiesce_previous_control_plane; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	if ! disable_previous_protocol_before_switch; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	if epon_mode "$pon_mode" && ! epon_mode "$previous_pon_mode"; then
+		# EPON start_mac requires a cached ONU MAC. An inactive EPON backend
+		# accepts these values before the owner switches PCS/PMA into EPON.
+		if ! prepare_epon; then
+			handle_runtime_failure || true
+			return 1
+		fi
+		epon_prepared=1
+	fi
+	if ! switch_pon_mode; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	case "$pon_mode" in
+		gpon) prepare_gpon_registration ;;
+		xgpon|xgspon) prepare_xgspon_registration ;;
+		epon-10g-1g|epon-10g-10g)
+			[ "$epon_prepared" -eq 1 ] || prepare_epon
+			;;
+	esac
+	if [ "$?" -ne 0 ]; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	if ! start_target_control_plane; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	case "$pon_mode" in
+		gpon) apply_gpon_registration ;;
+		xgpon|xgspon) apply_xgspon_registration ;;
+		epon-10g-1g|epon-10g-10g) apply_epon_registration ;;
+	esac
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		handle_runtime_failure || true
+		return "$ret"
+	fi
+	if ! disable_inactive_mode || ! stop_inactive_control_plane; then
+		handle_runtime_failure || true
+		return 1
+	fi
+	epon_snapshot_valid=0
+}
+
+record_manual_gem() {
+	local wanted="$1" temporary
+
+	umask 077
+	mkdir -p "$state_dir" || return 1
+	temporary="$(mktemp "$state_dir/.manual-gem.XXXXXX")" || return 1
+	printf '%s\n' "$wanted" > "$temporary" || {
+		rm -f "$temporary"
+		return 1
+	}
+	mv -f "$temporary" "$manual_gem_file"
+}
+
+clear_manual_gem() {
+	local previous current candidate_gem candidate_tcont candidate_encrypted
+
+	[ -f "$manual_gem_file" ] || return 0
+	previous="$(cat "$manual_gem_file" 2>/dev/null)"
+	set -f
+	set -- $previous
+	set +f
+	[ "$#" -eq 3 ] || {
+		rm -f "$manual_gem_file"
+		return 0
+	}
+	candidate_gem="$1"
+	candidate_tcont="$2"
+	candidate_encrypted="$3"
+	valid_manual_values "$candidate_gem" "$candidate_tcont" "$candidate_encrypted" || {
+		rm -f "$manual_gem_file"
+		return 0
+	}
+	current="$(cat "$gpon/data_gem" 2>/dev/null)"
+	if [ "$current" = "$previous" ]; then
+		printf 'off\n' > "$gpon/data_gem" 2>/dev/null || return 1
+	fi
+	rm -f "$manual_gem_file"
+}
+
+reconcile_manual_gem() {
+	local current state tconts wanted
+
+	read_config
+	if ! { [ "$pon_mode" = gpon ] && [ "$enabled" -eq 1 ] &&
+		[ "$omci_mode" = manual ] &&
+		[ "$manual_gem" -eq 1 ] && valid_manual_gem; }; then
+		clear_manual_gem
+		return
+	fi
+
+	state="$(cat "$gpon/state" 2>/dev/null)"
+	case "$state" in
+		5\ *) ;;
+		*) return ;;
+	esac
+
+	tconts="$(cat "$gpon/tconts" 2>/dev/null)"
+	case " $tconts " in
+		*" $tcont:"*) ;;
+		*) return ;;
+	esac
+
+	wanted="$gem_id $tcont $encrypted"
+	current="$(cat "$gpon/data_gem" 2>/dev/null)"
+	if [ "$current" != "$wanted" ]; then
+		printf '%s\n' "$wanted" > "$gpon/data_gem" 2>/dev/null || return 1
+	fi
+	record_manual_gem "$wanted"
+}
+
+sync_configuration() {
+	apply_registration || return
+	reconcile_manual_gem
+}
+
+monitor_manual_gem() {
+
+	while :; do
+		reconcile_manual_gem || true
+		sleep 2
+	done
+}
+
+case "${1:-}" in
+	monitor)
+		read_config
+		valid_pon_mode || {
+			echo "airoha-xpon: invalid PON mode" >&2
+			exit 1
+		}
+		for _ in $(seq 1 60); do
+			xpon="$(find_xpon)" && break
+			sleep 1
+		done
+		[ -n "$xpon" ] || {
+			echo "airoha-xpon: runtime owner sysfs device not found" >&2
+			exit 1
+		}
+		gpon="$(find_gpon 2>/dev/null || true)"
+		xgspon="$(find_xgspon 2>/dev/null || true)"
+		epon="$(find_epon 2>/dev/null || true)"
+		apply_registration || exit 1
+		monitor_manual_gem
+		;;
+	sync|sync-deferred)
+		[ "$1" = sync-deferred ] && defer_runtime_rollback=1
+		read_config
+		valid_pon_mode || exit 1
+		if [ "$pon_mode" = gpon ]; then
+			gpon="$(find_gpon)" || {
+				echo "airoha-gpon: GPON sysfs device not found" >&2
+				exit 1
+			}
+		elif [ "$pon_mode" = xgpon ] || [ "$pon_mode" = xgspon ]; then
+			xgspon="$(find_xgspon)" || {
+				echo "airoha-xgspon: XGS-PON sysfs device not found" >&2
+				exit 1
+			}
+		else
+			epon="$(find_epon)" || {
+				echo "airoha-epon: EPON sysfs device not found" >&2
+				exit 1
+			}
+		fi
+		sync_configuration
+		;;
+	*)
+		echo "usage: $0 {monitor|sync|sync-deferred}" >&2
+		exit 2
+		;;
+esac

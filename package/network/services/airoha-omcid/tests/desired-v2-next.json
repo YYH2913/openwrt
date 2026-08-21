@@ -1,0 +1,123 @@
+{
+  "version": 7,
+  "state_domain": "xg2010g:gpon",
+  "operation": "set",
+  "mib_data_sync": 8,
+  "mib_state": {
+    "version": 1,
+    "state_domain": "xg2010g:gpon",
+    "mib_data_sync": 8,
+    "instances": [
+      {
+        "class_id": 2,
+        "entity_id": 0,
+        "origin": 0,
+        "attributes": [
+          { "name": "MibDataSync", "kind": "uint8", "unsigned": 8 }
+        ]
+      }
+    ]
+  },
+  "service_graph": {
+    "unis": [
+      { "entity_id": 257, "interface": "lan1", "administrative_state": 0, "operational_state": 0, "configuration": 4 }
+    ],
+    "dot1_rate_limiters": [],
+    "gem_ports": [
+      { "entity_id": 1024, "port_id": 200, "alloc_id": 100, "direction": 3 },
+      { "entity_id": 1025, "port_id": 202, "alloc_id": 100, "direction": 3 }
+    ],
+    "gem_interworking": [
+      { "entity_id": 768, "gem_port": 1024, "option": 5, "service_profile": 512 },
+      { "entity_id": 769, "gem_port": 1025, "option": 5, "service_profile": 512 }
+    ],
+    "pbit_mappers": [
+      {
+        "entity_id": 512,
+        "tp_type": 1,
+        "tp_pointer": 257,
+        "pbits": [768, 768, 768, 768, 769, 769, 769, 769],
+        "unmarked_frame_option": 1,
+        "default_pbit": 4,
+        "dscp_to_pbit": [
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
+      }
+    ],
+    "bridges": [
+      {
+        "entity_id": 256,
+        "spanning_tree": 0,
+        "learning": 1,
+        "port_bridging": 0,
+        "priority": 32768,
+        "max_age_256ths": 5120,
+        "hello_time_256ths": 512,
+        "forward_delay_256ths": 3840,
+        "unknown_mac_discard": 0,
+        "mac_learning_depth": 0,
+        "dynamic_filtering_age_time_seconds": 300,
+        "ports": [
+          {
+            "entity_id": 1280,
+            "port": 1,
+            "tp_type": 1,
+            "tp": 257,
+            "priority": 128,
+            "path_cost": 10,
+            "spanning_tree": 0,
+            "outbound_td": 65535,
+            "inbound_td": 65535,
+            "mac_learning_depth": 0
+          }
+        ]
+      }
+    ],
+    "vlan_filters": [
+      {
+        "entity_id": 1280,
+        "bridge_port": 1280,
+        "forward_operation": 16,
+        "tagged_action": "h",
+        "tagged_criterion": "vid",
+        "untagged_action": "c",
+        "entries": [100]
+      }
+    ],
+    "extended_vlans": [
+      {
+        "entity_id": 1536,
+        "association_type": 2,
+        "associated_class": 11,
+        "associated_me": 257,
+        "input_tpid": 33024,
+        "output_tpid": 33024,
+        "downstream_mode": 0,
+        "enhanced_mode": 0,
+        "dscp_to_pbit": [
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ],
+        "rules": [
+          {
+            "order": 0,
+            "row_key": 0,
+            "direction": 0,
+            "filter_outer": { "priority": 15, "vid": 4096, "tpid_dei": 0 },
+            "filter_inner": { "priority": 15, "vid": 4096, "tpid_dei": 0 },
+            "ethertype": 0,
+            "extended_criteria": 0,
+            "tags_to_remove": 0,
+            "treatment_outer": { "priority": 15, "vid": 0, "tpid_dei": 0 },
+            "treatment_inner": { "priority": 0, "vid": 100, "tpid_dei": 4 }
+          }
+        ]
+      }
+    ]
+  }
+}

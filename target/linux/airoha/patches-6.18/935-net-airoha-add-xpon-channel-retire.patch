@@ -1,0 +1,317 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Mon, 17 Aug 2026 12:00:00 +0800
+Subject: [PATCH] net: airoha: add transactional XPON channel retire
+
+The AN758x SDK blocks GDM2/CDM2 hardware forwarding, closes the QDMA queues,
+terminates a stuck MBI transaction and retires GDM2 channels before an XPON
+MAC is reset.  Merely restoring the GDM2 TX/PSE baseline can leave an old
+protocol's queued descriptors visible to the next protocol after a hot switch.
+
+Add a shared transaction which can run only after GPON, XG/XGS and EPON
+service state is inactive.  It snapshots QDMA queue-close, GDM2 and CDM2
+state, blocks the requested channels, clears any MBI busy condition, issues
+the SDK channel-release command, and waits for the GDM TX/RX and QDMA valid
+bits to drain.  The snapshot is restored and read back on both success and
+failure; callers receive any retire or restore error and can therefore fail
+the outer mode switch closed.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -117,6 +117,9 @@
+ #define REG_CDM_FWD_CFG(_n)		(CDM_BASE(_n) + 0x08)
+ #define CDM_OAM_QSEL_MASK		GENMASK(31, 27)
+ #define CDM_VIP_QSEL_MASK		GENMASK(24, 20)
++#define REG_CDM_HWF_CHN_EN(_n)		(CDM_BASE(_n) + 0x0c)
++#define CDM_HWF_CHN_EN_MASK		GENMASK(7, 0)
++
+ 
+ #define REG_CDM_CRSN_QSEL(_n, _m)	(CDM_BASE(_n) + 0x10 + ((_m) << 2))
+ #define CDM_CRSN_QSEL_REASON_MASK(_n)	\
+@@ -167,11 +170,20 @@
+ #define LPBK_EN_MASK			BIT(0)
+ 
+ #define REG_GDM_CHN_RLS(_n)		(GDM_BASE(_n) + 0x20)
++#define GDM_CHN_RLS_MBI_RX_BUSY_MASK	BIT(27)
++#define GDM_CHN_RLS_MBI_RX_TERMINATE_MASK	BIT(24)
++#define GDM_CHN_RLS_MBI_TX_BUSY_MASK	BIT(19)
++#define GDM_CHN_RLS_MBI_TX_TERMINATE_MASK	BIT(16)
++#define GDM_CHN_RLS_CHANNEL_MASK	GENMASK(8, 4)
++#define GDM_CHN_RLS_STATUS_MASK		BIT(1)
++#define GDM_CHN_RLS_ENABLE_MASK		BIT(0)
+ #define MBI_RX_AGE_SEL_MASK		GENMASK(26, 25)
+ #define MBI_TX_AGE_SEL_MASK		GENMASK(18, 17)
+ 
+ #define REG_GDM_TXCHN_EN(_n)		(GDM_BASE(_n) + 0x24)
+ #define REG_GDM_RXCHN_EN(_n)		(GDM_BASE(_n) + 0x28)
++#define REG_GDM_TX_CHN_VLD(_n)		(GDM_BASE(_n) + 0x70)
++#define REG_GDM_RX_CHN_VLD(_n)		(GDM_BASE(_n) + 0x74)
+ 
+ #define REG_FE_CPORT_CFG		(GDM1_BASE + 0x40)
+ #define FE_CPORT_PAD			BIT(26)
+@@ -784,6 +791,9 @@
+ #define REG_QUEUE_CLOSE_CFG(_n)		(0x00a0 + ((_n) & 0xfc))
+ #define TXQ_DISABLE_CHAN_QUEUE_MASK(_n, _m)	BIT((_m) + (((_n) & 0x3) << 3))
+ 
++#define REG_TXQ_CHAN_VALID(_n)		(0x1280 + (((_n) >> 2) << 2))
++#define TXQ_CHAN_VALID_MASK(_n)		(0xffU << (((_n) & 0x3) << 3))
++
+ #define REG_TXQ_DIS_CFG_BASE(_n)	((_n) ? 0x20a0 : 0x00a0)
+ #define REG_TXQ_DIS_CFG(_n, _m)		(REG_TXQ_DIS_CFG_BASE((_n)) + (_m) << 2)
+ 
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -5716,6 +5716,242 @@ int airoha_epon_qdma_llids_clear(struct
+ }
+ EXPORT_SYMBOL_GPL(airoha_epon_qdma_llids_clear);
+ 
++#define AIROHA_XPON_QDMA_CLOSE_REGS	8
++#define AIROHA_XPON_MBI_TIMEOUT_US	100
++#define AIROHA_XPON_RETIRE_TIMEOUT_US	10000
++#define AIROHA_XPON_GDM_RLS_WRITABLE_MASK			\
++	(GDM_CHN_RLS_MBI_RX_TERMINATE_MASK |			\
++	 GDM_CHN_RLS_MBI_TX_TERMINATE_MASK |			\
++	 GDM_CHN_RLS_CHANNEL_MASK | GDM_CHN_RLS_ENABLE_MASK)
++
++static bool airoha_xpon_channel_retired(struct airoha_gdm_dev *dev,
++					 struct airoha_qdma *qdma,
++					 unsigned int channel)
++{
++	u32 release = airoha_fe_rr(dev->eth,
++				   REG_GDM_CHN_RLS(AIROHA_GDM2_IDX));
++	u32 gdm_tx_valid = airoha_fe_rr(
++		dev->eth, REG_GDM_TX_CHN_VLD(AIROHA_GDM2_IDX));
++	u32 gdm_rx_valid = airoha_fe_rr(
++		dev->eth, REG_GDM_RX_CHN_VLD(AIROHA_GDM2_IDX));
++	u32 qdma_valid = airoha_qdma_rr(qdma,
++					REG_TXQ_CHAN_VALID(channel));
++
++	return release & GDM_CHN_RLS_STATUS_MASK &&
++	       !(gdm_tx_valid & BIT(channel)) &&
++	       !(gdm_rx_valid & BIT(channel)) &&
++	       !(qdma_valid & TXQ_CHAN_VALID_MASK(channel));
++}
++
++static int airoha_xpon_mbi_terminate_direction(struct airoha_gdm_dev *dev,
++						 u32 busy_mask,
++						 u32 terminate_mask)
++{
++	u32 value;
++	int ret;
++
++	value = airoha_fe_rr(dev->eth,
++			     REG_GDM_CHN_RLS(AIROHA_GDM2_IDX));
++	if (!(value & busy_mask))
++		return 0;
++
++	airoha_fe_set(dev->eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++		      terminate_mask);
++	ret = read_poll_timeout(airoha_fe_rr, value, !(value & busy_mask),
++				1, AIROHA_XPON_MBI_TIMEOUT_US, false, dev->eth,
++				REG_GDM_CHN_RLS(AIROHA_GDM2_IDX));
++	airoha_fe_clear(dev->eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++			terminate_mask);
++	if (airoha_fe_rr(dev->eth,
++			 REG_GDM_CHN_RLS(AIROHA_GDM2_IDX)) & terminate_mask)
++		return -EIO;
++
++	return ret;
++}
++
++int airoha_xpon_qdma_channels_retire(struct device_node *np, u32 channel_mask)
++{
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct net_device *netdev;
++	u32 old_queue_close[AIROHA_XPON_QDMA_CLOSE_REGS];
++	u32 old_cdm_hwf, old_release, old_rxchn, old_txchn;
++	unsigned long flags;
++	unsigned int channel, i;
++	bool done, restore_failed = false;
++	int mbi_ret, ret = 0;
++
++	if (!np)
++		return -EINVAL;
++	if (!channel_mask)
++		return 0;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&dev->xgs_service_lock);
++	mutex_lock(&dev->epon_service_lock);
++	mutex_lock(&dev->gpon_qos_lock);
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	if (dev->gpon_tx_ready || dev->gpon_omcc_ready ||
++	    dev->gpon_gem_count)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	if (!ret && !bitmap_empty(dev->gpon_qos, AIROHA_GPON_QOS_CHANNELS))
++		ret = -EBUSY;
++	if (!ret && !bitmap_empty(dev->xgs_qos,
++				 AIROHA_XGS_SERVICE_MAX_TCONTS))
++		ret = -EBUSY;
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	if (!ret && dev->xgs_service_active)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (!ret && dev->epon_llid_mask)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (ret)
++		goto unlock;
++
++	qdma = airoha_qdma_deref(dev);
++	if (!qdma) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	old_txchn = airoha_fe_rr(dev->eth,
++				 REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX));
++	old_rxchn = airoha_fe_rr(dev->eth,
++				 REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX));
++	old_cdm_hwf = airoha_fe_rr(dev->eth,
++				   REG_CDM_HWF_CHN_EN(2));
++	old_release = airoha_fe_rr(dev->eth,
++				   REG_GDM_CHN_RLS(AIROHA_GDM2_IDX));
++	if (old_release & (GDM_CHN_RLS_MBI_RX_TERMINATE_MASK |
++			   GDM_CHN_RLS_MBI_TX_TERMINATE_MASK |
++			   GDM_CHN_RLS_ENABLE_MASK)) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	for (i = 0; i < AIROHA_XPON_QDMA_CLOSE_REGS; i++)
++		old_queue_close[i] = airoha_qdma_rr(
++			qdma, REG_QUEUE_CLOSE_CFG(i * 4));
++
++	/* Match the SDK wrapper: block GDM2/CDM2 before draining QDMA. */
++	airoha_fe_clear(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX),
++			channel_mask);
++	airoha_fe_clear(dev->eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX),
++			channel_mask);
++	airoha_fe_clear(dev->eth, REG_CDM_HWF_CHN_EN(2),
++			channel_mask & CDM_HWF_CHN_EN_MASK);
++	if ((airoha_fe_rr(dev->eth,
++			  REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX)) & channel_mask) ||
++	    (airoha_fe_rr(dev->eth,
++			  REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX)) & channel_mask) ||
++	    (airoha_fe_rr(dev->eth, REG_CDM_HWF_CHN_EN(2)) &
++					(channel_mask & CDM_HWF_CHN_EN_MASK))) {
++		ret = -EIO;
++		goto restore;
++	}
++
++	for (channel = 0; channel < 32; channel++) {
++		if (!(channel_mask & BIT(channel)))
++			continue;
++		for (i = 0; i < AIROHA_NUM_QOS_QUEUES; i++)
++			airoha_qdma_set(qdma, REG_QUEUE_CLOSE_CFG(channel),
++					 TXQ_DISABLE_CHAN_QUEUE_MASK(channel, i));
++		for (i = 0; i < AIROHA_NUM_QOS_QUEUES; i++)
++			if (!(airoha_qdma_rr(qdma,
++					    REG_QUEUE_CLOSE_CFG(channel)) &
++			      TXQ_DISABLE_CHAN_QUEUE_MASK(channel, i))) {
++				ret = -EIO;
++				goto restore;
++			}
++	}
++
++	ret = airoha_xpon_mbi_terminate_direction(
++		dev, GDM_CHN_RLS_MBI_TX_BUSY_MASK,
++		GDM_CHN_RLS_MBI_TX_TERMINATE_MASK);
++	mbi_ret = airoha_xpon_mbi_terminate_direction(
++		dev, GDM_CHN_RLS_MBI_RX_BUSY_MASK,
++		GDM_CHN_RLS_MBI_RX_TERMINATE_MASK);
++	if (!ret)
++		ret = mbi_ret;
++	if (ret)
++		goto restore;
++	usleep_range(1000, 2000);
++
++	for (channel = 0; channel < 32; channel++) {
++		if (!(channel_mask & BIT(channel)))
++			continue;
++		/* Match the SDK's AN758x single-channel retire window. */
++		airoha_fe_wr(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX),
++			     BIT(channel));
++		airoha_fe_wr(dev->eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX),
++			     BIT(channel));
++		airoha_fe_rmw(dev->eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++			      GDM_CHN_RLS_CHANNEL_MASK |
++			      GDM_CHN_RLS_ENABLE_MASK,
++			      FIELD_PREP(GDM_CHN_RLS_CHANNEL_MASK, channel) |
++			      GDM_CHN_RLS_ENABLE_MASK);
++		ret = read_poll_timeout(airoha_xpon_channel_retired, done, done,
++					100, AIROHA_XPON_RETIRE_TIMEOUT_US,
++					false, dev, qdma, channel);
++		airoha_fe_clear(dev->eth,
++				REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++				GDM_CHN_RLS_ENABLE_MASK);
++		if (ret)
++			break;
++		if (airoha_fe_rr(dev->eth,
++				REG_GDM_CHN_RLS(AIROHA_GDM2_IDX)) &
++		    GDM_CHN_RLS_ENABLE_MASK) {
++			ret = -EIO;
++			break;
++		}
++	}
++
++restore:
++	airoha_fe_rmw(dev->eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++		      AIROHA_XPON_GDM_RLS_WRITABLE_MASK,
++		      old_release & AIROHA_XPON_GDM_RLS_WRITABLE_MASK);
++	for (i = 0; i < AIROHA_XPON_QDMA_CLOSE_REGS; i++)
++		airoha_qdma_wr(qdma, REG_QUEUE_CLOSE_CFG(i * 4),
++			       old_queue_close[i]);
++	airoha_fe_wr(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), old_txchn);
++	airoha_fe_wr(dev->eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX), old_rxchn);
++	/* Re-open hardware forwarding last, after all producer state is restored. */
++	airoha_fe_wr(dev->eth, REG_CDM_HWF_CHN_EN(2), old_cdm_hwf);
++	restore_failed |= (airoha_fe_rr(
++		dev->eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX)) &
++		AIROHA_XPON_GDM_RLS_WRITABLE_MASK) !=
++		(old_release & AIROHA_XPON_GDM_RLS_WRITABLE_MASK);
++	restore_failed |= airoha_fe_rr(
++		dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX)) != old_txchn;
++	restore_failed |= airoha_fe_rr(
++		dev->eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX)) != old_rxchn;
++	restore_failed |= airoha_fe_rr(
++		dev->eth, REG_CDM_HWF_CHN_EN(2)) != old_cdm_hwf;
++	for (i = 0; i < AIROHA_XPON_QDMA_CLOSE_REGS; i++)
++		restore_failed |= airoha_qdma_rr(
++			qdma, REG_QUEUE_CLOSE_CFG(i * 4)) != old_queue_close[i];
++	if (restore_failed && !ret)
++		ret = -EIO;
++unlock:
++	mutex_unlock(&dev->gpon_qos_lock);
++	mutex_unlock(&dev->epon_service_lock);
++	mutex_unlock(&dev->xgs_service_lock);
++	mutex_unlock(&flow_offload_mutex);
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_xpon_qdma_channels_retire);
++
+ int airoha_epon_loopback_set(struct device_node *np, u8 llid_index,
+ 			     bool enabled)
+ {
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -893,5 +893,7 @@ int airoha_epon_qdma_llids_apply(struct
+ 				 u32 report_fec_mask);
+ int airoha_epon_qdma_llids_clear(struct device_node *np);
++int airoha_xpon_qdma_channels_retire(struct device_node *np,
++				      u32 channel_mask);
+ int airoha_epon_loopback_set(struct device_node *np, u8 llid_index,
+ 			     bool enabled);
+ int airoha_epon_oam_register(struct device_node *np,

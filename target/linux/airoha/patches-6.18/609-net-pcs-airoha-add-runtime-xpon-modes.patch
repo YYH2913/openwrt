@@ -1,0 +1,581 @@
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -59,10 +59,22 @@ static void airoha_pcs_setup_scu_pon(str
+ 		wan_sel = AIROHA_SCU_WAN_SEL_GPON;
+ 		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
+ 		break;
++	case AIROHA_PCS_PON_MODE_XGPON:
++		wan_sel = AIROHA_SCU_WAN_SEL_XGPON;
++		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
++		break;
+ 	case AIROHA_PCS_PON_MODE_XGSPON:
+ 		wan_sel = AIROHA_SCU_WAN_SEL_XGSPON;
+ 		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
+ 		break;
++	case AIROHA_PCS_PON_MODE_EPON_10G_1G:
++		wan_sel = AIROHA_SCU_WAN_SEL_EPON_10G_1G;
++		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
++		break;
++	case AIROHA_PCS_PON_MODE_EPON_10G_10G:
++		wan_sel = AIROHA_SCU_WAN_SEL_EPON_10G_10G;
++		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
++		break;
+ 	case AIROHA_PCS_PON_MODE_NONE:
+ 	default:
+ 		switch (interface) {
+@@ -1037,6 +1049,199 @@ int airoha_pcs_xgspon_rx_recover(struct
+ }
+ EXPORT_SYMBOL_GPL(airoha_pcs_xgspon_rx_recover);
+ 
++static int airoha_pcs_xpon_port(struct phylink_pcs *pcs,
++				struct airoha_pcs_port **port)
++{
++	if (!pcs || pcs->ops != &airoha_pcs_ops)
++		return -EINVAL;
++
++	*port = to_airoha_pcs_port(pcs);
++	if ((*port)->priv->data->port_type != AIROHA_PCS_PON ||
++	    (*port)->priv->pon_mode == AIROHA_PCS_PON_MODE_NONE)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int
++airoha_pcs_xpon_mode_from_public(enum airoha_pcs_xpon_mode mode,
++				 enum airoha_pcs_pon_mode *internal)
++{
++	switch (mode) {
++	case AIROHA_PCS_XPON_MODE_GPON:
++		*internal = AIROHA_PCS_PON_MODE_GPON;
++		break;
++	case AIROHA_PCS_XPON_MODE_XGPON:
++		*internal = AIROHA_PCS_PON_MODE_XGPON;
++		break;
++	case AIROHA_PCS_XPON_MODE_XGSPON:
++		*internal = AIROHA_PCS_PON_MODE_XGSPON;
++		break;
++	case AIROHA_PCS_XPON_MODE_EPON_10G_1G:
++		*internal = AIROHA_PCS_PON_MODE_EPON_10G_1G;
++		break;
++	case AIROHA_PCS_XPON_MODE_EPON_10G_10G:
++		*internal = AIROHA_PCS_PON_MODE_EPON_10G_10G;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static enum airoha_pcs_xpon_mode
++airoha_pcs_xpon_mode_to_public(enum airoha_pcs_pon_mode mode)
++{
++	switch (mode) {
++	case AIROHA_PCS_PON_MODE_GPON:
++		return AIROHA_PCS_XPON_MODE_GPON;
++	case AIROHA_PCS_PON_MODE_XGPON:
++		return AIROHA_PCS_XPON_MODE_XGPON;
++	case AIROHA_PCS_PON_MODE_XGSPON:
++		return AIROHA_PCS_XPON_MODE_XGSPON;
++	case AIROHA_PCS_PON_MODE_EPON_10G_1G:
++		return AIROHA_PCS_XPON_MODE_EPON_10G_1G;
++	case AIROHA_PCS_PON_MODE_EPON_10G_10G:
++		return AIROHA_PCS_XPON_MODE_EPON_10G_10G;
++	case AIROHA_PCS_PON_MODE_NONE:
++	default:
++		return AIROHA_PCS_XPON_MODE_GPON;
++	}
++}
++
++int airoha_pcs_xpon_get_mode(struct phylink_pcs *pcs,
++			     enum airoha_pcs_xpon_mode *mode)
++{
++	struct airoha_pcs_port *port;
++	int ret;
++
++	if (!mode)
++		return -EINVAL;
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++
++	mutex_lock(&port->priv->recovery_lock);
++	*mode = airoha_pcs_xpon_mode_to_public(port->priv->pon_mode);
++	mutex_unlock(&port->priv->recovery_lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_get_mode);
++
++int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	struct airoha_pcs_maps *maps;
++	int ret;
++
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++	maps = &priv->maps[port->index];
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (priv->pon_quiesced) {
++		ret = 0;
++		goto unlock;
++	}
++
++	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			AIROHA_PCS_XFI_RXMPI_STOP |
++			AIROHA_PCS_XFI_RXMBI_STOP |
++			AIROHA_PCS_XFI_TXMPI_STOP |
++			AIROHA_PCS_XFI_TXMBI_STOP);
++	ret = an7581_pcs_xpon_quiesce(priv, port->index);
++	if (!ret) {
++		priv->pon_quiesced = true;
++		priv->pon_pma_ready = false;
++	}
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_quiesce);
++
++int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
++			     enum airoha_pcs_xpon_mode mode)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	enum airoha_pcs_pon_mode internal;
++	phy_interface_t interface;
++	int ret;
++
++	ret = airoha_pcs_xpon_mode_from_public(mode, &internal);
++	if (ret)
++		return ret;
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (!priv->pon_quiesced) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	priv->pon_pma_ready = false;
++	priv->pon_mode = internal;
++	interface = priv->interface == PHY_INTERFACE_MODE_NA ?
++		    PHY_INTERFACE_MODE_2500BASEX : priv->interface;
++	ret = airoha_pcs_setup_scu(priv, port->index, interface);
++	if (ret)
++		goto unlock;
++	ret = priv->data->bringup(priv, port->index, interface);
++	if (!ret)
++		priv->pon_pma_ready = true;
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_set_mode);
++
++int airoha_pcs_xpon_recover(struct phylink_pcs *pcs)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	struct airoha_pcs_maps *maps;
++	int ret;
++
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++	maps = &priv->maps[port->index];
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (!priv->pon_quiesced || !priv->pon_pma_ready) {
++		ret = -EAGAIN;
++		goto unlock;
++	}
++
++	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			  AIROHA_PCS_XFI_RXMPI_STOP |
++			  AIROHA_PCS_XFI_RXMBI_STOP |
++			  AIROHA_PCS_XFI_TXMPI_STOP |
++			  AIROHA_PCS_XFI_TXMBI_STOP);
++	priv->pon_quiesced = false;
++	priv->pon_pma_ready = false;
++	ret = 0;
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_recover);
++
+ static int airoha_pcs_init_named_regmap(struct platform_device *pdev,
+ 					const char *name, struct regmap **regmap)
+ {
+@@ -1316,8 +1521,14 @@ static int airoha_pcs_probe(struct platf
+ 
+ 		if (!strcmp(pon_mode, "gpon"))
+ 			priv->pon_mode = AIROHA_PCS_PON_MODE_GPON;
++		else if (!strcmp(pon_mode, "xgpon"))
++			priv->pon_mode = AIROHA_PCS_PON_MODE_XGPON;
+ 		else if (!strcmp(pon_mode, "xgspon"))
+ 			priv->pon_mode = AIROHA_PCS_PON_MODE_XGSPON;
++		else if (!strcmp(pon_mode, "epon-10g-1g"))
++			priv->pon_mode = AIROHA_PCS_PON_MODE_EPON_10G_1G;
++		else if (!strcmp(pon_mode, "epon-10g-10g"))
++			priv->pon_mode = AIROHA_PCS_PON_MODE_EPON_10G_10G;
+ 		else
+ 			return dev_err_probe(dev, -EINVAL,
+ 					     "unsupported PON mode %s\n",
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -20,6 +20,9 @@
+ #define   AIROHA_SCU_ETH_MAC_SEL_PON		FIELD_PREP_CONST(AIROHA_SCU_ETH_MAC_SEL, 0x1)
+ #define   AIROHA_SCU_WAN_SEL			GENMASK(7, 0)
+ #define   AIROHA_SCU_WAN_SEL_GPON		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x0)
++#define   AIROHA_SCU_WAN_SEL_EPON_10G_1G	FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x6)
++#define   AIROHA_SCU_WAN_SEL_EPON_10G_10G	FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x7)
++#define   AIROHA_SCU_WAN_SEL_XGPON		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x9)
+ #define   AIROHA_SCU_WAN_SEL_XGSPON		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0xa)
+ #define   AIROHA_SCU_WAN_SEL_SGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x10)
+ #define   AIROHA_SCU_WAN_SEL_HSGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x11)
+@@ -1645,9 +1648,35 @@ struct airoha_pcs_maps {
+ enum airoha_pcs_pon_mode {
+ 	AIROHA_PCS_PON_MODE_NONE,
+ 	AIROHA_PCS_PON_MODE_GPON,
++	AIROHA_PCS_PON_MODE_XGPON,
+ 	AIROHA_PCS_PON_MODE_XGSPON,
++	AIROHA_PCS_PON_MODE_EPON_10G_1G,
++	AIROHA_PCS_PON_MODE_EPON_10G_10G,
+ };
+ 
++static inline bool
++airoha_pcs_pon_mode_has_10g_downstream(enum airoha_pcs_pon_mode mode)
++{
++	return mode == AIROHA_PCS_PON_MODE_XGPON ||
++	       mode == AIROHA_PCS_PON_MODE_XGSPON ||
++	       mode == AIROHA_PCS_PON_MODE_EPON_10G_1G ||
++	       mode == AIROHA_PCS_PON_MODE_EPON_10G_10G;
++}
++
++static inline bool
++airoha_pcs_pon_mode_has_10g_upstream(enum airoha_pcs_pon_mode mode)
++{
++	return mode == AIROHA_PCS_PON_MODE_XGSPON ||
++	       mode == AIROHA_PCS_PON_MODE_EPON_10G_10G;
++}
++
++static inline bool
++airoha_pcs_pon_mode_is_epon(enum airoha_pcs_pon_mode mode)
++{
++	return mode == AIROHA_PCS_PON_MODE_EPON_10G_1G ||
++	       mode == AIROHA_PCS_PON_MODE_EPON_10G_10G;
++}
++
+ struct airoha_pcs_priv {
+ 	struct device *dev;
+ 	const struct airoha_pcs_match_data *data;
+@@ -1670,6 +1699,8 @@ struct airoha_pcs_priv {
+ 	struct mutex recovery_lock;
+ 
+ 	bool manual_rx_calib;
++	bool pon_quiesced;
++	bool pon_pma_ready;
+ 	enum airoha_pcs_pon_mode pon_mode;
+ };
+ 
+@@ -1705,6 +1736,7 @@ int an7581_pcs_bringup(struct airoha_pcs
+ 		       int index, phy_interface_t interface);
+ int an7581_pcs_xgspon_rx_quiesce(struct airoha_pcs_priv *priv, int index);
+ int an7581_pcs_xgspon_rx_recover(struct airoha_pcs_priv *priv, int index);
++int an7581_pcs_xpon_quiesce(struct airoha_pcs_priv *priv, int index);
+ int an7581_pcs_usb_bringup(struct airoha_pcs_priv *priv,
+ 			   int index, phy_interface_t interface);
+ 
+@@ -1738,6 +1770,12 @@ static inline int an7581_pcs_xgspon_rx_r
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int an7581_pcs_xpon_quiesce(struct airoha_pcs_priv *priv,
++					  int index)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline int an7581_pcs_usb_bringup(struct airoha_pcs_priv *priv,
+ 					 int index, phy_interface_t interface)
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -813,19 +813,22 @@ static void an7581_pcs_txpll_bringup(str
+ 	struct regmap *pcs_pma;
+ 	u32 tcl_amp_vref;
+ 	bool postdiv_en, sdm_hren, sdm_ifm;
+-	u32 vco_cfix;
++	u32 hrdds_pcw, vco_cfix;
+ 	bool vcodiv;
+ 	u32 pcw;
+ 
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		bool epon = airoha_pcs_pon_mode_is_epon(priv->pon_mode);
++
+ 		lpf_chp_ibias = 0xc;
+ 		lpf_bp = 0x2;
+ 		lpf_bwr = 0xb;
+ 		lpf_bwc = 0x18;
+-		vco_cfix = 0x3;
+-		pcw = 0x07f66e86;
++		vco_cfix = epon ? 0x1 : 0x3;
++		pcw = epon ? 0x08400000 : 0x07f66e86;
++		hrdds_pcw = epon ? 0x10800000 : 0x0fecdd0c;
+ 		tcl_amp_vref = 0xb;
+-		kband_div = 0x5;
++		kband_div = epon ? 0x4 : 0x5;
+ 		vcodiv = false;
+ 		postdiv_en = true;
+ 		sdm_hren = true;
+@@ -840,6 +843,7 @@ static void an7581_pcs_txpll_bringup(str
+ 			lpf_bwc = BIT(4) | BIT(3);
+ 			vco_cfix = BIT(1) | BIT(0);
+ 			pcw = BIT(27);
++			hrdds_pcw = 0;
+ 			tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
+ 			vcodiv = false;
+ 			postdiv_en = false;
+@@ -854,6 +858,7 @@ static void an7581_pcs_txpll_bringup(str
+ 			lpf_bwc = 0;
+ 			vco_cfix = 0;
+ 			pcw = BIT(27) | BIT(25);
++			hrdds_pcw = 0;
+ 			tcl_amp_vref = BIT(3) | BIT(2) | BIT(0);
+ 			vcodiv = true;
+ 			postdiv_en = false;
+@@ -869,6 +874,7 @@ static void an7581_pcs_txpll_bringup(str
+ 			lpf_bwc = BIT(4) | BIT(3);
+ 			vco_cfix = BIT(0);
+ 			pcw = BIT(27) | BIT(22);
++			hrdds_pcw = 0;
+ 			tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
+ 			vcodiv = false;
+ 			postdiv_en = false;
+@@ -967,11 +973,11 @@ static void an7581_pcs_txpll_bringup(str
+ 		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PCW_1,
+ 				   AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_GPON,
+ 				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_GPON,
+-					      0x0fecdd0c));
++					      hrdds_pcw));
+ 		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PCW_2,
+ 				   AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_EPON,
+ 				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_EPON,
+-					      0x0fecdd0c));
++					      hrdds_pcw));
+ 	}
+ 
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
+@@ -1022,19 +1028,40 @@ static void an7581_pcs_tx_bringup(struct
+ 	u32 fir_cn1, fir_c0b, fir_c1;
+ 	u32 tx_rate_ctrl;
+ 	u32 ckin_divisor;
++	u32 tx_delay_ben, tx_delay_data;
+ 	u32 xfi_tx_mode;
+ 
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
+ 		fir_cn1 = 0;
+-		if (priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON) {
++		if (airoha_pcs_pon_mode_has_10g_upstream(priv->pon_mode)) {
+ 			ckin_divisor = 0x5;
+ 			tx_rate_ctrl = 0x2;
++			tx_delay_ben = 0xd;
++			tx_delay_data = 0x30;
+ 			fir_c0b = 0xe;
+ 			fir_c1 = 0x4;
+ 			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_10G3;
++		} else if (priv->pon_mode == AIROHA_PCS_PON_MODE_XGPON) {
++			ckin_divisor = 0x3;
++			tx_rate_ctrl = 0x0;
++			tx_delay_ben = 0x0;
++			tx_delay_data = 0x8;
++			fir_c0b = 0;
++			fir_c1 = 0;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_3G12;
++		} else if (priv->pon_mode == AIROHA_PCS_PON_MODE_EPON_10G_1G) {
++			ckin_divisor = 0x1;
++			tx_rate_ctrl = 0x1;
++			tx_delay_ben = 0x2;
++			tx_delay_data = 0x6;
++			fir_c0b = 0;
++			fir_c1 = 0;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
+ 		} else {
+ 			ckin_divisor = 0x2;
+ 			tx_rate_ctrl = 0x0;
++			tx_delay_ben = 0x0;
++			tx_delay_data = 0x4;
+ 			fir_c0b = 0;
+ 			fir_c1 = 0;
+ 			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
+@@ -1049,6 +1076,8 @@ static void an7581_pcs_tx_bringup(struct
+ 			fir_c0b = 12;
+ 			fir_c1 = 0;
+ 			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
++			tx_delay_ben = 0;
++			tx_delay_data = 0;
+ 			break;
+ 		case PHY_INTERFACE_MODE_2500BASEX:
+ 			ckin_divisor = BIT(2);
+@@ -1057,6 +1086,8 @@ static void an7581_pcs_tx_bringup(struct
+ 			fir_c0b = 11;
+ 			fir_c1 = 1;
+ 			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_3G12;
++			tx_delay_ben = 0;
++			tx_delay_data = 0;
+ 			break;
+ 		case PHY_INTERFACE_MODE_USXGMII:
+ 		case PHY_INTERFACE_MODE_10GBASER:
+@@ -1066,6 +1097,8 @@ static void an7581_pcs_tx_bringup(struct
+ 			fir_c0b = 1;
+ 			fir_c1 = 11;
+ 			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_10G3;
++			tx_delay_ben = 0;
++			tx_delay_data = 0;
+ 			break;
+ 		default:
+ 			return;
+@@ -1124,9 +1157,9 @@ static void an7581_pcs_tx_bringup(struct
+ 				   AIROHA_PCS_PMA_TX_DLY_BEN_FTUNE |
+ 				   AIROHA_PCS_PMA_TX_DLY_DATA_FTUNE,
+ 				   FIELD_PREP(AIROHA_PCS_PMA_TX_DLY_BEN_FTUNE,
+-					      priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0xd : 0) |
++					      tx_delay_ben) |
+ 				   FIELD_PREP(AIROHA_PCS_PMA_TX_DLY_DATA_FTUNE,
+-					      priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x30 : 0x4));
++					      tx_delay_data));
+ 
+ 	/* Setup TX FIR Load Parameters (Reference 660mV) */
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TX_FIR_C0B,
+@@ -1167,18 +1200,21 @@ static void an7581_pcs_rx_bringup(struct
+ 	u32 osr;
+ 
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
+-		osr = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x0 : 0x2;
+-		pr_cdr_beta_dac = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++		bool downstream_10g =
++			airoha_pcs_pon_mode_has_10g_downstream(priv->pon_mode);
++
++		osr = downstream_10g ? 0x0 : 0x2;
++		pr_cdr_beta_dac = downstream_10g ?
+ 				  BIT(3) : BIT(2) | BIT(1);
+-		rx_rate_ctrl = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x2 : 0x0;
+-		cdr_pr_cap_en = priv->pon_mode != AIROHA_PCS_PON_MODE_XGSPON;
+-		cdr_pr_buf_in_sr = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++		rx_rate_ctrl = downstream_10g ? 0x2 : 0x0;
++		cdr_pr_cap_en = !downstream_10g;
++		cdr_pr_buf_in_sr = downstream_10g ?
+ 				    BIT(2) | BIT(1) | BIT(0) : BIT(2) | BIT(1);
+-		sigdet_vth_sel = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++		sigdet_vth_sel = downstream_10g ?
+ 				   BIT(1) : BIT(2) | BIT(1);
+ 		phyck_div = 0x0;
+ 		phyck_sel = 0x0;
+-		xfi_rx_mode = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++		xfi_rx_mode = downstream_10g ?
+ 			      AIROHA_PCS_PMA_XFI_RX_MODE_10G3 :
+ 			      AIROHA_PCS_PMA_XFI_RX_MODE_3G12;
+ 	} else {
+@@ -1225,7 +1261,8 @@ static void an7581_pcs_rx_bringup(struct
+ 
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
+ 		regmap_write(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
+-			     priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x100 : 0x300);
++			     airoha_pcs_pon_mode_has_10g_downstream(priv->pon_mode) ?
++			     0x100 : 0x300);
+ 		regmap_update_bits(priv->pcs_ana, AIROHA_PCS_ANA_PXP_RX_BUSBIT_SEL,
+ 				   AIROHA_PCS_ANA_RX_BUSBIT_SEL_FORCE |
+ 				   AIROHA_PCS_ANA_RX_BUSBIT_SEL,
+@@ -1729,9 +1766,15 @@ static void an7581_pcs_rx_prcal(struct a
+ 	u32 cyclecnt;
+ 
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
+-		target_fl_out = 0xa49a;
+-		target_begin = 0xa436;
+-		target_end = 0xa4ff;
++		if (airoha_pcs_pon_mode_is_epon(priv->pon_mode)) {
++			target_fl_out = 0x9edf;
++			target_begin = 0x9e7a;
++			target_end = 0x9f43;
++		} else {
++			target_fl_out = 0xa49a;
++			target_begin = 0xa436;
++			target_end = 0xa4ff;
++		}
+ 		cyclecnt = 0x7fff;
+ 	} else {
+ 		switch (interface) {
+@@ -1960,6 +2003,32 @@ static void an7581_pcs_pon_tdc_on(struct
+ static void an7581_pcs_cdr_reset(struct airoha_pcs_priv *priv, int index,
+ 				 phy_interface_t interface, bool calibrate);
+ 
++int an7581_pcs_xpon_quiesce(struct airoha_pcs_priv *priv, int index)
++{
++	struct regmap *pcs_pma = priv->pcs_pma[index];
++	u32 reset_mask;
++
++	if (priv->pon_mode == AIROHA_PCS_PON_MODE_NONE)
++		return -EINVAL;
++
++	an7581_pcs_pon_tdc_off(priv, index);
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA |
++			   AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++
++	/* SDK XPON_DIG_reset_hold(): hold PMA, TX/RX and both FIFOs. */
++	reset_mask = AIROHA_PCS_PMA_SW_TX_FIFO_RST_N |
++		     AIROHA_PCS_PMA_SW_REF_RST_N |
++		     AIROHA_PCS_PMA_SW_ALLPCS_RST_N |
++		     AIROHA_PCS_PMA_SW_PMA_RST_N |
++		     AIROHA_PCS_PMA_SW_TX_RST_N |
++		     AIROHA_PCS_PMA_SW_RX_RST_N |
++		     AIROHA_PCS_PMA_SW_RX_FIFO_RST_N;
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET, reset_mask);
++	return 0;
++}
++
+ int an7581_pcs_xgspon_rx_quiesce(struct airoha_pcs_priv *priv, int index)
+ {
+ 	struct regmap *pcs_pma = priv->pcs_pma[index];
+--- a/include/linux/pcs/pcs-airoha.h
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -4,7 +4,21 @@
+ 
+ struct phylink_pcs;
+ 
++enum airoha_pcs_xpon_mode {
++	AIROHA_PCS_XPON_MODE_GPON,
++	AIROHA_PCS_XPON_MODE_XGPON,
++	AIROHA_PCS_XPON_MODE_XGSPON,
++	AIROHA_PCS_XPON_MODE_EPON_10G_1G,
++	AIROHA_PCS_XPON_MODE_EPON_10G_10G,
++};
++
+ int airoha_pcs_xgspon_rx_quiesce(struct phylink_pcs *pcs);
+ int airoha_pcs_xgspon_rx_recover(struct phylink_pcs *pcs);
++int airoha_pcs_xpon_get_mode(struct phylink_pcs *pcs,
++			     enum airoha_pcs_xpon_mode *mode);
++int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs);
++int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
++			     enum airoha_pcs_xpon_mode mode);
++int airoha_pcs_xpon_recover(struct phylink_pcs *pcs);
+ 
+ #endif /* __LINUX_PCS_AIROHA_H */

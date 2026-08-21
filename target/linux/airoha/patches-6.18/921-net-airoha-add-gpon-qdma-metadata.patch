@@ -1,0 +1,161 @@
+Subject: [PATCH] net: airoha: add GPON QDMA metadata support
+
+Teach the Airoha Ethernet driver to encode and filter the GPON GEM and
+TCONT metadata carried by QDMA descriptors.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -559,6 +559,13 @@ struct airoha_gdm_dev {
+ 	struct airoha_gdm_port *port;
+ 	struct airoha_eth *eth;
+ 
++	/* GPON uses the QDMA special-tag and channel fields for GEM/TCONT. */
++	spinlock_t gpon_lock;
++	bool gpon_mode;
++	bool gpon_tx_ready;
++	u16 gpon_gem;
++	u8 gpon_channel;
++
+ 	DECLARE_BITMAP(qos_sq_bmap, AIROHA_NUM_QOS_CHANNELS);
+ 	/* qos stats counters */
+ 	u64 cpu_tx_packets;
+@@ -705,6 +712,8 @@ int airoha_get_fe_port(struct airoha_gdm
+ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+ 			     struct airoha_gdm_dev *dev);
+ 
++int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
++			bool valid);
+ extern struct mutex flow_offload_mutex;
+ 
+ static inline struct airoha_qdma *
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -943,6 +943,24 @@ static int airoha_qdma_rx_process(struct
+ 		if (FIELD_GET(QDMA_DESC_MORE_MASK, desc_ctrl))
+ 			continue;
+ 
++		if (dev->gpon_mode) {
++			unsigned long flags;
++			u32 msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
++			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
++			u16 configured_gem;
++			bool ready;
++
++			spin_lock_irqsave(&dev->gpon_lock, flags);
++			ready = dev->gpon_tx_ready;
++			configured_gem = dev->gpon_gem;
++			spin_unlock_irqrestore(&dev->gpon_lock, flags);
++
++			/* OMCI is not an Ethernet frame and must not enter the LAN stack. */
++			if ((msg0 & QDMA_ETH_TXMSG_OAM_MASK) ||
++			    !ready || gem != configured_gem)
++				goto drop_skb;
++		}
++
+ 		if (netdev_uses_dsa(netdev)) {
+ 			struct airoha_gdm_port *port = dev->port;
+ 
+@@ -978,6 +996,10 @@ static int airoha_qdma_rx_process(struct
+ 		napi_gro_receive(&q->napi, q->skb);
+ 		q->skb = NULL;
+ 		continue;
++drop_skb:
++		dev_kfree_skb(q->skb);
++		q->skb = NULL;
++		continue;
+ free_frag:
+ 		if (q->skb) {
+ 			dev_kfree_skb(q->skb);
+@@ -2562,6 +2574,8 @@ static netdev_tx_t airoha_dev_xmit(struc
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	u32 nr_frags, tag, msg0, msg1, len;
++	u16 gpon_gem = 0;
++	u8 gpon_channel = 0;
+ 	struct airoha_queue_entry *e;
+ 	struct airoha_qdma *qdma;
+ 	struct netdev_queue *txq;
+@@ -2574,13 +2587,27 @@ static netdev_tx_t airoha_dev_xmit(struc
+ 	u16 index;
+ 	u8 fport;
+ 
++	rcu_read_lock();
++	if (dev->gpon_mode) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&dev->gpon_lock, flags);
++		if (!dev->gpon_tx_ready) {
++			spin_unlock_irqrestore(&dev->gpon_lock, flags);
++			goto error;
++		}
++		gpon_gem = dev->gpon_gem;
++		gpon_channel = dev->gpon_channel;
++		spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	}
++
+-	rcu_read_lock();
+ 	qdma = rcu_dereference(dev->qdma);
+ 	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
+-	tag = airoha_get_dsa_tag(skb, netdev);
++	tag = dev->gpon_mode ? gpon_gem : airoha_get_dsa_tag(skb, netdev);
+ 
+-	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
+-			  qid / AIROHA_NUM_QOS_QUEUES) |
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, dev->gpon_mode ?
++			  gpon_channel :
++			  qid / AIROHA_NUM_QOS_QUEUES) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+ 			  qid % AIROHA_NUM_QOS_QUEUES) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
+@@ -3886,6 +3914,9 @@ static int airoha_alloc_gdm_device(struc
+ 	dev->port = port;
+ 	dev->eth = eth;
+ 	dev->nbq = nbq;
++	spin_lock_init(&dev->gpon_lock);
++	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
++	dev->gpon_tx_ready = false;
+ 	port->devs[index] = dev;
+ 
+ 	return airoha_setup_phylink(netdev);
+@@ -4192,6 +4223,40 @@ static void airoha_remove(struct platfor
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
++int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
++			bool valid)
++{
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!np || gem > 0xfff || channel > 0x1f)
++		return -EINVAL;
++
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	dev->gpon_tx_ready = false;
++	dev->gpon_gem = gem;
++	dev->gpon_channel = channel;
++	dev->gpon_tx_ready = valid;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_gpon_set_gem);
++
+ static const char * const en7581_xsi_rsts_names[] = {
+ 	"hsi0-mac",
+ 	"hsi1-mac",

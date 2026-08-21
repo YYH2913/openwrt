@@ -1,0 +1,101 @@
+From: OpenWrt XPON integration
+Subject: [PATCH] net: pcs: airoha: validate the live XPON mode
+
+The runtime XPON owner must not publish a protocol backend merely because the
+cached mode matches.  Export a validation helper which proves the live SCU
+WAN selector, the full SDK-derived PMA mode fingerprint, released MAC stop
+bits and released XPON digital resets under the PCS recovery lock.
+
+This lets initial backend claim, forward switching and rollback reject stale
+or partially restored hardware before MAC traffic and interrupts are exposed.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1328,6 +1328,77 @@ int airoha_pcs_xpon_get_mode(struct phyl
+ }
+ EXPORT_SYMBOL_GPL(airoha_pcs_xpon_get_mode);
+ 
++int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,
++				   enum airoha_pcs_xpon_mode mode)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	struct airoha_pcs_maps *maps;
++	enum airoha_pcs_pon_mode internal;
++	u32 reset_mask, stop_mask;
++	u32 expected, value;
++	int ret;
++
++	ret = airoha_pcs_xpon_mode_from_public(mode, &internal);
++	if (ret)
++		return ret;
++	ret = airoha_pcs_xpon_wan_sel(internal, &expected);
++	if (ret)
++		return ret;
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++	maps = &priv->maps[port->index];
++	stop_mask = AIROHA_PCS_XFI_RXMPI_STOP |
++		    AIROHA_PCS_XFI_RXMBI_STOP |
++		    AIROHA_PCS_XFI_TXMPI_STOP |
++		    AIROHA_PCS_XFI_TXMBI_STOP;
++	reset_mask = AIROHA_PCS_PMA_SW_TX_FIFO_RST_N |
++		     AIROHA_PCS_PMA_SW_REF_RST_N |
++		     AIROHA_PCS_PMA_SW_ALLPCS_RST_N |
++		     AIROHA_PCS_PMA_SW_PMA_RST_N |
++		     AIROHA_PCS_PMA_SW_TX_RST_N |
++		     AIROHA_PCS_PMA_SW_RX_RST_N |
++		     AIROHA_PCS_PMA_SW_RX_FIFO_RST_N;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (priv->pon_mode != internal) {
++		ret = -EIO;
++		goto unlock;
++	}
++	ret = regmap_read(priv->scu, AIROHA_SCU_WAN_CONF, &value);
++	if (ret)
++		goto unlock;
++	if ((value & AIROHA_SCU_WAN_SEL) != expected) {
++		ret = -EIO;
++		goto unlock;
++	}
++	ret = airoha_pcs_xpon_verify_mode(priv, port->index, internal);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			  &value);
++	if (ret)
++		goto unlock;
++	if (value & stop_mask) {
++		ret = -EIO;
++		goto unlock;
++	}
++	ret = regmap_read(priv->pcs_pma[port->index],
++			  AIROHA_PCS_PMA_SW_RST_SET, &value);
++	if (ret)
++		goto unlock;
++	if ((value & reset_mask) != reset_mask)
++		ret = -EIO;
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_validate_mode);
++
+ int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs)
+ {
+ 	struct airoha_pcs_port *port;
+--- a/include/linux/pcs/pcs-airoha.h
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -17,5 +17,7 @@ int airoha_pcs_xgspon_rx_recover(struct
+ int airoha_pcs_xpon_get_mode(struct phylink_pcs *pcs,
+ 			     enum airoha_pcs_xpon_mode *mode);
++int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,
++				   enum airoha_pcs_xpon_mode mode);
+ int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs);
+ int airoha_pcs_xpon_select_wan(struct phylink_pcs *pcs,
+ 			       enum airoha_pcs_xpon_mode mode);

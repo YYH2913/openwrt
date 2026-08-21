@@ -1,0 +1,588 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Sat, 15 Aug 2026 16:00:00 +0800
+Subject: [PATCH] net: airoha: add dedicated EPON OAM consumer
+
+Route EPON OAM frames through a dedicated RCU consumer instead of OMCI.
+Preserve the SDK LLID metadata contract and transmit OAM on queue 7 with
+matching channel/NBOQ. Keep GPON OMCI, XGS OMCC and EPON OAM ownership
+mutually exclusive and require a live OAM consumer before exposing LLIDs.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -36,6 +36,7 @@
+ 	struct airoha_gdm_dev *dev;
+ 	bool omcc;
+ 	bool xgs_omcc;
++	bool epon_oam;
+ 	bool epon_data;
+ 	bool no_mic;
+ 	u8 channel;
+@@ -55,6 +56,17 @@
+ 	return present;
+ }
+ 
++static bool airoha_epon_oam_consumer_present(struct airoha_gdm_dev *dev)
++{
++	bool present;
++
++	rcu_read_lock();
++	present = rcu_access_pointer(dev->epon_oam_consumer);
++	rcu_read_unlock();
++
++	return present;
++}
++
+ static void airoha_xgs_omcc_receive(struct airoha_gdm_dev *dev,
+ 				    struct sk_buff *skb, u16 gem,
+ 				    bool no_mic)
+@@ -74,6 +86,26 @@
+ 	rcu_read_unlock();
+ }
+ 
++static void airoha_epon_oam_receive(struct airoha_gdm_dev *dev,
++				    struct sk_buff *skb, u8 llid_index,
++				    u16 llid, bool no_mic)
++{
++	struct airoha_epon_oam_metadata metadata = {
++		.llid_index = llid_index,
++		.llid = llid,
++		.no_mic = no_mic,
++	};
++	struct airoha_epon_oam_consumer *consumer;
++
++	rcu_read_lock();
++	consumer = rcu_dereference(dev->epon_oam_consumer);
++	if (consumer)
++		consumer->ops->receive(consumer->context, skb, &metadata);
++	else
++		dev_kfree_skb_any(skb);
++	rcu_read_unlock();
++}
++
+ static void airoha_xgs_omcc_detach(struct airoha_gdm_dev *dev)
+ {
+ 	struct airoha_xgs_omcc_consumer *consumer;
+@@ -89,6 +121,21 @@
+ 	}
+ }
+ 
++static void airoha_epon_oam_detach(struct airoha_gdm_dev *dev)
++{
++	struct airoha_epon_oam_consumer *consumer;
++
++	mutex_lock(&dev->epon_oam_lock);
++	consumer = rcu_dereference_protected(dev->epon_oam_consumer,
++					     lockdep_is_held(&dev->epon_oam_lock));
++	RCU_INIT_POINTER(dev->epon_oam_consumer, NULL);
++	mutex_unlock(&dev->epon_oam_lock);
++	if (consumer) {
++		synchronize_net();
++		kfree(consumer);
++	}
++}
++
+ static const struct airoha_xgs_service_xgem *
+ airoha_xgs_find_xgem(struct airoha_gdm_dev *dev, u16 xgem_id,
+ 		     u8 direction)
+@@ -991,6 +1038,7 @@
+ 		struct net_device *netdev;
+ 		bool omci = false;
+ 		bool xgs_omcc = false;
++		bool epon_oam = false;
+ 		bool epon_data = false;
+ 		bool no_mic = false;
+ 		int data_len, len;
+@@ -1036,6 +1084,7 @@
+ 
+ 				omci = cb->omcc;
+ 				xgs_omcc = cb->xgs_omcc;
++				epon_oam = cb->epon_oam;
+ 				epon_data = cb->epon_data;
+ 				no_mic = cb->no_mic;
+ 				gpon_gem = cb->gem;
+@@ -1047,15 +1096,15 @@
+ 				omci = true;
+ 				gpon_gem = gem;
+ 				spin_lock_irqsave(&dev->epon_service_state_lock, flags);
+-				ready = !dev->epon_llid_mask;
++				epon_oam = !!(dev->epon_llid_mask & BIT(channel));
+ 				spin_unlock_irqrestore(&dev->epon_service_state_lock,
+ 						       flags);
+-				xgs_omcc = ready &&
+-					airoha_xgs_omcc_consumer_present(dev);
+-				if (!ready) {
+-					/* EPON OAM has a separate consumer; never use OMCI. */
+-					ready = false;
+-				} else if (xgs_omcc) {
++				epon_oam = epon_oam &&
++					airoha_epon_oam_consumer_present(dev);
++				ready = epon_oam;
++				if (!epon_oam)
++					xgs_omcc = airoha_xgs_omcc_consumer_present(dev);
++				if (epon_oam || xgs_omcc) {
+ 					ready = true;
+ 					no_mic = !!(msg0 & QDMA_ETH_RXMSG_NO_MIC_MASK);
+ 				} else {
+@@ -1098,9 +1148,10 @@
+ 				}
+ 			}
+ 
+-			if (!ready || (omci && !xgs_omcc && !dev->omci_dev))
++			if (!ready || (omci && !xgs_omcc && !epon_oam &&
++				       !dev->omci_dev))
+ 				goto free_frag;
+-			if (omci && !xgs_omcc)
++			if (omci && !xgs_omcc && !epon_oam)
+ 				netdev = dev->omci_dev;
+ 		}
+ 		if (!q->skb) { /* first buffer */
+@@ -1115,6 +1166,7 @@
+ 				cb->dev = dev;
+ 				cb->omcc = omci;
+ 				cb->xgs_omcc = xgs_omcc;
++				cb->epon_oam = epon_oam;
+ 				cb->epon_data = epon_data;
+ 				cb->no_mic = no_mic;
+ 				cb->channel = FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
+@@ -1176,7 +1228,11 @@
+ 					     false);
+ 
+ 		done++;
+-		if (xgs_omcc) {
++		if (epon_oam) {
++			airoha_epon_oam_receive(dev, q->skb,
++						AIROHA_PON_RX_CB(q->skb)->channel,
++					  gpon_gem, no_mic);
++		} else if (xgs_omcc) {
+ 			airoha_xgs_omcc_receive(dev, q->skb, gpon_gem, no_mic);
+ 		} else if (omci) {
+ 			netdev->stats.rx_packets++;
+@@ -4365,6 +4421,7 @@
+ 	spin_lock_init(&dev->xgs_service_state_lock);
+ 	mutex_init(&dev->epon_service_lock);
+ 	spin_lock_init(&dev->epon_service_state_lock);
++	mutex_init(&dev->epon_oam_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
+ 	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
+@@ -4622,6 +4679,7 @@
+ 				continue;
+ 
+ 			airoha_xgs_omcc_detach(dev);
++			airoha_epon_oam_detach(dev);
+ 			netdev = netdev_from_priv(dev);
+ 			if (dev->omci_dev &&
+ 			    dev->omci_dev->reg_state == NETREG_REGISTERED)
+@@ -4665,6 +4723,7 @@
+ 				continue;
+ 
+ 			airoha_xgs_omcc_detach(dev);
++			airoha_epon_oam_detach(dev);
+ 			netdev = netdev_from_priv(dev);
+ 			if (dev->omci_dev)
+ 				unregister_netdev(dev->omci_dev);
+@@ -4878,6 +4937,7 @@
+ 	}
+ 
+ 	mutex_lock(&dev->xgs_omcc_lock);
++	mutex_lock(&dev->epon_oam_lock);
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	gpon_ready = dev->gpon_omcc_ready;
+ 	spin_unlock_irqrestore(&dev->gpon_lock, flags);
+@@ -4885,12 +4945,15 @@
+ 	if (dev->epon_llid_mask)
+ 		ret = -EBUSY;
+ 	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
+-	if (!ret && rcu_access_pointer(dev->xgs_omcc_consumer))
++	if (!ret && rcu_access_pointer(dev->epon_oam_consumer))
++		ret = -EBUSY;
++	else if (!ret && rcu_access_pointer(dev->xgs_omcc_consumer))
+ 		ret = -EBUSY;
+ 	else if (!ret && gpon_ready)
+ 		ret = -EBUSY;
+ 	else if (!ret)
+ 		rcu_assign_pointer(dev->xgs_omcc_consumer, consumer);
++	mutex_unlock(&dev->epon_oam_lock);
+ 	mutex_unlock(&dev->xgs_omcc_lock);
+ put:
+ 	put_device(&netdev->dev);
+@@ -4931,6 +4994,265 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_xgs_omcc_unregister);
+ 
++static int airoha_epon_oam_transmit_skb(struct net_device *netdev,
++					struct sk_buff *skb,
++					const struct airoha_epon_oam_tx_metadata *metadata)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_queue_entry *entry, *next_entry;
++	struct airoha_qdma *qdma;
++	struct airoha_queue *q;
++	struct netdev_queue *txq;
++	dma_addr_t addr;
++	u32 msg0, msg1;
++	u16 qid, index, next_index;
++
++	if (!metadata || !skb->len ||
++	    skb->len > FIELD_MAX(QDMA_DESC_LEN_MASK) ||
++	    metadata->llid_index >= AIROHA_EPON_LLID_COUNT)
++		return -ERANGE;
++	if (!dev->gpon_mode)
++		return -EOPNOTSUPP;
++
++	rcu_read_lock();
++	qdma = rcu_dereference(dev->qdma);
++	if (!qdma) {
++		rcu_read_unlock();
++		return -ENODEV;
++	}
++	qid = airoha_qdma_get_txq(qdma, AIROHA_NUM_QOS_QUEUES - 1);
++	q = &qdma->q_tx[qid];
++	if (WARN_ON_ONCE(!q->ndesc)) {
++		rcu_read_unlock();
++		return -ENODEV;
++	}
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, metadata->llid_index) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
++			  AIROHA_NUM_QOS_QUEUES - 1) |
++	       QDMA_ETH_TXMSG_OAM_MASK;
++	msg1 = QDMA_ETH_TXMSG_NO_DROP |
++	       FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, metadata->llid_index) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, airoha_get_fe_port(dev)) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
++
++	spin_lock_bh(&q->lock);
++	skb_set_queue_mapping(skb, AIROHA_NUM_QOS_QUEUES - 1);
++	txq = skb_get_tx_queue(netdev, skb);
++	if (q->queued >= q->ndesc - 1) {
++		netif_tx_stop_queue(txq);
++		q->txq_stopped = true;
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++		return -EAGAIN;
++	}
++	entry = list_first_entry(&q->tx_list, struct airoha_queue_entry, list);
++	index = entry - q->entry;
++	addr = dma_map_single(netdev->dev.parent, skb->data, skb->len,
++			      DMA_TO_DEVICE);
++	if (dma_mapping_error(netdev->dev.parent, addr)) {
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++		return -ENOMEM;
++	}
++	list_move_tail(&entry->list, &q->tx_list);
++	next_entry = list_first_entry(&q->tx_list,
++				      struct airoha_queue_entry, list);
++	next_index = next_entry - q->entry;
++	entry->skb = skb;
++	entry->dma_addr = addr;
++	entry->dma_len = skb->len;
++	WRITE_ONCE(q->desc[index].ctrl,
++		   cpu_to_le32(FIELD_PREP(QDMA_DESC_LEN_MASK, skb->len)));
++	WRITE_ONCE(q->desc[index].addr, cpu_to_le32(addr));
++	WRITE_ONCE(q->desc[index].data,
++		   cpu_to_le32(FIELD_PREP(QDMA_DESC_NEXT_ID_MASK, next_index)));
++	WRITE_ONCE(q->desc[index].msg0, cpu_to_le32(msg0));
++	WRITE_ONCE(q->desc[index].msg1, cpu_to_le32(msg1));
++	WRITE_ONCE(q->desc[index].msg2, cpu_to_le32(0xffff));
++	q->queued++;
++	skb_tx_timestamp(skb);
++	netdev_tx_sent_queue(txq, skb->len);
++	if (q->ndesc - q->queued < q->free_thr) {
++		netif_tx_stop_queue(txq);
++		q->txq_stopped = true;
++	}
++	airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid), TX_RING_CPU_IDX_MASK,
++			FIELD_PREP(TX_RING_CPU_IDX_MASK, next_index));
++	spin_unlock_bh(&q->lock);
++	rcu_read_unlock();
++	return 0;
++}
++
++int airoha_epon_oam_transmit(struct device_node *np, const u8 *data,
++			     size_t len,
++			     const struct airoha_epon_oam_tx_metadata *metadata)
++{
++	struct net_device *netdev;
++	struct airoha_gdm_dev *dev;
++	struct sk_buff *skb = NULL;
++	unsigned long flags;
++	size_t skb_len;
++	bool ready;
++	int ret;
++
++	if (!np || !data || !metadata || !len ||
++	    len > FIELD_MAX(QDMA_DESC_LEN_MASK) ||
++	    metadata->llid_index >= AIROHA_EPON_LLID_COUNT)
++		return -EINVAL;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	skb_len = max_t(size_t, len, ETH_ZLEN);
++	mutex_lock(&dev->epon_service_lock);
++	mutex_lock(&dev->epon_oam_lock);
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	ready = dev->epon_llid_mask & BIT(metadata->llid_index);
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (!rcu_access_pointer(dev->epon_oam_consumer)) {
++		ret = -ENODEV;
++	} else if (!ready) {
++		ret = -EHOSTDOWN;
++	} else {
++		skb = alloc_skb(skb_len, GFP_KERNEL);
++		if (!skb) {
++			ret = -ENOMEM;
++		} else {
++			skb_put_data(skb, data, len);
++			if (len < skb_len)
++				skb_put_zero(skb, skb_len - len);
++			skb->dev = netdev;
++			ret = airoha_epon_oam_transmit_skb(netdev, skb, metadata);
++		}
++	}
++	mutex_unlock(&dev->epon_oam_lock);
++	mutex_unlock(&dev->epon_service_lock);
++	if (ret && skb)
++		dev_kfree_skb_any(skb);
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_epon_oam_transmit);
++
++bool airoha_epon_oam_tx_available(struct device_node *np)
++{
++	struct net_device *netdev;
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct airoha_queue *q;
++	unsigned long flags;
++	bool available = false, registered;
++	u16 qid;
++
++	if (!np)
++		return false;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return false;
++	dev = netdev_priv(netdev);
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	registered = dev->epon_llid_mask != 0;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	rcu_read_lock();
++	if (registered && rcu_access_pointer(dev->epon_oam_consumer)) {
++		qdma = rcu_dereference(dev->qdma);
++		if (qdma) {
++			qid = airoha_qdma_get_txq(qdma,
++						  AIROHA_NUM_QOS_QUEUES - 1);
++			q = &qdma->q_tx[qid];
++			spin_lock_bh(&q->lock);
++			available = q->ndesc && q->queued < q->ndesc - 1;
++			spin_unlock_bh(&q->lock);
++		}
++	}
++	rcu_read_unlock();
++	put_device(&netdev->dev);
++	return available;
++}
++EXPORT_SYMBOL_GPL(airoha_epon_oam_tx_available);
++
++int airoha_epon_oam_register(struct device_node *np,
++			     const struct airoha_epon_oam_ops *ops,
++			     void *context)
++{
++	struct airoha_epon_oam_consumer *consumer;
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned long flags;
++	bool gpon_ready, xgs_active;
++	int ret = 0;
++
++	if (!np || !ops || !ops->receive || !context)
++		return -EINVAL;
++	consumer = kzalloc(sizeof(*consumer), GFP_KERNEL);
++	if (!consumer)
++		return -ENOMEM;
++	consumer->ops = ops;
++	consumer->context = context;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev) {
++		ret = -ENODEV;
++		goto free;
++	}
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto put;
++	}
++
++	mutex_lock(&dev->xgs_omcc_lock);
++	mutex_lock(&dev->epon_oam_lock);
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	gpon_ready = dev->gpon_tx_ready || dev->gpon_omcc_ready;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	xgs_active = dev->xgs_service_active;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	if (rcu_access_pointer(dev->epon_oam_consumer) ||
++	    rcu_access_pointer(dev->xgs_omcc_consumer) || gpon_ready || xgs_active)
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(dev->epon_oam_consumer, consumer);
++	mutex_unlock(&dev->epon_oam_lock);
++	mutex_unlock(&dev->xgs_omcc_lock);
++put:
++	put_device(&netdev->dev);
++free:
++	if (ret)
++		kfree(consumer);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_epon_oam_register);
++
++void airoha_epon_oam_unregister(struct device_node *np, void *context)
++{
++	struct airoha_epon_oam_consumer *consumer = NULL;
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++
++	if (!np || !context)
++		return;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return;
++	dev = netdev_priv(netdev);
++	mutex_lock(&dev->epon_oam_lock);
++	consumer = rcu_dereference_protected(dev->epon_oam_consumer,
++					     lockdep_is_held(&dev->epon_oam_lock));
++	if (consumer && consumer->context == context)
++		RCU_INIT_POINTER(dev->epon_oam_consumer, NULL);
++	else
++		consumer = NULL;
++	mutex_unlock(&dev->epon_oam_lock);
++	put_device(&netdev->dev);
++	if (consumer) {
++		synchronize_net();
++		kfree(consumer);
++	}
++}
++EXPORT_SYMBOL_GPL(airoha_epon_oam_unregister);
++
+ static int airoha_xgs_validate_service(
+ 	const struct airoha_xgs_service_config *config,
+ 	unsigned long *channels)
+@@ -5061,6 +5377,13 @@
+ 	/* Keep the selected QDMA stable while programming shared service state. */
+ 	mutex_lock(&flow_offload_mutex);
+ 	mutex_lock(&dev->xgs_service_lock);
++	mutex_lock(&dev->epon_oam_lock);
++	if ((config->tcont_count || config->xgem_count) &&
++	    rcu_access_pointer(dev->epon_oam_consumer))
++		ret = -EBUSY;
++	mutex_unlock(&dev->epon_oam_lock);
++	if (ret)
++		goto unlock;
+ 	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
+ 	if (dev->epon_llid_mask &&
+ 	    (config->tcont_count || config->xgem_count))
+@@ -5228,8 +5551,12 @@
+ 	if (ret)
+ 		goto unlock;
+ 	mutex_lock(&dev->xgs_omcc_lock);
+-	if (llid_mask && rcu_access_pointer(dev->xgs_omcc_consumer))
++	mutex_lock(&dev->epon_oam_lock);
++	if (llid_mask && !rcu_access_pointer(dev->epon_oam_consumer))
++		ret = -ENODEV;
++	else if (llid_mask && rcu_access_pointer(dev->xgs_omcc_consumer))
+ 		ret = -EBUSY;
++	mutex_unlock(&dev->epon_oam_lock);
+ 	mutex_unlock(&dev->xgs_omcc_lock);
+ 	if (ret)
+ 		goto unlock;
+@@ -5646,10 +5973,15 @@
+ 	}
+ 
+ 	mutex_lock(&dev->xgs_omcc_lock);
++	mutex_lock(&dev->epon_oam_lock);
+ 	if (valid && rcu_access_pointer(dev->xgs_omcc_consumer)) {
+ 		ret = -EBUSY;
+ 		goto unlock;
+ 	}
++	if (valid && rcu_access_pointer(dev->epon_oam_consumer)) {
++		ret = -EBUSY;
++		goto unlock;
++	}
+ 	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
+ 	if (valid && dev->epon_llid_mask)
+ 		ret = -EBUSY;
+@@ -5668,6 +6000,7 @@
+ 		netif_carrier_off(dev->omci_dev);
+ 
+ unlock:
++	mutex_unlock(&dev->epon_oam_lock);
+ 	mutex_unlock(&dev->xgs_omcc_lock);
+ out:
+ 	put_device(&netdev->dev);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -645,11 +645,32 @@
+ 	u8 mic_idx;
+ };
+ 
++struct airoha_epon_oam_metadata {
++	u8 llid_index;
++	u16 llid;
++	bool no_mic;
++};
++
++struct airoha_epon_oam_ops {
++	/* Called from NAPI and consumes skb in all cases. */
++	void (*receive)(void *context, struct sk_buff *skb,
++			const struct airoha_epon_oam_metadata *metadata);
++};
++
++struct airoha_epon_oam_tx_metadata {
++	u8 llid_index;
++};
++
+ struct airoha_xgs_omcc_consumer {
+ 	const struct airoha_xgs_omcc_ops *ops;
+ 	void *context;
+ };
+ 
++struct airoha_epon_oam_consumer {
++	const struct airoha_epon_oam_ops *ops;
++	void *context;
++};
++
+ struct airoha_gdm_dev {
+ 	struct airoha_qdma __rcu *qdma;
+ 	struct airoha_gdm_port *port;
+@@ -675,6 +696,9 @@
+ 	u16 xgs_pse_rsv_baseline[AIROHA_XGS_SERVICE_MAX_TCONTS];
+ 	struct mutex epon_service_lock;
+ 	spinlock_t epon_service_state_lock;
++	/* Protects epon_oam_consumer. */
++	struct mutex epon_oam_lock;
++	struct airoha_epon_oam_consumer __rcu *epon_oam_consumer;
+ 	u32 epon_llid_mask;
+ 	u32 epon_report_fec_mask;
+ 	bool epon_resource_baseline_valid;
+@@ -867,6 +890,14 @@
+ int airoha_epon_qdma_llids_apply(struct device_node *np, u32 llid_mask,
+ 				 u32 report_fec_mask);
+ int airoha_epon_qdma_llids_clear(struct device_node *np);
++int airoha_epon_oam_register(struct device_node *np,
++			     const struct airoha_epon_oam_ops *ops,
++			     void *context);
++void airoha_epon_oam_unregister(struct device_node *np, void *context);
++int airoha_epon_oam_transmit(struct device_node *np, const u8 *data,
++			     size_t len,
++			     const struct airoha_epon_oam_tx_metadata *metadata);
++bool airoha_epon_oam_tx_available(struct device_node *np);
+ extern struct mutex flow_offload_mutex;
+ 
+ static inline struct airoha_qdma *

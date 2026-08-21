@@ -1,0 +1,38 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Fri, 14 Aug 2026 02:05:00 +0800
+Subject: [PATCH] net: airoha: reserve all XGS service QDMA channels
+
+The normal Ethernet queue-selection path intentionally exposes four QoS
+channels, while XGS-PON service descriptors, QDMA scheduling and GDM2 support
+the full five-bit channel space.  Track ownership across all 32 hardware
+channels so XGS transactions cannot collide with ordinary QoS channels.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -26,7 +26,10 @@
+ #define AIROHA_MAX_MTU			9220
+ #define AIROHA_MAX_RX_SIZE		16128
+ #define AIROHA_MAX_PACKET_SIZE		2048
+ #define AIROHA_NUM_QOS_CHANNELS		4
++/* Linux Ethernet QoS selects 0..3; PON metadata supports 0..31. */
++#define AIROHA_QDMA_SERVICE_CHANNELS	32
++
+ #define AIROHA_NUM_QOS_QUEUES		8
+ #define AIROHA_NUM_TX_RING		32
+ #define AIROHA_NUM_RX_RING		32
+@@ -549,7 +552,7 @@ struct airoha_qdma {
+ 	struct airoha_queue q_tx[AIROHA_NUM_TX_RING];
+ 	struct airoha_queue q_rx[AIROHA_NUM_RX_RING];
+ 
+-	DECLARE_BITMAP(qos_channel_map, AIROHA_NUM_QOS_CHANNELS);
++	DECLARE_BITMAP(qos_channel_map, AIROHA_QDMA_SERVICE_CHANNELS);
+ };
+ 
+ enum airoha_priv_flags {
+-- 
+2.43.0

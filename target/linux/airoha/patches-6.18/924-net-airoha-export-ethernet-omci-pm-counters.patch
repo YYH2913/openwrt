@@ -1,0 +1,153 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 05:00:00 +0800
+Subject: [PATCH] net: airoha: export Ethernet counters for OMCI PM
+
+Keep the GDM MIB counters split by NBQ and expose the counters needed by
+G.988 Ethernet performance monitoring through a root-only netdev sysfs
+attribute.  Keep runt frames separate from the exact 64-octet bucket so the
+two OMCI counters are not conflated.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 120 ++++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_eth.h |   2 +
+ 2 files changed, 119 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -244,9 +244,11 @@ struct airoha_hw_stats {
+ 	/* ethtool stats */
+ 	u64 tx_broadcast;
+ 	u64 tx_multicast;
++	u64 tx_runt;
+ 	u64 tx_len[7];
+ 	u64 rx_broadcast;
+ 	u64 rx_fragment;
+ 	u64 rx_jabber;
++	u64 rx_runt;
+ 	u64 rx_len[7];
+ };
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1962,7 +1962,7 @@ static void airoha_dev_get_hw_stats(stru
+ 	dev->stats.tx_multicast += val;
+ 
+ 	val = airoha_fe_rr(eth, REG_FE_GDM_TX_ETH_RUNT_CNT(port->id));
+-	dev->stats.tx_len[i] += val;
++	dev->stats.tx_runt += val;
+ 
+ 	val = airoha_fe_rr(eth, REG_FE_GDM_TX_ETH_E64_CNT_H(port->id));
+ 	dev->stats.tx_len[i] += ((u64)val << 32);
+@@ -2029,7 +2029,7 @@ static void airoha_dev_get_hw_stats(stru
+ 
+ 	i = 0;
+ 	val = airoha_fe_rr(eth, REG_FE_GDM_RX_ETH_RUNT_CNT(port->id));
+-	dev->stats.rx_len[i] += val;
++	dev->stats.rx_runt += val;
+ 
+ 	val = airoha_fe_rr(eth, REG_FE_GDM_RX_ETH_E64_CNT_H(port->id));
+ 	dev->stats.rx_len[i] += ((u64)val << 32);
+@@ -2839,7 +2839,7 @@ static void airoha_ethtool_get_mac_stats
+ }
+ 
+ static const struct ethtool_rmon_hist_range airoha_ethtool_rmon_ranges[] = {
+-	{    0,    64 },
++	{   64,    64 },
+ 	{   65,   127 },
+ 	{  128,   255 },
+ 	{  256,   511 },
+@@ -2874,5 +2874,7 @@ airoha_ethtool_get_rmon_stats(struct net
+ 
+ 		start = u64_stats_fetch_begin(&dev->stats.syncp);
++		stats->undersize_pkts = hw_stats->rx_runt;
++		stats->oversize_pkts = hw_stats->rx_len[6];
+ 		stats->fragments = hw_stats->rx_fragment;
+ 		stats->jabbers = hw_stats->rx_jabber;
+ 		for (i = 0; i < ARRAY_SIZE(airoha_ethtool_rmon_ranges) - 1;
+@@ -2883,6 +2885,76 @@ airoha_ethtool_get_rmon_stats(struct net
+ 	} while (u64_stats_fetch_retry(&dev->stats.syncp, start));
+ }
+ 
++static ssize_t omci_pm_counters_show(struct device *device,
++				     struct device_attribute *attr, char *buf)
++{
++	struct net_device *netdev = to_net_dev(device);
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_hw_stats stats;
++	unsigned int start;
++
++	airoha_update_hw_stats(dev);
++	do {
++		start = u64_stats_fetch_begin(&dev->stats.syncp);
++		stats = dev->stats;
++	} while (u64_stats_fetch_retry(&dev->stats.syncp, start));
++
++	return sysfs_emit(buf,
++		"rx_frames=%llu rx_octets=%llu rx_drop_events=%llu "
++		"rx_broadcast_frames=%llu rx_multicast_frames=%llu "
++		"rx_crc_errors=%llu rx_buffer_overflows=%llu "
++		"rx_internal_errors=%llu rx_undersize_frames=%llu "
++		"rx_fragments=%llu rx_jabbers=%llu rx_oversize_frames=%llu "
++		"rx_64=%llu rx_65_127=%llu rx_128_255=%llu "
++		"rx_256_511=%llu rx_512_1023=%llu rx_1024_1518=%llu "
++		"tx_frames=%llu tx_octets=%llu tx_drop_events=%llu "
++		"tx_broadcast_frames=%llu tx_multicast_frames=%llu "
++		"tx_crc_errors=0 tx_buffer_overflows=%llu "
++		"tx_internal_errors=0 tx_undersize_frames=%llu "
++		"tx_fragments=0 tx_jabbers=0 tx_oversize_frames=%llu "
++		"tx_64=%llu tx_65_127=%llu tx_128_255=%llu "
++		"tx_256_511=%llu tx_512_1023=%llu tx_1024_1518=%llu\n",
++		(unsigned long long)stats.rx_ok_pkts,
++		(unsigned long long)stats.rx_ok_bytes,
++		(unsigned long long)stats.rx_drops,
++		(unsigned long long)stats.rx_broadcast,
++		(unsigned long long)stats.rx_multicast,
++		(unsigned long long)stats.rx_crc_error,
++		(unsigned long long)stats.rx_over_errors,
++		(unsigned long long)stats.rx_errors,
++		(unsigned long long)stats.rx_runt,
++		(unsigned long long)stats.rx_fragment,
++		(unsigned long long)stats.rx_jabber,
++		(unsigned long long)stats.rx_len[6],
++		(unsigned long long)stats.rx_len[0],
++		(unsigned long long)stats.rx_len[1],
++		(unsigned long long)stats.rx_len[2],
++		(unsigned long long)stats.rx_len[3],
++		(unsigned long long)stats.rx_len[4],
++		(unsigned long long)stats.rx_len[5],
++		(unsigned long long)stats.tx_ok_pkts,
++		(unsigned long long)stats.tx_ok_bytes,
++		(unsigned long long)stats.tx_drops,
++		(unsigned long long)stats.tx_broadcast,
++		(unsigned long long)stats.tx_multicast,
++		(unsigned long long)stats.tx_drops,
++		(unsigned long long)stats.tx_runt,
++		(unsigned long long)stats.tx_len[6],
++		(unsigned long long)stats.tx_len[0],
++		(unsigned long long)stats.tx_len[1],
++		(unsigned long long)stats.tx_len[2],
++		(unsigned long long)stats.tx_len[3],
++		(unsigned long long)stats.tx_len[4],
++		(unsigned long long)stats.tx_len[5]);
++}
++static DEVICE_ATTR(omci_pm_counters, 0400, omci_pm_counters_show, NULL);
++
++static struct attribute *airoha_netdev_attrs[] = {
++	&dev_attr_omci_pm_counters.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(airoha_netdev);
++
+ static int
+ airoha_ethtool_get_link_ksettings(struct net_device *netdev,
+ 				  struct ethtool_link_ksettings *cmd)
+@@ -3998,6 +4111,7 @@ static int airoha_alloc_gdm_device(struc
+ 	netdev->max_mtu = AIROHA_MAX_MTU;
+ 	netdev->watchdog_timeo = 5 * HZ;
+ 	netdev->hw_features = AIROHA_HW_FEATURES | NETIF_F_LRO;
++	netdev->sysfs_groups[0] = airoha_netdev_groups[0];
+ 	netdev->features |= AIROHA_HW_FEATURES;
+ 	netdev->vlan_features = AIROHA_HW_FEATURES;
+ 	SET_NETDEV_DEV(netdev, eth->dev);
+-- 
+2.43.0

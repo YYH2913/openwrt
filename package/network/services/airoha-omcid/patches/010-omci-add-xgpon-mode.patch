@@ -1,0 +1,223 @@
+diff --git a/cmd/airoha-omcid/main.go b/cmd/airoha-omcid/main.go
+index 837e7b7..411c194 100644
+--- a/cmd/airoha-omcid/main.go
++++ b/cmd/airoha-omcid/main.go
+@@ -103,7 +103,7 @@ func main() {
+ 	flag.StringVar(&opts.onu3StatePath, "onu3-state", "", "persistent platform document used to restore ONU3-G snapshots")
+ 	flag.StringVar(&opts.runtimeStatePath, "runtime-state", "", "persistent alarm, ARC and performance runtime state")
+ 	flag.UintVar(&opts.restartReason, "restart-reason", 0, "G.988 ONU3-G latest restart reason (0..255)")
+-	flag.StringVar(&opts.ponMode, "pon-mode", string(pon.GPON), "PON protocol mode: gpon or xgspon")
++	flag.StringVar(&opts.ponMode, "pon-mode", string(pon.GPON), "PON protocol mode: gpon, xgpon or xgspon")
+ 	flag.StringVar(&opts.transportBackend, "transport", "packet", "OMCC transport: packet or device")
+ 	flag.StringVar(&opts.devicePath, "device", "/dev/airoha-xgs-omcc", "secure OMCC character device")
+ 	flag.Parse()
+@@ -180,8 +180,8 @@ func run(opts options) error {
+ 		return err
+ 	}
+ 	defer conn.Close()
+-	if mode == pon.XGSPON && !conn.Capabilities().SecureOMCC() {
+-		return errors.New("xgspon mode requires kernel-verified downstream and kernel-signed upstream OMCC")
++	if mode.IsXG() && !conn.Capabilities().SecureOMCC() {
++		return errors.New("XG-PON/XGS-PON mode requires kernel-verified downstream and kernel-signed upstream OMCC")
+ 	}
+ 
+ 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+@@ -214,7 +214,7 @@ func run(opts options) error {
+ 	var xgsOMCIEvidence status.XGSOMCIEvidence
+ 	var xgsOMCIEvidenceWriter *status.XGSOMCIEvidenceWriter
+ 	xgsOMCIKernelSessionKnown := false
+-	if mode == pon.XGSPON && opts.xgsOMCIEvidencePath != "" {
++	if mode.IsXG() && opts.xgsOMCIEvidencePath != "" {
+ 		xgsOMCIEvidence = status.XGSOMCIEvidence{
+ 			Version: 4, Complete: false,
+ 			Semantics: "trusted-transport-kernel-instance-session",
+diff --git a/internal/engine/engine.go b/internal/engine/engine.go
+index 7eda25d..4da24cb 100644
+--- a/internal/engine/engine.go
++++ b/internal/engine/engine.go
+@@ -1509,8 +1509,8 @@ func validateFrame(mode pon.Mode, input DownstreamFrame) error {
+ 	}
+ 	switch omci.DeviceIdent(frame[3]) {
+ 	case omci.BaselineIdent:
+-		if mode == pon.XGSPON && !input.MICVerified {
+-			return errors.New("XGS-PON OMCI frame has no trusted MIC verification")
++		if mode.IsXG() && !input.MICVerified {
++			return errors.New("XG-PON/XGS-PON OMCI frame has no trusted MIC verification")
+ 		}
+ 		// OMCC adapters may remove the MIC or the complete eight-byte trailer
+ 		// after validating it. omci-lib-go emits the MIC-stripped form.
+@@ -1521,12 +1521,12 @@ func validateFrame(mode pon.Mode, input DownstreamFrame) error {
+ 		if mode == pon.GPON && len(frame) == omci.MaxBaselineLength {
+ 			return validateGPONMIC(frame[:omci.MaxBaselineLength-4], frame[omci.MaxBaselineLength-4:])
+ 		}
+-		if mode == pon.XGSPON && len(frame) == omci.MaxBaselineLength {
+-			return errors.New("XGS-PON OMCI adapter did not remove the security trailer")
++		if mode.IsXG() && len(frame) == omci.MaxBaselineLength {
++			return errors.New("XG-PON/XGS-PON OMCI adapter did not remove the security trailer")
+ 		}
+ 	case omci.ExtendedIdent:
+-		if mode == pon.XGSPON && !input.MICVerified {
+-			return errors.New("XGS-PON OMCI frame has no trusted MIC verification")
++		if mode.IsXG() && !input.MICVerified {
++			return errors.New("XG-PON/XGS-PON OMCI frame has no trusted MIC verification")
+ 		}
+ 		if len(frame) < 10 {
+ 			return fmt.Errorf("invalid extended OMCI frame length %d", len(frame))
+@@ -1541,8 +1541,8 @@ func validateFrame(mode pon.Mode, input DownstreamFrame) error {
+ 		if mode == pon.GPON && len(frame) == payloadEnd+4 {
+ 			return validateGPONMIC(frame[:payloadEnd], frame[payloadEnd:])
+ 		}
+-		if mode == pon.XGSPON && len(frame) == payloadEnd+4 {
+-			return errors.New("XGS-PON OMCI adapter did not remove the security trailer")
++		if mode.IsXG() && len(frame) == payloadEnd+4 {
++			return errors.New("XG-PON/XGS-PON OMCI adapter did not remove the security trailer")
+ 		}
+ 	default:
+ 		return fmt.Errorf("unsupported OMCI device identifier %#x", frame[3])
+diff --git a/internal/model/capabilities.go b/internal/model/capabilities.go
+index 8fda6b9..4fec9c7 100644
+--- a/internal/model/capabilities.go
++++ b/internal/model/capabilities.go
+@@ -59,7 +59,7 @@ func XG2010GSupportedClasses(mode pon.Mode) []me.ClassID {
+ 		me.FecPerformanceMonitoringHistoryDataClassID,
+ 		me.GemPortNetworkCtpPerformanceMonitoringHistoryDataClassID,
+ 	}
+-	if mode == pon.XGSPON {
++	if mode.IsXG() {
+ 		classes = append(classes,
+ 			me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+ 			me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID,
+@@ -139,7 +139,7 @@ func XG2010GSupportedAttributeMasks(mode pon.Mode, factory []mib.Instance) (map[
+ 		me.ManagedEntityMeClassID: 0xff00,
+ 		me.AttributeMeClassID:     0xff80,
+ 	}
+-	if mode == pon.XGSPON {
++	if mode.IsXG() {
+ 		audited[me.XgPonTcPerformanceMonitoringHistoryDataClassID] = 0xfffe
+ 		audited[me.XgPonDownstreamManagementPerformanceMonitoringHistoryDataClassID] = 0xffff
+ 		audited[me.XgPonUpstreamManagementPerformanceMonitoringHistoryDataClassID] = 0xff00
+diff --git a/internal/model/xg2010g.go b/internal/model/xg2010g.go
+index 51dbb81..fcfc2ca 100644
+--- a/internal/model/xg2010g.go
++++ b/internal/model/xg2010g.go
+@@ -63,7 +63,9 @@ func XG2010G(identity Identity) ([]mib.Instance, error) {
+ 
+ 	vendor := serial[:4]
+ 	ponEquipmentID := identity.EquipmentID + " GPON"
+-	if identity.PONMode == pon.XGSPON {
++	if identity.PONMode == pon.XGPON {
++		ponEquipmentID = identity.EquipmentID + " XG-PON"
++	} else if identity.PONMode == pon.XGSPON {
+ 		ponEquipmentID = identity.EquipmentID + " XGS-PON"
+ 	}
+ 	instances := []mib.Instance{
+diff --git a/internal/model/xg2010g_test.go b/internal/model/xg2010g_test.go
+index 3a415d2..35412d0 100644
+--- a/internal/model/xg2010g_test.go
++++ b/internal/model/xg2010g_test.go
+@@ -192,6 +192,7 @@ func TestXG2010GSupportedClassesAreExplicitAndSorted(t *testing.T) {
+ 
+ func TestXG2010GCapabilitiesAreIsolatedByPONMode(t *testing.T) {
+ 	xgsClasses := XG2010GSupportedClasses(pon.XGSPON)
++	xgClasses := XG2010GSupportedClasses(pon.XGPON)
+ 	gponClasses := XG2010GSupportedClasses(pon.GPON)
+ 	for _, classID := range []me.ClassID{
+ 		me.XgPonTcPerformanceMonitoringHistoryDataClassID,
+@@ -201,6 +202,9 @@ func TestXG2010GCapabilitiesAreIsolatedByPONMode(t *testing.T) {
+ 		if !slices.Contains(xgsClasses, classID) {
+ 			t.Fatalf("XGS-PON capability list omits class %v", classID)
+ 		}
++		if !slices.Contains(xgClasses, classID) {
++			t.Fatalf("XG-PON capability list omits class %v", classID)
++		}
+ 		if slices.Contains(gponClasses, classID) {
+ 			t.Fatalf("GPON capability list advertises XGS-PON class %v", classID)
+ 		}
+diff --git a/internal/platform/exec.go b/internal/platform/exec.go
+index 5fa4a1e..df25203 100644
+--- a/internal/platform/exec.go
++++ b/internal/platform/exec.go
+@@ -81,8 +81,8 @@ func DecodeApplyRequest(reader io.Reader) (ApplyRequest, error) {
+ 	if err != nil {
+ 		return ApplyRequest{}, err
+ 	}
+-	if mode == pon.XGSPON && request.Service.PONMode != pon.XGSPON {
+-		return ApplyRequest{}, fmt.Errorf("XGS-PON platform request has no explicit xgspon service graph")
++	if mode.IsXG() && request.Service.PONMode != mode {
++		return ApplyRequest{}, fmt.Errorf("%s platform request has mismatched service graph mode %q", mode, request.Service.PONMode)
+ 	}
+ 	if mode == pon.GPON && request.Service.PONMode != "" && request.Service.PONMode != pon.GPON {
+ 		return ApplyRequest{}, fmt.Errorf("GPON platform request has mismatched service graph mode %q", request.Service.PONMode)
+diff --git a/internal/platform/graph.go b/internal/platform/graph.go
+index 034338b..4def39a 100644
+--- a/internal/platform/graph.go
++++ b/internal/platform/graph.go
+@@ -337,7 +337,7 @@ func buildServiceGraph(snapshot []mib.Instance, mode pon.Mode, explicitMode bool
+ 	}
+ 	allocIDLimit := uint16(0x0fff)
+ 	gemPortLimit := uint16(0x0fff)
+-	if mode == pon.XGSPON {
++	if mode.IsXG() {
+ 		allocIDLimit = 0x3fff
+ 		gemPortLimit = 0xfffe
+ 	}
+@@ -1337,7 +1337,7 @@ func multicastIPv4Ranges(instance mib.Instance, mode pon.Mode) ([]MulticastIPv4R
+ 		start := binary.BigEndian.Uint32(row[4:8])
+ 		stop := binary.BigEndian.Uint32(row[8:12])
+ 		if (mode == pon.GPON && portID > 0x0fff) ||
+-			(mode == pon.XGSPON && portID == 0xffff) ||
++			(mode.IsXG() && portID == 0xffff) ||
+ 			start>>28 != 0xe || stop>>28 != 0xe || start > stop {
+ 			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv4 address row %x",
+ 				instance.EntityID, row)
+@@ -1380,7 +1380,7 @@ func multicastIPv6Ranges(instance mib.Instance, mode pon.Mode) ([]MulticastIPv6R
+ 		startLow := binary.BigEndian.Uint32(row[4:8])
+ 		stopLow := binary.BigEndian.Uint32(row[8:12])
+ 		if (mode == pon.GPON && portID > 0x0fff) ||
+-			(mode == pon.XGSPON && portID == 0xffff) ||
++			(mode.IsXG() && portID == 0xffff) ||
+ 			row[12] != 0xff || startLow > stopLow {
+ 			return nil, fmt.Errorf("multicast GEM IW TP %#x has invalid IPv6 address row %x",
+ 				instance.EntityID, row)
+@@ -1577,7 +1577,7 @@ func resolveMulticastACLEntry(instance mib.Instance, name string, key uint16,
+ 		ImputedBandwidth: binary.BigEndian.Uint32(part0[18:22]),
+ 	}
+ 	if (mode == pon.GPON && result.GEMPortID > 0x0fff) ||
+-		(mode == pon.XGSPON && result.GEMPortID == 0xffff) {
++		(mode.IsXG() && result.GEMPortID == 0xffff) {
+ 		return MulticastACLEntry{}, fmt.Errorf("multicast operations profile %#x %s row key %d has invalid GEM Port-ID %d",
+ 			instance.EntityID, name, key, result.GEMPortID)
+ 	}
+diff --git a/internal/pon/mode.go b/internal/pon/mode.go
+index 910eb5c..ddd56b5 100644
+--- a/internal/pon/mode.go
++++ b/internal/pon/mode.go
+@@ -10,6 +10,7 @@ type Mode string
+ 
+ const (
+ 	GPON   Mode = "gpon"
++	XGPON  Mode = "xgpon"
+ 	XGSPON Mode = "xgspon"
+ )
+ 
+@@ -23,13 +24,19 @@ func ParseMode(value string) (Mode, error) {
+ 
+ func (m Mode) Validate() error {
+ 	switch m {
+-	case GPON, XGSPON:
++	case GPON, XGPON, XGSPON:
+ 		return nil
+ 	default:
+ 		return fmt.Errorf("unsupported PON mode %q", m)
+ 	}
+ }
+ 
++// IsXG reports whether the mode uses the secure XGEM OMCC transport and the
++// 16-bit XGEM/14-bit Alloc-ID service namespace.
++func (m Mode) IsXG() bool {
++	return m == XGPON || m == XGSPON
++}
++
+ // StateDomain binds persistent MIB documents to both this board model and one
+ // PON protocol family. A serial number alone cannot prevent GPON/XGS state reuse.
+ func (m Mode) StateDomain() (string, error) {

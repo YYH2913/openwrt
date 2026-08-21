@@ -1,0 +1,313 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 09:55:00 +0800
+Subject: [PATCH] net: airoha: add native GPON QDMA QoS ABI
+
+Expose the EN7581 egress scheduler and TRTCM meters to the GPON driver.
+The API accepts G.988 byte-per-second traffic descriptors and converts them
+to the QDMA bit-rate units. GPON channels reserve the shared QDMA channel
+map and apply complete-table replacement with hardware rollback.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 202 ++++++++++++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_eth.h |  19 +++
+ 2 files changed, 221 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -11,6 +11,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/reset.h>
+ #include <linux/soc/airoha/airoha_offload.h>
+@@ -560,6 +561,18 @@
+ #define AIROHA_GPON_MARK_MASK		GENMASK(31, 12)
+ #define AIROHA_GPON_MARK_KEY		0xa1700000
+ 
++#define AIROHA_GPON_QOS_CHANNELS	16
++
++struct airoha_gpon_qos_config {
++	u8 channel;
++	u8 scheduler;
++	u16 weights[AIROHA_NUM_QOS_QUEUES];
++	u32 cir;
++	u32 pir;
++	u32 cbs;
++	u32 pbs;
++};
++
+ struct airoha_gdm_dev {
+ 	struct airoha_qdma __rcu *qdma;
+ 	struct airoha_gdm_port *port;
+@@ -578,6 +591,9 @@
+ 	DECLARE_BITMAP(gpon_gems, AIROHA_GPON_MAX_GEMS);
+ 	u8 gpon_channels[AIROHA_GPON_MAX_GEMS];
+ 	u8 gpon_directions[AIROHA_GPON_MAX_GEMS];
++	struct mutex gpon_qos_lock;
++	DECLARE_BITMAP(gpon_qos, AIROHA_GPON_QOS_CHANNELS);
++	struct airoha_gpon_qos_config gpon_qos_cfg[AIROHA_GPON_QOS_CHANNELS];
+ 
+ 	DECLARE_BITMAP(qos_sq_bmap, AIROHA_NUM_QOS_CHANNELS);
+ 	/* qos stats counters */
+@@ -731,6 +747,12 @@
+ int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
+ 			 const u8 *channels, const u8 *directions,
+ 			 unsigned int count);
++int airoha_gpon_set_qos(struct device_node *np,
++			const struct airoha_gpon_qos_config *cfg,
++			unsigned int count);
++int airoha_gpon_get_qos(struct device_node *np,
++			struct airoha_gpon_qos_config *cfg,
++			unsigned int *count);
+ int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid);
+ extern struct mutex flow_offload_mutex;
+ 
+
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2978,6 +2978,7 @@ static int airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
+ {
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_qdma *qdma;
++	u32 index = channel & 0x7;
+ 	int i;
+ 
+ 	qdma = airoha_qdma_deref(dev);
+@@ -3003,8 +3004,8 @@ static int airoha_qdma_set_chan_tx_sched(struct net_device *netdev,
+ 	}
+ 
+ 	airoha_qdma_rmw(qdma, REG_CHAN_QOS_MODE(channel >> 3),
+-			CHAN_QOS_MODE_MASK(channel),
+-			__field_prep(CHAN_QOS_MODE_MASK(channel), mode));
++			CHAN_QOS_MODE_MASK(index),
++			__field_prep(CHAN_QOS_MODE_MASK(index), mode));
+ 
+ 	return 0;
+ }
+@@ -4110,9 +4111,11 @@
+ 	dev->eth = eth;
+ 	dev->nbq = nbq;
+ 	spin_lock_init(&dev->gpon_lock);
++	mutex_init(&dev->gpon_qos_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
+ 	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
++	bitmap_zero(dev->gpon_qos, AIROHA_GPON_QOS_CHANNELS);
+ 	dev->gpon_omcc_ready = false;
+ 	port->devs[index] = dev;
+ 	if (dev->gpon_mode) {
+@@ -4488,6 +4491,210 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_gpon_set_gem);
+ 
++static u32 airoha_gpon_qos_rate(u32 bytes_per_second)
++{
++	return div_u64((u64)bytes_per_second * BITS_PER_BYTE, 1000);
++}
++
++static int
++airoha_gpon_program_qos(struct net_device *netdev,
++			const struct airoha_gpon_qos_config *cfg)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
++	u32 rates[] = {
++		airoha_gpon_qos_rate(cfg->cir),
++		airoha_gpon_qos_rate(cfg->pir),
++	};
++	u32 bursts[] = { cfg->cbs, cfg->pbs };
++	/* G.988 policy 2 is WRR; null and strict-priority both use SP
++	 * because the EN7581 has no separate null scheduler mode. */
++	enum tx_sched_mode mode = cfg->scheduler == 2 ? TC_SCH_WRR8 : TC_SCH_SP;
++	int i, err;
++
++	err = airoha_qdma_set_chan_tx_sched(netdev, cfg->channel, mode,
++					cfg->weights, ARRAY_SIZE(cfg->weights));
++	if (err)
++		return err;
++
++	for (i = TRTCM_COMMIT_MODE; i <= TRTCM_PEAK_MODE; i++) {
++		err = airoha_qdma_set_trtcm_config(qdma, cfg->channel,
++						   REG_EGRESS_TRTCM_CFG, i,
++						   !!rates[i], TRTCM_METER_MODE);
++		if (err)
++			return err;
++		if (!rates[i])
++			continue;
++
++		err = airoha_qdma_set_trtcm_token_bucket(qdma, cfg->channel,
++							 REG_EGRESS_TRTCM_CFG,
++							 i, rates[i], bursts[i]);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int airoha_gpon_disable_qos(struct net_device *netdev, u8 channel)
++{
++	struct airoha_gpon_qos_config cfg = {
++		.channel = channel,
++		.scheduler = 1,
++	};
++
++	return airoha_gpon_program_qos(netdev, &cfg);
++}
++
++int airoha_gpon_set_qos(struct device_node *np,
++			const struct airoha_gpon_qos_config *cfg,
++			unsigned int count)
++{
++	DECLARE_BITMAP(acquired, AIROHA_GPON_QOS_CHANNELS);
++	DECLARE_BITMAP(wanted, AIROHA_GPON_QOS_CHANNELS);
++	DECLARE_BITMAP(oldmap, AIROHA_GPON_QOS_CHANNELS);
++	struct airoha_gpon_qos_config old[AIROHA_GPON_QOS_CHANNELS];
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct net_device *netdev;
++	unsigned long channel;
++	unsigned int i;
++	int err = 0;
++
++	if (!np || count > AIROHA_GPON_QOS_CHANNELS || (count && !cfg))
++		return -EINVAL;
++
++	bitmap_zero(wanted, AIROHA_GPON_QOS_CHANNELS);
++	for (i = 0; i < count; i++) {
++		bool have_weight = false;
++		int queue;
++
++		if (cfg[i].channel >= AIROHA_GPON_QOS_CHANNELS ||
++		    cfg[i].scheduler > 2 ||
++		    (cfg[i].pir && cfg[i].cir > cfg[i].pir) ||
++		    (cfg[i].cir && !airoha_gpon_qos_rate(cfg[i].cir)) ||
++		    (cfg[i].pir && !airoha_gpon_qos_rate(cfg[i].pir)))
++			return -ERANGE;
++		if (test_and_set_bit(cfg[i].channel, wanted))
++			return -EEXIST;
++		for (queue = 0; queue < ARRAY_SIZE(cfg[i].weights); queue++) {
++			if (cfg[i].weights[queue] > U8_MAX)
++				return -ERANGE;
++			have_weight |= cfg[i].weights[queue] != 0;
++		}
++		if (cfg[i].scheduler == 2 && !have_weight)
++			return -EINVAL;
++	}
++
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++
++	qdma = airoha_qdma_deref(dev);
++	bitmap_zero(acquired, AIROHA_GPON_QOS_CHANNELS);
++	mutex_lock(&dev->gpon_qos_lock);
++	bitmap_copy(oldmap, dev->gpon_qos, AIROHA_GPON_QOS_CHANNELS);
++	memcpy(old, dev->gpon_qos_cfg, sizeof(old));
++
++	for_each_set_bit(channel, wanted, AIROHA_GPON_QOS_CHANNELS) {
++		if (channel >= AIROHA_NUM_QOS_CHANNELS ||
++		    test_bit(channel, dev->gpon_qos))
++			continue;
++		if (test_and_set_bit(channel, qdma->qos_channel_map)) {
++			err = -EBUSY;
++			goto release;
++		}
++		__set_bit(channel, acquired);
++	}
++
++	for (i = 0; i < count; i++) {
++		err = airoha_gpon_program_qos(netdev, &cfg[i]);
++		if (err)
++			goto restore;
++	}
++	for_each_set_bit(channel, dev->gpon_qos, AIROHA_GPON_QOS_CHANNELS) {
++		if (test_bit(channel, wanted))
++			continue;
++		err = airoha_gpon_disable_qos(netdev, channel);
++		if (err)
++			goto restore;
++	}
++
++	bitmap_copy(dev->gpon_qos, wanted, AIROHA_GPON_QOS_CHANNELS);
++	memset(dev->gpon_qos_cfg, 0, sizeof(dev->gpon_qos_cfg));
++	for (i = 0; i < count; i++)
++		dev->gpon_qos_cfg[cfg[i].channel] = cfg[i];
++	for_each_set_bit(channel, oldmap, AIROHA_GPON_QOS_CHANNELS)
++		if (channel < AIROHA_NUM_QOS_CHANNELS &&
++		    !test_bit(channel, wanted))
++			clear_bit(channel, qdma->qos_channel_map);
++	goto unlock;
++
++restore:
++	for (channel = 0; channel < AIROHA_GPON_QOS_CHANNELS; channel++) {
++		if (test_bit(channel, dev->gpon_qos))
++			airoha_gpon_program_qos(netdev, &old[channel]);
++		else if (test_bit(channel, wanted))
++			airoha_gpon_disable_qos(netdev, channel);
++	}
++release:
++	for_each_set_bit(channel, acquired, AIROHA_GPON_QOS_CHANNELS)
++		clear_bit(channel, qdma->qos_channel_map);
++unlock:
++	mutex_unlock(&dev->gpon_qos_lock);
++out:
++	put_device(&netdev->dev);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_gpon_set_qos);
++
++int airoha_gpon_get_qos(struct device_node *np,
++			struct airoha_gpon_qos_config *cfg,
++			unsigned int *count)
++{
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned int capacity, n = 0;
++	unsigned long channel;
++	int err = 0;
++
++	if (!np || !count)
++		return -EINVAL;
++	capacity = *count;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++
++	mutex_lock(&dev->gpon_qos_lock);
++	if (cfg && capacity < bitmap_weight(dev->gpon_qos,
++						     AIROHA_GPON_QOS_CHANNELS)) {
++		err = -ENOSPC;
++		goto unlock;
++	}
++	for_each_set_bit(channel, dev->gpon_qos, AIROHA_GPON_QOS_CHANNELS)
++		if (cfg)
++			cfg[n++] = dev->gpon_qos_cfg[channel];
++		else
++			n++;
++	*count = n;
++unlock:
++	mutex_unlock(&dev->gpon_qos_lock);
++out:
++	put_device(&netdev->dev);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_gpon_get_qos);
++
+ int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid)
+ {
+ 	struct airoha_gdm_dev *dev;

@@ -1,0 +1,52 @@
+From: OpenWrt XPON integration
+Subject: [PATCH] net: pcs: airoha: apply EN7581 XPON FEOS workarounds
+
+The EN7581 SDK XPON_RX() sequence enables one U22 and four T22 receive
+front-end offset-calibration workarounds for every XPON rate.  The generic
+PCS bringup did not carry these settings over, which can leave FEOS behavior
+dependent on bootloader residue after a runtime PON mode change.
+
+Program the SDK bits for every PON mode and include them in the existing PMA
+mode-profile readback gate.  A rejected or stale write therefore keeps the
+PCS quiesced and lets the XPON switch transaction roll back with TX disabled.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1611,6 +1611,8 @@
+ #define AIROHA_PCS_PMA_DIG_RESERVE_29		0x910
+ #define   AIROHA_PCS_PMA_2L_TX_RATE_CTRL	GENMASK(1, 0)
+ #define   AIROHA_PCS_PMA_2L_RX_RATE_CTRL	GENMASK(5, 4)
++#define AIROHA_PCS_PMA_DIG_RESERVE_47		0x958
++#define   AIROHA_PCS_PMA_RESERVE_47_FEOS_T22	GENMASK(31, 28)
+ 
+ #define AIROHA_PCS_MAX_CALIBRATION_TRY		50
+ #define AIROHA_PCS_MAX_NUM_RSTS			2
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -1288,6 +1288,11 @@ static void an7581_pcs_rx_bringup(struct
+ 				   (priv->pon_mode == AIROHA_PCS_PON_MODE_GPON ?
+ 				    AIROHA_PCS_ANA_RX_BUSBIT_SEL_FORCE : 0) |
+ 				   AIROHA_PCS_ANA_RX_BUSBIT_SEL_16BIT);
++		/* SDK FEOS_Modify_U22/T22_20230807, required for all XPON rates. */
++		regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_12,
++				AIROHA_PCS_PMA_RESERVE_12_FEOS_0);
++		regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_47,
++				AIROHA_PCS_PMA_RESERVE_47_FEOS_T22);
+ 	}
+ 
+ 	/* Set RX rate ctrl */
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1271,6 +1271,12 @@ airoha_pcs_xpon_verify_mode(struct airoh
+ 	expected = FIELD_PREP(AIROHA_PCS_ANA_RX_REV_0, profile.rx_rev_0);
+ 	AIROHA_XPON_VERIFY(priv->pcs_ana, AIROHA_PCS_ANA_PXP_RX_REV_0,
+ 		AIROHA_PCS_ANA_RX_REV_0, expected);
++	AIROHA_XPON_VERIFY(pma, AIROHA_PCS_PMA_DIG_RESERVE_12,
++		AIROHA_PCS_PMA_RESERVE_12_FEOS_0,
++		AIROHA_PCS_PMA_RESERVE_12_FEOS_0);
++	AIROHA_XPON_VERIFY(pma, AIROHA_PCS_PMA_DIG_RESERVE_47,
++		AIROHA_PCS_PMA_RESERVE_47_FEOS_T22,
++		AIROHA_PCS_PMA_RESERVE_47_FEOS_T22);
+ 
+ #undef AIROHA_XPON_VERIFY
+ 	return 0;

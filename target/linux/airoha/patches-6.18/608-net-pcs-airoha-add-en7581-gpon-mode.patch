@@ -1,0 +1,856 @@
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -9,6 +9,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/pcs/pcs-provider.h>
++#include <linux/property.h>
+ #include <linux/phy/phy.h>
+ #include <linux/phylink.h>
+ #include <linux/platform_device.h>
+@@ -52,21 +53,33 @@
+ {
+ 	u32 xsi_sel, wan_sel;
+ 
+-	switch (interface) {
+-	case PHY_INTERFACE_MODE_SGMII:
+-	case PHY_INTERFACE_MODE_1000BASEX:
+-		wan_sel = AIROHA_SCU_WAN_SEL_SGMII;
++	switch (priv->pon_mode) {
++	case AIROHA_PCS_PON_MODE_GPON:
++		wan_sel = AIROHA_SCU_WAN_SEL_GPON;
+ 		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
+ 		break;
+-	case PHY_INTERFACE_MODE_2500BASEX:
+-		wan_sel = AIROHA_SCU_WAN_SEL_HSGMII;
++	case AIROHA_PCS_PON_MODE_XGSPON:
++		wan_sel = AIROHA_SCU_WAN_SEL_XGSPON;
+ 		xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
+ 		break;
+-	case PHY_INTERFACE_MODE_USXGMII:
+-	case PHY_INTERFACE_MODE_10GBASER:
++	case AIROHA_PCS_PON_MODE_NONE:
+ 	default:
+-		wan_sel = AIROHA_SCU_WAN_SEL_USXGMII;
+-		xsi_sel = AIROHA_SCU_PON_XSI_USXGMII;
++		switch (interface) {
++		case PHY_INTERFACE_MODE_SGMII:
++		case PHY_INTERFACE_MODE_1000BASEX:
++			wan_sel = AIROHA_SCU_WAN_SEL_SGMII;
++			xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
++			break;
++		case PHY_INTERFACE_MODE_2500BASEX:
++			wan_sel = AIROHA_SCU_WAN_SEL_HSGMII;
++			xsi_sel = AIROHA_SCU_PON_XSI_HSGMII;
++			break;
++		case PHY_INTERFACE_MODE_USXGMII:
++		case PHY_INTERFACE_MODE_10GBASER:
++		default:
++			wan_sel = AIROHA_SCU_WAN_SEL_USXGMII;
++			xsi_sel = AIROHA_SCU_PON_XSI_USXGMII;
++		}
+ 	}
+ 
+ 	regmap_update_bits(priv->scu, AIROHA_SCU_SSTR,
+@@ -1252,6 +1265,29 @@
+ 	priv->dev = dev;
+ 	priv->data = data;
+ 
++	if (data->port_type == AIROHA_PCS_PON &&
++	    device_property_present(dev, "airoha,pon-mode")) {
++		const char *pon_mode;
++
++		ret = device_property_read_string(dev, "airoha,pon-mode",
++						  &pon_mode);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to read PON mode\n");
++
++		if (!strcmp(pon_mode, "gpon"))
++			priv->pon_mode = AIROHA_PCS_PON_MODE_GPON;
++		else if (!strcmp(pon_mode, "xgspon"))
++			priv->pon_mode = AIROHA_PCS_PON_MODE_XGSPON;
++		else
++			return dev_err_probe(dev, -EINVAL,
++					     "unsupported PON mode %s\n",
++					     pon_mode);
++
++		/* PON modes require the SDK frequency target on every revision. */
++		priv->manual_rx_calib = true;
++	}
++
+ 	if (data->port_type == AIROHA_PCS_USB ||
+ 	    device_is_compatible(dev, "airoha,an7583-pcs-pcie")) {
+ 		struct phy *phy;
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -18,6 +18,8 @@
+ #define   AIROHA_SCU_ETH_MAC_SEL_XFI		FIELD_PREP_CONST(AIROHA_SCU_ETH_MAC_SEL, 0x0)
+ #define   AIROHA_SCU_ETH_MAC_SEL_PON		FIELD_PREP_CONST(AIROHA_SCU_ETH_MAC_SEL, 0x1)
+ #define   AIROHA_SCU_WAN_SEL			GENMASK(7, 0)
++#define   AIROHA_SCU_WAN_SEL_GPON		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x0)
++#define   AIROHA_SCU_WAN_SEL_XGSPON		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0xa)
+ #define   AIROHA_SCU_WAN_SEL_SGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x10)
+ #define   AIROHA_SCU_WAN_SEL_HSGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x11)
+ #define   AIROHA_SCU_WAN_SEL_USXGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x12)
+@@ -1639,6 +1641,12 @@
+ 	struct regmap *usxgmii_pcs;
+ };
+ 
++enum airoha_pcs_pon_mode {
++	AIROHA_PCS_PON_MODE_NONE,
++	AIROHA_PCS_PON_MODE_GPON,
++	AIROHA_PCS_PON_MODE_XGSPON,
++};
++
+ struct airoha_pcs_priv {
+ 	struct device *dev;
+ 	const struct airoha_pcs_match_data *data;
+@@ -1660,6 +1668,7 @@
+ 	struct phy *phy;
+ 
+ 	bool manual_rx_calib;
++	enum airoha_pcs_pon_mode pon_mode;
+ };
+ 
+ struct airoha_pcs_port {
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -809,52 +809,76 @@
+ 				     int index, phy_interface_t interface)
+ {
+ 	struct regmap_field **pcs_ana_fields = priv->pcs_ana_fields[index];
+-	u32 lpf_chp_ibias, lpf_bp, lpf_bwr, lpf_bwc;
++	u32 lpf_chp_ibias, lpf_bp, lpf_bwr, lpf_bwc, kband_div;
+ 	struct regmap *pcs_pma;
+ 	u32 tcl_amp_vref;
+-	bool sdm_hren;
++	bool postdiv_en, sdm_hren, sdm_ifm;
+ 	u32 vco_cfix;
+ 	bool vcodiv;
+ 	u32 pcw;
+ 
+-	switch (interface) {
+-	case PHY_INTERFACE_MODE_SGMII:
+-	case PHY_INTERFACE_MODE_1000BASEX:
+-		lpf_chp_ibias = 0xf;
+-		lpf_bp = BIT(1);
+-		lpf_bwr = BIT(3) | BIT(1) | BIT(0);
+-		lpf_bwc = BIT(4) | BIT(3);
+-		vco_cfix = BIT(1) | BIT(0);
+-		pcw = BIT(27);
+-		tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
+-		vcodiv = false;
+-		sdm_hren = false;
+-		break;
+-	case PHY_INTERFACE_MODE_2500BASEX:
+-		lpf_chp_ibias = 0xa;
+-		lpf_bp = BIT(2) | BIT(0);
+-		lpf_bwr = 0;
+-		lpf_bwc = 0;
+-		vco_cfix = 0;
+-		pcw = BIT(27) | BIT(25);
+-		tcl_amp_vref = BIT(3) | BIT(2) | BIT(0);
+-		vcodiv = true;
+-		sdm_hren = false;
+-		break;
+-	case PHY_INTERFACE_MODE_USXGMII:
+-	case PHY_INTERFACE_MODE_10GBASER:
+-		lpf_chp_ibias = 0xf;
+-		lpf_bp = BIT(1);
+-		lpf_bwr = BIT(3) | BIT(1) | BIT(0);
+-		lpf_bwc = BIT(4) | BIT(3);
+-		vco_cfix = BIT(0);
+-		pcw = BIT(27) | BIT(22);
+-		tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		lpf_chp_ibias = 0xc;
++		lpf_bp = 0x2;
++		lpf_bwr = 0xb;
++		lpf_bwc = 0x18;
++		vco_cfix = 0x3;
++		pcw = 0x07f66e86;
++		tcl_amp_vref = 0xb;
++		kband_div = 0x5;
+ 		vcodiv = false;
++		postdiv_en = true;
+ 		sdm_hren = true;
+-		break;
+-	default:
+-		return;
++		sdm_ifm = true;
++	} else {
++		switch (interface) {
++		case PHY_INTERFACE_MODE_SGMII:
++		case PHY_INTERFACE_MODE_1000BASEX:
++			lpf_chp_ibias = 0xf;
++			lpf_bp = BIT(1);
++			lpf_bwr = BIT(3) | BIT(1) | BIT(0);
++			lpf_bwc = BIT(4) | BIT(3);
++			vco_cfix = BIT(1) | BIT(0);
++			pcw = BIT(27);
++			tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
++			vcodiv = false;
++			postdiv_en = false;
++			kband_div = 0x4;
++			sdm_ifm = false;
++			sdm_hren = false;
++			break;
++		case PHY_INTERFACE_MODE_2500BASEX:
++			lpf_chp_ibias = 0xa;
++			lpf_bp = BIT(2) | BIT(0);
++			lpf_bwr = 0;
++			lpf_bwc = 0;
++			vco_cfix = 0;
++			pcw = BIT(27) | BIT(25);
++			tcl_amp_vref = BIT(3) | BIT(2) | BIT(0);
++			vcodiv = true;
++			postdiv_en = false;
++			kband_div = 0x4;
++			sdm_ifm = false;
++			sdm_hren = false;
++			break;
++		case PHY_INTERFACE_MODE_USXGMII:
++		case PHY_INTERFACE_MODE_10GBASER:
++			lpf_chp_ibias = 0xf;
++			lpf_bp = BIT(1);
++			lpf_bwr = BIT(3) | BIT(1) | BIT(0);
++			lpf_bwc = BIT(4) | BIT(3);
++			vco_cfix = BIT(0);
++			pcw = BIT(27) | BIT(22);
++			tcl_amp_vref = BIT(3) | BIT(1) | BIT(0);
++			vcodiv = false;
++			postdiv_en = false;
++			kband_div = 0x4;
++			sdm_ifm = false;
++			sdm_hren = true;
++			break;
++		default:
++			return;
++		}
+ 	}
+ 
+ 	/* This comment only apply to Serdes PCIe that expose
+@@ -885,7 +909,7 @@
+ 
+ 	/* Setup SDM */
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_SDM_MODE], 0x0);
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_SDM_IFM], 0x0);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_SDM_IFM], sdm_ifm);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_SDM_DI_LS],
+ 			   AIROHA_PCS_ANA_TXPLL_SDM_DI_LS_2_23);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_SDM_DI_EN], 0x0);
+@@ -924,6 +948,32 @@
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TXPLL_SDM_PCW,
+ 			   AIROHA_PCS_PMA_FORCE_DA_TXPLL_SDM_PCW, pcw);
+ 
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_0,
++				   AIROHA_PCS_PMA_LCPLL_KI |
++				   AIROHA_PCS_PMA_LCPLL_PON_RX_CDR_DIVTDC,
++				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_KI, 0x3) |
++				   AIROHA_PCS_PMA_LCPLL_PON_RX_CDR_DIVTDC_16);
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_1,
++				   AIROHA_PCS_PMA_LCPLL_A_TDC |
++				   AIROHA_PCS_PMA_LCPLL_GPON_SEL,
++				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_A_TDC, 0x5) |
++				   AIROHA_PCS_PMA_LCPLL_GPON_SEL_FROM_GPON);
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_3,
++				   AIROHA_PCS_PMA_LCPLL_NCPO_LOAD |
++				   AIROHA_PCS_PMA_LCPLL_NCPO_SHIFT,
++				   AIROHA_PCS_PMA_LCPLL_NCPO_LOAD |
++				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_NCPO_SHIFT, 0x1));
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PCW_1,
++				   AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_GPON,
++				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_GPON,
++					      0x0fecdd0c));
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PCW_2,
++				   AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_EPON,
++				   FIELD_PREP(AIROHA_PCS_PMA_LCPLL_PON_HRDDS_PCW_NCPO_EPON,
++					      0x0fecdd0c));
++	}
++
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
+ 			AIROHA_PCS_PMA_FORCE_SEL_DA_TXPLL_SDM_PCW);
+ 
+@@ -933,10 +983,10 @@
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_KBAND_KS], 0x1);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_KBAND_KF], 0x3);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_KBAND_KFC], 0x0);
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_KBAND_DIV], 0x4);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_KBAND_DIV], kband_div);
+ 
+ 	/* Setup DIV */
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_POSTDIV_EN], 0x0);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_POSTDIV_EN], postdiv_en);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_MMD_PREDIV_MODE],
+ 			   AIROHA_PCS_ANA_TXPLL_MMD_PREDIV_MODE_2);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_TXPLL_VCODIV],
+@@ -974,35 +1024,52 @@
+ 	u32 ckin_divisor;
+ 	u32 xfi_tx_mode;
+ 
+-	switch (interface) {
+-	case PHY_INTERFACE_MODE_SGMII:
+-	case PHY_INTERFACE_MODE_1000BASEX:
+-		ckin_divisor = BIT(1);
+-		tx_rate_ctrl = BIT(0);
+-		fir_cn1 = 0;
+-		fir_c0b = 12;
+-		fir_c1 = 0;
+-		xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
+-		break;
+-	case PHY_INTERFACE_MODE_2500BASEX:
+-		ckin_divisor = BIT(2);
+-		tx_rate_ctrl = BIT(0);
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
+ 		fir_cn1 = 0;
+-		fir_c0b = 11;
+-		fir_c1 = 1;
+-		xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_3G12;
+-		break;
+-	case PHY_INTERFACE_MODE_USXGMII:
+-	case PHY_INTERFACE_MODE_10GBASER:
+-		ckin_divisor = BIT(2) | BIT(0);
+-		tx_rate_ctrl = BIT(1);
+-		fir_cn1 = 1;
+-		fir_c0b = 1;
+-		fir_c1 = 11;
+-		xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_10G3;
+-		break;
+-	default:
+-		return;
++		if (priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON) {
++			ckin_divisor = 0x5;
++			tx_rate_ctrl = 0x2;
++			fir_c0b = 0xe;
++			fir_c1 = 0x4;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_10G3;
++		} else {
++			ckin_divisor = 0x2;
++			tx_rate_ctrl = 0x0;
++			fir_c0b = 0;
++			fir_c1 = 0;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
++		}
++	} else {
++		switch (interface) {
++		case PHY_INTERFACE_MODE_SGMII:
++		case PHY_INTERFACE_MODE_1000BASEX:
++			ckin_divisor = BIT(1);
++			tx_rate_ctrl = BIT(0);
++			fir_cn1 = 0;
++			fir_c0b = 12;
++			fir_c1 = 0;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
++			break;
++		case PHY_INTERFACE_MODE_2500BASEX:
++			ckin_divisor = BIT(2);
++			tx_rate_ctrl = BIT(0);
++			fir_cn1 = 0;
++			fir_c0b = 11;
++			fir_c1 = 1;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_3G12;
++			break;
++		case PHY_INTERFACE_MODE_USXGMII:
++		case PHY_INTERFACE_MODE_10GBASER:
++			ckin_divisor = BIT(2) | BIT(0);
++			tx_rate_ctrl = BIT(1);
++			fir_cn1 = 1;
++			fir_c0b = 1;
++			fir_c1 = 11;
++			xfi_tx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_10G3;
++			break;
++		default:
++			return;
++		}
+ 	}
+ 
+ 	/* Set TX rate ctrl */
+@@ -1052,6 +1119,15 @@
+ 					      tx_rate_ctrl));
+ 	}
+ 
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_TX_DLY_CTRL,
++				   AIROHA_PCS_PMA_TX_DLY_BEN_FTUNE |
++				   AIROHA_PCS_PMA_TX_DLY_DATA_FTUNE,
++				   FIELD_PREP(AIROHA_PCS_PMA_TX_DLY_BEN_FTUNE,
++					      priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0xd : 0) |
++				   FIELD_PREP(AIROHA_PCS_PMA_TX_DLY_DATA_FTUNE,
++					      priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x30 : 0x4));
++
+ 	/* Setup TX FIR Load Parameters (Reference 660mV) */
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TX_FIR_C0B,
+ 			   AIROHA_PCS_PMA_FORCE_SEL_DA_TX_FIR_CN1 |
+@@ -1090,44 +1166,72 @@
+ 	u32 xfi_rx_mode;
+ 	u32 osr;
+ 
+-	switch (interface) {
+-	case PHY_INTERFACE_MODE_SGMII:
+-	case PHY_INTERFACE_MODE_1000BASEX:
+-		osr = BIT(1) | BIT(0); /* 1.25G */
+-		pr_cdr_beta_dac = BIT(3);
+-		rx_rate_ctrl = 0;
+-		cdr_pr_cap_en = false;
+-		cdr_pr_buf_in_sr = BIT(2) | BIT(1) | BIT(0);
+-		sigdet_vth_sel = BIT(2) | BIT(1);
+-		phyck_div = BIT(5) | BIT(3) | BIT(0);
+-		phyck_sel = BIT(0);
+-		xfi_rx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
+-		break;
+-	case PHY_INTERFACE_MODE_2500BASEX:
+-		osr = BIT(0); /* 2.5G */
+-		pr_cdr_beta_dac = BIT(2) | BIT(1);
+-		rx_rate_ctrl = 0;
+-		cdr_pr_cap_en = true;
+-		cdr_pr_buf_in_sr = BIT(2) | BIT(1);
+-		sigdet_vth_sel = BIT(2) | BIT(1);
+-		phyck_div = BIT(3) | BIT(1) | BIT(0);
+-		phyck_sel = BIT(0);
+-		xfi_rx_mode = AIROHA_PCS_PMA_XFI_RX_MODE_3G12;
+-		break;
+-	case PHY_INTERFACE_MODE_USXGMII:
+-	case PHY_INTERFACE_MODE_10GBASER:
+-		osr = 0; /* 10G */
+-		cdr_pr_cap_en = false;
+-		pr_cdr_beta_dac = BIT(3);
+-		rx_rate_ctrl = BIT(1);
+-		cdr_pr_buf_in_sr = BIT(2) | BIT(1) | BIT(0);
+-		sigdet_vth_sel = BIT(1);
+-		phyck_div = BIT(6) | BIT(1);
+-		phyck_sel = BIT(1);
+-		xfi_rx_mode = AIROHA_PCS_PMA_XFI_RX_MODE_10G3;
+-		break;
+-	default:
+-		return;
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		osr = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x0 : 0x2;
++		pr_cdr_beta_dac = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++				  BIT(3) : BIT(2) | BIT(1);
++		rx_rate_ctrl = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x2 : 0x0;
++		cdr_pr_cap_en = priv->pon_mode != AIROHA_PCS_PON_MODE_XGSPON;
++		cdr_pr_buf_in_sr = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++				    BIT(2) | BIT(1) | BIT(0) : BIT(2) | BIT(1);
++		sigdet_vth_sel = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++				   BIT(1) : BIT(2) | BIT(1);
++		phyck_div = 0x0;
++		phyck_sel = 0x0;
++		xfi_rx_mode = priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ?
++			      AIROHA_PCS_PMA_XFI_RX_MODE_10G3 :
++			      AIROHA_PCS_PMA_XFI_RX_MODE_3G12;
++	} else {
++		switch (interface) {
++		case PHY_INTERFACE_MODE_SGMII:
++		case PHY_INTERFACE_MODE_1000BASEX:
++			osr = BIT(1) | BIT(0); /* 1.25G */
++			pr_cdr_beta_dac = BIT(3);
++			rx_rate_ctrl = 0;
++			cdr_pr_cap_en = false;
++			cdr_pr_buf_in_sr = BIT(2) | BIT(1) | BIT(0);
++			sigdet_vth_sel = BIT(2) | BIT(1);
++			phyck_div = BIT(5) | BIT(3) | BIT(0);
++			phyck_sel = BIT(0);
++			xfi_rx_mode = AIROHA_PCS_PMA_XFI_TX_MODE_1G25;
++			break;
++		case PHY_INTERFACE_MODE_2500BASEX:
++			osr = BIT(0); /* 2.5G */
++			pr_cdr_beta_dac = BIT(2) | BIT(1);
++			rx_rate_ctrl = 0;
++			cdr_pr_cap_en = true;
++			cdr_pr_buf_in_sr = BIT(2) | BIT(1);
++			sigdet_vth_sel = BIT(2) | BIT(1);
++			phyck_div = BIT(3) | BIT(1) | BIT(0);
++			phyck_sel = BIT(0);
++			xfi_rx_mode = AIROHA_PCS_PMA_XFI_RX_MODE_3G12;
++			break;
++		case PHY_INTERFACE_MODE_USXGMII:
++		case PHY_INTERFACE_MODE_10GBASER:
++			osr = 0; /* 10G */
++			cdr_pr_cap_en = false;
++			pr_cdr_beta_dac = BIT(3);
++			rx_rate_ctrl = BIT(1);
++			cdr_pr_buf_in_sr = BIT(2) | BIT(1) | BIT(0);
++			sigdet_vth_sel = BIT(1);
++			phyck_div = BIT(6) | BIT(1);
++			phyck_sel = BIT(1);
++			xfi_rx_mode = AIROHA_PCS_PMA_XFI_RX_MODE_10G3;
++			break;
++		default:
++			return;
++		}
++	}
++
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		regmap_write(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
++			     priv->pon_mode == AIROHA_PCS_PON_MODE_XGSPON ? 0x100 : 0x300);
++		regmap_update_bits(priv->pcs_ana, AIROHA_PCS_ANA_PXP_RX_BUSBIT_SEL,
++				   AIROHA_PCS_ANA_RX_BUSBIT_SEL_FORCE |
++				   AIROHA_PCS_ANA_RX_BUSBIT_SEL,
++				   (priv->pon_mode == AIROHA_PCS_PON_MODE_GPON ?
++				    AIROHA_PCS_ANA_RX_BUSBIT_SEL_FORCE : 0) |
++				   AIROHA_PCS_ANA_RX_BUSBIT_SEL_16BIT);
+ 	}
+ 
+ 	/* Set RX rate ctrl */
+@@ -1203,7 +1307,8 @@
+ 			AIROHA_PCS_PMA_FORCE_DA_CDR_INJCK_SEL);
+ 
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_DAC_MON], 0x0);
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_XFICK_EN], 0x1);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_XFICK_EN],
++			   priv->pon_mode != AIROHA_PCS_PON_MODE_GPON);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_MONPI_EN], 0x0);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_MONPR_EN], 0x0);
+ 
+@@ -1418,13 +1523,16 @@
+ 			  AIROHA_PCS_PMA_RX_SIDGET_PWDB);
+ 
+ 	/* Setup PHYCK */
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_TDC_CK_SEL], 0x0);
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHYCK_RSTB], 0x1);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_TDC_CK_SEL],
++			   priv->pon_mode != AIROHA_PCS_PON_MODE_NONE);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHYCK_RSTB],
++			   priv->pon_mode == AIROHA_PCS_PON_MODE_NONE);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHYCK_SEL],
+ 			   phyck_sel);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHYCK_DIV],
+ 			   phyck_div);
+-	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHY_CK_SEL_FORCE], 0x1);
++	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHY_CK_SEL_FORCE],
++			   priv->pon_mode == AIROHA_PCS_PON_MODE_NONE);
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_RX_PHY_CK_SEL], 0x0);
+ 
+ 	usleep_range(100, 200);
+@@ -1617,25 +1725,36 @@
+ 	unsigned int fl_out, fl_out_diff;
+ 
+ 	u32 target_fl_out;
++	u32 target_begin, target_end;
+ 	u32 cyclecnt;
+ 
+-	switch (interface) {
+-	case PHY_INTERFACE_MODE_SGMII:  /* DS_1.25G      / US_1.25G  */
+-	case PHY_INTERFACE_MODE_1000BASEX:
+-		target_fl_out = 0xa3d6;
+-		cyclecnt = 32767;
+-		break;
+-	case PHY_INTERFACE_MODE_2500BASEX: /* DS_9.95328G   / US_9.95328G */
+-		target_fl_out = 0xa000;
+-		cyclecnt = 20000;
+-		break;
+-	case PHY_INTERFACE_MODE_USXGMII: /* DS_10.3125G  / US_1.25G */
+-	case PHY_INTERFACE_MODE_10GBASER:
+-		target_fl_out = 0x9edf;
+-		cyclecnt = 32767;
+-		break;
+-	default:
+-		return;
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE) {
++		target_fl_out = 0xa49a;
++		target_begin = 0xa436;
++		target_end = 0xa4ff;
++		cyclecnt = 0x7fff;
++	} else {
++		switch (interface) {
++		case PHY_INTERFACE_MODE_SGMII:  /* DS_1.25G / US_1.25G */
++		case PHY_INTERFACE_MODE_1000BASEX:
++			target_fl_out = 0xa3d6;
++			cyclecnt = 32767;
++			break;
++		case PHY_INTERFACE_MODE_2500BASEX: /* DS/US 9.95328G */
++			target_fl_out = 0xa000;
++			cyclecnt = 20000;
++			break;
++		case PHY_INTERFACE_MODE_USXGMII: /* DS 10.3125G / US 1.25G */
++		case PHY_INTERFACE_MODE_10GBASER:
++			target_fl_out = 0x9edf;
++			cyclecnt = 32767;
++			break;
++		default:
++			return;
++		}
++
++		target_begin = target_fl_out - 100;
++		target_end = target_fl_out + 100;
+ 	}
+ 
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
+@@ -1646,8 +1765,8 @@
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_SS_RX_FREQ_DET_2,
+ 			   AIROHA_PCS_PMA_LOCK_TARGET_END |
+ 			   AIROHA_PCS_PMA_LOCK_TARGET_BEG,
+-			   FIELD_PREP(AIROHA_PCS_PMA_LOCK_TARGET_END, target_fl_out + 100) |
+-			   FIELD_PREP(AIROHA_PCS_PMA_LOCK_TARGET_BEG, target_fl_out - 100));
++			   FIELD_PREP(AIROHA_PCS_PMA_LOCK_TARGET_END, target_end) |
++			   FIELD_PREP(AIROHA_PCS_PMA_LOCK_TARGET_BEG, target_begin));
+ 
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_SS_RX_FREQ_DET_1,
+ 			   AIROHA_PCS_PMA_UNLOCK_CYCLECNT |
+@@ -1664,8 +1783,8 @@
+ 	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_SS_RX_FREQ_DET_3,
+ 			   AIROHA_PCS_PMA_UNLOCK_TARGET_END |
+ 			   AIROHA_PCS_PMA_UNLOCK_TARGET_BEG,
+-			   FIELD_PREP(AIROHA_PCS_PMA_UNLOCK_TARGET_END, target_fl_out + 100) |
+-			   FIELD_PREP(AIROHA_PCS_PMA_UNLOCK_TARGET_BEG, target_fl_out - 100));
++			   FIELD_PREP(AIROHA_PCS_PMA_UNLOCK_TARGET_END, target_end) |
++			   FIELD_PREP(AIROHA_PCS_PMA_UNLOCK_TARGET_BEG, target_begin));
+ 
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_INJ_FORCE_OFF], 0x1);
+ 
+@@ -1773,6 +1892,71 @@
+ 	usleep_range(100, 200);
+ }
+ 
++static void an7581_pcs_pon_tdc_off(struct airoha_pcs_priv *priv, int index)
++{
++	struct regmap *pcs_pma = priv->pcs_pma[index];
++
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
++			AIROHA_PCS_PMA_FORCE_SEL_DA_TXPLL_SDM_PCW);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_3,
++			AIROHA_PCS_PMA_LCPLL_NCPO_LOAD);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TXPLL_SDM_PCW_CHG,
++			AIROHA_PCS_PMA_FORCE_SEL_DA_TXPLL_SDM_PCW_CHG);
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TXPLL_SDM_PCW_CHG,
++			  AIROHA_PCS_PMA_FORCE_DA_TXPLL_SDM_PCW_CHG);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TXPLL_SDM_PCW_CHG,
++			AIROHA_PCS_PMA_FORCE_DA_TXPLL_SDM_PCW_CHG);
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_1,
++			   AIROHA_PCS_PMA_LCPLL_GPON_SEL,
++			   AIROHA_PCS_PMA_LCPLL_GPON_SEL_FROM_EPON);
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PW_0,
++			  AIROHA_PCS_PMA_LCPLL_TDC_DIG_PWDB);
++
++	usleep_range(100, 200);
++}
++
++static void an7581_pcs_pon_tdc_on(struct airoha_pcs_priv *priv, int index)
++{
++	struct regmap *pcs_pma = priv->pcs_pma[index];
++
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_6,
++			   AIROHA_PCS_PMA_LCPLL_NCPO_CHG_DELAY,
++			   AIROHA_PCS_PMA_LCPLL_NCPO_CHG_DELAY_SEL);
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_0,
++			   AIROHA_PCS_PMA_LCPLL_PON_RX_CDR_DIVTDC,
++			   AIROHA_PCS_PMA_LCPLL_PON_RX_CDR_DIVTDC_16);
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TXPLL_SDM_PCW_CHG,
++			  AIROHA_PCS_PMA_FORCE_SEL_DA_TXPLL_SDM_PCW_CHG);
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
++			  AIROHA_PCS_PMA_FORCE_SEL_DA_TXPLL_SDM_PCW);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PW_5,
++			AIROHA_PCS_PMA_LCPLL_AUTOK_TDC);
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_3,
++			  AIROHA_PCS_PMA_LCPLL_NCPO_LOAD);
++
++	usleep_range(100, 200);
++
++	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_5,
++			  AIROHA_PCS_PMA_LCPLL_TDC_AUTOPW_NCPO);
++
++	usleep_range(100, 200);
++
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_FLT_1,
++			   AIROHA_PCS_PMA_LCPLL_GPON_SEL,
++			   AIROHA_PCS_PMA_LCPLL_GPON_SEL_FROM_GPON);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_LCPLL_TDC_PW_0,
++			AIROHA_PCS_PMA_LCPLL_TDC_DIG_PWDB);
++
++	usleep_range(500, 700);
++
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB |
++			   AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_RSTB,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB);
++	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
++			AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_RSTB);
++}
++
+ /* This is used to both calibrate and lock to signal (after a previous
+  * calibration) after a global reset.
+  */
+@@ -1831,6 +2015,9 @@
+ 	usleep_range(100, 200);
+ 
+ retry_calibration:
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
++		an7581_pcs_pon_tdc_off(priv, index);
++
+ 	an7581_pcs_cdr_reset(priv, index, interface, priv->manual_rx_calib);
+ 
+ 	/* Global reset clear */
+@@ -1870,6 +2057,9 @@
+ 
+ 	an7581_pcs_cdr_reset(priv, index, interface, false);
+ 
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
++		an7581_pcs_pon_tdc_on(priv, index);
++
+	/* Manual RX calibration is required only for SoC before E2
+	 * revision. E2+ SoC autocalibrate RX and only CDR reset is needed.
+	 */
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -9,6 +9,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/pcs/pcs-provider.h>
++#include <linux/pcs/pcs-airoha.h>
+ #include <linux/property.h>
+ #include <linux/phy/phy.h>
+ #include <linux/phylink.h>
+@@ -999,6 +1000,43 @@
+ 	.pcs_link_down = airoha_pcs_link_down,
+ };
+ 
++static int airoha_pcs_xgspon_rx_update(struct phylink_pcs *pcs, bool recover)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	int ret;
++
++	if (!pcs || pcs->ops != &airoha_pcs_ops)
++		return -EINVAL;
++
++	port = to_airoha_pcs_port(pcs);
++	priv = port->priv;
++	if (priv->data->port_type != AIROHA_PCS_PON ||
++	    priv->pon_mode != AIROHA_PCS_PON_MODE_XGSPON)
++		return -EINVAL;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	ret = recover ? an7581_pcs_xgspon_rx_recover(priv, port->index) :
++			an7581_pcs_xgspon_rx_quiesce(priv, port->index);
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++
++	return ret;
++}
++
++int airoha_pcs_xgspon_rx_quiesce(struct phylink_pcs *pcs)
++{
++	return airoha_pcs_xgspon_rx_update(pcs, false);
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xgspon_rx_quiesce);
++
++int airoha_pcs_xgspon_rx_recover(struct phylink_pcs *pcs)
++{
++	return airoha_pcs_xgspon_rx_update(pcs, true);
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xgspon_rx_recover);
++
+ static int airoha_pcs_init_named_regmap(struct platform_device *pdev,
+ 					const char *name, struct regmap **regmap)
+ {
+@@ -1264,6 +1302,7 @@
+ 
+ 	priv->dev = dev;
+ 	priv->data = data;
++	mutex_init(&priv->recovery_lock);
+ 
+ 	if (data->port_type == AIROHA_PCS_PON &&
+ 	    device_property_present(dev, "airoha,pon-mode")) {
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/mutex.h>
+ #include <linux/phylink.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -1666,6 +1667,7 @@
+ 	struct reset_control_bulk_data rsts[AIROHA_PCS_MAX_NUM_RSTS];
+ 
+ 	struct phy *phy;
++	struct mutex recovery_lock;
+ 
+ 	bool manual_rx_calib;
+ 	enum airoha_pcs_pon_mode pon_mode;
+@@ -1701,6 +1703,8 @@
+ int an7581_pcs_pcie_alloc_regmap_fields(struct airoha_pcs_priv *priv);
+ int an7581_pcs_bringup(struct airoha_pcs_priv *priv,
+ 		       int index, phy_interface_t interface);
++int an7581_pcs_xgspon_rx_quiesce(struct airoha_pcs_priv *priv, int index);
++int an7581_pcs_xgspon_rx_recover(struct airoha_pcs_priv *priv, int index);
+ int an7581_pcs_usb_bringup(struct airoha_pcs_priv *priv,
+ 			   int index, phy_interface_t interface);
+ 
+@@ -1722,6 +1726,18 @@
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int an7581_pcs_xgspon_rx_quiesce(
++	struct airoha_pcs_priv *priv, int index)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int an7581_pcs_xgspon_rx_recover(
++	struct airoha_pcs_priv *priv, int index)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline int an7581_pcs_usb_bringup(struct airoha_pcs_priv *priv,
+ 					 int index, phy_interface_t interface)
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -1957,6 +1957,38 @@
+ 			AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_RSTB);
+ }
+ 
++static void an7581_pcs_cdr_reset(struct airoha_pcs_priv *priv, int index,
++				 phy_interface_t interface, bool calibrate);
++
++int an7581_pcs_xgspon_rx_quiesce(struct airoha_pcs_priv *priv, int index)
++{
++	struct regmap *pcs_pma = priv->pcs_pma[index];
++
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_XGSPON)
++		return -EINVAL;
++
++	an7581_pcs_pon_tdc_off(priv, index);
++	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA |
++			   AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA,
++			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++
++	return 0;
++}
++
++int an7581_pcs_xgspon_rx_recover(struct airoha_pcs_priv *priv, int index)
++{
++	if (priv->pon_mode != AIROHA_PCS_PON_MODE_XGSPON)
++		return -EINVAL;
++
++	/* The digital XGS PHY owner holds its reset around this PMA sequence. */
++	an7581_pcs_pon_tdc_off(priv, index);
++	an7581_pcs_cdr_reset(priv, index, PHY_INTERFACE_MODE_2500BASEX, false);
++	an7581_pcs_pon_tdc_on(priv, index);
++
++	return 0;
++}
++
+ /* This is used to both calibrate and lock to signal (after a previous
+  * calibration) after a global reset.
+  */
+--- /dev/null
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __LINUX_PCS_AIROHA_H
++#define __LINUX_PCS_AIROHA_H
++
++struct phylink_pcs;
++
++int airoha_pcs_xgspon_rx_quiesce(struct phylink_pcs *pcs);
++int airoha_pcs_xgspon_rx_recover(struct phylink_pcs *pcs);
++
++#endif /* __LINUX_PCS_AIROHA_H */

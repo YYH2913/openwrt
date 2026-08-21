@@ -1,0 +1,343 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 15:10:00 +0800
+Subject: [PATCH] net: sched: act_vlan: add partial tag treatment
+
+G.988 extended VLAN rules can copy individual fields from the received tag
+while replacing the others.  Add explicit DEI treatment and let MODIFY omit
+VID, protocol, priority, or DEI attributes to preserve those fields.
+
+PUSH retains its existing required VID and default values.  The flow action
+offload ABI cannot represent DEI or partial MODIFY masks, so reject those
+requests instead of silently changing the tag.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/tc_act/tc_vlan.h
++++ b/include/uapi/linux/tc_act/tc_vlan.h
+@@ -29,6 +29,7 @@
+ 	TCA_VLAN_PUSH_VLAN_PRIORITY,
+ 	TCA_VLAN_PUSH_ETH_DST,
+ 	TCA_VLAN_PUSH_ETH_SRC,
++	TCA_VLAN_PUSH_VLAN_DEI,
+ 	__TCA_VLAN_MAX,
+ };
+ #define TCA_VLAN_MAX (__TCA_VLAN_MAX - 1)
+--- a/include/net/tc_act/tc_vlan.h
++++ b/include/net/tc_act/tc_vlan.h
+@@ -15,9 +15,13 @@
+ 	unsigned char     tcfv_push_dst[ETH_ALEN];
+ 	unsigned char     tcfv_push_src[ETH_ALEN];
+ 	u16               tcfv_push_vid;
++	bool              tcfv_push_vid_exists;
+ 	__be16            tcfv_push_proto;
++	bool              tcfv_push_proto_exists;
+ 	u8                tcfv_push_prio;
+ 	bool              tcfv_push_prio_exists;
++	u8                tcfv_push_dei;
++	bool              tcfv_push_dei_exists;
+ 	struct rcu_head   rcu;
+ };
+ 
+@@ -49,6 +53,18 @@
+ 	return tcfv_push_vid;
+ }
+ 
++static inline bool tcf_vlan_push_vid_exists(const struct tc_action *a)
++{
++	bool tcfv_push_vid_exists;
++
++	rcu_read_lock();
++	tcfv_push_vid_exists =
++		rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_vid_exists;
++	rcu_read_unlock();
++
++	return tcfv_push_vid_exists;
++}
++
+ static inline __be16 tcf_vlan_push_proto(const struct tc_action *a)
+ {
+ 	__be16 tcfv_push_proto;
+@@ -60,6 +76,18 @@
+ 	return tcfv_push_proto;
+ }
+ 
++static inline bool tcf_vlan_push_proto_exists(const struct tc_action *a)
++{
++	bool tcfv_push_proto_exists;
++
++	rcu_read_lock();
++	tcfv_push_proto_exists =
++		rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_proto_exists;
++	rcu_read_unlock();
++
++	return tcfv_push_proto_exists;
++}
++
+ static inline u8 tcf_vlan_push_prio(const struct tc_action *a)
+ {
+ 	u8 tcfv_push_prio;
+@@ -71,6 +99,41 @@
+ 	return tcfv_push_prio;
+ }
+ 
++static inline bool tcf_vlan_push_prio_exists(const struct tc_action *a)
++{
++	bool tcfv_push_prio_exists;
++
++	rcu_read_lock();
++	tcfv_push_prio_exists =
++		rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_prio_exists;
++	rcu_read_unlock();
++
++	return tcfv_push_prio_exists;
++}
++
++static inline u8 tcf_vlan_push_dei(const struct tc_action *a)
++{
++	u8 tcfv_push_dei;
++
++	rcu_read_lock();
++	tcfv_push_dei = rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_dei;
++	rcu_read_unlock();
++
++	return tcfv_push_dei;
++}
++
++static inline bool tcf_vlan_push_dei_exists(const struct tc_action *a)
++{
++	bool tcfv_push_dei_exists;
++
++	rcu_read_lock();
++	tcfv_push_dei_exists =
++		rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_dei_exists;
++	rcu_read_unlock();
++
++	return tcfv_push_dei_exists;
++}
++
+ static inline void tcf_vlan_push_eth(unsigned char *src, unsigned char *dest,
+ 				     const struct tc_action *a)
+ {
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -26,6 +26,7 @@
+ 	struct tcf_vlan *v = to_vlan(a);
+ 	struct tcf_vlan_params *p;
+ 	int err;
++	__be16 proto;
+ 	u16 tci;
+ 
+ 	tcf_lastuse_update(&v->tcf_tm);
+@@ -47,7 +48,8 @@
+ 		break;
+ 	case TCA_VLAN_ACT_PUSH:
+ 		err = skb_vlan_push(skb, p->tcfv_push_proto, p->tcfv_push_vid |
+-				    (p->tcfv_push_prio << VLAN_PRIO_SHIFT));
++				    (p->tcfv_push_prio << VLAN_PRIO_SHIFT) |
++				    (p->tcfv_push_dei ? VLAN_CFI_MASK : 0));
+ 		if (err)
+ 			goto drop;
+ 		break;
+@@ -57,23 +59,33 @@
+ 			goto out;
+ 		/* extract existing tag (and guarantee no hw-accel tag) */
+ 		if (skb_vlan_tag_present(skb)) {
++			proto = skb->vlan_proto;
+ 			tci = skb_vlan_tag_get(skb);
+ 			__vlan_hwaccel_clear_tag(skb);
+ 		} else {
+ 			/* in-payload vlan tag, pop it */
++			proto = vlan_eth_hdr(skb)->h_vlan_proto;
+ 			err = __skb_vlan_pop(skb, &tci);
+ 			if (err)
+ 				goto drop;
+ 		}
+-		/* replace the vid */
+-		tci = (tci & ~VLAN_VID_MASK) | p->tcfv_push_vid;
++		/* replace the vid, if tcfv_push_vid was specified */
++		if (p->tcfv_push_vid_exists)
++			tci = (tci & ~VLAN_VID_MASK) | p->tcfv_push_vid;
+ 		/* replace prio bits, if tcfv_push_prio specified */
+ 		if (p->tcfv_push_prio_exists) {
+ 			tci &= ~VLAN_PRIO_MASK;
+ 			tci |= p->tcfv_push_prio << VLAN_PRIO_SHIFT;
+ 		}
++		/* replace DEI, if tcfv_push_dei was specified */
++		if (p->tcfv_push_dei_exists) {
++			tci &= ~VLAN_CFI_MASK;
++			tci |= p->tcfv_push_dei ? VLAN_CFI_MASK : 0;
++		}
+ 		/* put updated tci as hwaccel tag */
+-		__vlan_hwaccel_put_tag(skb, p->tcfv_push_proto, tci);
++		if (p->tcfv_push_proto_exists)
++			proto = p->tcfv_push_proto;
++		__vlan_hwaccel_put_tag(skb, proto, tci);
+ 		break;
+ 	case TCA_VLAN_ACT_POP_ETH:
+ 		err = skb_eth_pop(skb);
+@@ -107,6 +119,7 @@
+ 	[TCA_VLAN_PUSH_VLAN_ID]		= { .type = NLA_U16 },
+ 	[TCA_VLAN_PUSH_VLAN_PROTOCOL]	= { .type = NLA_U16 },
+ 	[TCA_VLAN_PUSH_VLAN_PRIORITY]	= { .type = NLA_U8 },
++	[TCA_VLAN_PUSH_VLAN_DEI]	= { .type = NLA_U8 },
+ 	[TCA_VLAN_PUSH_ETH_DST]		= NLA_POLICY_ETH_ADDR,
+ 	[TCA_VLAN_PUSH_ETH_SRC]		= NLA_POLICY_ETH_ADDR,
+ };
+@@ -120,13 +133,17 @@
+ 	bool bind = flags & TCA_ACT_FLAGS_BIND;
+ 	struct nlattr *tb[TCA_VLAN_MAX + 1];
+ 	struct tcf_chain *goto_ch = NULL;
++	bool push_vid_exists = false;
++	bool push_proto_exists = false;
+ 	bool push_prio_exists = false;
++	bool push_dei_exists = false;
+ 	struct tcf_vlan_params *p;
+ 	struct tc_vlan *parm;
+ 	struct tcf_vlan *v;
+ 	int action;
+ 	u16 push_vid = 0;
+ 	__be16 push_proto = 0;
++	u8 push_dei = 0;
+ 	u8 push_prio = 0;
+ 	bool exists = false;
+ 	int ret = 0, err;
+@@ -155,7 +172,6 @@
+ 	case TCA_VLAN_ACT_POP:
+ 		break;
+ 	case TCA_VLAN_ACT_PUSH:
+-	case TCA_VLAN_ACT_MODIFY:
+ 		if (!tb[TCA_VLAN_PUSH_VLAN_ID]) {
+ 			if (exists)
+ 				tcf_idr_release(*a, bind);
+@@ -163,16 +179,33 @@
+ 				tcf_idr_cleanup(tn, index);
+ 			return -EINVAL;
+ 		}
+-		push_vid = nla_get_u16(tb[TCA_VLAN_PUSH_VLAN_ID]);
+-		if (push_vid >= VLAN_VID_MASK) {
++		fallthrough;
++	case TCA_VLAN_ACT_MODIFY:
++		if (parm->v_action == TCA_VLAN_ACT_MODIFY &&
++		    !tb[TCA_VLAN_PUSH_VLAN_ID] &&
++		    !tb[TCA_VLAN_PUSH_VLAN_PROTOCOL] &&
++		    !tb[TCA_VLAN_PUSH_VLAN_PRIORITY] &&
++		    !tb[TCA_VLAN_PUSH_VLAN_DEI]) {
+ 			if (exists)
+ 				tcf_idr_release(*a, bind);
+ 			else
+ 				tcf_idr_cleanup(tn, index);
+-			return -ERANGE;
++			return -EINVAL;
++		}
++		push_vid_exists = !!tb[TCA_VLAN_PUSH_VLAN_ID];
++		if (push_vid_exists) {
++			push_vid = nla_get_u16(tb[TCA_VLAN_PUSH_VLAN_ID]);
++			if (push_vid >= VLAN_VID_MASK) {
++				if (exists)
++					tcf_idr_release(*a, bind);
++				else
++					tcf_idr_cleanup(tn, index);
++				return -ERANGE;
++			}
+ 		}
+ 
+-		if (tb[TCA_VLAN_PUSH_VLAN_PROTOCOL]) {
++		push_proto_exists = !!tb[TCA_VLAN_PUSH_VLAN_PROTOCOL];
++		if (push_proto_exists) {
+ 			push_proto = nla_get_be16(tb[TCA_VLAN_PUSH_VLAN_PROTOCOL]);
+ 			switch (push_proto) {
+ 			case htons(ETH_P_8021Q):
+@@ -185,13 +218,24 @@
+ 					tcf_idr_cleanup(tn, index);
+ 				return -EPROTONOSUPPORT;
+ 			}
+-		} else {
++		} else if (parm->v_action == TCA_VLAN_ACT_PUSH) {
+ 			push_proto = htons(ETH_P_8021Q);
+ 		}
+ 
+ 		push_prio_exists = !!tb[TCA_VLAN_PUSH_VLAN_PRIORITY];
+ 		if (push_prio_exists)
+ 			push_prio = nla_get_u8(tb[TCA_VLAN_PUSH_VLAN_PRIORITY]);
++		push_dei_exists = !!tb[TCA_VLAN_PUSH_VLAN_DEI];
++		if (push_dei_exists) {
++			push_dei = nla_get_u8(tb[TCA_VLAN_PUSH_VLAN_DEI]);
++			if (push_dei > 1) {
++				if (exists)
++					tcf_idr_release(*a, bind);
++				else
++					tcf_idr_cleanup(tn, index);
++				return -ERANGE;
++			}
++		}
+ 		break;
+ 	case TCA_VLAN_ACT_POP_ETH:
+ 		break;
+@@ -241,9 +285,13 @@
+ 
+ 	p->tcfv_action = action;
+ 	p->tcfv_push_vid = push_vid;
++	p->tcfv_push_vid_exists = push_vid_exists;
+ 	p->tcfv_push_prio = push_prio;
+ 	p->tcfv_push_prio_exists = push_prio_exists || action == TCA_VLAN_ACT_PUSH;
++	p->tcfv_push_dei = push_dei;
++	p->tcfv_push_dei_exists = push_dei_exists || action == TCA_VLAN_ACT_PUSH;
+ 	p->tcfv_push_proto = push_proto;
++	p->tcfv_push_proto_exists = push_proto_exists || action == TCA_VLAN_ACT_PUSH;
+ 
+ 	if (action == TCA_VLAN_ACT_PUSH_ETH) {
+ 		nla_memcpy(&p->tcfv_push_dst, tb[TCA_VLAN_PUSH_ETH_DST],
+@@ -304,11 +352,15 @@
+ 
+ 	if ((p->tcfv_action == TCA_VLAN_ACT_PUSH ||
+ 	     p->tcfv_action == TCA_VLAN_ACT_MODIFY) &&
+-	    (nla_put_u16(skb, TCA_VLAN_PUSH_VLAN_ID, p->tcfv_push_vid) ||
+-	     nla_put_be16(skb, TCA_VLAN_PUSH_VLAN_PROTOCOL,
+-			  p->tcfv_push_proto) ||
++	    ((p->tcfv_push_vid_exists &&
++	      nla_put_u16(skb, TCA_VLAN_PUSH_VLAN_ID, p->tcfv_push_vid)) ||
++	     (p->tcfv_push_proto_exists &&
++	      nla_put_be16(skb, TCA_VLAN_PUSH_VLAN_PROTOCOL,
++			   p->tcfv_push_proto)) ||
+ 	     (p->tcfv_push_prio_exists &&
+-	      nla_put_u8(skb, TCA_VLAN_PUSH_VLAN_PRIORITY, p->tcfv_push_prio))))
++	      nla_put_u8(skb, TCA_VLAN_PUSH_VLAN_PRIORITY, p->tcfv_push_prio)) ||
++	     (p->tcfv_push_dei_exists &&
++	      nla_put_u8(skb, TCA_VLAN_PUSH_VLAN_DEI, p->tcfv_push_dei))))
+ 		goto nla_put_failure;
+ 
+ 	if (p->tcfv_action == TCA_VLAN_ACT_PUSH_ETH) {
+@@ -348,13 +400,29 @@
+ 	return nla_total_size(sizeof(struct tc_vlan))
+ 		+ nla_total_size(sizeof(u16)) /* TCA_VLAN_PUSH_VLAN_ID */
+ 		+ nla_total_size(sizeof(u16)) /* TCA_VLAN_PUSH_VLAN_PROTOCOL */
+-		+ nla_total_size(sizeof(u8)); /* TCA_VLAN_PUSH_VLAN_PRIORITY */
++		+ nla_total_size(sizeof(u8)) /* TCA_VLAN_PUSH_VLAN_PRIORITY */
++		+ nla_total_size(sizeof(u8)); /* TCA_VLAN_PUSH_VLAN_DEI */
+ }
+ 
+ static int tcf_vlan_offload_act_setup(struct tc_action *act, void *entry_data,
+ 				      u32 *index_inc, bool bind,
+ 				      struct netlink_ext_ack *extack)
+ {
++	u32 action = tcf_vlan_action(act);
++
++	if (tcf_vlan_push_dei_exists(act) &&
++	    (action == TCA_VLAN_ACT_MODIFY || tcf_vlan_push_dei(act))) {
++		NL_SET_ERR_MSG_MOD(extack, "VLAN DEI treatment is not representable for offload");
++		return -EOPNOTSUPP;
++	}
++	if (action == TCA_VLAN_ACT_MODIFY &&
++	    (!tcf_vlan_push_vid_exists(act) ||
++	     !tcf_vlan_push_proto_exists(act) ||
++	     !tcf_vlan_push_prio_exists(act))) {
++		NL_SET_ERR_MSG_MOD(extack, "Partial VLAN modify is not representable for offload");
++		return -EOPNOTSUPP;
++	}
++
+ 	if (bind) {
+ 		struct flow_action_entry *entry = entry_data;
+ 
+-- 
+2.51.0
+

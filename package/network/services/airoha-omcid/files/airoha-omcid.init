@@ -1,0 +1,117 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=9
+USE_PROCD=1
+
+PROG=/usr/sbin/airoha-omcid
+MCAST=/usr/sbin/airoha-mcastd
+PLATFORM=/usr/libexec/airoha-omci-platform
+PERSIST_DIR=/etc/airoha-omci
+ONU3_STATE=$PERSIST_DIR/onu3-state.json
+RUNTIME_STATE=$PERSIST_DIR/runtime-state.json
+RESTART_REASON=$PERSIST_DIR/restart-reason
+
+start_service() {
+	local enabled serial_number pon_mode omci_mode restart_reason=0 invalid_reason=0 xgspon
+
+	config_load airoha-gpon
+	config_get_bool enabled main enabled 0
+	enabled="${AIROHA_OMCI_ENABLED_OVERRIDE:-$enabled}"
+	config_get serial_number main serial_number
+	config_get pon_mode main pon_mode gpon
+	pon_mode="${AIROHA_OMCI_PON_MODE_OVERRIDE:-$pon_mode}"
+	config_get omci_mode main omci_mode auto
+	omci_mode="${AIROHA_OMCI_MODE_OVERRIDE:-$omci_mode}"
+
+	[ "$enabled" -eq 1 ] || return 0
+	[ "$omci_mode" = auto ] || return 0
+	case "$pon_mode" in gpon|xgpon|xgspon) ;; *)
+		echo "airoha-omcid: invalid PON mode" >&2
+		return 1
+	;; esac
+	[ "${#serial_number}" -eq 12 ] || {
+		echo "airoha-omcid: valid ONU serial number is required" >&2
+		return 1
+	}
+	if [ "$pon_mode" = xgpon ] || [ "$pon_mode" = xgspon ]; then
+		for xgspon in /sys/bus/platform/drivers/airoha-xgspon/*; do
+			[ -r "$xgspon/activation_ready" ] || continue
+			break
+		done
+		[ -r "$xgspon/activation_ready" ] &&
+			[ "$(cat "$xgspon/activation_ready")" = 1 ] || {
+			echo "airoha-omcid: XGS-PON control path is not ready" >&2
+			return 1
+		}
+	fi
+	mkdir -p "$PERSIST_DIR" || return 1
+	if [ -e "$RESTART_REASON" ]; then
+		if [ -r "$RESTART_REASON" ]; then
+			restart_reason="$(cat "$RESTART_REASON")"
+			case "$restart_reason" in
+				''|*[!0-9]*) invalid_reason=1 ;;
+				*) [ "$restart_reason" -le 255 ] 2>/dev/null || invalid_reason=1 ;;
+			esac
+		else
+			invalid_reason=1
+		fi
+		if [ "$invalid_reason" -eq 1 ]; then
+			echo "airoha-omcid: ignoring invalid restart reason marker" >&2
+			restart_reason=0
+		fi
+	fi
+
+	if [ "$pon_mode" = gpon ]; then
+		ip link set dev pon up || return 1
+		ip link set dev omci up || return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_append_param command -interface omci
+	procd_append_param command -pon-mode "$pon_mode"
+	if [ "$pon_mode" = xgpon ] || [ "$pon_mode" = xgspon ]; then
+		procd_append_param command -transport device
+		procd_append_param command -device /dev/airoha-xgs-omcc
+	fi
+	procd_append_param command -serial "$serial_number"
+	procd_append_param command -status /var/run/airoha-omcid/status.json
+	procd_append_param command -xgs-omci-evidence /var/run/airoha-omcid/xgs-omci-evidence.json
+	procd_append_param command -state /var/run/airoha-omcid/desired.json
+	procd_append_param command -onu3-state "$ONU3_STATE"
+	procd_append_param command -runtime-state "$RUNTIME_STATE"
+	procd_append_param command -restart-reason "$restart_reason"
+	procd_append_param command -apply-helper /usr/libexec/airoha-omci-apply
+	procd_append_param command -control-helper /usr/libexec/airoha-omci-control
+	procd_append_param command -event-helper /usr/libexec/airoha-omci-events
+	procd_append_param command -software-helper /usr/libexec/airoha-omci-software
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param env AIROHA_OMCI_ONU3_STATE="$ONU3_STATE" AIROHA_OMCI_RESTART_REASON="$RESTART_REASON" AIROHA_OMCI_PON_MODE="$pon_mode"
+	[ "$pon_mode" = gpon ] && procd_set_param netdev omci
+	procd_close_instance
+
+	procd_open_instance multicast
+	procd_set_param command "$MCAST"
+	procd_append_param command -desired /var/run/airoha-omcid/desired.json
+	procd_append_param command -state-dir /var/run/airoha-omci/multicast
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param netdev lan1 lan2 lan3 lan4
+	procd_close_instance
+
+	procd_open_instance platform
+	procd_set_param command "$PLATFORM" monitor
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param env AIROHA_OMCI_PON_MODE="$pon_mode"
+	procd_set_param netdev pon
+	procd_close_instance
+
+	# The marker describes this boot only; procd retains the parsed value for respawns.
+	rm -f "$RESTART_REASON"
+}

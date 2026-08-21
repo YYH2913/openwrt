@@ -1,0 +1,3 @@
+#!/bin/sh
+
+exec "${AIROHA_OMCI_UCODE:?}" "${AIROHA_OMCI_RENDER_SOURCE:?}" "$@"

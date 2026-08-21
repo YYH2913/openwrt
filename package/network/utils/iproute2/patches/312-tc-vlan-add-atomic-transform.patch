@@ -1,0 +1,372 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 20:15:00 +0800
+Subject: [PATCH] tc: vlan: add atomic tag transform
+
+Expose the kernel VLAN TRANSFORM action.  It removes and pushes up to two
+tags in one action, with each output protocol, VID, PCP and DEI field either
+fixed or copied from the original outer or inner tag.
+
+Require every field of every output tag explicitly and reject unused tag
+descriptors.  This keeps command output round-trippable and avoids implicit
+defaults in the packet-dependent ABI.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/tc_act/tc_vlan.h
++++ b/include/uapi/linux/tc_act/tc_vlan.h
+@@ -13,6 +13,37 @@
+ #define TCA_VLAN_ACT_MODIFY	3
+ #define TCA_VLAN_ACT_POP_ETH	4
+ #define TCA_VLAN_ACT_PUSH_ETH	5
++#define TCA_VLAN_ACT_TRANSFORM	6
++
++#define TC_VLAN_TRANSFORM_MAX_TAGS	2
++
++enum tc_vlan_transform_source {
++	TC_VLAN_TRANSFORM_FIXED,
++	TC_VLAN_TRANSFORM_OUTER,
++	TC_VLAN_TRANSFORM_INNER,
++	__TC_VLAN_TRANSFORM_SOURCE_MAX,
++};
++#define TC_VLAN_TRANSFORM_SOURCE_MAX \
++	(__TC_VLAN_TRANSFORM_SOURCE_MAX - 1)
++
++struct tc_vlan_transform_tag {
++	__be16 protocol;
++	__u16 id;
++	__u8 priority;
++	__u8 dei;
++	__u8 protocol_source;
++	__u8 id_source;
++	__u8 priority_source;
++	__u8 dei_source;
++	__u8 reserved[2];
++};
++
++struct tc_vlan_transform {
++	__u8 pop_tags;
++	__u8 push_tags;
++	__u8 reserved[2];
++	struct tc_vlan_transform_tag tag[TC_VLAN_TRANSFORM_MAX_TAGS];
++};
+ 
+ struct tc_vlan {
+ 	tc_gen;
+@@ -30,6 +61,7 @@ enum {
+ 	TCA_VLAN_PUSH_ETH_DST,
+ 	TCA_VLAN_PUSH_ETH_SRC,
+ 	TCA_VLAN_PUSH_VLAN_DEI,
++	TCA_VLAN_TRANSFORM,
+ 	__TCA_VLAN_MAX,
+ };
+ #define TCA_VLAN_MAX (__TCA_VLAN_MAX - 1)
+--- a/tc/m_vlan.c
++++ b/tc/m_vlan.c
+@@ -20,6 +20,7 @@ static const char * const action_names[]
+ 	[TCA_VLAN_ACT_MODIFY] = "modify",
+ 	[TCA_VLAN_ACT_POP_ETH] = "pop_eth",
+ 	[TCA_VLAN_ACT_PUSH_ETH] = "push_eth",
++	[TCA_VLAN_ACT_TRANSFORM] = "transform",
+ };
+ 
+ static void explain(void)
+@@ -30,8 +31,13 @@ static void explain(void)
+ 		"       vlan modify [ protocol VLANPROTO ] [ id VLANID ] [ priority VLANPRIO ] [ dei VLANDEI ] [CONTROL]\n"
+ 		"       vlan pop_eth [CONTROL]\n"
+ 		"       vlan push_eth dst_mac LLADDR src_mac LLADDR [CONTROL]\n"
++		"       vlan transform pop_tags COUNT push_tags COUNT\n"
++		"            [ outer protocol VALUE id VALUE priority VALUE dei VALUE ]\n"
++		"            [ inner protocol VALUE id VALUE priority VALUE dei VALUE ] [CONTROL]\n"
+ 		"       VLANPROTO is one of 802.1Q or 802.1AD\n"
+ 		"            with default: 802.1Q\n"
++		"       transform VALUE is a fixed value, outer, or inner\n"
++		"       transform COUNT is between 0 and 2\n"
+ 		"       CONTROL := reclassify | pipe | drop | continue | pass |\n"
+ 		"                  goto chain <CHAIN_INDEX>\n");
+ }
+@@ -51,6 +57,18 @@ static bool has_push_attribs(int action)
+ 	return action == TCA_VLAN_ACT_PUSH || action == TCA_VLAN_ACT_MODIFY;
+ }
+ 
++static bool transform_source(__u8 *source, const char *value)
++{
++	if (strcmp(value, "outer") == 0)
++		*source = TC_VLAN_TRANSFORM_OUTER;
++	else if (strcmp(value, "inner") == 0)
++		*source = TC_VLAN_TRANSFORM_INNER;
++	else
++		return false;
++
++	return true;
++}
++
+ static void unexpected(const char *arg)
+ {
+ 	fprintf(stderr,
+@@ -77,6 +95,12 @@ static int parse_vlan(const struct action
+ 	__u8 dei;
+ 	int dei_set = 0;
+ 	struct tc_vlan parm = {};
++	struct tc_vlan_transform transform = {};
++	__u8 transform_fields[TC_VLAN_TRANSFORM_MAX_TAGS] = {};
++	int transform_tag = -1;
++	int pop_tags_set = 0;
++	int push_tags_set = 0;
++	int i;
+ 
+ 	if (matches(*argv, "vlan") != 0)
+ 		return -1;
+@@ -108,7 +132,31 @@ static int parse_vlan(const struct action
+ 				return -1;
+ 			}
+ 			action = TCA_VLAN_ACT_PUSH_ETH;
++		} else if (matches(*argv, "transform") == 0) {
++			if (action) {
++				unexpected(*argv);
++				return -1;
++			}
++			action = TCA_VLAN_ACT_TRANSFORM;
+ 		} else if (matches(*argv, "id") == 0) {
++			if (action == TCA_VLAN_ACT_TRANSFORM) {
++				if (transform_tag < 0 ||
++				    transform_fields[transform_tag] & 0x2)
++					invarg("transform id is misplaced or repeated", *argv);
++				NEXT_ARG();
++				if (!transform_source(
++					    &transform.tag[transform_tag].id_source,
++					    *argv) &&
++				    get_u16(&transform.tag[transform_tag].id,
++					    *argv, 0))
++					invarg("transform id is invalid", *argv);
++				if (transform.tag[transform_tag].id_source ==
++					    TC_VLAN_TRANSFORM_FIXED &&
++				    transform.tag[transform_tag].id >= 4095)
++					invarg("transform id is invalid", *argv);
++				transform_fields[transform_tag] |= 0x2;
++				goto next;
++			}
+ 			if (!has_push_attribs(action))
+ 				invarg("only valid for push/modify", *argv);
+ 
+@@ -117,6 +148,27 @@ static int parse_vlan(const struct action
+ 				invarg("id is invalid", *argv);
+ 			id_set = 1;
+ 		} else if (matches(*argv, "protocol") == 0) {
++			if (action == TCA_VLAN_ACT_TRANSFORM) {
++				if (transform_tag < 0 ||
++				    transform_fields[transform_tag] & 0x1)
++					invarg("transform protocol is misplaced or repeated", *argv);
++				NEXT_ARG();
++				if (!transform_source(
++					    &transform.tag[transform_tag].protocol_source,
++					    *argv)) {
++					if (ll_proto_a2n(
++						    &transform.tag[transform_tag].protocol,
++						    *argv))
++						invarg("transform protocol is invalid", *argv);
++					if (transform.tag[transform_tag].protocol !=
++						    htons(ETH_P_8021Q) &&
++					    transform.tag[transform_tag].protocol !=
++						    htons(ETH_P_8021AD))
++						invarg("transform protocol is not supported", *argv);
++				}
++				transform_fields[transform_tag] |= 0x1;
++				goto next;
++			}
+ 			if (!has_push_attribs(action))
+ 				invarg("only valid for push/modify", *argv);
+ 
+@@ -127,5 +180,20 @@ static int parse_vlan(const struct action
+ 			proto_set = 1;
+ 		} else if (matches(*argv, "priority") == 0) {
++			if (action == TCA_VLAN_ACT_TRANSFORM) {
++				if (transform_tag < 0 ||
++				    transform_fields[transform_tag] & 0x4)
++					invarg("transform priority is misplaced or repeated", *argv);
++				NEXT_ARG();
++				if (!transform_source(
++					    &transform.tag[transform_tag].priority_source,
++					    *argv) &&
++				    (get_u8(&transform.tag[transform_tag].priority,
++					    *argv, 0) ||
++				     transform.tag[transform_tag].priority > 7))
++					invarg("transform priority is invalid", *argv);
++				transform_fields[transform_tag] |= 0x4;
++				goto next;
++			}
+ 			if (!has_push_attribs(action))
+ 				invarg("only valid for push/modify", *argv);
+ 
+@@ -137,5 +207,20 @@ static int parse_vlan(const struct action
+ 			prio_set = 1;
+ 		} else if (matches(*argv, "dei") == 0) {
++			if (action == TCA_VLAN_ACT_TRANSFORM) {
++				if (transform_tag < 0 ||
++				    transform_fields[transform_tag] & 0x8)
++					invarg("transform dei is misplaced or repeated", *argv);
++				NEXT_ARG();
++				if (!transform_source(
++					    &transform.tag[transform_tag].dei_source,
++					    *argv) &&
++				    (get_u8(&transform.tag[transform_tag].dei,
++					    *argv, 0) ||
++				     transform.tag[transform_tag].dei > 1))
++					invarg("transform dei is invalid", *argv);
++				transform_fields[transform_tag] |= 0x8;
++				goto next;
++			}
+ 			if (!has_push_attribs(action))
+ 				invarg("only valid for push/modify", *argv);
+ 
+@@ -165,14 +252,62 @@ static int parse_vlan(const struct action
+ 				invarg("src_mac is invalid", *argv);
+ 			src_mac_set = 1;
++		} else if (matches(*argv, "pop_tags") == 0) {
++			if (action != TCA_VLAN_ACT_TRANSFORM || pop_tags_set)
++				invarg("only one pop_tags is valid for transform", *argv);
++			NEXT_ARG();
++			if (get_u8(&transform.pop_tags, *argv, 0) ||
++			    transform.pop_tags > TC_VLAN_TRANSFORM_MAX_TAGS)
++				invarg("pop_tags is invalid", *argv);
++			pop_tags_set = 1;
++		} else if (matches(*argv, "push_tags") == 0) {
++			if (action != TCA_VLAN_ACT_TRANSFORM || push_tags_set)
++				invarg("only one push_tags is valid for transform", *argv);
++			NEXT_ARG();
++			if (get_u8(&transform.push_tags, *argv, 0) ||
++			    transform.push_tags > TC_VLAN_TRANSFORM_MAX_TAGS)
++				invarg("push_tags is invalid", *argv);
++			push_tags_set = 1;
++		} else if (matches(*argv, "outer") == 0) {
++			if (action != TCA_VLAN_ACT_TRANSFORM)
++				invarg("only valid for transform", *argv);
++			transform_tag = 0;
++		} else if (matches(*argv, "inner") == 0) {
++			if (action != TCA_VLAN_ACT_TRANSFORM)
++				invarg("only valid for transform", *argv);
++			transform_tag = 1;
+ 		} else if (matches(*argv, "help") == 0) {
+ 			usage();
+ 		} else {
+ 			break;
+ 		}
++next:
+ 		argc--;
+ 		argv++;
+ 	}
+ 
++	if (action == TCA_VLAN_ACT_TRANSFORM) {
++		if (!pop_tags_set || !push_tags_set ||
++		    (!transform.pop_tags && !transform.push_tags)) {
++			fprintf(stderr, "transform requires non-empty pop_tags and push_tags counts\n");
++			explain();
++			return -1;
++		}
++		for (i = 0; i < TC_VLAN_TRANSFORM_MAX_TAGS; i++) {
++			if (i < transform.push_tags && transform_fields[i] != 0xf) {
++				fprintf(stderr, "%s transform tag requires protocol, id, priority and dei\n",
++					i ? "inner" : "outer");
++				explain();
++				return -1;
++			}
++			if (i >= transform.push_tags && transform_fields[i]) {
++				fprintf(stderr, "unused %s transform tag was specified\n",
++					i ? "inner" : "outer");
++				explain();
++				return -1;
++			}
++		}
++	}
++
+ 	parse_action_control_dflt(&argc, &argv, &parm.action,
+ 				  false, TC_ACT_PIPE);
+ 
+@@ -236,5 +371,8 @@ static int parse_vlan(const struct action
+ 	if (dei_set)
+ 		addattr8(n, MAX_MSG, TCA_VLAN_PUSH_VLAN_DEI, dei);
++	if (action == TCA_VLAN_ACT_TRANSFORM)
++		addattr_l(n, MAX_MSG, TCA_VLAN_TRANSFORM, &transform,
++			  sizeof(transform));
+ 	if (dst_mac_set)
+ 		addattr_l(n, MAX_MSG, TCA_VLAN_PUSH_ETH_DST, dst_mac,
+ 			  sizeof(dst_mac));
+@@ -250,6 +388,50 @@ static int parse_vlan(const struct action
+ 	return 0;
+ }
+ 
++static const char *transform_source_name(__u8 source)
++{
++	switch (source) {
++	case TC_VLAN_TRANSFORM_OUTER:
++		return "outer";
++	case TC_VLAN_TRANSFORM_INNER:
++		return "inner";
++	default:
++		return NULL;
++	}
++}
++
++static void print_transform_tag(const struct tc_vlan_transform_tag *tag,
++				const char *name)
++{
++	const char *source;
++	SPRINT_BUF(buffer);
++
++	print_string(PRINT_FP, NULL, " %s", name);
++	open_json_object(name);
++	source = transform_source_name(tag->protocol_source);
++	if (source)
++		print_string(PRINT_ANY, "protocol", " protocol %s", source);
++	else
++		print_string(PRINT_ANY, "protocol", " protocol %s",
++			     ll_proto_n2a(tag->protocol, buffer, sizeof(buffer)));
++	source = transform_source_name(tag->id_source);
++	if (source)
++		print_string(PRINT_ANY, "id", " id %s", source);
++	else
++		print_uint(PRINT_ANY, "id", " id %u", tag->id);
++	source = transform_source_name(tag->priority_source);
++	if (source)
++		print_string(PRINT_ANY, "priority", " priority %s", source);
++	else
++		print_uint(PRINT_ANY, "priority", " priority %u", tag->priority);
++	source = transform_source_name(tag->dei_source);
++	if (source)
++		print_string(PRINT_ANY, "dei", " dei %s", source);
++	else
++		print_uint(PRINT_ANY, "dei", " dei %u", tag->dei);
++	close_json_object();
++}
++
+ static int print_vlan(const struct action_util *au, FILE *f, struct rtattr *arg)
+ {
+ 	SPRINT_BUF(b1);
+@@ -290,6 +480,26 @@ static int print_vlan(const struct action
+ 			print_uint(PRINT_ANY, "dei", " dei %u", val);
+ 		}
+ 		break;
++	case TCA_VLAN_ACT_TRANSFORM:
++		if (!tb[TCA_VLAN_TRANSFORM] ||
++		    RTA_PAYLOAD(tb[TCA_VLAN_TRANSFORM]) !=
++			    sizeof(struct tc_vlan_transform)) {
++			fprintf(stderr, "Missing or invalid VLAN transform parameters\n");
++			return -1;
++		} else {
++			struct tc_vlan_transform *transform =
++				RTA_DATA(tb[TCA_VLAN_TRANSFORM]);
++
++			print_uint(PRINT_ANY, "pop_tags", " pop_tags %u",
++				   transform->pop_tags);
++			print_uint(PRINT_ANY, "push_tags", " push_tags %u",
++				   transform->push_tags);
++			if (transform->push_tags > 0)
++				print_transform_tag(&transform->tag[0], "outer");
++			if (transform->push_tags > 1)
++				print_transform_tag(&transform->tag[1], "inner");
++		}
++		break;
+ 	case TCA_VLAN_ACT_PUSH_ETH:
+ 		if (tb[TCA_VLAN_PUSH_ETH_DST] &&
+ 		    RTA_PAYLOAD(tb[TCA_VLAN_PUSH_ETH_DST]) == ETH_ALEN) {
+-- 
+2.51.0

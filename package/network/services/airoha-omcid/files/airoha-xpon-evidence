@@ -1,0 +1,284 @@
+#!/bin/sh
+
+# Read-only four-mode target evidence collector. It never changes PON state or
+# emits ONU serial numbers, passwords, Registration-IDs, keys, or packet data.
+set -eu
+
+sysfs_root="${AIROHA_XPON_EVIDENCE_SYSFS_ROOT:-/sys}"
+procfs_root="${AIROHA_XPON_EVIDENCE_PROCFS_ROOT:-/proc}"
+run_root="${AIROHA_XPON_EVIDENCE_RUN_ROOT:-/var/run}"
+jsonfilter="${AIROHA_XPON_EVIDENCE_JSONFILTER:-jsonfilter}"
+expected_mode="${1:-}"
+
+valid_mode() {
+	case "$1" in
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+find_device() {
+	local override="$1" pattern="$2" required="$3" path
+
+	if [ -n "$override" ]; then
+		[ -r "$override/$required" ] || return 1
+		printf '%s\n' "$override"
+		return 0
+	fi
+	for path in $pattern; do
+		[ -r "$path/$required" ] || continue
+		printf '%s\n' "$path"
+		return 0
+	done
+	return 1
+}
+
+emit_file() {
+	local prefix="$1" path="$2" name="$3" value
+
+	if [ -r "$path/$name" ]; then
+		value="$(tr '\n' ' ' < "$path/$name" | sed 's/[[:space:]]*$//')"
+		[ -n "$value" ] || value=empty
+	else
+		value=unavailable
+	fi
+	printf '%s_%s=%s\n' "$prefix" "$name" "$value"
+}
+
+emit_json_field() {
+	local prefix="$1" file="$2" field="$3" value
+
+	if [ -r "$file" ] && command -v "$jsonfilter" >/dev/null 2>&1; then
+		value="$("$jsonfilter" -i "$file" -e "@.$field" 2>/dev/null)" ||
+			value=unavailable
+		case "$value" in
+			''|*'
+'*) value=unavailable ;;
+		esac
+	else
+		value=unavailable
+	fi
+	printf '%s_%s=%s\n' "$prefix" "$field" "$value"
+}
+
+pair_field() {
+	local file="$1" field="$2" value
+
+	if [ -r "$file" ]; then
+		value="$(awk -v field="$field" '{
+			for (i = 1; i <= NF; i++) {
+				if (index($i, field "=") == 1) {
+					print substr($i, length(field) + 2)
+					exit
+				}
+			}
+		}' "$file")"
+	else
+		value=
+	fi
+	case "$value" in
+		''|*[!0-9]*) printf '%s\n' unavailable ;;
+		*) printf '%s\n' "$value" ;;
+	esac
+}
+
+[ -z "$expected_mode" ] || valid_mode "$expected_mode" || {
+	echo "error=invalid-expected-mode:$expected_mode" >&2
+	exit 2
+}
+
+core="$(find_device "${AIROHA_XPON_EVIDENCE_CORE_PATH:-}" \
+	"$sysfs_root/bus/platform/drivers/airoha-xpon-core/*" mode)" || {
+	echo 'error=xpon-core-not-found' >&2
+	exit 1
+}
+bosa="$(find_device "${AIROHA_XPON_EVIDENCE_BOSA_PATH:-}" \
+	"$sysfs_root/bus/i2c/drivers/airoha-en7572/*" pon_mode)" || {
+	echo 'error=en7572-bosa-not-found' >&2
+	exit 1
+}
+mode="$(cat "$core/mode")"
+valid_mode "$mode" || {
+	echo "error=invalid-runtime-mode:$mode" >&2
+	exit 1
+}
+bosa_mode="$(cat "$bosa/pon_mode")"
+[ -z "$expected_mode" ] || [ "$mode" = "$expected_mode" ] || {
+	echo "error=runtime-mode-mismatch:expected=$expected_mode:actual=$mode" >&2
+	exit 1
+}
+
+case "$mode" in
+	gpon)
+		protocol="$(find_device "${AIROHA_XPON_EVIDENCE_GPON_PATH:-}" \
+			"$sysfs_root/bus/platform/drivers/airoha-gpon/*" enabled)" || {
+			echo 'error=gpon-driver-not-found' >&2
+			exit 1
+		}
+		driver=gpon
+		;;
+	xgpon|xgspon)
+		protocol="$(find_device "${AIROHA_XPON_EVIDENCE_XGSPON_PATH:-}" \
+			"$sysfs_root/bus/platform/drivers/airoha-xgspon/*" enabled)" || {
+			echo 'error=xgspon-driver-not-found' >&2
+			exit 1
+		}
+		driver=xgspon
+		;;
+	epon-10g-1g|epon-10g-10g)
+		protocol="$(find_device "${AIROHA_XPON_EVIDENCE_EPON_PATH:-}" \
+			"$sysfs_root/bus/platform/drivers/airoha-en7581-epon/*" enabled)" || {
+			echo 'error=epon-driver-not-found' >&2
+			exit 1
+		}
+		driver=epon
+		;;
+esac
+
+printf 'version=1\n'
+printf 'semantics=read-only-target-evidence-not-acceptance\n'
+printf 'collected_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'kernel_release=%s\n' "$(uname -r)"
+printf 'runtime_mode=%s\n' "$mode"
+printf 'selected_driver=%s\n' "$driver"
+if [ "$bosa_mode" = "$mode" ]; then
+	printf 'bosa_mode_match=1\n'
+else
+	printf 'bosa_mode_match=0\n'
+fi
+if [ -n "$expected_mode" ]; then
+	printf 'expected_mode=%s\n' "$expected_mode"
+	printf 'expected_mode_match=1\n'
+else
+	printf 'expected_mode=unspecified\n'
+	printf 'expected_mode_match=unavailable\n'
+fi
+if [ -r "$procfs_root/sys/kernel/random/boot_id" ]; then
+	printf 'boot_id=%s\n' "$(cat "$procfs_root/sys/kernel/random/boot_id")"
+else
+	printf 'boot_id=unavailable\n'
+fi
+if [ -r "$procfs_root/uptime" ]; then
+	read -r uptime_seconds _ < "$procfs_root/uptime"
+	printf 'uptime_seconds=%s\n' "$uptime_seconds"
+else
+	printf 'uptime_seconds=unavailable\n'
+fi
+
+emit_file core "$core" mode
+emit_file core "$core" available_modes
+emit_file core "$core" switch_state
+emit_file core "$core" dying_gasp
+emit_file bosa "$bosa" pon_mode
+emit_file bosa "$bosa" initialized
+emit_file bosa "$bosa" calibration_source
+emit_file bosa "$bosa" vendor
+emit_file bosa "$bosa" part_number
+emit_file bosa "$bosa" firmware_version
+emit_file bosa "$bosa" mcu_idle
+emit_file bosa "$bosa" los
+emit_file bosa "$bosa" tx_disable
+emit_file bosa "$bosa" fault_locked
+emit_file bosa "$bosa" optical_diagnostics
+
+case "$driver" in
+	gpon)
+		emit_file gpon "$protocol" enabled
+		emit_file gpon "$protocol" state
+		emit_file gpon "$protocol" onu_id
+		emit_file gpon "$protocol" omcc_id
+		emit_file gpon "$protocol" equalization_delay
+		emit_file gpon "$protocol" tconts
+		emit_file gpon "$protocol" data_gems
+		emit_file gpon "$protocol" safety_status
+		emit_file gpon "$protocol" optical_link
+		emit_file gpon "$protocol" ber_sample
+		emit_file gpon "$protocol" stats
+		;;
+	xgspon)
+		emit_file xgspon "$protocol" pon_mode
+		emit_file xgspon "$protocol" control_abi_version
+		emit_file xgspon "$protocol" enabled
+		emit_file xgspon "$protocol" activation_ready
+		emit_file xgspon "$protocol" ready
+		emit_file xgspon "$protocol" state
+		emit_file xgspon "$protocol" activation_blockers
+		emit_file xgspon "$protocol" key_derivation_state
+		emit_file xgspon "$protocol" registration_id_configured
+		emit_file xgspon "$protocol" mac_initialization
+		emit_file xgspon "$protocol" phy_evidence
+		emit_file xgspon "$protocol" activation_evidence
+		emit_file xgspon "$protocol" to1_evidence
+		emit_file xgspon "$protocol" mac_errors
+		emit_file xgspon "$protocol" service_state
+		emit_file xgspon "$protocol" omcc_rx_evidence
+		emit_file xgspon "$protocol" xgs_counter_evidence
+		emit_file xgspon "$protocol" xgs_ploam_evidence
+		emit_file xgspon "$protocol" xgs_pm_snapshot
+		;;
+	epon)
+		emit_file epon "$protocol" enabled
+		emit_file epon "$protocol" llid_mask
+		emit_file epon "$protocol" silent_time
+		emit_file epon "$protocol" holdover
+		emit_file epon "$protocol" mpcp_state
+		emit_file epon "$protocol" counter_evidence
+		emit_file epon "$protocol" statistics
+		;;
+esac
+
+net_path="${AIROHA_XPON_EVIDENCE_NET_PATH:-$sysfs_root/class/net/pon}"
+emit_file net "$net_path" operstate
+emit_file net "$net_path/statistics" rx_bytes
+emit_file net "$net_path/statistics" tx_bytes
+emit_file net "$net_path/statistics" rx_packets
+emit_file net "$net_path/statistics" tx_packets
+emit_file net "$net_path/statistics" rx_errors
+emit_file net "$net_path/statistics" tx_errors
+
+case "$driver" in
+	xgspon)
+		printf 'pon_counter_source=xgs-mac-session-non-idle-bytes\n'
+		printf 'pon_counter_reset=0\n'
+		printf 'pon_rx_counter=%s\n' \
+			"$(pair_field "$protocol/xgs_pm_snapshot" \
+				received_non_idle_bytes)"
+		printf 'pon_rx_counter_unit=bytes\n'
+		printf 'pon_tx_counter=%s\n' \
+			"$(pair_field "$protocol/xgs_pm_snapshot" \
+				transmitted_non_idle_bytes)"
+		printf 'pon_tx_counter_unit=bytes\n'
+		;;
+	epon)
+		printf 'pon_counter_source=epon-mac-session\n'
+		printf 'pon_counter_reset=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" counter_reset)"
+		printf 'pon_rx_counter=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" \
+				rx_ethernet_bytes)"
+		printf 'pon_rx_counter_unit=bytes\n'
+		printf 'pon_tx_counter=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" \
+				tx_mpi_ethernet_frames)"
+		printf 'pon_tx_counter_unit=frames\n'
+		;;
+	*)
+		printf 'pon_counter_source=unavailable\n'
+		printf 'pon_counter_reset=unavailable\n'
+		printf 'pon_rx_counter=unavailable\n'
+		printf 'pon_rx_counter_unit=unavailable\n'
+		printf 'pon_tx_counter=unavailable\n'
+		printf 'pon_tx_counter_unit=unavailable\n'
+		;;
+esac
+
+if [ "$driver" = epon ]; then
+	emit_json_field control "$run_root/airoha-epon-oamd/status.json" state
+	emit_json_field control "$run_root/airoha-epon-oamd/status.json" pon_mode
+	emit_json_field control "$run_root/airoha-epon-oamd/status.json" control_plane
+	emit_json_field control "$run_root/airoha-epon-oamd/status.json" omci
+else
+	emit_json_field control "$run_root/airoha-omcid/status.json" state
+	emit_json_field control "$run_root/airoha-omcid/status.json" pon_mode
+	emit_json_field platform "$run_root/airoha-omcid/platform.json" state
+fi

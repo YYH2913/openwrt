@@ -1,0 +1,185 @@
+From: OpenWrt XPON integration
+Subject: [PATCH] net: pcs: airoha: split XPON WAN selection from PMA setup
+
+Make the runtime transaction's WAN-selection stage correspond to a real
+hardware boundary.  Program and read back SCU WAN_SEL while the PCS is
+quiesced, then require that stage before PMA bring-up.  Re-quiescing always
+reasserts the SDK reset-hold sequence so rollback after PMA bring-up cannot
+leave the target PMA running.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1110,6 +1110,33 @@
+ 	}
+ }
+ 
++static int airoha_pcs_xpon_wan_sel(enum airoha_pcs_pon_mode mode,
++				    u32 *wan_sel)
++{
++	switch (mode) {
++	case AIROHA_PCS_PON_MODE_GPON:
++		*wan_sel = AIROHA_SCU_WAN_SEL_GPON;
++		break;
++	case AIROHA_PCS_PON_MODE_XGPON:
++		*wan_sel = AIROHA_SCU_WAN_SEL_XGPON;
++		break;
++	case AIROHA_PCS_PON_MODE_XGSPON:
++		*wan_sel = AIROHA_SCU_WAN_SEL_XGSPON;
++		break;
++	case AIROHA_PCS_PON_MODE_EPON_10G_1G:
++		*wan_sel = AIROHA_SCU_WAN_SEL_EPON_10G_1G;
++		break;
++	case AIROHA_PCS_PON_MODE_EPON_10G_10G:
++		*wan_sel = AIROHA_SCU_WAN_SEL_EPON_10G_10G;
++		break;
++	case AIROHA_PCS_PON_MODE_NONE:
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ int airoha_pcs_xpon_get_mode(struct phylink_pcs *pcs,
+ 			     enum airoha_pcs_xpon_mode *mode)
+ {
+@@ -1144,22 +1171,17 @@
+ 
+ 	rtnl_lock();
+ 	mutex_lock(&priv->recovery_lock);
+-	if (priv->pon_quiesced) {
+-		ret = 0;
+-		goto unlock;
+-	}
+-
+ 	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 			AIROHA_PCS_XFI_RXMPI_STOP |
+ 			AIROHA_PCS_XFI_RXMBI_STOP |
+ 			AIROHA_PCS_XFI_TXMPI_STOP |
+ 			AIROHA_PCS_XFI_TXMBI_STOP);
+ 	ret = an7581_pcs_xpon_quiesce(priv, port->index);
+ 	if (!ret) {
+ 		priv->pon_quiesced = true;
++		priv->pon_wan_selected = false;
+ 		priv->pon_pma_ready = false;
+ 	}
+-unlock:
+ 	mutex_unlock(&priv->recovery_lock);
+ 	rtnl_unlock();
+ 	return ret;
+@@ -1166,18 +1189,22 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_pcs_xpon_quiesce);
+ 
+-int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
+-			     enum airoha_pcs_xpon_mode mode)
++int airoha_pcs_xpon_select_wan(struct phylink_pcs *pcs,
++			       enum airoha_pcs_xpon_mode mode)
+ {
+ 	struct airoha_pcs_port *port;
+ 	struct airoha_pcs_priv *priv;
+ 	enum airoha_pcs_pon_mode internal;
+ 	phy_interface_t interface;
++	u32 expected, value;
+ 	int ret;
+ 
+ 	ret = airoha_pcs_xpon_mode_from_public(mode, &internal);
+ 	if (ret)
+ 		return ret;
++	ret = airoha_pcs_xpon_wan_sel(internal, &expected);
++	if (ret)
++		return ret;
+ 	ret = airoha_pcs_xpon_port(pcs, &port);
+ 	if (ret)
+ 		return ret;
+@@ -1190,6 +1217,7 @@
+ 		goto unlock;
+ 	}
+ 
++	priv->pon_wan_selected = false;
+ 	priv->pon_pma_ready = false;
+ 	priv->pon_mode = internal;
+ 	interface = priv->interface == PHY_INTERFACE_MODE_NA ?
+@@ -1197,7 +1225,52 @@
+ 	ret = airoha_pcs_setup_scu(priv, port->index, interface);
+ 	if (ret)
+ 		goto unlock;
+-	ret = priv->data->bringup(priv, port->index, interface);
++	ret = regmap_read(priv->scu, AIROHA_SCU_WAN_CONF, &value);
++	if (ret)
++		goto unlock;
++	if ((value & AIROHA_SCU_WAN_SEL) != expected) {
++		ret = -EIO;
++		goto unlock;
++	}
++	priv->pon_wan_selected = true;
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_select_wan);
++
++int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
++			     enum airoha_pcs_xpon_mode mode)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	enum airoha_pcs_pon_mode internal;
++	int ret;
++
++	ret = airoha_pcs_xpon_mode_from_public(mode, &internal);
++	if (ret)
++		return ret;
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (!priv->pon_quiesced || !priv->pon_wan_selected) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	if (priv->pon_mode != internal) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	priv->pon_pma_ready = false;
++	ret = priv->data->bringup(priv, port->index,
++		priv->interface == PHY_INTERFACE_MODE_NA ?
++		PHY_INTERFACE_MODE_2500BASEX : priv->interface);
+ 	if (!ret)
+ 		priv->pon_pma_ready = true;
+ unlock:
+@@ -1233,6 +1306,7 @@
+ 			  AIROHA_PCS_XFI_TXMPI_STOP |
+ 			  AIROHA_PCS_XFI_TXMBI_STOP);
+ 	priv->pon_quiesced = false;
++	priv->pon_wan_selected = false;
+ 	priv->pon_pma_ready = false;
+ 	ret = 0;
+ unlock:
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1700,6 +1700,7 @@
+ 
+ 	bool manual_rx_calib;
+ 	bool pon_quiesced;
++	bool pon_wan_selected;
+ 	bool pon_pma_ready;
+ 	enum airoha_pcs_pon_mode pon_mode;
+ };
+--- a/include/linux/pcs/pcs-airoha.h
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -17,6 +17,8 @@
+ int airoha_pcs_xpon_get_mode(struct phylink_pcs *pcs,
+ 			     enum airoha_pcs_xpon_mode *mode);
+ int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs);
++int airoha_pcs_xpon_select_wan(struct phylink_pcs *pcs,
++			       enum airoha_pcs_xpon_mode mode);
+ int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
+ 			     enum airoha_pcs_xpon_mode mode);
+ int airoha_pcs_xpon_recover(struct phylink_pcs *pcs);

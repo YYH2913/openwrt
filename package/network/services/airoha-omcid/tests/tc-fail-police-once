@@ -1,0 +1,11 @@
+#!/bin/sh
+
+for argument in "$@"; do
+	[ "$argument" = police ] || continue
+	if [ ! -e "${AIROHA_OMCI_TC_FAILED:?}" ]; then
+		touch "$AIROHA_OMCI_TC_FAILED"
+		exit 1
+	fi
+	break
+done
+exec "$(dirname "$0")/tc-host-dei" "$@"

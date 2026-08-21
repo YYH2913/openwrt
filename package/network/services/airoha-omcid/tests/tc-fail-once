@@ -1,0 +1,7 @@
+#!/bin/sh
+
+if [ "$1" = filter ] && [ "$2" = replace ] && [ ! -e "${AIROHA_OMCI_TC_FAILED:?}" ]; then
+	touch "$AIROHA_OMCI_TC_FAILED"
+	exit 1
+fi
+exec "$(dirname "$0")/tc-host-dei" "$@"

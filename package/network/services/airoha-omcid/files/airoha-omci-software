@@ -1,0 +1,545 @@
+#!/bin/sh
+
+set -eu
+
+umask 077
+
+CONFIG=airoha-omci-images
+PRODUCT=XG2010G
+OLD_VOLUME=omci_fit_old
+FAILED_VOLUME=omci_fit_failed
+ROOTFS_DATA_MAX=0x15800000
+BOOT_UBI='ubi part ubi && run omci_boot_guard && run boot_production'
+OMCI_ROLLBACK='if ubi check omci_fit_old; then if ubi check fit; then if ubi check omci_fit_failed; then ubi remove omci_fit_failed; fi; ubi rename fit omci_fit_failed; fi; ubi rename omci_fit_old fit; fi; if ubi check fit; then if ubi check omci_fit_failed; then ubi remove omci_fit_failed; fi; setenv omci_active_id ${omci_committed_id}; setenv omci_pending; saveenv; else false; fi'
+OMCI_BOOT_COMMIT='if ubi check fit; then if ubi check omci_fit_switch; then run omci_boot_finish; elif ubi check omci_fit_${omci_active_id}; then setenv omci_active_id ${omci_committed_id}; saveenv; else if ubi rename fit omci_fit_switch; then run omci_boot_finish; else false; fi; fi; elif ubi check omci_fit_switch; then run omci_boot_finish; else false; fi'
+OMCI_BOOT_FINISH='if ubi check fit; then run omci_boot_stage; elif ubi check omci_fit_old; then if ubi rename omci_fit_old fit; then run omci_boot_stage; else false; fi; elif ubi check omci_fit_${omci_committed_id}; then if ubi rename omci_fit_${omci_committed_id} fit; then run omci_boot_stage; else false; fi; else false; fi'
+OMCI_BOOT_STAGE='if ubi check omci_fit_switch; then if ubi check omci_fit_${omci_active_id}; then if ubi remove omci_fit_${omci_active_id}; then ubi rename omci_fit_switch omci_fit_${omci_active_id}; else false; fi; else ubi rename omci_fit_switch omci_fit_${omci_active_id}; fi; fi; if ubi check fit; then if ubi check omci_fit_${omci_active_id}; then setenv omci_active_id ${omci_committed_id}; saveenv; else false; fi; else false; fi'
+OMCI_BOOT_GUARD='if test "${omci_pending}" = "1"; then setenv omci_pending 2; saveenv; elif test "${omci_pending}" = "prepare"; then run omci_rollback; elif test "${omci_pending}" = "2"; then if test "${omci_active_id}" = "${omci_committed_id}"; then setenv omci_pending; saveenv; else run omci_rollback; fi; elif test "${omci_active_id}" != "${omci_committed_id}"; then run omci_boot_commit; else true; fi'
+RESTART_REASON="${AIROHA_OMCI_RESTART_REASON:-/etc/airoha-omci/restart-reason}"
+REBOOT_COMMAND="${AIROHA_OMCI_REBOOT:-/sbin/reboot}"
+REBOOT_DELAY="${AIROHA_OMCI_REBOOT_DELAY:-2}"
+SYS_CLASS_ROOT="${AIROHA_OMCI_SYS_CLASS:-/sys/class}"
+
+write_restart_reason() {
+	local value="$1" directory temporary_reason
+
+	[ ! -d "$RESTART_REASON" ] || return 1
+	directory="${RESTART_REASON%/*}"
+	[ "$directory" != "$RESTART_REASON" ] || directory=.
+	mkdir -p "$directory" || return 1
+	temporary_reason="$(mktemp "$directory/.restart-reason.XXXXXX")" || return 1
+	if ! printf '%s\n' "$value" > "$temporary_reason" ||
+			! mv -f "$temporary_reason" "$RESTART_REASON"; then
+		rm -f "$temporary_reason"
+		return 1
+	fi
+}
+
+schedule_reboot() {
+	write_restart_reason 1 || {
+		echo "airoha-omci-software: failed to persist restart reason" >&2
+		return 1
+	}
+	(sleep "$REBOOT_DELAY"; "$REBOOT_COMMAND") </dev/null >/dev/null 2>&1 &
+}
+
+v() {
+	printf '%s\n' "$*" >&2
+}
+
+validate_id() {
+	case "$1" in 0|1) ;; *) return 1 ;; esac
+}
+
+validate_number() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+env_value() {
+	local value
+	value="$(fw_printenv -n "$1" 2>/dev/null || true)"
+	printf '%s' "$value"
+}
+
+find_ubi() {
+	local path mtd name
+	for path in "$SYS_CLASS_ROOT"/ubi/ubi[0-9]*; do
+		[ -f "$path/mtd_num" ] || continue
+		mtd="$(cat "$path/mtd_num")"
+		name="$(cat "$SYS_CLASS_ROOT/mtd/mtd$mtd/name" 2>/dev/null || true)"
+		[ "$name" = ubi ] || continue
+		printf '/dev/%s\n' "${path##*/}"
+		return 0
+	done
+	return 1
+}
+
+find_volume() {
+	local wanted="$1" path
+	for path in "$SYS_CLASS_ROOT"/ubi/ubi[0-9]*_[0-9]*; do
+		[ -f "$path/name" ] || continue
+		[ "$(cat "$path/name")" = "$wanted" ] || continue
+		printf '/dev/%s\n' "${path##*/}"
+		return 0
+	done
+	return 1
+}
+
+block_for_volume() {
+	local volume="${1#/dev/ubi}"
+	printf '/dev/ubiblock%s\n' "$volume"
+}
+
+remove_block() {
+	local volume="$1" block
+	block="$(block_for_volume "$volume")"
+	[ ! -b "$block" ] || ubiblock --remove "$volume" >/dev/null 2>&1 || true
+}
+
+bool_json() {
+	[ "$1" = 1 ] && printf true || printf false
+}
+
+safe_version() {
+	local value="$1"
+	case "$value" in
+		''|*[!A-Za-z0-9._+-]*) value=unknown ;;
+	esac
+	printf '%s' "$value" | cut -c1-14
+}
+
+safe_hash() {
+	local value="$1"
+	case "$value" in
+		????????????????????????????????)
+			case "$value" in *[!0-9a-fA-F]*) value= ;; esac
+			;;
+		*) value= ;;
+	esac
+	printf '%s' "$value"
+}
+
+ensure_state() {
+	if ! uci -q get "$CONFIG.image0" >/dev/null; then
+		uci -q batch <<-EOF
+			set $CONFIG.image0=image
+			set $CONFIG.image0.version='OpenWrt'
+			set $CONFIG.image0.product_code='$PRODUCT'
+			set $CONFIG.image0.image_hash=''
+			set $CONFIG.image0.valid='1'
+			set $CONFIG.image1=image
+			set $CONFIG.image1.version='standby'
+			set $CONFIG.image1.product_code='$PRODUCT'
+			set $CONFIG.image1.image_hash=''
+			set $CONFIG.image1.valid='0'
+		EOF
+		uci -q commit "$CONFIG"
+	fi
+}
+
+ensure_environment() {
+	local name wanted current
+	for name in rootfs_data_max boot_ubi omci_rollback omci_boot_commit omci_boot_finish omci_boot_stage omci_boot_guard; do
+		case "$name" in
+			rootfs_data_max) wanted="$ROOTFS_DATA_MAX" ;;
+			boot_ubi) wanted="$BOOT_UBI" ;;
+			omci_rollback) wanted="$OMCI_ROLLBACK" ;;
+			omci_boot_commit) wanted="$OMCI_BOOT_COMMIT" ;;
+			omci_boot_finish) wanted="$OMCI_BOOT_FINISH" ;;
+			omci_boot_stage) wanted="$OMCI_BOOT_STAGE" ;;
+			omci_boot_guard) wanted="$OMCI_BOOT_GUARD" ;;
+		esac
+		current="$(env_value "$name")"
+		[ "$current" = "$wanted" ] || fw_setenv "$name" "$wanted"
+	done
+	for name in omci_active_id omci_committed_id; do
+		current="$(env_value "$name")"
+		validate_id "$current" || fw_setenv "$name" 0
+	done
+}
+
+reconcile_storage() {
+	local active committed pending ubi old_id old_stage failed_dev
+	active="$(env_value omci_active_id)"
+	committed="$(env_value omci_committed_id)"
+	pending="$(env_value omci_pending)"
+	validate_id "$active" || return 0
+	validate_id "$committed" || return 0
+	if [ "$pending" = prepare ]; then
+		rollback_prepared_activation "$active" || return 1
+		pending=
+	fi
+	[ "$active" = "$committed" ] || return 0
+	[ -z "$pending" ] || return 0
+
+	ubi="$(find_ubi)" || return 0
+	if find_volume "$OLD_VOLUME" >/dev/null 2>&1; then
+		old_id=$((1 - active))
+		old_stage="omci_fit_$old_id"
+		if find_volume "$old_stage" >/dev/null 2>&1; then
+			remove_block "$(find_volume "$old_stage")"
+			ubirmvol "$ubi" -N "$old_stage" >&2
+		fi
+		ubirename "$ubi" "$OLD_VOLUME" "$old_stage" >&2
+	fi
+	if failed_dev="$(find_volume "$FAILED_VOLUME")"; then
+		remove_block "$failed_dev"
+		ubirmvol "$ubi" -N "$FAILED_VOLUME" >&2
+	fi
+}
+
+rollback_prepared_activation() {
+	local active="$1" target ubi stage
+	validate_id "$active" || return 1
+	target=$((1 - active))
+	stage="omci_fit_$target"
+	if find_volume "$OLD_VOLUME" >/dev/null 2>&1; then
+		ubi="$(find_ubi)" || return 1
+		find_volume fit >/dev/null 2>&1 || return 1
+		if find_volume "$stage" >/dev/null 2>&1; then
+			echo "cannot restore prepared activation: $stage already exists" >&2
+			return 1
+		fi
+		ubirename "$ubi" fit "$stage" "$OLD_VOLUME" fit >&2 || return 1
+	fi
+	fw_setenv omci_pending
+}
+
+image_value() {
+	local id="$1" option="$2" fallback="$3" value
+	value="$(uci -q get "$CONFIG.image$id.$option" || true)"
+	[ -n "$value" ] || value="$fallback"
+	printf '%s' "$value"
+}
+
+image_valid() {
+	local id="$1" active="$2" committed="$3" configured stage
+	configured="$(image_value "$id" valid 0)"
+	[ "$configured" = 1 ] || {
+		printf 0
+		return
+	}
+	if [ "$id" = "$active" ]; then
+		printf 1
+		return
+	fi
+	if [ "$id" = "$committed" ] && find_volume "$OLD_VOLUME" >/dev/null 2>&1; then
+		printf 1
+		return
+	fi
+	stage="omci_fit_$id"
+	find_volume "$stage" >/dev/null 2>&1 && printf 1 || printf 0
+}
+
+show_state() {
+	local active committed id version product hash valid is_active is_committed
+	ensure_state
+	ensure_environment
+	reconcile_storage
+	active="$(env_value omci_active_id)"
+	committed="$(env_value omci_committed_id)"
+	validate_id "$active" || active=0
+	validate_id "$committed" || committed=0
+
+	printf '{"images":['
+	for id in 0 1; do
+		[ "$id" = 0 ] || printf ','
+		version="$(safe_version "$(image_value "$id" version unknown)")"
+		product="$(image_value "$id" product_code "$PRODUCT")"
+		[ "$product" = "$PRODUCT" ] || product="$PRODUCT"
+		hash="$(safe_hash "$(image_value "$id" image_hash '')")"
+		valid="$(image_valid "$id" "$active" "$committed")"
+		[ "$id" = "$active" ] && is_active=1 || is_active=0
+		[ "$id" = "$committed" ] && is_committed=1 || is_committed=0
+		printf '{"entity_id":%s,"version":"%s","product_code":"%s","image_hash":"%s","committed":%s,"active":%s,"valid":%s}' \
+			"$id" "$version" "$product" "$hash" \
+			"$(bool_json "$is_committed")" "$(bool_json "$is_active")" "$(bool_json "$valid")"
+	done
+	printf ']}\n'
+}
+
+download_image() {
+	local id="$1" size="$2" active ubi stage stage_dev available_pebs leb_size available
+	local metadata version hash block_dev fit_size download_ok=0 block_created=0
+	validate_id "$id" || exit 2
+	validate_number "$size" || exit 2
+	[ "$size" -gt 0 ] || exit 2
+	ensure_state
+	ensure_environment
+	reconcile_storage
+	active="$(env_value omci_active_id)"
+	validate_id "$active" || active=0
+	[ "$id" != "$active" ] || {
+		echo "refusing to overwrite active software image $id" >&2
+		exit 1
+	}
+
+	ubi="$(find_ubi)" || {
+		echo "UBI device is unavailable" >&2
+		exit 1
+	}
+	stage="omci_fit_$id"
+	if find_volume "$stage" >/dev/null 2>&1; then
+		remove_block "$(find_volume "$stage")"
+		ubirmvol "$ubi" -N "$stage" >&2
+	fi
+	uci -q set "$CONFIG.image$id.valid=0"
+	uci -q commit "$CONFIG"
+	available_pebs="$(cat "$SYS_CLASS_ROOT/ubi/${ubi#/dev/}/avail_eraseblocks")"
+	leb_size="$(cat "$SYS_CLASS_ROOT/ubi/${ubi#/dev/}/eraseblock_size")"
+	available=$((available_pebs * leb_size))
+	[ "$size" -le "$available" ] || {
+		echo "image needs $size bytes but UBI has $available bytes available" >&2
+		exit 1
+	}
+
+	ubimkvol "$ubi" -N "$stage" -s "$size" -t static >&2
+	stage_dev="$(find_volume "$stage")" || exit 1
+	metadata="$(mktemp /tmp/airoha-omci-metadata.XXXXXX)"
+	cleanup_download() {
+		if [ "$block_created" -eq 1 ]; then
+			ubiblock --remove "$stage_dev" >/dev/null 2>&1 || true
+			block_created=0
+		fi
+		rm -f "$metadata"
+		if [ "$download_ok" -ne 1 ] && find_volume "$stage" >/dev/null 2>&1; then
+			ubirmvol "$ubi" -N "$stage" >/dev/null 2>&1 || true
+		fi
+	}
+	trap cleanup_download EXIT INT TERM
+
+	ubiupdatevol "$stage_dev" -s "$size" - >&2
+	fit_size="$(fwtool -q -T -i /dev/null "$stage_dev" | wc -c)"
+	validate_number "$fit_size" || exit 1
+	[ "$fit_size" -gt 0 ] || exit 1
+	[ $((fit_size % 512)) -eq 0 ] || {
+		echo "FIT payload must be aligned to a 512-byte UBI block boundary" >&2
+		exit 1
+	}
+	ubiblock --create "$stage_dev" >&2
+	block_created=1
+	block_dev="$(block_for_volume "$stage_dev")"
+	[ -b "$block_dev" ] || {
+		echo "UBI block device $block_dev was not created" >&2
+		exit 1
+	}
+	fit_check_sign -f "$block_dev" >/dev/null
+	(
+		REQUIRE_IMAGE_METADATA=1
+		SAVE_CONFIG=0
+		FORCE=0
+		. /lib/upgrade/fwtool.sh
+		fwtool_check_image "$stage_dev"
+	) >&2
+	fwtool -q -i "$metadata" "$stage_dev"
+	version="$(jsonfilter -i "$metadata" -e '@.version.version')"
+	version="$(safe_version "$version")"
+	hash="$(head -c "$size" "$stage_dev" | md5sum | cut -d' ' -f1)"
+	hash="$(safe_hash "$hash")"
+	[ -n "$hash" ] || exit 1
+	ubiblock --remove "$stage_dev" >&2
+	block_created=0
+
+	uci -q set "$CONFIG.image$id.version=$version"
+	uci -q set "$CONFIG.image$id.product_code=$PRODUCT"
+	uci -q set "$CONFIG.image$id.image_hash=$hash"
+	uci -q set "$CONFIG.image$id.valid=1"
+	uci -q commit "$CONFIG"
+	download_ok=1
+	trap - EXIT INT TERM
+	rm -f "$metadata"
+	printf '{"version":"%s","product_code":"%s"}\n' "$version" "$PRODUCT"
+}
+
+prepare_activate_image() {
+	local id="$1" flags="$2" active ubi stage
+	validate_id "$id" || exit 2
+	validate_number "$flags" || exit 2
+	[ "$flags" -le 2 ] || exit 2
+	ensure_state
+	ensure_environment
+	reconcile_storage
+	active="$(env_value omci_active_id)"
+	validate_id "$active" || active=0
+	if [ "$id" = "$active" ]; then
+		return 0
+	fi
+	[ "$(image_valid "$id" "$active" "$(env_value omci_committed_id)")" = 1 ] || {
+		echo "software image $id is not valid" >&2
+		exit 1
+	}
+	ubi="$(find_ubi)" || exit 1
+	stage="omci_fit_$id"
+	find_volume "$stage" >/dev/null 2>&1 || exit 1
+	if find_volume "$OLD_VOLUME" >/dev/null 2>&1; then
+		echo "an uncommitted rollback image already exists" >&2
+		exit 1
+	fi
+	find_volume "$FAILED_VOLUME" >/dev/null 2>&1 && ubirmvol "$ubi" -N "$FAILED_VOLUME" >&2
+
+	fw_setenv omci_pending prepare
+	if ! ubirename "$ubi" fit "$OLD_VOLUME" "$stage" fit >&2; then
+		fw_setenv omci_pending || true
+		exit 1
+	fi
+}
+
+commit_activate_image() {
+	local id="$1" active pending ubi stage
+	validate_id "$id" || exit 2
+	ensure_state
+	ensure_environment
+	active="$(env_value omci_active_id)"
+	pending="$(env_value omci_pending)"
+	validate_id "$active" || active=0
+	if [ "$id" = "$active" ]; then
+		[ "$pending" != prepare ] || exit 1
+		schedule_reboot
+		return 0
+	fi
+	[ "$pending" = prepare ] || {
+		echo "software activation $id was not prepared" >&2
+		exit 1
+	}
+	[ "$id" -eq $((1 - active)) ] || exit 1
+	ubi="$(find_ubi)" || exit 1
+	stage="omci_fit_$id"
+	find_volume fit >/dev/null 2>&1 || exit 1
+	find_volume "$OLD_VOLUME" >/dev/null 2>&1 || exit 1
+	find_volume "$stage" >/dev/null 2>&1 && exit 1
+	if ! fw_setenv omci_active_id "$id" || ! fw_setenv omci_pending 1; then
+		ubirename "$ubi" fit "$stage" "$OLD_VOLUME" fit >/dev/null 2>&1 || true
+		fw_setenv omci_active_id "$active" || true
+		fw_setenv omci_pending || true
+		exit 1
+	fi
+	if ! schedule_reboot; then
+		ubirename "$ubi" fit "$stage" "$OLD_VOLUME" fit >/dev/null 2>&1 || true
+		fw_setenv omci_active_id "$active" || true
+		fw_setenv omci_pending || true
+		rm -f "$RESTART_REASON"
+		exit 1
+	fi
+}
+
+abort_activate_image() {
+	local id="$1" active pending
+	validate_id "$id" || exit 2
+	active="$(env_value omci_active_id)"
+	pending="$(env_value omci_pending)"
+	validate_id "$active" || active=0
+	[ "$pending" = prepare ] || return 0
+	[ "$id" -eq $((1 - active)) ] || exit 1
+	rollback_prepared_activation "$active"
+}
+
+prepare_commit_image() {
+	local id="$1" active committed pending old_id ubi old_stage stage
+	validate_id "$id" || exit 2
+	ensure_state
+	ensure_environment
+	reconcile_storage
+	active="$(env_value omci_active_id)"
+	committed="$(env_value omci_committed_id)"
+	pending="$(env_value omci_pending)"
+	validate_id "$active" || active=0
+	validate_id "$committed" || committed=0
+	[ "$(image_valid "$id" "$active" "$committed")" = 1 ] || exit 1
+	[ "$id" != "$committed" ] || return 0
+	ubi="$(find_ubi)" || exit 1
+	if [ "$id" != "$active" ]; then
+		[ -z "$pending" ] || {
+			echo "cannot commit an inactive image while a boot transition is pending" >&2
+			exit 1
+		}
+		find_volume "$OLD_VOLUME" >/dev/null 2>&1 && {
+			echo "cannot commit an inactive image while a rollback volume exists" >&2
+			exit 1
+		}
+		stage="omci_fit_$id"
+		find_volume "$stage" >/dev/null 2>&1 || exit 1
+		return 0
+	fi
+	find_volume "$OLD_VOLUME" >/dev/null 2>&1 || {
+		echo "rollback image is unavailable" >&2
+		exit 1
+	}
+	old_id="$committed"
+	old_stage="omci_fit_$old_id"
+	[ "$old_stage" != "omci_fit_$id" ] || exit 1
+}
+
+commit_commit_image() {
+	local id="$1" active committed pending old_id ubi old_stage stage
+	prepare_commit_image "$id"
+	active="$(env_value omci_active_id)"
+	committed="$(env_value omci_committed_id)"
+	pending="$(env_value omci_pending)"
+	[ "$id" != "$committed" ] || return 0
+	if [ "$id" != "$active" ]; then
+		if ! fw_setenv omci_committed_id "$id" || ! fw_setenv omci_pending; then
+			fw_setenv omci_committed_id "$committed" || true
+			[ -z "$pending" ] && fw_setenv omci_pending ||
+				fw_setenv omci_pending "$pending" || true
+			exit 1
+		fi
+		return 0
+	fi
+	ubi="$(find_ubi)" || exit 1
+	old_id="$committed"
+	old_stage="omci_fit_$old_id"
+	find_volume "$old_stage" >/dev/null 2>&1 && ubirmvol "$ubi" -N "$old_stage" >&2
+
+	if ! fw_setenv omci_committed_id "$id" || ! fw_setenv omci_pending; then
+		fw_setenv omci_committed_id "$committed" || true
+		[ -z "$pending" ] && fw_setenv omci_pending ||
+			fw_setenv omci_pending "$pending" || true
+		exit 1
+	fi
+	if ! ubirename "$ubi" "$OLD_VOLUME" "$old_stage" >&2; then
+		echo "committed image is active, but retaining rollback volume cleanup for next maintenance" >&2
+	fi
+}
+
+abort_commit_image() {
+	validate_id "$1" || exit 2
+}
+
+case "${1:-}" in
+	state)
+		[ "$#" -eq 1 ] || exit 2
+		show_state
+		;;
+	download)
+		[ "$#" -eq 3 ] || exit 2
+		download_image "$2" "$3"
+		;;
+	activate-prepare)
+		[ "$#" -eq 3 ] || exit 2
+		prepare_activate_image "$2" "$3"
+		;;
+	activate-commit)
+		[ "$#" -eq 2 ] || exit 2
+		commit_activate_image "$2"
+		;;
+	activate-abort)
+		[ "$#" -eq 2 ] || exit 2
+		abort_activate_image "$2"
+		;;
+	commit-prepare)
+		[ "$#" -eq 2 ] || exit 2
+		prepare_commit_image "$2"
+		;;
+	commit-commit)
+		[ "$#" -eq 2 ] || exit 2
+		commit_commit_image "$2"
+		;;
+	commit-abort)
+		[ "$#" -eq 2 ] || exit 2
+		abort_commit_image "$2"
+		;;
+	*)
+		echo "usage: $0 {state|download ID SIZE|activate-{prepare ID FLAGS|commit ID|abort ID}|commit-{prepare|commit|abort} ID}" >&2
+		exit 2
+		;;
+esac

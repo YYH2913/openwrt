@@ -1,0 +1,1918 @@
+#!/bin/sh
+
+set -u
+
+state_dir="${AIROHA_OMCI_STATE_DIR:-/var/run/airoha-omcid}"
+renderer="${AIROHA_OMCI_RENDER:-/usr/libexec/airoha-omci-render}"
+tc_command="${AIROHA_OMCI_TC:-/sbin/tc}"
+ip_command="${AIROHA_OMCI_IP:-/sbin/ip}"
+bridge_command="${AIROHA_OMCI_BRIDGE:-/usr/sbin/bridge}"
+pon_device="${AIROHA_OMCI_PON_DEVICE:-pon}"
+managed_bridges_file="$state_dir/platform-bridges"
+managed_evto_chains_file="$state_dir/platform-evto-chains"
+tc_chain=2010
+evto_up_chain=2009
+evto_down_chain=2011
+vlan_filter_up_chain=2008
+vlan_filter_down_chain=2012
+multicast_down_chain=2013
+evto_gem_up_base=10000
+evto_gem_down_base=15000
+mark_key=0xa1700000
+
+# The GPON sysfs files below are a protocol-specific ABI. XG-PON and XGS-PON
+# must use the separate staged XGEM/T-CONT/QDMA ABI.
+pon_mode="${AIROHA_OMCI_PON_MODE:-gpon}"
+xg_mode() {
+	case "$1" in xgpon|xgspon) return 0 ;; *) return 1 ;; esac
+}
+case "$pon_mode" in
+	gpon|xgpon|xgspon) ;;
+	*)
+		echo "airoha-omci-platform: invalid PON mode $pon_mode" >&2
+		exit 1
+	;;
+esac
+xg_mode "$pon_mode" && mark_key=0xa1710000
+
+find_gpon() {
+	local path
+	if [ -n "${AIROHA_OMCI_GPON_PATH:-}" ]; then
+		[ -f "$AIROHA_OMCI_GPON_PATH/data_gems" ] || return 1
+		printf '%s\n' "$AIROHA_OMCI_GPON_PATH"
+		return 0
+	fi
+	for path in /sys/bus/platform/drivers/airoha-gpon/*; do
+		[ -f "$path/data_gems" ] || continue
+		printf '%s\n' "$path"
+		return 0
+	done
+	return 1
+}
+
+find_xgspon() {
+	local path
+	if [ -n "${AIROHA_OMCI_XGSPON_PATH:-}" ]; then
+		[ -f "$AIROHA_OMCI_XGSPON_PATH/service_state" ] || return 1
+		[ -w "$AIROHA_OMCI_XGSPON_PATH/service_reset" ] || return 1
+		[ -w "$AIROHA_OMCI_XGSPON_PATH/service_tcont" ] || return 1
+		[ -w "$AIROHA_OMCI_XGSPON_PATH/service_xgem" ] || return 1
+		[ -w "$AIROHA_OMCI_XGSPON_PATH/service_commit" ] || return 1
+		[ -w "$AIROHA_OMCI_XGSPON_PATH/service_rollback" ] || return 1
+		printf '%s\n' "$AIROHA_OMCI_XGSPON_PATH"
+		return 0
+	fi
+	for path in /sys/bus/platform/drivers/airoha-xgspon/*; do
+		[ -f "$path/service_state" ] || continue
+		[ -w "$path/service_reset" ] || continue
+		[ -w "$path/service_tcont" ] || continue
+		[ -w "$path/service_xgem" ] || continue
+		[ -w "$path/service_commit" ] || continue
+		[ -w "$path/service_rollback" ] || continue
+		printf '%s\n' "$path"
+		return 0
+	done
+	return 1
+}
+
+rollback_xgs_service() {
+	local path="$1" count="${2:-0}" configured="${3:-}" classifiers="${4:-0}"
+	if printf 'rollback\n' > "$path/service_rollback"; then
+		return 0
+	fi
+	publish_status xgs-service-rollback-failed "$count" "$configured" "$classifiers"
+	return 1
+}
+
+publish_status() {
+	local state="$1" count="${2:-0}" configured="${3:-}" classifiers="${4:-0}"
+	local temporary bridge bridge_count=0 bridge_names=
+	if [ -f "$managed_bridges_file" ]; then
+		while IFS= read -r bridge; do
+			valid_bridge_name "$bridge" || continue
+			bridge_count=$((bridge_count + 1))
+			bridge_names="${bridge_names}${bridge_names:+ }$bridge"
+		done < "$managed_bridges_file"
+	fi
+	mkdir -p "$state_dir"
+	temporary="$(mktemp "$state_dir/.platform.XXXXXX")" || return
+	printf '{"state":"%s","provisioned_gems":%u,"configured_gems":"%s","classifiers":%u,"configured_bridges":"%s","bridge_count":%u,"single_gem_limit":false}\n' \
+		"$state" "$count" "$configured" "$classifiers" "$bridge_names" "$bridge_count" > "$temporary"
+	mv -f "$temporary" "$state_dir/platform.json"
+}
+
+lock() {
+	local attempt=0
+	mkdir -p "$state_dir"
+	while ! mkdir "$state_dir/apply.lock" 2>/dev/null; do
+		attempt=$((attempt + 1))
+		[ "$attempt" -lt 100 ] || return 1
+		sleep 0.05
+	done
+}
+
+unlock() {
+	rmdir "$state_dir/apply.lock" 2>/dev/null || true
+}
+
+valid_bridge_name() {
+	case "$1" in
+		omb[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|omm[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+	esac
+	return 1
+}
+
+valid_ani_name() {
+	case "$1" in
+		oma[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|omp[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|\
+		omx[0-9a-f][0-9a-f][0-9a-f][0-9a-f]|omy[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+	esac
+	return 1
+}
+
+bridge_inside_name() {
+	case "$1" in
+		omb*) printf 'oma%s\n' "${1#omb}" ;;
+		omm*) printf 'omx%s\n' "${1#omm}" ;;
+		*) return 1 ;;
+	esac
+}
+
+bridge_peer_name() {
+	case "$1" in
+		omb*) printf 'omp%s\n' "${1#omb}" ;;
+		omm*) printf 'omy%s\n' "${1#omm}" ;;
+		*) return 1 ;;
+	esac
+}
+
+ani_bridge_name() {
+	case "$1" in
+		oma*|omp*) printf 'omb%s\n' "${1#???}" ;;
+		omx*|omy*) printf 'omm%s\n' "${1#???}" ;;
+		*) return 1 ;;
+	esac
+}
+
+is_managed_bridge() {
+	local wanted="$1" name
+	[ -f "$managed_bridges_file" ] || return 1
+	while IFS= read -r name; do
+		[ "$name" = "$wanted" ] && return 0
+	done < "$managed_bridges_file"
+	return 1
+}
+
+is_managed_ani() {
+	local name="$1" bridge
+	valid_ani_name "$name" || return 1
+	bridge="$(ani_bridge_name "$name")" || return 1
+	is_managed_bridge "$bridge"
+}
+
+valid_evto_interface() {
+	case "$1" in
+		lan[1-4]) return 0 ;;
+		*) valid_ani_name "$1" ;;
+	esac
+}
+
+valid_tc_hook() {
+	case "$1" in ingress|egress) return 0 ;; esac
+	return 1
+}
+
+clear_managed_evto_chains() {
+	local wanted="$1" interface hook chain
+	[ -f "$managed_evto_chains_file" ] || return 0
+	while IFS=: read -r interface hook chain; do
+		[ "$interface" = "$wanted" ] || continue
+		valid_evto_interface "$interface" && valid_tc_hook "$hook" || continue
+		case "$chain" in ''|*[!0-9]*) continue ;; esac
+		[ "$chain" -le 268435455 ] 2>/dev/null || continue
+		"$tc_command" filter del dev "$interface" "$hook" chain "$chain" 2>/dev/null || true
+	done < "$managed_evto_chains_file"
+}
+
+stage_managed_evto_chains() {
+	local temporary
+	mkdir -p "$state_dir" || return 1
+	temporary="$(mktemp "$state_dir/.evto-chains.XXXXXX")" || return 1
+	mv -f "$temporary" "$managed_evto_chains_file"
+}
+
+has_candidate_bridge() {
+	local wanted="$1" bridges="$2" record
+	for record in $bridges; do
+		[ "${record%%:*}" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
+is_candidate_ani() {
+	local bridge="$1" wanted="$2" anis="$3" record candidate_bridge
+	for record in $anis; do
+		candidate_bridge="${record%%:*}"
+		record="${record#*:}"
+		[ "$candidate_bridge" = "$bridge" ] && [ "${record%%:*}" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
+interface_master() {
+	local interface="$1" description master
+	description="$("$ip_command" -o link show dev "$interface" 2>/dev/null)" || return 1
+	case " $description " in
+		*' master '*)
+			master="${description#* master }"
+			printf '%s\n' "${master%% *}"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+is_bridge_device() {
+	"$ip_command" -details link show dev "$1" 2>/dev/null |
+		grep -q '[[:space:]]bridge[[:space:]]'
+}
+
+preflight_bridges() {
+	local bridges="$1" ports="$2" anis="$3" record name interface master ani peer expected_ani expected_peer
+	for record in $bridges; do
+		name="${record%%:*}"
+		valid_bridge_name "$name" || return 1
+		if "$ip_command" link show dev "$name" >/dev/null 2>&1 && ! is_managed_bridge "$name"; then
+			return 1
+		fi
+	done
+	for record in $anis; do
+		name="${record%%:*}"; record="${record#*:}"
+		ani="${record%%:*}"; peer="${record#*:}"
+		valid_bridge_name "$name" && valid_ani_name "$ani" && valid_ani_name "$peer" || return 1
+		has_candidate_bridge "$name" "$bridges" || return 1
+		expected_ani="$(bridge_inside_name "$name")" || return 1
+		expected_peer="$(bridge_peer_name "$name")" || return 1
+		[ "$ani" = "$expected_ani" ] && [ "$peer" = "$expected_peer" ] || return 1
+		if "$ip_command" link show dev "$ani" >/dev/null 2>&1 && ! is_managed_ani "$ani"; then
+			return 1
+		fi
+		if "$ip_command" link show dev "$peer" >/dev/null 2>&1 && ! is_managed_ani "$peer"; then
+			return 1
+		fi
+	done
+	for record in $ports; do
+		name="${record%%:*}"
+		record="${record#*:}"
+		interface="${record%%:*}"
+		valid_bridge_name "$name" || return 1
+		if is_candidate_ani "$name" "$interface" "$anis"; then
+			continue
+		fi
+		"$ip_command" link show dev "$interface" >/dev/null 2>&1 || return 1
+		master="$(interface_master "$interface" 2>/dev/null)" || master=
+		[ -z "$master" ] || is_managed_bridge "$master" || return 1
+	done
+	if [ -n "$bridges" ]; then
+		"$ip_command" link show dev "$pon_device" >/dev/null 2>&1 || return 1
+		master="$(interface_master "$pon_device" 2>/dev/null)" || master=
+		[ -z "$master" ] || is_managed_bridge "$master" || return 1
+	fi
+}
+
+clear_managed_bridges() {
+	local name ani peer result=0
+	[ -f "$managed_bridges_file" ] || return 0
+	while IFS= read -r name; do
+		valid_bridge_name "$name" || { result=1; continue; }
+		ani="$(bridge_inside_name "$name")" || { result=1; continue; }
+		peer="$(bridge_peer_name "$name")" || { result=1; continue; }
+		if "$ip_command" link show dev "$peer" >/dev/null 2>&1; then
+			"$ip_command" link delete dev "$peer" 2>/dev/null || result=1
+		elif "$ip_command" link show dev "$ani" >/dev/null 2>&1; then
+			"$ip_command" link delete dev "$ani" 2>/dev/null || result=1
+		fi
+		"$ip_command" link show dev "$name" >/dev/null 2>&1 || continue
+		is_bridge_device "$name" || { result=1; continue; }
+		"$ip_command" link set dev "$name" down 2>/dev/null || true
+		"$ip_command" link delete dev "$name" type bridge 2>/dev/null || result=1
+	done < "$managed_bridges_file"
+	rm -f "$managed_bridges_file"
+	return "$result"
+}
+
+stage_managed_bridges() {
+	local bridges="$1" record name temporary
+	mkdir -p "$state_dir" || return 1
+	temporary="$(mktemp "$state_dir/.bridges.XXXXXX")" || return 1
+	for record in $bridges; do
+		name="${record%%:*}"
+		valid_bridge_name "$name" || { rm -f "$temporary"; return 1; }
+		printf '%s\n' "$name" >> "$temporary" || { rm -f "$temporary"; return 1; }
+	done
+	mv -f "$temporary" "$managed_bridges_file"
+}
+
+on_off() {
+	[ "$1" -eq 0 ] && printf '%s\n' off || printf '%s\n' on
+}
+
+apply_bridges() {
+	local bridges="$1" ports="$2" anis="$3" record name entity packed old_ifs
+	local stp learning port_bridging priority max_age hello_time forward_delay unknown age learning_depth
+	local interface port_entity port_priority path_cost port_stp flood isolated fastleave max_groups port_learning_depth
+	local ani peer expected_ani expected_peer
+
+	clear_managed_bridges || return 1
+	stage_managed_bridges "$bridges" || return 1
+	for record in $bridges; do
+		name="${record%%:*}"; record="${record#*:}"
+		entity="${record%%:*}"; packed="${record#*:}"
+		old_ifs="$IFS"; IFS=:
+		set -- $packed
+		IFS="$old_ifs"
+		[ "$#" -eq 10 ] || { clear_managed_bridges; return 1; }
+		stp="$1"; learning="$2"; port_bridging="$3"; priority="$4"
+		max_age="$5"; hello_time="$6"; forward_delay="$7"; unknown="$8"; age="$9"
+		learning_depth="${10}"
+		case "$entity:$stp:$learning:$port_bridging:$priority:$max_age:$hello_time:$forward_delay:$unknown:$age:$learning_depth" in
+			*[!0-9:]*) clear_managed_bridges; return 1 ;;
+		esac
+		[ "$learning_depth" -le 255 ] || { clear_managed_bridges; return 1; }
+		"$ip_command" link add name "$name" type bridge \
+				stp_state "$stp" priority "$priority" max_age "$max_age" \
+				hello_time "$hello_time" forward_delay "$forward_delay" ageing_time "$age" \
+				mcast_snooping 0 || {
+				clear_managed_bridges
+				return 1
+			}
+		# The G.988 profile value is a bridge-wide learned-FDB entry limit. Zero
+		# means unlimited, which is the Linux bridge default.
+		if [ "$learning_depth" -ne 0 ]; then
+			"$ip_command" link set dev "$name" type bridge fdb_max_learned "$learning_depth" || {
+				clear_managed_bridges
+				return 1
+			}
+		fi
+	done
+	for record in $anis; do
+		name="${record%%:*}"; record="${record#*:}"
+		ani="${record%%:*}"; peer="${record#*:}"
+		expected_ani="$(bridge_inside_name "$name")" || {
+			clear_managed_bridges
+			return 1
+		}
+		expected_peer="$(bridge_peer_name "$name")" || {
+			clear_managed_bridges
+			return 1
+		}
+		valid_bridge_name "$name" && [ "$ani" = "$expected_ani" ] && [ "$peer" = "$expected_peer" ] || {
+			clear_managed_bridges
+			return 1
+		}
+		"$ip_command" link add name "$ani" type veth peer name "$peer" || {
+			clear_managed_bridges
+			return 1
+		}
+		"$ip_command" link set dev "$ani" up && "$ip_command" link set dev "$peer" up &&
+			ensure_clsact "$peer" &&
+			"$tc_command" filter replace dev "$peer" ingress protocol all pref 1 flower skip_hw \
+				action mirred egress redirect dev "$pon_device" || {
+			clear_managed_bridges
+			return 1
+		}
+	done
+
+	for record in $ports; do
+		name="${record%%:*}"; record="${record#*:}"
+		interface="${record%%:*}"; packed="${record#*:}"
+		old_ifs="$IFS"; IFS=:
+		set -- $packed
+		IFS="$old_ifs"
+		[ "$#" -eq 10 ] || { clear_managed_bridges; return 1; }
+		port_entity="$1"; port_priority="$2"; path_cost="$3"; port_stp="$4"
+		learning="$5"; flood="$6"; isolated="$7"; fastleave="$8"; max_groups="$9"
+		port_learning_depth="${10}"
+		case "$port_entity:$port_priority:$path_cost:$port_stp:$learning:$flood:$isolated:$fastleave:$max_groups:$port_learning_depth" in
+			*[!0-9:]*) clear_managed_bridges; return 1 ;;
+		esac
+		[ "$fastleave" -le 1 ] && [ "$max_groups" -le 65535 ] &&
+			[ "$port_learning_depth" -le 255 ] || { clear_managed_bridges; return 1; }
+		"$ip_command" link set dev "$interface" master "$name" || {
+			clear_managed_bridges
+			return 1
+		}
+		"$bridge_command" link set dev "$interface" cost "$path_cost" priority "$port_priority" \
+			learning "$(on_off "$learning")" flood "$(on_off "$flood")" \
+			isolated "$(on_off "$isolated")" fastleave "$(on_off "$fastleave")" || {
+			clear_managed_bridges
+			return 1
+		}
+		if [ "$max_groups" -ne 0 ]; then
+			"$bridge_command" link set dev "$interface" mcast_max_groups "$max_groups" || {
+				clear_managed_bridges
+				return 1
+			}
+		fi
+		if [ "$port_learning_depth" -ne 0 ]; then
+			"$bridge_command" link set dev "$interface" \
+				fdb_max_learned "$port_learning_depth" || {
+				clear_managed_bridges
+				return 1
+			}
+		fi
+	done
+
+	for record in $bridges; do
+		name="${record%%:*}"
+		"$ip_command" link set dev "$name" up || { clear_managed_bridges; return 1; }
+	done
+}
+
+is_bridge_member() {
+	local wanted="$1" record interface
+	for record in ${bridge_ports_current:-}; do
+		record="${record#*:}"
+		interface="${record%%:*}"
+		[ "$interface" = "$wanted" ] && return 0
+	done
+	return 1
+}
+
+add_pbit_filter() {
+	local interface="$1" protocol="$2" preference="$3" pbit="$4" target="$5" mark
+	if [ "$target" -lt 0 ]; then
+		"$tc_command" filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol "$protocol" pref "$preference" flower skip_hw vlan_prio "$pbit" action drop
+	else
+		mark="$(printf '0x%08x' "$((mark_key | target))")"
+		set -- filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol "$protocol" pref "$preference" flower skip_hw vlan_prio "$pbit" \
+			action skbedit mark "$mark"
+		if is_bridge_member "$interface"; then
+			set -- "$@" action pass
+		else
+			set -- "$@" action mirred egress redirect dev "$pon_device"
+		fi
+		"$tc_command" "$@"
+	fi
+}
+
+add_dscp_filter() {
+	local interface="$1" protocol="$2" preference="$3" dscp="$4" target="$5" mark tos
+	tos="$(printf '0x%02x/0xfc' "$((dscp << 2))")"
+	if [ "$target" -lt 0 ]; then
+		"$tc_command" filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol "$protocol" pref "$preference" flower skip_hw ip_tos "$tos" action drop
+	else
+		mark="$(printf '0x%08x' "$((mark_key | target))")"
+		set -- filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol "$protocol" pref "$preference" flower skip_hw ip_tos "$tos" \
+			action skbedit mark "$mark"
+		if is_bridge_member "$interface"; then
+			set -- "$@" action pass
+		else
+			set -- "$@" action mirred egress redirect dev "$pon_device"
+		fi
+		"$tc_command" "$@"
+	fi
+}
+
+add_default_filter() {
+	local interface="$1" target="$2" mark
+	if [ "$target" -lt 0 ]; then
+		"$tc_command" filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol all pref 400 flower skip_hw action drop
+	else
+		mark="$(printf '0x%08x' "$((mark_key | target))")"
+		set -- filter replace dev "$interface" ingress chain "$tc_chain" \
+			protocol all pref 400 flower skip_hw action skbedit mark "$mark"
+		if is_bridge_member "$interface"; then
+			set -- "$@" action pass
+		else
+			set -- "$@" action mirred egress redirect dev "$pon_device"
+		fi
+		"$tc_command" "$@"
+	fi
+}
+
+ensure_clsact() {
+	local interface="$1"
+	"$tc_command" qdisc show dev "$interface" 2>/dev/null | grep -q '[[:space:]]clsact[[:space:]]' ||
+		"$tc_command" qdisc add dev "$interface" clsact
+}
+
+ensure_dispatch() {
+	local interface="$1" hook="$2" target="$3" handle
+	if [ "$hook" = ingress ]; then
+		handle=0x2010
+	else
+		handle=0x2011
+	fi
+	"$tc_command" filter replace dev "$interface" "$hook" protocol all pref "$tc_chain" \
+		handle "$handle" flower skip_hw action goto chain "$target"
+}
+
+clear_dispatch() {
+	local interface="$1" hook="$2" handle
+	if [ "$hook" = ingress ]; then
+		handle=0x2010
+	else
+		handle=0x2011
+	fi
+	"$tc_command" filter del dev "$interface" "$hook" protocol all pref "$tc_chain" \
+		handle "$handle" flower 2>/dev/null || true
+}
+
+clear_multicast_guards() {
+	local interface="$1" protocol preference
+	for protocol in ip 802.1Q 802.1ad; do
+		for preference in 1900 1901 1902 1903 1904; do
+			"$tc_command" filter del dev "$interface" ingress protocol "$protocol" \
+				pref "$preference" flower 2>/dev/null || true
+		done
+	done
+	for protocol in ipv6 802.1Q 802.1ad; do
+		for preference in 1910 1911 1912 1913 1920 1921 1922 1923 1930 1931 1932 1933 \
+			1940 1941 1942 1943 1950 1951 1952 1953; do
+			"$tc_command" filter del dev "$interface" ingress protocol "$protocol" \
+				pref "$preference" flower 2>/dev/null || true
+		done
+	done
+	for protocol in ip ipv6 802.1Q 802.1ad; do
+		for preference in 1900 1901 1902 1903 1904 1905 1906 1907 1908 1909; do
+			"$tc_command" filter del dev "$interface" egress protocol "$protocol" \
+				pref "$preference" flower 2>/dev/null || true
+		done
+	done
+	"$tc_command" filter del dev "$interface" egress chain "$multicast_down_chain" 2>/dev/null || true
+}
+
+clear_rate_limiters() {
+	local interface="$1" preference
+	for preference in 1700 1701 1702; do
+		"$tc_command" filter del dev "$interface" egress protocol all \
+			pref "$preference" flower 2>/dev/null || true
+	done
+}
+
+clear_port_meters() {
+	local interface="$1" hook
+	for hook in ingress egress; do
+		"$tc_command" filter del dev "$interface" "$hook" protocol all \
+			pref 1800 flower 2>/dev/null || true
+	done
+}
+
+install_mld_guard() {
+	local interface="$1" protocol="$2" preference="$3" type="$4" tagged="$5"
+	set -- filter replace dev "$interface" ingress protocol "$protocol" pref "$preference" \
+		flower skip_hw
+	[ "$tagged" -eq 0 ] || set -- "$@" vlan_ethtype ipv6
+	"$tc_command" "$@" ip_proto icmpv6 type "$type" action drop
+}
+
+install_multicast_guards() {
+	local interface="$1" type offset protocol tagged preference
+	ensure_clsact "$interface" || return 1
+	# AF_PACKET sees these frames before tc ingress. Dropping the originals here
+	# prevents Linux bridge snooping or a rogue subscriber from bypassing G.988.
+	"$tc_command" filter replace dev "$interface" ingress protocol ip pref 1900 \
+		flower skip_hw ip_proto 2 action drop || return 1
+	"$tc_command" filter replace dev "$interface" ingress protocol 802.1Q pref 1901 \
+		flower skip_hw vlan_ethtype ip ip_proto 2 action drop || return 1
+	"$tc_command" filter replace dev "$interface" ingress protocol 802.1ad pref 1902 \
+		flower skip_hw vlan_ethtype ip ip_proto 2 action drop || return 1
+	"$tc_command" filter replace dev "$interface" ingress protocol 802.1Q pref 1903 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ip ip_proto 2 action drop || return 1
+	"$tc_command" filter replace dev "$interface" ingress protocol 802.1ad pref 1904 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ip ip_proto 2 action drop || return 1
+	for type in 130 131 132 143; do
+		offset=0
+		case "$type" in 131) offset=1 ;; 132) offset=2 ;; 143) offset=3 ;; esac
+		install_mld_guard "$interface" ipv6 "$((1910 + offset))" "$type" 0 || return 1
+		install_mld_guard "$interface" 802.1Q "$((1920 + offset))" "$type" 1 || return 1
+		install_mld_guard "$interface" 802.1ad "$((1930 + offset))" "$type" 1 || return 1
+		set -- filter replace dev "$interface" ingress protocol 802.1Q pref "$((1940 + offset))" \
+			flower skip_hw num_of_vlans 2 cvlan_ethtype ipv6 ip_proto icmpv6 \
+			type "$type" action drop
+		"$tc_command" "$@" || return 1
+		set -- filter replace dev "$interface" ingress protocol 802.1ad pref "$((1950 + offset))" \
+			flower skip_hw num_of_vlans 2 cvlan_ethtype ipv6 ip_proto icmpv6 \
+			type "$type" action drop
+		"$tc_command" "$@" || return 1
+	done
+
+	# Authorized static ranges and dynamic joins live in the daemon-owned chain.
+	# The terminal drop is installed before the daemon sees the new desired graph.
+	"$tc_command" filter replace dev "$interface" egress chain "$multicast_down_chain" \
+		protocol all pref 65000 flower skip_hw action drop || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol ip pref 1900 \
+		flower skip_hw dst_ip 224.0.0.0/4 action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol ipv6 pref 1901 \
+		flower skip_hw dst_ip ff00::/8 action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1Q pref 1902 \
+		flower skip_hw vlan_ethtype ip dst_ip 224.0.0.0/4 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1Q pref 1903 \
+		flower skip_hw vlan_ethtype ipv6 dst_ip ff00::/8 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1ad pref 1904 \
+		flower skip_hw vlan_ethtype ip dst_ip 224.0.0.0/4 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1ad pref 1905 \
+		flower skip_hw vlan_ethtype ipv6 dst_ip ff00::/8 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1Q pref 1906 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ip dst_ip 224.0.0.0/4 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1Q pref 1907 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ipv6 dst_ip ff00::/8 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1ad pref 1908 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ip dst_ip 224.0.0.0/4 \
+		action goto chain "$multicast_down_chain" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol 802.1ad pref 1909 \
+		flower skip_hw num_of_vlans 2 cvlan_ethtype ipv6 dst_ip ff00::/8 \
+		action goto chain "$multicast_down_chain"
+}
+
+apply_multicast_guards() {
+	local multicasts="$1" record interface seen=
+	for record in $multicasts; do
+		interface="${record%%:*}"
+		valid_evto_interface "$interface" || return 1
+		case " $seen " in *" $interface "*) return 1 ;; esac
+		install_multicast_guards "$interface" || return 1
+		seen="${seen}${seen:+ }$interface"
+	done
+}
+
+clear_managed_chains() {
+	local interface="$1"
+	clear_port_meters "$interface"
+	clear_rate_limiters "$interface"
+	clear_multicast_guards "$interface"
+	clear_managed_evto_chains "$interface"
+	"$tc_command" filter del dev "$interface" ingress chain "$tc_chain" 2>/dev/null || true
+	"$tc_command" filter del dev "$interface" ingress chain "$evto_up_chain" 2>/dev/null || true
+	"$tc_command" filter del dev "$interface" egress chain "$evto_down_chain" 2>/dev/null || true
+	"$tc_command" filter del dev "$interface" ingress chain "$vlan_filter_up_chain" 2>/dev/null || true
+	"$tc_command" filter del dev "$interface" egress chain "$vlan_filter_down_chain" 2>/dev/null || true
+	clear_dispatch "$interface" ingress
+	clear_dispatch "$interface" egress
+}
+
+install_rate_limiter() {
+	local interface="$1" category="$2" packed="$3" preference miss mac rate burst rate_bits old_ifs
+	valid_ani_name "$interface" && is_managed_ani "$interface" || return 1
+	old_ifs="$IFS"; IFS=:
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 2 ] || return 1
+	rate="$1"; burst="$2"
+	case "$rate:$burst" in *[!0-9:]*) return 1 ;; esac
+	[ "$rate" -gt 0 ] && [ "$rate" -le 4294967295 ] &&
+		[ "$burst" -gt 0 ] && [ "$burst" -le 4294967295 ] || return 1
+	case "$category" in
+		unknown)
+			preference=1700; miss=1; mac=00:00:00:00:00:00/01:00:00:00:00:00
+			;;
+		broadcast)
+			preference=1701; miss=0; mac=ff:ff:ff:ff:ff:ff
+			;;
+		multicast)
+			preference=1702; miss=1; mac=01:00:00:00:00:00/01:00:00:00:00:00
+			;;
+		*) return 1 ;;
+	esac
+	rate_bits=$((rate * 8))
+	ensure_clsact "$interface" || return 1
+	"$tc_command" filter replace dev "$interface" egress protocol all pref "$preference" \
+		flower skip_hw l2_miss "$miss" dst_mac "$mac" \
+		action police rate "${rate_bits}bit" burst "${burst}b" \
+		conform-exceed drop/pipe
+}
+
+apply_rate_limiters() {
+	local limiters="$1" record interface category
+	for record in $limiters; do
+		interface="${record%%:*}"; record="${record#*:}"
+		category="${record%%:*}"; record="${record#*:}"
+		install_rate_limiter "$interface" "$category" "$record" || return 1
+	done
+}
+
+install_port_meter() {
+	local interface="$1" hook="$2" packed="$3" old_ifs rate burst rate_bits
+	valid_evto_interface "$interface" && valid_tc_hook "$hook" &&
+		is_bridge_member "$interface" || return 1
+	old_ifs="$IFS"; IFS=:
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 2 ] || return 1
+	rate="$1"; burst="$2"
+	case "$rate:$burst" in *[!0-9:]*) return 1 ;; esac
+	[ "$rate" -gt 0 ] && [ "$rate" -le 4294967295 ] &&
+		[ "$burst" -gt 0 ] && [ "$burst" -le 4294967295 ] || return 1
+	rate_bits=$((rate * 8))
+	ensure_clsact "$interface" || return 1
+	"$tc_command" filter replace dev "$interface" "$hook" protocol all pref 1800 \
+		flower skip_hw action police rate "${rate_bits}bit" burst "${burst}b" \
+		conform-exceed drop/pipe
+}
+
+apply_port_meters() {
+	local meters="$1" record interface hook packed seen=
+	for record in $meters; do
+		interface="${record%%:*}"; record="${record#*:}"
+		hook="${record%%:*}"; packed="${record#*:}"
+		case " $seen " in *" $interface:$hook "*) return 1 ;; esac
+		install_port_meter "$interface" "$hook" "$packed" || return 1
+		seen="${seen}${seen:+ }$interface:$hook"
+	done
+}
+
+add_downstream_filter() {
+	local gem="$1" interfaces="$2" meter="$3" interface remaining=0 bridged=0 direct=0
+	local handle rate burst rate_bits preference
+	handle="$(printf '0x%08x/0xffffffff' "$((mark_key | gem))")"
+	preference="$(gem_preference "$gem")" || return 1
+	for interface in $interfaces; do
+		remaining=$((remaining + 1))
+		if is_bridge_member "$interface"; then
+			bridged=$((bridged + 1))
+		else
+			direct=$((direct + 1))
+		fi
+	done
+	[ "$remaining" -gt 0 ] || return 0
+	[ "$bridged" -eq 0 ] || [ "$direct" -eq 0 ] || return 1
+
+	set -- filter replace dev "$pon_device" ingress chain "$tc_chain" \
+		protocol all pref "$preference" handle "$handle" fw
+	if [ -n "$meter" ]; then
+		rate="${meter%%:*}"; burst="${meter#*:}"
+		case "$rate:$burst" in *[!0-9:]*) return 1 ;; esac
+		[ "$rate" -gt 0 ] && [ "$rate" -le 4294967295 ] &&
+			[ "$burst" -gt 0 ] && [ "$burst" -le 4294967295 ] || return 1
+		rate_bits=$((rate * 8))
+		set -- "$@" action police rate "${rate_bits}bit" burst "${burst}b" \
+			conform-exceed drop/pipe
+	fi
+	if [ "$bridged" -gt 0 ]; then
+		"$tc_command" "$@" action pass
+		return
+	fi
+	for interface in $interfaces; do
+		remaining=$((remaining - 1))
+		if [ "$remaining" -gt 0 ]; then
+			set -- "$@" action mirred egress mirror dev "$interface" pipe
+		else
+			set -- "$@" action mirred egress redirect dev "$interface"
+		fi
+	done
+	"$tc_command" "$@"
+}
+
+tc_protocol() {
+	case "$1" in
+		0) printf '%s\n' all ;;
+		33024) printf '%s\n' 802.1Q ;;
+		34984) printf '%s\n' 802.1ad ;;
+		*) printf '0x%04x\n' "$1" ;;
+	esac
+}
+
+valid_transform_source() {
+	case "$1" in fixed|outer|inner) return 0 ;; esac
+	return 1
+}
+
+transform_value() {
+	case "$1" in
+		fixed) printf '%s\n' "$2" ;;
+		outer|inner) printf '%s\n' "$1" ;;
+		*) return 1 ;;
+	esac
+}
+
+transform_protocol() {
+	case "$1" in
+		fixed) tc_protocol "$2" ;;
+		outer|inner) printf '%s\n' "$1" ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_gem_scope() {
+	case "$1" in
+		-1) return 0 ;;
+		''|*[!0-9]*) return 1 ;;
+		*)
+			if xg_mode "$pon_mode"; then
+				[ "$1" -le 65534 ]
+			else
+				[ "$1" -le 4095 ]
+			fi
+			;;
+	esac
+}
+
+gem_preference() {
+	valid_gem_scope "$1" && [ "$1" -ge 0 ] || return 1
+	if xg_mode "$pon_mode"; then
+		printf '%u\n' "$(($1 + 1))"
+	else
+		printf '%u\n' "$((1000 + $1))"
+	fi
+}
+
+valid_evto_path() {
+	local hook="$1" direction="$2" tail="$3" gem="$4"
+	valid_gem_scope "$gem" || return 1
+	case "$hook:$direction:$tail" in
+		ingress:up:vlan|egress:down:pass) [ "$gem" -eq -1 ] ;;
+		egress:up:pass|ingress:down:pass) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+evto_chain() {
+	local direction="$1" gem="$2"
+	valid_gem_scope "$gem" || return 1
+	if [ "$gem" -lt 0 ]; then
+		case "$direction" in
+			up) printf '%s\n' "$evto_up_chain" ;;
+			down) printf '%s\n' "$evto_down_chain" ;;
+			*) return 1 ;;
+		esac
+	elif [ "$direction" = up ]; then
+		printf '%s\n' "$((evto_gem_up_base + gem))"
+	elif [ "$direction" = down ]; then
+		printf '%s\n' "$((evto_gem_down_base + gem))"
+	else
+		return 1
+	fi
+}
+
+install_evto_variant() {
+	local hook="$1" direction="$2" tail="$3" interface="$4" gem="$5" packed="$6"
+	local payload="$7" source_port="$8" destination_port="$9" variant="${10}"
+	local entity order tags outer_priority outer_vid outer_tpid inner_priority inner_vid inner_tpid
+	local ethertype extended drop remove additions add_outer_priority add_outer_vid add_outer_tpid
+	local add_outer_dei add_inner_priority add_inner_vid add_inner_tpid add_inner_dei
+	local slot outer_dei inner_dei ip_version dscp branch
+	local add_outer_priority_source add_outer_vid_source add_outer_tpid_source add_outer_dei_source
+	local add_inner_priority_source add_inner_vid_source add_inner_tpid_source add_inner_dei_source
+	local chain protocol payload_protocol preference count old_ifs tos replace pop_count dynamic source
+	valid_evto_path "$hook" "$direction" "$tail" "$gem" || return 1
+	old_ifs="$IFS"; IFS=:
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 36 ] || return 1
+	entity="$1"; order="$2"; tags="$3"
+	outer_priority="$4"; outer_vid="$5"; outer_tpid="$6"
+	inner_priority="$7"; inner_vid="$8"; inner_tpid="$9"
+	shift 9
+	ethertype="$1"; extended="$2"; drop="$3"; remove="$4"; additions="$5"
+	add_outer_priority="$6"; add_outer_vid="$7"; add_outer_tpid="$8"; add_outer_dei="$9"
+	shift 9
+	add_inner_priority="$1"; add_inner_vid="$2"; add_inner_tpid="$3"; add_inner_dei="$4"
+	slot="$5"; outer_dei="$6"; inner_dei="$7"; ip_version="$8"; dscp="$9"; branch="${10}"
+	shift 10
+	add_outer_priority_source="$1"; add_outer_vid_source="$2"
+	add_outer_tpid_source="$3"; add_outer_dei_source="$4"
+	add_inner_priority_source="$5"; add_inner_vid_source="$6"
+	add_inner_tpid_source="$7"; add_inner_dei_source="$8"
+	for source in "$add_outer_priority_source" "$add_outer_vid_source" \
+		"$add_outer_tpid_source" "$add_outer_dei_source" \
+		"$add_inner_priority_source" "$add_inner_vid_source" \
+		"$add_inner_tpid_source" "$add_inner_dei_source"; do
+		valid_transform_source "$source" || return 1
+	done
+	case "$slot" in ''|*[!0-9]*) return 1 ;; esac
+	case "$outer_dei" in -1|0|1) ;; *) return 1 ;; esac
+	case "$inner_dei" in -1|0|1) ;; *) return 1 ;; esac
+	case "$ip_version" in 0|4|6) ;; *) return 1 ;; esac
+	case "$dscp" in -1) ;; ''|*[!0-9]*) return 1 ;; esac
+	case "$branch" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$branch" -le 127 ] || return 1
+	[ "$tags" -le 4 ] && [ "$remove" -le 2 ] && [ "$additions" -le 2 ] || return 1
+	if [ "$dscp" -ge 0 ]; then
+		[ "$dscp" -le 63 ] && { [ "$ip_version" -eq 4 ] || [ "$ip_version" -eq 6 ]; } || return 1
+		if [ "$ip_version" -eq 4 ]; then
+			[ "$branch" -eq "$dscp" ] || return 1
+		else
+			[ "$branch" -eq "$((64 + dscp))" ] || return 1
+		fi
+	else
+		[ "$ip_version" -eq 0 ] && [ "$branch" -le 7 ] || return 1
+	fi
+	chain="$(evto_chain "$direction" "$gem")"
+	if [ "$tags" -eq 0 ] && [ "$payload" -ne 0 ]; then
+		protocol="$(tc_protocol "$payload")"
+	elif [ "$tags" -gt 0 ] && [ "$outer_tpid" -ne 0 ]; then
+		protocol="$(tc_protocol "$outer_tpid")"
+	else
+		protocol=all
+	fi
+	payload_protocol="$(tc_protocol "$payload")"
+	preference=$((10 + order * 512 + variant))
+	[ "$preference" -lt 65000 ] || return 1
+	set -- filter replace dev "$interface" "$hook" chain "$chain" \
+		protocol "$protocol" pref "$preference" flower skip_hw num_of_vlans "$tags"
+
+	if [ "$tags" -ge 1 ]; then
+		[ "$outer_priority" -lt 0 ] || set -- "$@" vlan_prio "$outer_priority"
+		[ "$outer_vid" -lt 0 ] || set -- "$@" vlan_id "$outer_vid"
+		[ "$outer_dei" -lt 0 ] || set -- "$@" vlan_dei "$outer_dei"
+	fi
+	if [ "$tags" -eq 1 ] && [ "$payload" -ne 0 ]; then
+		set -- "$@" vlan_ethtype "$payload_protocol"
+	elif [ "$tags" -ge 2 ]; then
+		[ "$inner_tpid" -eq 0 ] || set -- "$@" vlan_ethtype "$(tc_protocol "$inner_tpid")"
+		[ "$inner_priority" -lt 0 ] || set -- "$@" cvlan_prio "$inner_priority"
+		[ "$inner_vid" -lt 0 ] || set -- "$@" cvlan_id "$inner_vid"
+		[ "$inner_dei" -lt 0 ] || set -- "$@" cvlan_dei "$inner_dei"
+		[ "$tags" -ne 2 ] || [ "$payload" -eq 0 ] || set -- "$@" cvlan_ethtype "$payload_protocol"
+	fi
+	if [ -n "$source_port" ]; then
+		set -- "$@" ip_proto udp src_port "$source_port" dst_port "$destination_port"
+	fi
+	if [ "$dscp" -ge 0 ]; then
+		tos="$(printf '0x%02x/0xfc' "$((dscp << 2))")"
+		set -- "$@" ip_tos "$tos"
+	fi
+
+	if [ "$drop" -eq 1 ]; then
+		set -- "$@" action drop
+	else
+		dynamic=0
+		if [ "$additions" -eq 2 ]; then
+			case "$add_outer_priority_source:$add_outer_vid_source:$add_outer_tpid_source:$add_outer_dei_source" in
+				fixed:fixed:fixed:fixed) ;;
+				*) dynamic=1 ;;
+			esac
+		fi
+		if [ "$additions" -ge 1 ]; then
+			case "$add_inner_priority_source:$add_inner_vid_source:$add_inner_tpid_source:$add_inner_dei_source" in
+				fixed:fixed:fixed:fixed) ;;
+				*) dynamic=1 ;;
+			esac
+		fi
+		if [ "$dynamic" -eq 1 ]; then
+			[ "$remove" -gt 0 ] || [ "$additions" -gt 0 ] || return 1
+			set -- "$@" action vlan transform pop_tags "$remove" push_tags "$additions"
+			if [ "$additions" -eq 2 ]; then
+				set -- "$@" outer \
+					protocol "$(transform_protocol "$add_outer_tpid_source" "$add_outer_tpid")" \
+					id "$(transform_value "$add_outer_vid_source" "$add_outer_vid")" \
+					priority "$(transform_value "$add_outer_priority_source" "$add_outer_priority")" \
+					dei "$(transform_value "$add_outer_dei_source" "$add_outer_dei")"
+			fi
+			if [ "$additions" -ge 1 ]; then
+				set -- "$@" "$( [ "$additions" -eq 2 ] && printf inner || printf outer )" \
+					protocol "$(transform_protocol "$add_inner_tpid_source" "$add_inner_tpid")" \
+					id "$(transform_value "$add_inner_vid_source" "$add_inner_vid")" \
+					priority "$(transform_value "$add_inner_priority_source" "$add_inner_priority")" \
+					dei "$(transform_value "$add_inner_dei_source" "$add_inner_dei")"
+			fi
+			set -- "$@" pipe
+		else
+		replace=0
+		pop_count="$remove"
+		if [ "$remove" -gt 0 ] && [ "$additions" -gt 0 ]; then
+			replace=1
+			pop_count=$((remove - 1))
+		fi
+		count=0
+		while [ "$count" -lt "$pop_count" ]; do
+			set -- "$@" action vlan pop pipe
+			count=$((count + 1))
+		done
+		if [ "$additions" -ge 1 ]; then
+			if [ "$replace" -eq 1 ]; then
+				if [ "$add_inner_tpid" -ne 0 ] || [ "$add_inner_vid" -ge 0 ] ||
+					[ "$add_inner_priority" -ge 0 ] || [ "$add_inner_dei" -ge 0 ]; then
+					set -- "$@" action vlan modify
+					[ "$add_inner_tpid" -eq 0 ] || set -- "$@" protocol "$(tc_protocol "$add_inner_tpid")"
+					[ "$add_inner_vid" -lt 0 ] || set -- "$@" id "$add_inner_vid"
+					[ "$add_inner_priority" -lt 0 ] || set -- "$@" priority "$add_inner_priority"
+					[ "$add_inner_dei" -lt 0 ] || set -- "$@" dei "$add_inner_dei"
+					set -- "$@" pipe
+				fi
+			else
+				[ "$add_inner_tpid" -ne 0 ] && [ "$add_inner_vid" -ge 0 ] &&
+					[ "$add_inner_priority" -ge 0 ] || return 1
+				set -- "$@" action vlan push protocol "$(tc_protocol "$add_inner_tpid")" \
+					id "$add_inner_vid" priority "$add_inner_priority"
+				[ "$add_inner_dei" -lt 0 ] || set -- "$@" dei "$add_inner_dei"
+				set -- "$@" pipe
+			fi
+		fi
+		if [ "$additions" -eq 2 ]; then
+			[ "$add_outer_tpid" -ne 0 ] && [ "$add_outer_vid" -ge 0 ] &&
+				[ "$add_outer_priority" -ge 0 ] || return 1
+			set -- "$@" action vlan push protocol "$(tc_protocol "$add_outer_tpid")" \
+				id "$add_outer_vid" priority "$add_outer_priority"
+			[ "$add_outer_dei" -lt 0 ] || set -- "$@" dei "$add_outer_dei"
+			set -- "$@" pipe
+		fi
+		fi
+		if [ "$tail" = vlan ]; then
+			set -- "$@" action goto chain "$vlan_filter_up_chain"
+		else
+			set -- "$@" action pass
+		fi
+	fi
+	"$tc_command" "$@"
+}
+
+install_evto_rule() {
+	local hook="$1" direction="$2" tail="$3" interface="$4" gem="$5" packed="$6"
+	local ethertype extended ip_version dscp branch payload variant
+	# Skip entity, order, tag and two normalized tag filters.
+	local old_ifs="$IFS"; IFS=:
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 36 ] || return 1
+	ethertype="${10}"
+	extended="${11}"
+	shift 25
+	ip_version="$1"; dscp="$2"; branch="$3"
+	case "$ip_version" in 0|4|6) ;; *) return 1 ;; esac
+	case "$dscp" in -1) ;; ''|*[!0-9]*) return 1 ;; esac
+	case "$branch" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$branch" -le 127 ] || return 1
+	variant=$((branch * 2))
+	if [ "$dscp" -ge 0 ]; then
+		[ "$dscp" -le 63 ] || return 1
+		case "$ip_version" in 4) payload=2048 ;; 6) payload=34525 ;; *) return 1 ;; esac
+		if [ "$ip_version" -eq 4 ]; then
+			[ "$branch" -eq "$dscp" ] || return 1
+		else
+			[ "$branch" -eq "$((64 + dscp))" ] || return 1
+		fi
+		case "$extended" in
+			1)
+				[ "$ip_version" -eq 4 ] || return 1
+				install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 2048 67 68 "$variant" || return 1
+				install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 2048 68 67 "$((variant + 1))"
+				return
+				;;
+			2)
+				[ "$ip_version" -eq 6 ] || return 1
+				install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34525 546 547 "$variant" || return 1
+				install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34525 547 546 "$((variant + 1))"
+				return
+				;;
+		esac
+		install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" "$payload" '' '' "$variant"
+		return
+	fi
+	[ "$ip_version" -eq 0 ] && [ "$branch" -le 7 ] || return 1
+	case "$extended" in
+		1)
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 2048 67 68 "$variant" || return 1
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 2048 68 67 "$((variant + 1))"
+			return
+			;;
+		2)
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34525 546 547 "$variant" || return 1
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34525 547 546 "$((variant + 1))"
+			return
+			;;
+	esac
+	case "$ethertype" in
+		0) payload=0 ;;
+		1) payload=2048 ;;
+		2)
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34915 '' '' "$variant" || return 1
+			install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" 34916 '' '' "$((variant + 1))"
+			return
+			;;
+		3) payload=2054 ;;
+		4) payload=34525 ;;
+		5) payload=34958 ;;
+		*) return 1 ;;
+	esac
+	install_evto_variant "$hook" "$direction" "$tail" "$interface" "$gem" "$packed" "$payload" '' '' "$variant"
+}
+
+policy_for_interface() {
+	local interface="$1" policies="$2" pair
+	for pair in $policies; do
+		[ "${pair%%:*}" = "$interface" ] || continue
+		printf '%s\n' "${pair#*:}"
+		return 0
+	done
+	return 1
+}
+
+install_evto_policy() {
+	local interface="$1" hook="$2" direction="$3" tail="$4" gem="$5" policy="$6" chain
+	valid_evto_path "$hook" "$direction" "$tail" "$gem" || return 1
+	case "$policy" in pass|drop) ;; *) return 1 ;; esac
+	chain="$(evto_chain "$direction" "$gem")" || return 1
+	if [ "$policy" = drop ]; then
+		"$tc_command" filter replace dev "$interface" "$hook" chain "$chain" \
+			protocol all pref 65000 flower skip_hw action drop
+	elif [ "$tail" = vlan ]; then
+		"$tc_command" filter replace dev "$interface" "$hook" chain "$chain" \
+			protocol all pref 65000 flower skip_hw action goto chain "$vlan_filter_up_chain"
+	else
+		"$tc_command" filter replace dev "$interface" "$hook" chain "$chain" \
+			protocol all pref 65000 flower skip_hw action pass
+	fi
+}
+
+install_evto_gem_dispatch() {
+	local interface="$1" hook="$2" direction="$3" gem="$4" chain target mark preference
+	valid_gem_scope "$gem" && [ "$gem" -ge 0 ] || return 1
+	chain="$(evto_chain "$direction" -1)" || return 1
+	target="$(evto_chain "$direction" "$gem")" || return 1
+	mark="$(printf '0x%08x/0xffffffff' "$((mark_key | gem))")"
+	preference="$(gem_preference "$gem")" || return 1
+	"$tc_command" filter replace dev "$interface" "$hook" chain "$chain" \
+		protocol all pref "$preference" handle "$mark" fw action goto chain "$target"
+}
+
+install_vlan_filter() {
+	local interface="$1" hook="$2" packed="$3" encoded entity chain bytecode
+	entity="${packed##*:}"
+	encoded="${packed%:*}"
+	case "$entity" in ''|*[!0-9]*) return 1 ;; esac
+	bytecode="$(printf '%s\n' "$encoded" | tr ':' ' ')" || return 1
+	if [ "$hook" = ingress ]; then
+		chain="$vlan_filter_up_chain"
+	else
+		chain="$vlan_filter_down_chain"
+	fi
+	"$tc_command" filter replace dev "$interface" "$hook" chain "$chain" \
+		protocol all pref 100 bpf bytecode "$bytecode" action drop
+}
+
+install_vlan_filter_tail() {
+	local interface="$1" hook="$2" has_evto="$3" chain
+	if [ "$hook" = ingress ]; then
+		"$tc_command" filter replace dev "$interface" ingress chain "$vlan_filter_up_chain" \
+			protocol all pref 65000 flower skip_hw action goto chain "$tc_chain"
+		return
+	fi
+	chain="$vlan_filter_down_chain"
+	if [ "$has_evto" -eq 1 ]; then
+		"$tc_command" filter replace dev "$interface" egress chain "$chain" \
+			protocol all pref 65000 flower skip_hw action goto chain "$evto_down_chain"
+	else
+		"$tc_command" filter replace dev "$interface" egress chain "$chain" \
+			protocol all pref 65000 flower skip_hw action pass
+	fi
+}
+
+apply_vlan_filters() {
+	local filters="$1" pair interface hook
+	for pair in $filters; do
+		interface="${pair%%:*}"
+		pair="${pair#*:}"
+		hook="${pair%%:*}"
+		install_vlan_filter "$interface" "$hook" "${pair#*:}" || return 1
+	done
+}
+
+install_vlan_operation() {
+	local hook="$1" interface="$2" packed="$3" entity mode tci vid priority dei chain
+	local protocol tags preference old_ifs
+	old_ifs="$IFS"; IFS=:
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 3 ] || return 1
+	entity="$1"; mode="$2"; tci="$3"
+	case "$entity:$mode:$tci" in *[!0-9:]*) return 1 ;; esac
+	[ "$mode" -gt 0 ] || return 0
+	vid=$((tci & 4095))
+	priority=$(((tci >> 13) & 7))
+	dei=$(((tci >> 12) & 1))
+	if [ "$hook" = ingress ]; then
+		chain="$evto_up_chain"
+		case "$mode" in
+			1|2)
+				"$tc_command" filter replace dev "$interface" ingress chain "$chain" \
+					protocol all pref 1000 flower skip_hw num_of_vlans 0 \
+					action vlan push protocol 802.1Q id "$vid" priority "$priority" dei "$dei" pipe \
+					action goto chain "$vlan_filter_up_chain" || return 1
+				for protocol in 802.1Q 802.1ad; do
+					for tags in 1 2; do
+						if [ "$protocol" = 802.1Q ]; then
+							preference=$((1000 + tags))
+						else
+							preference=$((1002 + tags))
+						fi
+						set -- filter replace dev "$interface" ingress chain "$chain" \
+							protocol "$protocol" pref "$preference" flower skip_hw num_of_vlans "$tags" \
+							action vlan
+						if [ "$mode" -eq 1 ]; then
+							set -- "$@" modify protocol "$protocol"
+						else
+							set -- "$@" push protocol 802.1Q
+						fi
+						"$tc_command" "$@" id "$vid" priority "$priority" dei "$dei" pipe \
+							action goto chain "$vlan_filter_up_chain" || return 1
+					done
+				done
+				;;
+			*) return 1 ;;
+		esac
+	else
+		chain="$evto_down_chain"
+		[ "$mode" -eq 1 ] || return 1
+		for protocol in 802.1Q 802.1ad; do
+			for tags in 1 2; do
+				if [ "$protocol" = 802.1Q ]; then
+					preference=$((1000 + tags))
+				else
+					preference=$((1002 + tags))
+				fi
+				"$tc_command" filter replace dev "$interface" egress chain "$chain" \
+					protocol "$protocol" pref "$preference" flower skip_hw num_of_vlans "$tags" \
+					action vlan pop pipe action pass || return 1
+			done
+		done
+	fi
+}
+
+apply_vlan_operations() {
+	local upstream="$1" downstream="$2" pair interface
+	for pair in $upstream; do
+		interface="${pair%%:*}"
+		install_vlan_operation ingress "$interface" "${pair#*:}" || return 1
+	done
+	for pair in $downstream; do
+		interface="${pair%%:*}"
+		install_vlan_operation egress "$interface" "${pair#*:}" || return 1
+	done
+}
+
+apply_evto() {
+	local upstream="$1" downstream="$2" upstream_policies="$3" downstream_policies="$4"
+	local interface pair policy target has_downstream
+	for pair in $upstream; do
+		interface="${pair%%:*}"
+		install_evto_rule ingress up vlan "$interface" -1 "${pair#*:}" || return 1
+	done
+	for pair in $downstream; do
+		interface="${pair%%:*}"
+		install_evto_rule egress down pass "$interface" -1 "${pair#*:}" || return 1
+	done
+	for interface in lan1 lan2 lan3 lan4; do
+		"$ip_command" link show dev "$interface" >/dev/null 2>&1 || continue
+		install_vlan_filter_tail "$interface" ingress 0 || return 1
+		target="$vlan_filter_up_chain"
+		if policy="$(policy_for_interface "$interface" "$upstream_policies")"; then
+			install_evto_policy "$interface" ingress up vlan -1 "$policy" || return 1
+			target="$evto_up_chain"
+		fi
+		ensure_dispatch "$interface" ingress "$target" || return 1
+		has_downstream=0
+		if policy="$(policy_for_interface "$interface" "$downstream_policies")"; then
+			install_evto_policy "$interface" egress down pass -1 "$policy" || return 1
+			has_downstream=1
+		fi
+		install_vlan_filter_tail "$interface" egress "$has_downstream" || return 1
+		ensure_dispatch "$interface" egress "$vlan_filter_down_chain" || return 1
+	done
+}
+
+apply_ani_evto() {
+	local upstream="$1" downstream="$2" upstream_policies="$3" downstream_policies="$4"
+	local pair interface gem packed policy
+	for pair in $upstream; do
+		interface="${pair%%:*}"; pair="${pair#*:}"
+		gem="${pair%%:*}"; packed="${pair#*:}"
+		ensure_clsact "$interface" || return 1
+		install_evto_rule egress up pass "$interface" "$gem" "$packed" || return 1
+	done
+	for pair in $downstream; do
+		interface="${pair%%:*}"; pair="${pair#*:}"
+		gem="${pair%%:*}"; packed="${pair#*:}"
+		ensure_clsact "$interface" || return 1
+		install_evto_rule ingress down pass "$interface" "$gem" "$packed" || return 1
+	done
+	for pair in $upstream_policies; do
+		interface="${pair%%:*}"; pair="${pair#*:}"
+		gem="${pair%%:*}"; policy="${pair#*:}"
+		valid_gem_scope "$gem" || return 1
+		ensure_clsact "$interface" || return 1
+		[ "$gem" -lt 0 ] || install_evto_gem_dispatch "$interface" egress up "$gem" || return 1
+		install_evto_policy "$interface" egress up pass "$gem" "$policy" || return 1
+		ensure_dispatch "$interface" egress "$evto_up_chain" || return 1
+	done
+	for pair in $downstream_policies; do
+		interface="${pair%%:*}"; pair="${pair#*:}"
+		gem="${pair%%:*}"; policy="${pair#*:}"
+		valid_gem_scope "$gem" || return 1
+		ensure_clsact "$interface" || return 1
+		[ "$gem" -lt 0 ] || install_evto_gem_dispatch "$interface" ingress down "$gem" || return 1
+		install_evto_policy "$interface" ingress down pass "$gem" "$policy" || return 1
+		ensure_dispatch "$interface" ingress "$evto_down_chain" || return 1
+	done
+}
+
+apply_classifiers() {
+	local pbits="$1" dscps="$2" defaults="$3" downs="$4"
+	local vlan_filters="$5" vlan_op_up="$6" vlan_op_down="$7" evto_up="$8" evto_down="$9"
+	local evto_up_policies="${10}" evto_down_policies="${11}"
+	local evto_ani_up="${12}" evto_ani_down="${13}"
+	local evto_ani_up_policies="${14}" evto_ani_down_policies="${15}"
+	local multicasts="${16}"
+	local rate_limiters="${17}"
+	local downstream_meters="${18}"
+	local port_meters="${19}"
+	local pair interface pbit target dscp gem grouped interfaces meter record
+	ensure_clsact "$pon_device" || return 1
+	"$tc_command" filter del dev "$pon_device" ingress chain "$tc_chain" 2>/dev/null || true
+	ensure_dispatch "$pon_device" ingress "$tc_chain" || return 1
+	for interface in lan1 lan2 lan3 lan4; do
+		"$ip_command" link show dev "$interface" >/dev/null 2>&1 || continue
+		ensure_clsact "$interface" || return 1
+		clear_managed_chains "$interface"
+	done
+
+	for pair in $pbits; do
+		interface="${pair%%:*}"
+		pbit="${pair#*:}"; pbit="${pbit%%:*}"
+		target="${pair##*:}"
+		add_pbit_filter "$interface" 802.1Q "$((100 + pbit * 2))" "$pbit" "$target" || return 1
+		add_pbit_filter "$interface" 802.1ad "$((101 + pbit * 2))" "$pbit" "$target" || return 1
+	done
+	for pair in $dscps; do
+		interface="${pair%%:*}"
+		dscp="${pair#*:}"; dscp="${dscp%%:*}"
+		target="${pair##*:}"
+		add_dscp_filter "$interface" ip "$((200 + dscp))" "$dscp" "$target" || return 1
+		add_dscp_filter "$interface" ipv6 "$((300 + dscp))" "$dscp" "$target" || return 1
+	done
+	for pair in $defaults; do
+		interface="${pair%%:*}"
+		target="${pair#*:}"
+		add_default_filter "$interface" "$target" || return 1
+	done
+
+	grouped=
+	for pair in $downs; do
+		gem="${pair%%:*}"
+		case " $grouped " in *" $gem "*) continue ;; esac
+		interfaces=
+		for pair in $downs; do
+			[ "${pair%%:*}" = "$gem" ] || continue
+			interface="${pair#*:}"
+			case " $interfaces " in *" $interface "*) ;; *) interfaces="${interfaces}${interfaces:+ }$interface" ;; esac
+		done
+		meter=
+		for record in $downstream_meters; do
+			[ "${record%%:*}" = "$gem" ] || continue
+			meter="${record#*:}"
+			break
+		done
+		add_downstream_filter "$gem" "$interfaces" "$meter" || return 1
+		grouped="${grouped}${grouped:+ }$gem"
+	done
+	[ -z "$downs" ] || "$tc_command" filter replace dev "$pon_device" ingress chain "$tc_chain" \
+		protocol all pref 65535 flower skip_hw action drop || return 1
+	apply_vlan_filters "$vlan_filters" || return 1
+	apply_vlan_operations "$vlan_op_up" "$vlan_op_down" || return 1
+	apply_evto "$evto_up" "$evto_down" "$evto_up_policies" "$evto_down_policies" || return 1
+	apply_ani_evto "$evto_ani_up" "$evto_ani_down" \
+		"$evto_ani_up_policies" "$evto_ani_down_policies" || return 1
+	apply_multicast_guards "$multicasts" || return 1
+	apply_rate_limiters "$rate_limiters" || return 1
+	apply_port_meters "$port_meters"
+}
+
+apply_unis() {
+	local unis="$1" pair interface administrative state
+	for pair in $unis; do
+		interface="${pair%%:*}"
+		administrative="${pair#*:}"
+		"$ip_command" link show dev "$interface" >/dev/null 2>&1 || return 1
+		if [ "$administrative" -eq 0 ]; then
+			state=up
+		else
+			state=down
+		fi
+		"$ip_command" link set dev "$interface" "$state" || return 1
+	done
+}
+
+tc_signature() {
+	local interface hook chain
+	for interface in "$pon_device" lan1 lan2 lan3 lan4; do
+		for hook in ingress egress; do
+			case "$hook" in
+				ingress) set -- 0 "$vlan_filter_up_chain" "$evto_up_chain" "$tc_chain" ;;
+				egress) set -- 0 "$evto_down_chain" "$vlan_filter_down_chain" ;;
+			esac
+			for chain in "$@"; do
+				printf '%s %s %s\n' "$interface" "$hook" "$chain"
+				"$tc_command" filter show dev "$interface" "$hook" chain "$chain" 2>/dev/null || true
+			done
+		done
+	done | cksum
+}
+
+bridge_signature() {
+	local name ani peer
+	[ -f "$managed_bridges_file" ] || { printf '%s\n' none; return; }
+	while IFS= read -r name; do
+		valid_bridge_name "$name" || continue
+		printf '%s\n' "$name"
+		"$bridge_command" -details link show master "$name" 2>/dev/null |
+			sed -e 's/<[^>]*>/<link-flags>/' -e 's/ state [^ ]*/ state dynamic/' || true
+		ani="$(bridge_inside_name "$name")" || continue
+		peer="$(bridge_peer_name "$name")" || continue
+		"$ip_command" -details link show dev "$ani" 2>/dev/null || true
+		"$ip_command" -details link show dev "$peer" 2>/dev/null || true
+		"$tc_command" filter show dev "$peer" ingress 2>/dev/null || true
+		"$tc_command" filter show dev "$ani" ingress 2>/dev/null || true
+		"$tc_command" filter show dev "$ani" egress 2>/dev/null || true
+	done < "$managed_bridges_file" | cksum
+}
+
+document_signature() {
+	local rendered
+	rendered="$("$renderer" "$1")" || return 1
+	printf '%s\n' "$rendered" | cksum
+}
+
+clear_platform() {
+	local gpon xgspon interface xgs_committed=0
+	if xg_mode "$pon_mode"; then
+		if xgspon="$(find_xgspon)"; then
+			printf 'reset\n' > "$xgspon/service_reset" || return 1
+			printf 'commit\n' > "$xgspon/service_commit" || return 1
+			xgs_committed=1
+		fi
+	elif gpon="$(find_gpon)"; then
+		[ -w "$gpon/qos" ] && printf 'off\n' > "$gpon/qos" 2>/dev/null || true
+		printf 'off\n' > "$gpon/data_gems" 2>/dev/null || return 1
+	fi
+	if [ -x "$tc_command" ]; then
+		for interface in "$pon_device" lan1 lan2 lan3 lan4; do
+			clear_managed_chains "$interface"
+		done
+	fi
+	if ! clear_managed_bridges; then
+		[ "$xgs_committed" -eq 0 ] || rollback_xgs_service "$xgspon" || return 1
+		publish_status clear-failed
+		return 1
+	fi
+	rm -f "$managed_evto_chains_file"
+	publish_status idle
+}
+
+apply_document() {
+	local document="$1" rendered kind first second third
+	local gems= unis= pbits= dscps= defaults= downs= vlan_filters= vlan_op_up= vlan_op_down=
+	local evto_up= evto_down= evto_ani_up= evto_ani_down=
+	local bridges= bridge_ports= bridge_anis= multicasts=
+	local rate_limiters= downstream_meters= port_meters=
+	local evto_up_policies= evto_down_policies=
+	local evto_ani_up_policies= evto_ani_down_policies= count=0 classifiers=0
+	local gpon xgspon pair alloc channel wanted= qos_wanted= current qos_weight qos_have_weight mapping
+	local xgs_tconts= xgs_xgems= xgs_seen_tconts= xgs_seen_allocs= xgs_seen_xgems=
+	local requested_mode=
+	local old_ifs remaining old_data_gems old_qos xgs_committed=0
+	rendered="$("$renderer" "$document")" || {
+		publish_status invalid-graph
+		return 1
+	}
+	set -- $rendered
+	while [ "$#" -gt 0 ]; do
+		[ "$#" -ge 4 ] || return 1
+		kind="$1" first="$2" second="$3" third="$4"
+		shift 4
+		case "$kind" in
+			pon-mode)
+				[ -z "$requested_mode" ] || return 1
+				case "$first" in gpon|xgpon|xgspon) ;; *) return 1 ;; esac
+				[ "$second:$third" = 0:0 ] || return 1
+				requested_mode="$first"
+				;;
+			uni)
+				unis="${unis}${unis:+ }$first:$second"
+				;;
+			gem)
+				[ "$requested_mode" = gpon ] || return 1
+				gems="${gems}${gems:+ }$first:$second:$third"
+				count=$((count + 1))
+				;;
+			qos)
+				[ "$requested_mode" = gpon ] || return 1
+				# alloc scheduler:w0..w7 cir:pir:cbs:pbs
+				remaining="$*"
+				old_ifs="$IFS"; IFS=:
+				set -- $second
+				IFS="$old_ifs"
+				[ "$#" -eq 9 ] || return 1
+				case "$1:$2:$3:$4:$5:$6:$7:$8:$9" in
+					*[!0-9:]*) return 1 ;;
+				esac
+				[ "$1" -le 2 ] || return 1
+				qos_have_weight=0
+				for qos_weight in "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"; do
+					[ "$qos_weight" -le 255 ] || return 1
+					[ "$qos_weight" -eq 0 ] || qos_have_weight=1
+				done
+				[ "$1" -ne 2 ] || [ "$qos_have_weight" -eq 1 ] || return 1
+				old_ifs="$IFS"; IFS=:
+				set -- $third
+				IFS="$old_ifs"
+				[ "$#" -eq 4 ] || return 1
+				case "$1:$2:$3:$4" in *[!0-9:]*) return 1 ;; esac
+				[ "$2" -eq 0 ] || [ "$1" -le "$2" ] || return 1
+				qos_wanted="${qos_wanted}${qos_wanted:+ }$first:$second:$third"
+				# Restore the rendered stream after validating the packed fields.
+				set -- $remaining
+				;;
+			xgs-tcont)
+				xg_mode "$requested_mode" || return 1
+				case "$first:$second" in *[!0-9:]*) return 1 ;; esac
+				[ "$first" -ge 1 ] && [ "$first" -le 31 ] &&
+					[ "$second" -le 16383 ] || return 1
+				remaining="$*"; old_ifs="$IFS"; IFS=:
+				set -- $third
+				IFS="$old_ifs"
+				[ "$#" -eq 14 ] || return 1
+				case "$1:$2:$3:$4:$5:$6:$7:$8:$9:${10}:${11}:${12}:${13}:${14}" in
+					*[!0-9:]*) return 1 ;;
+				esac
+				[ "$1" -le 2 ] && [ "$2" -le 255 ] || return 1
+				qos_have_weight=0
+				for qos_weight in "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"; do
+					[ "$qos_weight" -le 255 ] || return 1
+					[ "$qos_weight" -eq 0 ] || qos_have_weight=1
+				done
+				[ "$1" -ne 2 ] || [ "$qos_have_weight" -eq 1 ] || return 1
+				[ "${12}" -eq 0 ] || [ "${11}" -le "${12}" ] || return 1
+				case " $xgs_seen_tconts " in *" $first "*) return 1 ;; esac
+				case " $xgs_seen_allocs " in *" $second "*) return 1 ;; esac
+				xgs_seen_tconts="${xgs_seen_tconts}${xgs_seen_tconts:+ }$first"
+				xgs_seen_allocs="${xgs_seen_allocs}${xgs_seen_allocs:+ }$second"
+				xgs_tconts="${xgs_tconts}${xgs_tconts:+ }$first:$second:$third"
+				set -- $remaining
+				;;
+			xgs-xgem)
+				xg_mode "$requested_mode" || return 1
+				case "$first:$second" in *[!0-9:]*) return 1 ;; esac
+				[ "$first" -ge 1 ] && [ "$first" -le 65534 ] &&
+					[ "$second" -ge 1 ] && [ "$second" -le 31 ] || return 1
+				remaining="$*"; old_ifs="$IFS"; IFS=:
+				set -- $third
+				IFS="$old_ifs"
+				[ "$#" -eq 6 ] || return 1
+				case "$1:$2:$3:$4:$5:$6" in *[!0-9:]*) return 1 ;; esac
+				[ "$1" -ge 1 ] && [ "$1" -le 3 ] && [ "$2" -le 31 ] &&
+					[ "$3" -le 31 ] && [ "$4" -le 1 ] &&
+					[ "$5" -le 1 ] && [ "$6" -le 1 ] || return 1
+				case " $xgs_seen_xgems " in *" $first "*) return 1 ;; esac
+				xgs_seen_xgems="${xgs_seen_xgems}${xgs_seen_xgems:+ }$first"
+				xgs_xgems="${xgs_xgems}${xgs_xgems:+ }$first:$second:$third"
+				count=$((count + 1))
+				wanted="${wanted}${wanted:+ }$first"
+				set -- $remaining
+				;;
+			bridge)
+				valid_bridge_name "$first" || return 1
+				bridges="${bridges}${bridges:+ }$first:$second:$third"
+				;;
+			bridge-port)
+				valid_bridge_name "$first" || return 1
+				bridge_ports="${bridge_ports}${bridge_ports:+ }$first:$second:$third"
+				;;
+			bridge-ani)
+				valid_bridge_name "$first" && valid_ani_name "$second" && valid_ani_name "$third" || return 1
+				bridge_anis="${bridge_anis}${bridge_anis:+ }$first:$second:$third"
+				;;
+			mcast-uni)
+				case "$second:$third" in *[!0-9:]*) return 1 ;; esac
+				multicasts="${multicasts}${multicasts:+ }$first:$second"
+				;;
+			rate-limit)
+				valid_ani_name "$first" || return 1
+				case "$second" in unknown|broadcast|multicast) ;; *) return 1 ;; esac
+				rate_limiters="${rate_limiters}${rate_limiters:+ }$first:$second:$third"
+				classifiers=$((classifiers + 1))
+				;;
+			down-meter)
+				case "$first:$second:$third" in *[!0-9:]*) return 1 ;; esac
+				valid_gem_scope "$first" && [ "$first" -ge 0 ] &&
+					[ "$second" -gt 0 ] &&
+					[ "$second" -le 4294967295 ] && [ "$third" -gt 0 ] &&
+					[ "$third" -le 4294967295 ] || return 1
+				case " $downstream_meters " in *" $first:"*) return 1 ;; esac
+				downstream_meters="${downstream_meters}${downstream_meters:+ }$first:$second:$third"
+				;;
+			port-meter)
+				valid_evto_interface "$first" && valid_tc_hook "$second" || return 1
+				case "$third" in *[!0-9:]*) return 1 ;; esac
+				port_meters="${port_meters}${port_meters:+ }$first:$second:$third"
+				classifiers=$((classifiers + 1))
+				;;
+			pbit)
+				pbits="${pbits}${pbits:+ }$first:$second:$third"
+				classifiers=$((classifiers + 1))
+				;;
+			dscp)
+				dscps="${dscps}${dscps:+ }$first:$second:$third"
+				classifiers=$((classifiers + 1))
+				;;
+			default)
+				defaults="${defaults}${defaults:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			down)
+				downs="${downs}${downs:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			vfilter)
+				case "$second" in ingress|egress) ;; *) return 1 ;; esac
+				vlan_filters="${vlan_filters}${vlan_filters:+ }$first:$second:$third"
+				classifiers=$((classifiers + 1))
+				;;
+			vlan-op-up)
+				vlan_op_up="${vlan_op_up}${vlan_op_up:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			vlan-op-down)
+				vlan_op_down="${vlan_op_down}${vlan_op_down:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			evto-up)
+				evto_up="${evto_up}${evto_up:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			evto-down)
+				evto_down="${evto_down}${evto_down:+ }$first:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			evto-ani-up)
+				valid_ani_name "$first" && valid_gem_scope "$third" || return 1
+				evto_ani_up="${evto_ani_up}${evto_ani_up:+ }$first:$third:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			evto-ani-down)
+				valid_ani_name "$first" && valid_gem_scope "$third" || return 1
+				evto_ani_down="${evto_ani_down}${evto_ani_down:+ }$first:$third:$second"
+				classifiers=$((classifiers + 1))
+				;;
+			evto-up-policy)
+				evto_up_policies="${evto_up_policies}${evto_up_policies:+ }$first:$second"
+				;;
+			evto-down-policy)
+				evto_down_policies="${evto_down_policies}${evto_down_policies:+ }$first:$second"
+				;;
+			evto-ani-up-policy)
+				valid_ani_name "$first" && valid_gem_scope "$third" || return 1
+				case "$second" in pass|drop) ;; *) return 1 ;; esac
+				evto_ani_up_policies="${evto_ani_up_policies}${evto_ani_up_policies:+ }$first:$third:$second"
+				;;
+			evto-ani-down-policy)
+				valid_ani_name "$first" && valid_gem_scope "$third" || return 1
+				case "$second" in pass|drop) ;; *) return 1 ;; esac
+				evto_ani_down_policies="${evto_ani_down_policies}${evto_ani_down_policies:+ }$first:$third:$second"
+				;;
+			*) return 1 ;;
+		esac
+		done
+
+	[ -n "$requested_mode" ] || {
+		publish_status invalid-graph "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	[ "$requested_mode" = "$pon_mode" ] || {
+		publish_status pon-mode-mismatch "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	if xg_mode "$requested_mode"; then
+		for pair in $xgs_xgems; do
+			channel="${pair#*:}"; channel="${channel%%:*}"
+			case " $xgs_seen_tconts " in *" $channel "*) ;; *) return 1 ;; esac
+		done
+	fi
+	preflight_bridges "$bridges" "$bridge_ports" "$bridge_anis" || {
+		publish_status bridge-conflict "$count" "$wanted" "$classifiers"
+		return 1
+	}
+
+	if xg_mode "$pon_mode"; then
+		xgspon="$(find_xgspon)" || {
+			publish_status driver-unavailable "$count" "$wanted" "$classifiers"
+			return 1
+		}
+		if [ "$count" -gt 0 ] && [ "$(cat "$xgspon/ready" 2>/dev/null)" != 1 ]; then
+			publish_status waiting-o5 "$count" "$wanted" "$classifiers"
+			return 1
+		fi
+		printf 'reset\n' > "$xgspon/service_reset" || {
+			publish_status xgs-service-stage-failed "$count" "$wanted" "$classifiers"
+			return 1
+		}
+		for pair in $xgs_tconts; do
+			alloc="${pair%%:*}"; pair="${pair#*:}"
+			channel="${pair%%:*}"; pair="${pair#*:}"
+			printf '%s %s %s\n' "$alloc" "$channel" "$(printf '%s' "$pair" | tr ':' ' ')" \
+				> "$xgspon/service_tcont" || {
+					publish_status xgs-service-stage-failed "$count" "$wanted" "$classifiers"
+					return 1
+				}
+		done
+		for pair in $xgs_xgems; do
+			alloc="${pair%%:*}"; pair="${pair#*:}"
+			channel="${pair%%:*}"; pair="${pair#*:}"
+			printf '%s %s %s\n' "$alloc" "$channel" "$(printf '%s' "$pair" | tr ':' ' ')" \
+				> "$xgspon/service_xgem" || {
+					publish_status xgs-service-stage-failed "$count" "$wanted" "$classifiers"
+					return 1
+				}
+		done
+		printf 'commit\n' > "$xgspon/service_commit" || {
+			publish_status xgs-service-commit-failed "$count" "$wanted" "$classifiers"
+			return 1
+		}
+		xgs_committed=1
+	else
+	gpon="$(find_gpon)" || {
+		[ "$count" -eq 0 ] || { publish_status driver-unavailable "$count"; return 1; }
+	}
+	if [ "$count" -gt 0 ]; then
+		case "$(cat "$gpon/state" 2>/dev/null)" in
+			5\ *) ;;
+			*) publish_status waiting-o5 "$count"; return 1 ;;
+		esac
+		for pair in $gems; do
+			alloc="${pair#*:}"
+			alloc="${alloc%%:*}"
+			channel=
+			for mapping in $(cat "$gpon/tconts" 2>/dev/null); do
+				[ "${mapping#*:}" = "$alloc" ] || continue
+				channel="${mapping%%:*}"
+				break
+			done
+			[ -n "$channel" ] || {
+				publish_status waiting-tcont "$count" "$wanted" "$classifiers"
+				return 1
+			}
+			wanted="${wanted}${wanted:+ }${pair%%:*}:$channel:${pair##*:}"
+		done
+		old_data_gems="$(cat "$gpon/data_gems" 2>/dev/null || printf 'off')"
+		old_qos="$(cat "$gpon/qos" 2>/dev/null || printf 'off')"
+		if [ -n "$qos_wanted" ]; then
+			[ -w "$gpon/qos" ] || {
+				publish_status qos-unavailable "$count" "$wanted" "$classifiers"
+				return 1
+			}
+			qos_current=
+			for pair in $qos_wanted; do
+				alloc="${pair%%:*}"; pair="${pair#*:}"
+				channel=
+				for mapping in $(cat "$gpon/tconts" 2>/dev/null); do
+					[ "${mapping#*:}" = "$alloc" ] || continue
+					channel="${mapping%%:*}"
+					break
+				done
+				[ -n "$channel" ] || {
+					publish_status waiting-tcont "$count" "$wanted" "$classifiers"
+					return 1
+				}
+				qos_current="${qos_current}${qos_current:+ }$channel:${pair}"
+			done
+			current="$(cat "$gpon/qos" 2>/dev/null || true)"
+			[ "$current" = "$qos_current" ] || printf '%s\n' "$qos_current" > "$gpon/qos" || {
+				printf '%s\n' "$old_qos" > "$gpon/qos" 2>/dev/null || true
+				publish_status qos-apply-failed "$count" "$wanted" "$classifiers"
+				return 1
+			}
+		elif [ -n "${gpon:-}" ] && [ -w "$gpon/qos" ]; then
+			current="$(cat "$gpon/qos" 2>/dev/null || true)"
+			[ "$current" = off ] || printf 'off\n' > "$gpon/qos" || return 1
+		fi
+		current="$(cat "$gpon/data_gems" 2>/dev/null)"
+		[ "$current" = "$wanted" ] || printf '%s\n' "$wanted" > "$gpon/data_gems" || {
+			printf '%s\n' "$old_qos" > "$gpon/qos" 2>/dev/null || true
+			printf '%s\n' "$old_data_gems" > "$gpon/data_gems" 2>/dev/null || true
+			publish_status gem-apply-failed "$count" "$wanted" "$classifiers"
+			return 1
+		}
+	elif [ -n "${gpon:-}" ]; then
+		if [ -w "$gpon/qos" ]; then
+			current="$(cat "$gpon/qos" 2>/dev/null || true)"
+			[ "$current" = off ] || printf 'off\n' > "$gpon/qos" || return 1
+		fi
+		current="$(cat "$gpon/data_gems" 2>/dev/null)"
+		[ "$current" = off ] || printf 'off\n' > "$gpon/data_gems" || return 1
+	fi
+	fi
+
+	apply_unis "$unis" || {
+		[ "$xgs_committed" -eq 0 ] ||
+			rollback_xgs_service "$xgspon" "$count" "$wanted" "$classifiers" || return 1
+		publish_status uni-apply-failed "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	apply_bridges "$bridges" "$bridge_ports" "$bridge_anis" || {
+		[ "$xgs_committed" -eq 0 ] ||
+			rollback_xgs_service "$xgspon" "$count" "$wanted" "$classifiers" || return 1
+		publish_status bridge-apply-failed "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	bridge_ports_current="$bridge_ports"
+	apply_classifiers "$pbits" "$dscps" "$defaults" "$downs" \
+		"$vlan_filters" "$vlan_op_up" "$vlan_op_down" "$evto_up" "$evto_down" \
+		"$evto_up_policies" "$evto_down_policies" "$evto_ani_up" "$evto_ani_down" \
+		"$evto_ani_up_policies" "$evto_ani_down_policies" "$multicasts" \
+		"$rate_limiters" "$downstream_meters" "$port_meters" || {
+		[ "$xgs_committed" -eq 0 ] ||
+			rollback_xgs_service "$xgspon" "$count" "$wanted" "$classifiers" || return 1
+		publish_status classifier-apply-failed "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	stage_managed_evto_chains || {
+		[ "$xgs_committed" -eq 0 ] ||
+			rollback_xgs_service "$xgspon" "$count" "$wanted" "$classifiers" || return 1
+		publish_status classifier-apply-failed "$count" "$wanted" "$classifiers"
+		return 1
+	}
+	publish_status applied "$count" "$wanted" "$classifiers"
+}
+
+apply_locked() {
+	local document="$1" result
+	lock || return 1
+	trap 'unlock' EXIT INT TERM
+	apply_document "$document"
+	result=$?
+	unlock
+	trap - EXIT INT TERM
+	return "$result"
+}
+
+monitor() {
+	local desired="$state_dir/desired.json" signature= current desired_state= document_checksum= current_document
+	local gpon xgspon driver_state tc_state bridge_state
+	while :; do
+		if [ -s "$desired" ]; then
+			current_document="$(cksum "$desired" 2>/dev/null)"
+			if [ "$current_document" != "$document_checksum" ]; then
+				desired_state="$(document_signature "$desired")" || {
+					signature=
+					sleep 2
+					continue
+				}
+				[ "$(cksum "$desired" 2>/dev/null)" = "$current_document" ] || {
+					sleep 2
+					continue
+				}
+				document_checksum="$current_document"
+			fi
+			driver_state=unavailable
+			if xg_mode "$pon_mode"; then
+				if xgspon="$(find_xgspon)"; then
+					driver_state="$(cat "$xgspon/state" 2>/dev/null):$(cat "$xgspon/service_state" 2>/dev/null)"
+				fi
+			elif gpon="$(find_gpon)"; then
+				driver_state="$(cat "$gpon/state" 2>/dev/null):$(cat "$gpon/data_gems" 2>/dev/null)"
+			fi
+			tc_state="$(tc_signature)"
+			bridge_state="$(bridge_signature)"
+			current="$desired_state:$driver_state:$tc_state:$bridge_state"
+			if [ "$current" != "$signature" ]; then
+				if apply_locked "$desired"; then
+					driver_state=unavailable
+					if xg_mode "$pon_mode"; then
+						if xgspon="$(find_xgspon)"; then
+							driver_state="$(cat "$xgspon/state" 2>/dev/null):$(cat "$xgspon/service_state" 2>/dev/null)"
+						fi
+					elif gpon="$(find_gpon)"; then
+						driver_state="$(cat "$gpon/state" 2>/dev/null):$(cat "$gpon/data_gems" 2>/dev/null)"
+					fi
+					tc_state="$(tc_signature)"
+					bridge_state="$(bridge_signature)"
+					desired_state="$(document_signature "$desired")" || desired_state=
+					document_checksum="$(cksum "$desired" 2>/dev/null)"
+					signature="$desired_state:$driver_state:$tc_state:$bridge_state"
+				else
+					signature=
+				fi
+			fi
+		else
+			publish_status waiting-mib
+		fi
+		sleep 2
+	done
+}
+
+case "${1:-}" in
+	apply) [ "$#" -eq 2 ] || exit 2; apply_locked "$2" ;;
+	clear) [ "$#" -eq 1 ] || exit 2; lock && trap 'unlock' EXIT INT TERM && clear_platform ;;
+	monitor) [ "$#" -eq 1 ] || exit 2; monitor ;;
+	*) echo "usage: $0 {apply FILE|clear|monitor}" >&2; exit 2 ;;
+esac

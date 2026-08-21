@@ -1,0 +1,1029 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Fri, 14 Aug 2026 01:20:00 +0800
+Subject: [PATCH] net: airoha: add XGS-PON service/QDMA data path
+
+Add the XGS-PON OMCC consumer and the native XGEM/T-CONT/QDMA service
+backend. Keep XGS state separate from GPON GEM/QoS state, preserve the
+full 16-bit XGEM Port-ID in RX/TX metadata, and provide transactional
+service provisioning for OMCI.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -21,6 +21,84 @@
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+ 
++/* SDK RX descriptor MSG0 bit 30: hardware did not consume an OMCI MIC. */
++#define QDMA_ETH_RXMSG_NO_MIC_MASK	BIT(30)
++
++struct airoha_gdm_dev;
++
++static u32 airoha_gpon_qos_rate(u32 bytes_per_second);
++static int airoha_gpon_program_qos(
++	struct net_device *netdev, const struct airoha_gpon_qos_config *cfg);
++static int airoha_gpon_disable_qos(struct net_device *netdev, u8 channel);
++
++struct airoha_pon_rx_cb {
++	struct airoha_gdm_dev *dev;
++	bool omcc;
++	bool xgs_omcc;
++	bool no_mic;
++	u16 gem;
++};
++
++#define AIROHA_PON_RX_CB(_skb) ((struct airoha_pon_rx_cb *)((_skb)->cb))
++
++static bool airoha_xgs_omcc_consumer_present(struct airoha_gdm_dev *dev)
++{
++	bool present;
++
++	rcu_read_lock();
++	present = rcu_access_pointer(dev->xgs_omcc_consumer);
++	rcu_read_unlock();
++
++	return present;
++}
++
++static void airoha_xgs_omcc_receive(struct airoha_gdm_dev *dev,
++				    struct sk_buff *skb, u16 gem,
++				    bool no_mic)
++{
++	struct airoha_xgs_omcc_metadata metadata = {
++		.xgem_id = gem,
++		.no_mic = no_mic,
++	};
++	struct airoha_xgs_omcc_consumer *consumer;
++
++	rcu_read_lock();
++	consumer = rcu_dereference(dev->xgs_omcc_consumer);
++	if (consumer)
++		consumer->ops->receive(consumer->context, skb, &metadata);
++	else
++		dev_kfree_skb_any(skb);
++	rcu_read_unlock();
++}
++
++static void airoha_xgs_omcc_detach(struct airoha_gdm_dev *dev)
++{
++	struct airoha_xgs_omcc_consumer *consumer;
++
++	mutex_lock(&dev->xgs_omcc_lock);
++	consumer = rcu_dereference_protected(dev->xgs_omcc_consumer,
++					     lockdep_is_held(&dev->xgs_omcc_lock));
++	RCU_INIT_POINTER(dev->xgs_omcc_consumer, NULL);
++	mutex_unlock(&dev->xgs_omcc_lock);
++	if (consumer) {
++		synchronize_net();
++		kfree(consumer);
++	}
++}
++
++static const struct airoha_xgs_service_xgem *
++airoha_xgs_find_xgem(struct airoha_gdm_dev *dev, u16 xgem_id,
++		     u8 direction)
++{
++	unsigned int i;
++
++	for (i = 0; i < dev->xgs_xgem_count; i++)
++		if (dev->xgs_xgems[i].xgem_id == xgem_id &&
++		    (dev->xgs_xgems[i].direction & direction))
++			return &dev->xgs_xgems[i];
++	return NULL;
++}
++
+ u32 airoha_rr(void __iomem *base, u32 offset)
+ {
+ 	return readl(base + offset);
+@@ -909,6 +984,8 @@
+ 		struct airoha_gdm_dev *dev;
+ 		struct net_device *netdev;
+ 		bool omci = false;
++		bool xgs_omcc = false;
++		bool no_mic = false;
+ 		int data_len, len;
+ 		struct page *page;
+ 		u32 msg0;
+@@ -937,29 +1014,64 @@
+ 			goto free_frag;
+ 
+ 		netdev = netdev_from_priv(dev);
++		if (q->skb && q->skb->dev != netdev &&
++		    (!dev->gpon_mode || q->skb->dev != dev->omci_dev))
++			goto free_frag;
+ 		msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
+ 		if (dev->gpon_mode) {
+ 			unsigned long flags;
+ 			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
+ 			bool ready;
+ 
+-			spin_lock_irqsave(&dev->gpon_lock, flags);
+-			if (msg0 & QDMA_ETH_TXMSG_OAM_MASK) {
+-				ready = dev->gpon_omcc_ready;
+-				ready = ready && gem == dev->gpon_omcc_gem;
++			if (q->skb) {
++				struct airoha_pon_rx_cb *cb = AIROHA_PON_RX_CB(q->skb);
++
++				omci = cb->omcc;
++				xgs_omcc = cb->xgs_omcc;
++				no_mic = cb->no_mic;
++				gpon_gem = cb->gem;
++				ready = dev == cb->dev &&
++					!!(msg0 & QDMA_ETH_TXMSG_OAM_MASK) == omci &&
++					gem == gpon_gem;
++				netdev = q->skb->dev;
++			} else if (msg0 & QDMA_ETH_TXMSG_OAM_MASK) {
+ 				omci = true;
+-			} else {
+-				ready = dev->gpon_tx_ready &&
+-					gem < AIROHA_GPON_MAX_GEMS &&
+-					test_bit(gem, dev->gpon_gems) &&
+-					(dev->gpon_directions[gem] & BIT(0));
+ 				gpon_gem = gem;
++				xgs_omcc = airoha_xgs_omcc_consumer_present(dev);
++				if (xgs_omcc) {
++					ready = true;
++					no_mic = !!(msg0 & QDMA_ETH_RXMSG_NO_MIC_MASK);
++				} else {
++					spin_lock_irqsave(&dev->gpon_lock, flags);
++					ready = dev->gpon_omcc_ready &&
++						gem == dev->gpon_omcc_gem;
++					spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				}
++			} else {
++				spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++				if (dev->xgs_service_active) {
++					ready = !!airoha_xgs_find_xgem(
++						dev, gem,
++						AIROHA_XGS_SERVICE_DIRECTION_DOWNSTREAM);
++					gpon_gem = gem;
++					spin_unlock_irqrestore(
++						&dev->xgs_service_state_lock, flags);
++				} else {
++					spin_unlock_irqrestore(
++						&dev->xgs_service_state_lock, flags);
++					spin_lock_irqsave(&dev->gpon_lock, flags);
++					ready = dev->gpon_tx_ready &&
++						gem < AIROHA_GPON_MAX_GEMS &&
++						test_bit(gem, dev->gpon_gems) &&
++						(dev->gpon_directions[gem] & BIT(0));
++					gpon_gem = gem;
++					spin_unlock_irqrestore(&dev->gpon_lock, flags);
++				}
+ 			}
+-			spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 
+-			if (!ready || (omci && !dev->omci_dev))
++			if (!ready || (omci && !xgs_omcc && !dev->omci_dev))
+ 				goto free_frag;
+-			if (omci)
++			if (omci && !xgs_omcc)
+ 				netdev = dev->omci_dev;
+ 		}
+ 		if (!q->skb) { /* first buffer */
+@@ -967,8 +1079,27 @@
+ 							  netdev, omci);
+ 			if (!q->skb)
+ 				goto free_frag;
+-			if (dev->gpon_mode && !omci)
+-				q->skb->mark = AIROHA_GPON_MARK_KEY | gpon_gem;
++			if (dev->gpon_mode) {
++				struct airoha_pon_rx_cb *cb = AIROHA_PON_RX_CB(q->skb);
++
++				memset(cb, 0, sizeof(*cb));
++				cb->dev = dev;
++				cb->omcc = omci;
++				cb->xgs_omcc = xgs_omcc;
++				cb->no_mic = no_mic;
++				cb->gem = gpon_gem;
++				if (!omci) {
++					unsigned long flags;
++
++					spin_lock_irqsave(&dev->xgs_service_state_lock,
++							  flags);
++					q->skb->mark = dev->xgs_service_active ?
++						AIROHA_XGS_MARK_KEY | gpon_gem :
++						AIROHA_GPON_MARK_KEY | gpon_gem;
++					spin_unlock_irqrestore(
++						&dev->xgs_service_state_lock, flags);
++				}
++			}
+ 		} else { /* scattered frame */
+ 			struct skb_shared_info *shinfo = skb_shinfo(q->skb);
+ 			int nr_frags = shinfo->nr_frags;
+@@ -1013,7 +1144,9 @@
+ 					     false);
+ 
+ 		done++;
+-		if (omci) {
++		if (xgs_omcc) {
++			airoha_xgs_omcc_receive(dev, q->skb, gpon_gem, no_mic);
++		} else if (omci) {
+ 			netdev->stats.rx_packets++;
+ 			netdev->stats.rx_bytes += q->skb->len;
+ 			netif_receive_skb(q->skb);
+@@ -2610,6 +2743,8 @@
+ 	u32 nr_frags, tag, msg0, msg1, len;
+ 	u16 gpon_gem = 0;
+ 	u8 gpon_channel = 0;
++	u8 xgs_nboq = 0, xgs_mic_idx = 0;
++	bool xgs_data = false;
+ 	struct airoha_queue_entry *e;
+ 	struct airoha_qdma *qdma;
+ 	struct netdev_queue *txq;
+@@ -2624,7 +2759,51 @@
+ 	rcu_read_lock();
+ 	if (dev->gpon_mode) {
+ 		unsigned long flags;
++		struct airoha_xgs_service_xgem xgem;
++		const struct airoha_xgs_service_xgem *entry;
++
++		spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++		if (!omci && dev->xgs_service_active) {
++			u16 requested;
++
++			if ((skb->mark & AIROHA_XGS_MARK_MASK) ==
++			    AIROHA_XGS_MARK_KEY)
++				requested = skb->mark & GENMASK(15, 0);
++			else if (dev->xgs_upstream_count == 1) {
++				for (requested = 0; requested < dev->xgs_xgem_count;
++				     requested++)
++					if (dev->xgs_xgems[requested].direction &
++					    AIROHA_XGS_SERVICE_DIRECTION_UPSTREAM)
++						break;
++				if (requested == dev->xgs_xgem_count) {
++					spin_unlock_irqrestore(
++						&dev->xgs_service_state_lock, flags);
++					goto error;
++				}
++				requested = dev->xgs_xgems[requested].xgem_id;
++			} else {
++				spin_unlock_irqrestore(&dev->xgs_service_state_lock,
++						       flags);
++				goto error;
++			}
++			entry = airoha_xgs_find_xgem(
++				dev, requested, AIROHA_XGS_SERVICE_DIRECTION_UPSTREAM);
++			if (!entry) {
++				spin_unlock_irqrestore(&dev->xgs_service_state_lock,
++						       flags);
++				goto error;
++			}
++			xgem = *entry;
++			xgs_data = true;
++			gpon_gem = xgem.xgem_id;
++			gpon_channel = xgem.channel;
++			xgs_nboq = xgem.nboq;
++			xgs_mic_idx = xgem.mic_idx;
++		}
++		spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
+ 
++		if (xgs_data)
++			goto pon_selected;
+ 		spin_lock_irqsave(&dev->gpon_lock, flags);
+ 		if (omci) {
+ 			if (!dev->gpon_omcc_ready) {
+@@ -2656,6 +2835,8 @@
+ 		spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 	}
+ 
++pon_selected:
++
+ 	qdma = rcu_dereference(dev->qdma);
+ 	if (unlikely(!qdma))
+ 		goto error;
+@@ -2670,6 +2851,8 @@
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+ 			  qid % AIROHA_NUM_QOS_QUEUES) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
++	if (xgs_data)
++		msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_MIC_IDX_MASK, xgs_mic_idx);
+ 	if (omci)
+ 		msg0 |= QDMA_ETH_TXMSG_OAM_MASK;
+ 	if (!omci && skb->ip_summed == CHECKSUM_PARTIAL)
+@@ -2692,7 +2875,8 @@
+ 	}
+ 
+ 	fport = airoha_get_fe_port(dev);
+-	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, dev->nbq) |
++	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK,
++			  xgs_data ? xgs_nboq : dev->nbq) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
+@@ -4112,6 +4296,9 @@
+ 	dev->nbq = nbq;
+ 	spin_lock_init(&dev->gpon_lock);
+ 	mutex_init(&dev->gpon_qos_lock);
++	mutex_init(&dev->xgs_omcc_lock);
++	mutex_init(&dev->xgs_service_lock);
++	spin_lock_init(&dev->xgs_service_state_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
+ 	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
+@@ -4368,6 +4555,7 @@
+ 			if (!dev)
+ 				continue;
+ 
++			airoha_xgs_omcc_detach(dev);
+ 			netdev = netdev_from_priv(dev);
+ 			if (dev->omci_dev &&
+ 			    dev->omci_dev->reg_state == NETREG_REGISTERED)
+@@ -4410,6 +4598,7 @@
+ 			if (!dev)
+ 				continue;
+ 
++			airoha_xgs_omcc_detach(dev);
+ 			netdev = netdev_from_priv(dev);
+ 			if (dev->omci_dev)
+ 				unregister_netdev(dev->omci_dev);
+@@ -4425,6 +4614,506 @@
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
++static int airoha_xgs_omcc_transmit_skb(
++				      struct net_device *netdev,
++				      struct sk_buff *skb,
++				      const struct airoha_xgs_omcc_tx_metadata *metadata)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_qdma *qdma;
++	struct airoha_queue_entry *entry, *next_entry;
++	struct airoha_queue *q;
++	struct netdev_queue *txq;
++	dma_addr_t addr;
++	u32 msg0, msg1;
++	u16 qid, index, next_index;
++
++	if (!metadata || !skb->len ||
++	    skb->len > FIELD_MAX(QDMA_DESC_LEN_MASK) ||
++	    metadata->channel > 0x1f || metadata->nboq > 0x1f ||
++	    metadata->mic_idx > 1)
++		return -ERANGE;
++	if (!dev->gpon_mode)
++		return -EOPNOTSUPP;
++
++	rcu_read_lock();
++	qdma = rcu_dereference(dev->qdma);
++	if (!qdma) {
++		rcu_read_unlock();
++		return -ENODEV;
++	}
++	qid = airoha_qdma_get_txq(qdma, AIROHA_NUM_QOS_QUEUES - 1);
++	q = &qdma->q_tx[qid];
++	if (WARN_ON_ONCE(!q->ndesc)) {
++		rcu_read_unlock();
++		return -ENODEV;
++	}
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, metadata->channel) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
++			  qid % AIROHA_NUM_QOS_QUEUES) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, metadata->xgem_id) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_MIC_IDX_MASK, metadata->mic_idx) |
++	       QDMA_ETH_TXMSG_OAM_MASK;
++	msg1 = QDMA_ETH_TXMSG_NO_DROP |
++	       FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, metadata->nboq) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, airoha_get_fe_port(dev)) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
++
++	spin_lock_bh(&q->lock);
++	/* Account the skb on the parent queue that maps to QDMA queue 7 so
++	 * completion and shared-QDMA wakeups use the same queue. */
++	skb_set_queue_mapping(skb, AIROHA_NUM_QOS_QUEUES - 1);
++	txq = skb_get_tx_queue(netdev, skb);
++	if (q->queued >= q->ndesc - 1) {
++		netif_tx_stop_queue(txq);
++		q->txq_stopped = true;
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++		return -EAGAIN;
++	}
++	entry = list_first_entry(&q->tx_list, struct airoha_queue_entry, list);
++	index = entry - q->entry;
++	addr = dma_map_single(netdev->dev.parent, skb->data, skb->len,
++				      DMA_TO_DEVICE);
++	if (dma_mapping_error(netdev->dev.parent, addr)) {
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++		return -ENOMEM;
++	}
++	list_move_tail(&entry->list, &q->tx_list);
++	next_entry = list_first_entry(&q->tx_list,
++				      struct airoha_queue_entry, list);
++	next_index = next_entry - q->entry;
++	entry->skb = skb;
++	entry->dma_addr = addr;
++	entry->dma_len = skb->len;
++	WRITE_ONCE(q->desc[index].ctrl,
++			   cpu_to_le32(FIELD_PREP(QDMA_DESC_LEN_MASK, skb->len)));
++	WRITE_ONCE(q->desc[index].addr, cpu_to_le32(addr));
++	WRITE_ONCE(q->desc[index].data,
++			   cpu_to_le32(FIELD_PREP(QDMA_DESC_NEXT_ID_MASK,
++						next_index)));
++	WRITE_ONCE(q->desc[index].msg0, cpu_to_le32(msg0));
++	WRITE_ONCE(q->desc[index].msg1, cpu_to_le32(msg1));
++	WRITE_ONCE(q->desc[index].msg2, cpu_to_le32(0xffff));
++	q->queued++;
++	skb_tx_timestamp(skb);
++	netdev_tx_sent_queue(txq, skb->len);
++	if (q->ndesc - q->queued < q->free_thr) {
++		netif_tx_stop_queue(txq);
++		q->txq_stopped = true;
++	}
++	airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid), TX_RING_CPU_IDX_MASK,
++			FIELD_PREP(TX_RING_CPU_IDX_MASK, next_index));
++	spin_unlock_bh(&q->lock);
++	rcu_read_unlock();
++	return 0;
++}
++
++int airoha_xgs_omcc_transmit(struct device_node *np, const u8 *data,
++			     size_t len,
++			     const struct airoha_xgs_omcc_tx_metadata *metadata)
++{
++	struct net_device *netdev;
++	struct airoha_gdm_dev *dev;
++	struct sk_buff *skb;
++	int ret;
++
++	if (!np || !data || !metadata || !len ||
++	    len > FIELD_MAX(QDMA_DESC_LEN_MASK))
++		return -EINVAL;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	rcu_read_lock();
++	if (!rcu_access_pointer(dev->xgs_omcc_consumer))
++		ret = -ENODEV;
++	else {
++		rcu_read_unlock();
++		skb = alloc_skb(len, GFP_KERNEL);
++		if (!skb) {
++			put_device(&netdev->dev);
++			return -ENOMEM;
++		}
++		skb_put_data(skb, data, len);
++		skb->dev = netdev;
++		ret = airoha_xgs_omcc_transmit_skb(netdev, skb, metadata);
++		if (ret)
++			dev_kfree_skb_any(skb);
++		put_device(&netdev->dev);
++		return ret;
++	}
++	rcu_read_unlock();
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_omcc_transmit);
++bool airoha_xgs_omcc_tx_available(struct device_node *np)
++{
++	struct net_device *netdev;
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct airoha_queue *q;
++	bool available = false;
++
++	if (!np)
++		return false;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return false;
++	dev = netdev_priv(netdev);
++	rcu_read_lock();
++	if (rcu_access_pointer(dev->xgs_omcc_consumer)) {
++		qdma = rcu_dereference(dev->qdma);
++		if (qdma) {
++			q = &qdma->q_tx[airoha_qdma_get_txq(
++				qdma, AIROHA_NUM_QOS_QUEUES - 1)];
++			spin_lock_bh(&q->lock);
++			available = q->ndesc && q->queued < q->ndesc - 1;
++			spin_unlock_bh(&q->lock);
++		}
++	}
++	rcu_read_unlock();
++	put_device(&netdev->dev);
++	return available;
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_omcc_tx_available);
++int airoha_xgs_omcc_register(struct device_node *np,
++			     const struct airoha_xgs_omcc_ops *ops,
++			     void *context)
++{
++	struct airoha_xgs_omcc_consumer *consumer;
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned long flags;
++	bool gpon_ready;
++	int ret = 0;
++
++	if (!np || !ops || !ops->receive || !context)
++		return -EINVAL;
++
++	consumer = kzalloc(sizeof(*consumer), GFP_KERNEL);
++	if (!consumer)
++		return -ENOMEM;
++	consumer->ops = ops;
++	consumer->context = context;
++
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev) {
++		ret = -ENODEV;
++		goto free;
++	}
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto put;
++	}
++
++	mutex_lock(&dev->xgs_omcc_lock);
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	gpon_ready = dev->gpon_omcc_ready;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	if (rcu_access_pointer(dev->xgs_omcc_consumer))
++		ret = -EBUSY;
++	else if (gpon_ready)
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(dev->xgs_omcc_consumer, consumer);
++	mutex_unlock(&dev->xgs_omcc_lock);
++put:
++	put_device(&netdev->dev);
++free:
++	if (ret)
++		kfree(consumer);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_omcc_register);
++
++void airoha_xgs_omcc_unregister(struct device_node *np, void *context)
++{
++	struct airoha_xgs_omcc_consumer *consumer = NULL;
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++
++	if (!np || !context)
++		return;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return;
++	dev = netdev_priv(netdev);
++
++	mutex_lock(&dev->xgs_omcc_lock);
++	consumer = rcu_dereference_protected(dev->xgs_omcc_consumer,
++					     lockdep_is_held(&dev->xgs_omcc_lock));
++	if (consumer && consumer->context == context)
++		RCU_INIT_POINTER(dev->xgs_omcc_consumer, NULL);
++	else
++		consumer = NULL;
++	mutex_unlock(&dev->xgs_omcc_lock);
++	put_device(&netdev->dev);
++
++	if (consumer) {
++		synchronize_net();
++		kfree(consumer);
++	}
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_omcc_unregister);
++
++static int airoha_xgs_validate_service(
++	const struct airoha_xgs_service_config *config,
++	unsigned long *channels)
++{
++	unsigned int i, j;
++
++	if (!config || config->version != AIROHA_XGS_SERVICE_ABI_VERSION ||
++	    config->tcont_count >= AIROHA_XGS_SERVICE_MAX_TCONTS ||
++	    config->xgem_count > AIROHA_XGS_SERVICE_MAX_XGEMS ||
++	    (config->tcont_count && !config->tconts) ||
++	    (config->xgem_count && !config->xgems))
++		return -EINVAL;
++	bitmap_zero(channels, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	for (i = 0; i < config->tcont_count; i++) {
++		const struct airoha_xgs_service_tcont *t = &config->tconts[i];
++		bool have_weight = false;
++
++		if (!t->valid || !t->index ||
++		    t->index > AIROHA_XGS_SERVICE_MAX_CHANNEL ||
++		    t->alloc_id > AIROHA_XGS_SERVICE_MAX_ALLOC_ID ||
++		    t->scheduler > 2 || (t->pir && t->cir > t->pir) ||
++		    (t->cir && !airoha_gpon_qos_rate(t->cir)) ||
++		    (t->pir && !airoha_gpon_qos_rate(t->pir)) ||
++		    test_and_set_bit(t->index, channels))
++			return -ERANGE;
++		for (j = 0; j < ARRAY_SIZE(t->queue_weights); j++)
++			have_weight |= t->queue_weights[j] != 0;
++		if (t->scheduler == 2 && !have_weight)
++			return -EINVAL;
++		for (j = 0; j < i; j++)
++			if (config->tconts[j].alloc_id == t->alloc_id)
++				return -EEXIST;
++	}
++	for (i = 0; i < config->xgem_count; i++) {
++		const struct airoha_xgs_service_xgem *x = &config->xgems[i];
++		bool have_tcont = false;
++
++		if (!x->valid || !x->xgem_id ||
++		    x->xgem_id > AIROHA_XGS_SERVICE_MAX_XGEM_ID ||
++		    x->direction < AIROHA_XGS_SERVICE_DIRECTION_DOWNSTREAM ||
++		    x->direction > AIROHA_XGS_SERVICE_DIRECTION_BIDIRECTIONAL ||
++		    x->channel > AIROHA_XGS_SERVICE_MAX_CHANNEL ||
++		    x->nboq > AIROHA_XGS_SERVICE_MAX_NBOQ || x->mic_idx > 1 ||
++		    !x->tcont_index || x->tcont_index > AIROHA_XGS_SERVICE_MAX_CHANNEL)
++			return -ERANGE;
++		for (j = 0; j < config->tcont_count; j++)
++			if (config->tconts[j].index == x->tcont_index)
++				have_tcont = true;
++		if (!have_tcont)
++			return -ENOENT;
++		for (j = 0; j < i; j++)
++			if (config->xgems[j].xgem_id == x->xgem_id)
++				return -EEXIST;
++	}
++	return 0;
++}
++
++static int airoha_xgs_program_qos(struct net_device *netdev,
++				  const struct airoha_xgs_service_tcont *t)
++{
++	struct airoha_gpon_qos_config cfg = {
++		.channel = t->index,
++		.scheduler = t->scheduler,
++		.cir = t->cir,
++		.pir = t->pir,
++		.cbs = t->cbs,
++		.pbs = t->pbs,
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(cfg.weights); i++)
++		cfg.weights[i] = t->queue_weights[i];
++	return airoha_gpon_program_qos(netdev, &cfg);
++}
++
++static int airoha_xgs_restore_qos(
++	struct net_device *netdev,
++	const struct airoha_xgs_service_tcont *old,
++	const unsigned long *oldmap, const unsigned long *wanted)
++{
++	unsigned long channel;
++	int first = 0, ret;
++
++	for (channel = 0; channel < AIROHA_XGS_SERVICE_MAX_TCONTS; channel++) {
++		if (test_bit(channel, oldmap))
++			ret = airoha_xgs_program_qos(netdev, &old[channel]);
++		else if (test_bit(channel, wanted))
++			ret = airoha_gpon_disable_qos(netdev, channel);
++		else
++			continue;
++		if (ret && !first)
++			first = ret;
++	}
++	return first;
++}
++
++int airoha_xgs_qdma_service_apply(
++	struct device_node *np, const struct airoha_xgs_service_config *config)
++{
++	DECLARE_BITMAP(acquired, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	DECLARE_BITMAP(wanted, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	DECLARE_BITMAP(oldmap, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	struct airoha_xgs_service_tcont old[AIROHA_XGS_SERVICE_MAX_TCONTS];
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct net_device *netdev;
++	unsigned long flags, channel;
++	u16 upstream = 0;
++	bool channel_conflict = false;
++	unsigned int i;
++	u32 old_txchn, new_txchn;
++	int ret;
++
++	if (!np)
++		return -EINVAL;
++	ret = airoha_xgs_validate_service(config, wanted);
++	if (ret)
++		return ret;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	/* Keep the selected QDMA stable while programming shared service state. */
++	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&dev->xgs_service_lock);
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	if (dev->gpon_tx_ready)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	if (ret)
++		goto unlock;
++	bitmap_copy(oldmap, dev->xgs_qos, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	memcpy(old, dev->xgs_qos_cfg, sizeof(old));
++	old_txchn = airoha_fe_rr(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX));
++	if (!dev->xgs_resource_baseline_valid) {
++		dev->xgs_gdm2_txchn_baseline = old_txchn;
++		for (i = 0; i < AIROHA_XGS_SERVICE_MAX_TCONTS; i++)
++			dev->xgs_pse_rsv_baseline[i] =
++				airoha_fe_get_pse_queue_rsv_pages(
++					dev->eth, FE_PSE_PORT_GDM2, i);
++	}
++	bitmap_zero(acquired, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	qdma = airoha_qdma_deref(dev);
++	if (!qdma)
++		channel_conflict = true;
++	else {
++		for_each_set_bit(channel, wanted,
++				 AIROHA_XGS_SERVICE_MAX_TCONTS) {
++			if (test_bit(channel, dev->xgs_qos))
++				continue;
++			if (test_and_set_bit(channel, qdma->qos_channel_map)) {
++				channel_conflict = true;
++				break;
++			}
++			__set_bit(channel, acquired);
++		}
++	}
++	if (channel_conflict) {
++		ret = -EBUSY;
++		goto release_channels;
++	}
++	new_txchn = dev->xgs_gdm2_txchn_baseline;
++	for_each_set_bit(channel, wanted, AIROHA_XGS_SERVICE_MAX_TCONTS)
++		new_txchn |= BIT(channel);
++
++	for (i = 0; i < config->tcont_count; i++) {
++		ret = airoha_xgs_program_qos(netdev, &config->tconts[i]);
++		if (ret)
++			goto restore_qos;
++	}
++	for_each_set_bit(channel, dev->xgs_qos,
++			 AIROHA_XGS_SERVICE_MAX_TCONTS) {
++		if (test_bit(channel, wanted))
++			continue;
++		ret = airoha_gpon_disable_qos(netdev, channel);
++		if (ret)
++			goto restore_qos;
++	}
++
++	for (i = 0; i < AIROHA_XGS_SERVICE_MAX_TCONTS; i++) {
++		bool wanted_channel = test_bit(i, wanted);
++		u32 reserve = wanted_channel ? PSE_QUEUE_RSV_PAGES :
++			dev->xgs_pse_rsv_baseline[i];
++
++		if ((old_txchn ^ new_txchn) & BIT(i))
++			airoha_fe_rmw(dev->eth,
++				REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), BIT(i),
++				new_txchn & BIT(i));
++		ret = airoha_fe_set_pse_oq_rsv(dev->eth, FE_PSE_PORT_GDM2,
++						 i, reserve);
++		if (ret)
++			goto restore_resources;
++	}
++	for (i = 0; i < config->xgem_count; i++)
++		if (config->xgems[i].direction &
++		    AIROHA_XGS_SERVICE_DIRECTION_UPSTREAM)
++			upstream++;
++
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	dev->xgs_service_active = false;
++	memcpy(dev->xgs_xgems, config->xgems,
++	       config->xgem_count * sizeof(*config->xgems));
++	dev->xgs_xgem_count = config->xgem_count;
++	dev->xgs_upstream_count = upstream;
++	dev->xgs_service_active = config->xgem_count != 0;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	bitmap_copy(dev->xgs_qos, wanted, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	memset(dev->xgs_qos_cfg, 0, sizeof(dev->xgs_qos_cfg));
++	for (i = 0; i < config->tcont_count; i++)
++		dev->xgs_qos_cfg[config->tconts[i].index] = config->tconts[i];
++	for_each_set_bit(channel, oldmap, AIROHA_XGS_SERVICE_MAX_TCONTS)
++		if (!test_bit(channel, wanted))
++			clear_bit(channel, qdma->qos_channel_map);
++	dev->xgs_resource_baseline_valid = true;
++	goto unlock;
++
++restore_resources:
++	airoha_fe_wr(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), old_txchn);
++	for (i = 0; i < AIROHA_XGS_SERVICE_MAX_TCONTS; i++)
++		airoha_fe_set_pse_oq_rsv(dev->eth, FE_PSE_PORT_GDM2, i,
++			test_bit(i, oldmap) ? PSE_QUEUE_RSV_PAGES :
++			dev->xgs_pse_rsv_baseline[i]);
++restore_qos:
++	if (airoha_xgs_restore_qos(netdev, old, oldmap, wanted))
++		netdev_err(netdev, "failed to restore XGS-PON QoS state\n");
++release_channels:
++	if (qdma)
++		for_each_set_bit(channel, acquired, AIROHA_XGS_SERVICE_MAX_TCONTS)
++			clear_bit(channel, qdma->qos_channel_map);
++unlock:
++	mutex_unlock(&dev->xgs_service_lock);
++	mutex_unlock(&flow_offload_mutex);
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_qdma_service_apply);
++
++int airoha_xgs_qdma_service_clear(struct device_node *np)
++{
++	struct airoha_xgs_service_config empty = {
++		.version = AIROHA_XGS_SERVICE_ABI_VERSION,
++	};
++
++	return airoha_xgs_qdma_service_apply(np, &empty);
++}
++EXPORT_SYMBOL_GPL(airoha_xgs_qdma_service_clear);
++
+ int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
+ 			 const u8 *channels, const u8 *directions,
+ 			 unsigned int count)
+@@ -4455,6 +5129,12 @@
+ 		ret = -EOPNOTSUPP;
+ 		goto out;
+ 	}
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	if (dev->xgs_service_active)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	if (ret)
++		goto out;
+ 
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	dev->gpon_tx_ready = false;
+@@ -4557,6 +5237,7 @@
+ 	struct airoha_gdm_dev *dev;
+ 	struct airoha_qdma *qdma;
+ 	struct net_device *netdev;
++	unsigned long flags;
+ 	unsigned long channel;
+ 	unsigned int i;
+ 	int err = 0;
+@@ -4594,6 +5275,12 @@
+ 		err = -EOPNOTSUPP;
+ 		goto out;
+ 	}
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	if (dev->xgs_service_active)
++		err = -EBUSY;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	if (err)
++		goto out;
+ 
+ 	qdma = airoha_qdma_deref(dev);
+ 	bitmap_zero(acquired, AIROHA_GPON_QOS_CHANNELS);
+@@ -4715,6 +5402,11 @@
+ 		goto out;
+ 	}
+ 
++	mutex_lock(&dev->xgs_omcc_lock);
++	if (valid && rcu_access_pointer(dev->xgs_omcc_consumer)) {
++		ret = -EBUSY;
++		goto unlock;
++	}
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	dev->gpon_omcc_ready = false;
+ 	dev->gpon_omcc_gem = gem;
+@@ -4726,6 +5418,8 @@
+ 	else
+ 		netif_carrier_off(dev->omci_dev);
+ 
++unlock:
++	mutex_unlock(&dev->xgs_omcc_lock);
+ out:
+ 	put_device(&netdev->dev);
+ 	return ret;
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -563,6 +563,53 @@
+ 
+ #define AIROHA_GPON_QOS_CHANNELS	16
+ 
++#define AIROHA_XGS_MARK_MASK		GENMASK(31, 16)
++#define AIROHA_XGS_MARK_KEY		0xa1710000
++#define AIROHA_XGS_SERVICE_ABI_VERSION	1
++#define AIROHA_XGS_SERVICE_MAX_TCONTS	32
++#define AIROHA_XGS_SERVICE_MAX_XGEMS	256
++#define AIROHA_XGS_SERVICE_MAX_XGEM_ID	0xfffe
++#define AIROHA_XGS_SERVICE_MAX_ALLOC_ID	0x3fff
++#define AIROHA_XGS_SERVICE_MAX_CHANNEL	31
++#define AIROHA_XGS_SERVICE_MAX_NBOQ	31
++
++#define AIROHA_XGS_SERVICE_DIRECTION_DOWNSTREAM	1
++#define AIROHA_XGS_SERVICE_DIRECTION_UPSTREAM	2
++#define AIROHA_XGS_SERVICE_DIRECTION_BIDIRECTIONAL 3
++
++struct airoha_xgs_service_tcont {
++	u8 index;
++	u8 valid;
++	u8 scheduler;
++	u8 weight;
++	u16 alloc_id;
++	u8 queue_weights[AIROHA_NUM_QOS_QUEUES];
++	u32 cir;
++	u32 pir;
++	u32 cbs;
++	u32 pbs;
++};
++
++struct airoha_xgs_service_xgem {
++	u16 xgem_id;
++	u8 tcont_index;
++	u8 direction;
++	u8 channel;
++	u8 nboq;
++	u8 mic_idx;
++	u8 valid;
++	u8 unicast;
++	u8 upstream_encrypted;
++};
++
++struct airoha_xgs_service_config {
++	u16 version;
++	u16 tcont_count;
++	u16 xgem_count;
++	const struct airoha_xgs_service_tcont *tconts;
++	const struct airoha_xgs_service_xgem *xgems;
++};
++
+ struct airoha_gpon_qos_config {
+ 	u8 channel;
+ 	u8 scheduler;
+@@ -573,6 +620,29 @@
+ 	u32 pbs;
+ };
+ 
++struct airoha_xgs_omcc_metadata {
++	u16 xgem_id;
++	bool no_mic;
++};
++
++struct airoha_xgs_omcc_ops {
++	/* Called from NAPI and consumes skb in all cases. */
++	void (*receive)(void *context, struct sk_buff *skb,
++			const struct airoha_xgs_omcc_metadata *metadata);
++};
++
++struct airoha_xgs_omcc_tx_metadata {
++	u16 xgem_id;
++	u8 channel;
++	u8 nboq;
++	u8 mic_idx;
++};
++
++struct airoha_xgs_omcc_consumer {
++	const struct airoha_xgs_omcc_ops *ops;
++	void *context;
++};
++
+ struct airoha_gdm_dev {
+ 	struct airoha_qdma __rcu *qdma;
+ 	struct airoha_gdm_port *port;
+@@ -581,6 +651,21 @@
+ 	/* GPON uses the QDMA special-tag and channel fields for GEM/TCONT. */
+ 	spinlock_t gpon_lock;
+ 	struct net_device *omci_dev;
++	struct mutex xgs_omcc_lock;
++	struct airoha_xgs_omcc_consumer __rcu *xgs_omcc_consumer;
++	struct mutex xgs_service_lock;
++	spinlock_t xgs_service_state_lock;
++	bool xgs_service_active;
++	u16 xgs_upstream_count;
++	u16 xgs_xgem_count;
++	struct airoha_xgs_service_xgem
++		xgs_xgems[AIROHA_XGS_SERVICE_MAX_XGEMS];
++	DECLARE_BITMAP(xgs_qos, AIROHA_XGS_SERVICE_MAX_TCONTS);
++	struct airoha_xgs_service_tcont
++		xgs_qos_cfg[AIROHA_XGS_SERVICE_MAX_TCONTS];
++	bool xgs_resource_baseline_valid;
++	u32 xgs_gdm2_txchn_baseline;
++	u16 xgs_pse_rsv_baseline[AIROHA_XGS_SERVICE_MAX_TCONTS];
+ 	bool gpon_mode;
+ 	bool gpon_tx_ready;
+ 	bool gpon_omcc_ready;
+@@ -754,6 +839,17 @@
+ 			struct airoha_gpon_qos_config *cfg,
+ 			unsigned int *count);
+ int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid);
++int airoha_xgs_omcc_register(struct device_node *np,
++			     const struct airoha_xgs_omcc_ops *ops,
++			     void *context);
++void airoha_xgs_omcc_unregister(struct device_node *np, void *context);
++int airoha_xgs_omcc_transmit(struct device_node *np, const u8 *data,
++			     size_t len,
++			     const struct airoha_xgs_omcc_tx_metadata *metadata);
++bool airoha_xgs_omcc_tx_available(struct device_node *np);
++int airoha_xgs_qdma_service_apply(struct device_node *np,
++				  const struct airoha_xgs_service_config *config);
++int airoha_xgs_qdma_service_clear(struct device_node *np);
+ extern struct mutex flow_offload_mutex;
+ 
+ static inline struct airoha_qdma *
+-- 
+2.43.0

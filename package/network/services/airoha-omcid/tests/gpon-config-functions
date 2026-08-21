@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# Minimal /lib/functions.sh fixture for airoha-gpon-config lifecycle tests.
+config_load() {
+	return 0
+}
+
+config_get_bool() {
+	case "$1:$3" in
+		enabled:enabled) enabled="${AIROHA_TEST_ENABLED:-0}" ;;
+		manual_gem:manual_gem) manual_gem="${AIROHA_TEST_MANUAL_GEM:-0}" ;;
+		encrypted:encrypted) encrypted="${AIROHA_TEST_ENCRYPTED:-0}" ;;
+		*) return 1 ;;
+	esac
+}
+
+config_get() {
+	case "$1:$3" in
+		pon_mode:pon_mode) pon_mode="${AIROHA_TEST_PON_MODE:-gpon}" ;;
+		serial_number:serial_number) serial_number="${AIROHA_TEST_SERIAL:-HWTC12345678}" ;;
+		password:password) password="${AIROHA_TEST_PASSWORD:-}" ;;
+		registration_id:registration_id) registration_id="${AIROHA_TEST_REGISTRATION_ID:-}" ;;
+		epon_onu_mac:epon_onu_mac) epon_onu_mac="${AIROHA_TEST_EPON_ONU_MAC:-02:11:22:33:44:55}" ;;
+		epon_llid_mask:epon_llid_mask) epon_llid_mask="${AIROHA_TEST_EPON_LLID_MASK:-0x1}" ;;
+		epon_silent_time:epon_silent_time) epon_silent_time="${AIROHA_TEST_EPON_SILENT_TIME:-60}" ;;
+		omci_mode:omci_mode) omci_mode="${AIROHA_TEST_OMCI_MODE:-auto}" ;;
+		gem_id:gem_id) gem_id="${AIROHA_TEST_GEM_ID:-0}" ;;
+		tcont:tcont) tcont="${AIROHA_TEST_TCONT:-0}" ;;
+		encrypted:encrypted) encrypted="${AIROHA_TEST_ENCRYPTED:-0}" ;;
+		*) return 1 ;;
+	esac
+}

@@ -1,0 +1,468 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Sat, 15 Aug 2026 13:30:00 +0800
+Subject: [PATCH] net: airoha: add EPON LLID QDMA data path
+
+Keep EPON LLID/QDMA state separate from GPON and XGS-PON, map each
+registered LLID index to the matching QDMA channel, and transactionally
+manage GDM2/PSE resources. Drop EPON OAM until its dedicated consumer is
+registered instead of passing IEEE 802.3ah frames to OMCI.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -23,6 +23,7 @@
+ 
+ /* SDK RX descriptor MSG0 bit 30: hardware did not consume an OMCI MIC. */
+ #define QDMA_ETH_RXMSG_NO_MIC_MASK	BIT(30)
++#define QDMA_EPON_REPORT_FEC		0x1130
+ 
+ struct airoha_gdm_dev;
+ 
+@@ -35,7 +36,9 @@
+ 	struct airoha_gdm_dev *dev;
+ 	bool omcc;
+ 	bool xgs_omcc;
++	bool epon_data;
+ 	bool no_mic;
++	u8 channel;
+ 	u16 gem;
+ };
+ 
+@@ -988,6 +991,7 @@
+ 		struct net_device *netdev;
+ 		bool omci = false;
+ 		bool xgs_omcc = false;
++		bool epon_data = false;
+ 		bool no_mic = false;
+ 		int data_len, len;
+ 		struct page *page;
+@@ -1024,6 +1028,7 @@
+ 		if (dev->gpon_mode) {
+ 			unsigned long flags;
+ 			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
++			u8 channel = FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
+ 			bool ready;
+ 
+ 			if (q->skb) {
+@@ -1031,17 +1036,26 @@
+ 
+ 				omci = cb->omcc;
+ 				xgs_omcc = cb->xgs_omcc;
++				epon_data = cb->epon_data;
+ 				no_mic = cb->no_mic;
+ 				gpon_gem = cb->gem;
+ 				ready = dev == cb->dev &&
+ 					!!(msg0 & QDMA_ETH_TXMSG_OAM_MASK) == omci &&
+-					gem == gpon_gem;
++					gem == gpon_gem && channel == cb->channel;
+ 				netdev = q->skb->dev;
+ 			} else if (msg0 & QDMA_ETH_TXMSG_OAM_MASK) {
+ 				omci = true;
+ 				gpon_gem = gem;
+-				xgs_omcc = airoha_xgs_omcc_consumer_present(dev);
+-				if (xgs_omcc) {
++				spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++				ready = !dev->epon_llid_mask;
++				spin_unlock_irqrestore(&dev->epon_service_state_lock,
++						       flags);
++				xgs_omcc = ready &&
++					airoha_xgs_omcc_consumer_present(dev);
++				if (!ready) {
++					/* EPON OAM has a separate consumer; never use OMCI. */
++					ready = false;
++				} else if (xgs_omcc) {
+ 					ready = true;
+ 					no_mic = !!(msg0 & QDMA_ETH_RXMSG_NO_MIC_MASK);
+ 				} else {
+@@ -1051,24 +1065,36 @@
+ 					spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 				}
+ 			} else {
+-				spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
+-				if (dev->xgs_service_active) {
+-					ready = !!airoha_xgs_find_xgem(
+-						dev, gem,
+-						AIROHA_XGS_SERVICE_DIRECTION_DOWNSTREAM);
++				spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++				if (dev->epon_llid_mask) {
++					ready = !!(dev->epon_llid_mask & BIT(channel));
++					epon_data = ready;
+ 					gpon_gem = gem;
+ 					spin_unlock_irqrestore(
+-						&dev->xgs_service_state_lock, flags);
++						&dev->epon_service_state_lock, flags);
+ 				} else {
+ 					spin_unlock_irqrestore(
+-						&dev->xgs_service_state_lock, flags);
+-					spin_lock_irqsave(&dev->gpon_lock, flags);
+-					ready = dev->gpon_tx_ready &&
+-						gem < AIROHA_GPON_MAX_GEMS &&
+-						test_bit(gem, dev->gpon_gems) &&
+-						(dev->gpon_directions[gem] & BIT(0));
+-					gpon_gem = gem;
+-					spin_unlock_irqrestore(&dev->gpon_lock, flags);
++						&dev->epon_service_state_lock, flags);
++					spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++					if (dev->xgs_service_active) {
++						ready = !!airoha_xgs_find_xgem(
++							dev, gem,
++							AIROHA_XGS_SERVICE_DIRECTION_DOWNSTREAM);
++						gpon_gem = gem;
++						spin_unlock_irqrestore(
++							&dev->xgs_service_state_lock, flags);
++					} else {
++						spin_unlock_irqrestore(
++							&dev->xgs_service_state_lock, flags);
++						spin_lock_irqsave(&dev->gpon_lock, flags);
++						ready = dev->gpon_tx_ready &&
++							gem < AIROHA_GPON_MAX_GEMS &&
++							test_bit(gem, dev->gpon_gems) &&
++							(dev->gpon_directions[gem] & BIT(0));
++						gpon_gem = gem;
++						spin_unlock_irqrestore(&dev->gpon_lock,
++								       flags);
++					}
+ 				}
+ 			}
+ 
+@@ -1089,14 +1115,17 @@
+ 				cb->dev = dev;
+ 				cb->omcc = omci;
+ 				cb->xgs_omcc = xgs_omcc;
++				cb->epon_data = epon_data;
+ 				cb->no_mic = no_mic;
++				cb->channel = FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
+ 				cb->gem = gpon_gem;
+ 				if (!omci) {
+ 					unsigned long flags;
+ 
+-					spin_lock_irqsave(&dev->xgs_service_state_lock,
+-							  flags);
+-					q->skb->mark = dev->xgs_service_active ?
++					spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++					q->skb->mark = epon_data ?
++						AIROHA_EPON_MARK_KEY | cb->channel :
++						dev->xgs_service_active ?
+ 						AIROHA_XGS_MARK_KEY | gpon_gem :
+ 						AIROHA_GPON_MARK_KEY | gpon_gem;
+ 					spin_unlock_irqrestore(
+@@ -2747,7 +2776,7 @@
+ 	u16 gpon_gem = 0;
+ 	u8 gpon_channel = 0;
+ 	u8 xgs_nboq = 0, xgs_mic_idx = 0;
+-	bool xgs_data = false;
++	bool epon_data = false, xgs_data = false;
+ 	struct airoha_queue_entry *e;
+ 	struct airoha_qdma *qdma;
+ 	struct netdev_queue *txq;
+@@ -2764,6 +2793,37 @@
+ 		unsigned long flags;
+ 		struct airoha_xgs_service_xgem xgem;
+ 		const struct airoha_xgs_service_xgem *entry;
++		u32 epon_mask;
++
++		spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++		epon_mask = dev->epon_llid_mask;
++		if (epon_mask) {
++			if (omci) {
++				spin_unlock_irqrestore(
++					&dev->epon_service_state_lock, flags);
++				goto error;
++			}
++			if ((skb->mark & AIROHA_EPON_MARK_MASK) ==
++			    AIROHA_EPON_MARK_KEY)
++				gpon_channel = skb->mark & GENMASK(4, 0);
++			else if (hweight32(epon_mask) == 1)
++				gpon_channel = __ffs(epon_mask);
++			else {
++				spin_unlock_irqrestore(
++					&dev->epon_service_state_lock, flags);
++				goto error;
++			}
++			if (!(epon_mask & BIT(gpon_channel))) {
++				spin_unlock_irqrestore(
++					&dev->epon_service_state_lock, flags);
++				goto error;
++			}
++			epon_data = true;
++		}
++		spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++
++		if (epon_data)
++			goto pon_selected;
+ 
+ 		spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
+ 		if (!omci && dev->xgs_service_active) {
+@@ -2879,6 +2939,7 @@
+ 
+ 	fport = airoha_get_fe_port(dev);
+ 	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK,
++			  epon_data ? gpon_channel :
+ 			  xgs_data ? xgs_nboq : dev->nbq) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+@@ -4302,6 +4363,8 @@
+ 	mutex_init(&dev->xgs_omcc_lock);
+ 	mutex_init(&dev->xgs_service_lock);
+ 	spin_lock_init(&dev->xgs_service_state_lock);
++	mutex_init(&dev->epon_service_lock);
++	spin_lock_init(&dev->epon_service_state_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
+ 	bitmap_zero(dev->gpon_gems, AIROHA_GPON_MAX_GEMS);
+@@ -4818,11 +4881,15 @@
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	gpon_ready = dev->gpon_omcc_ready;
+ 	spin_unlock_irqrestore(&dev->gpon_lock, flags);
+-	if (rcu_access_pointer(dev->xgs_omcc_consumer))
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (dev->epon_llid_mask)
+ 		ret = -EBUSY;
+-	else if (gpon_ready)
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (!ret && rcu_access_pointer(dev->xgs_omcc_consumer))
+ 		ret = -EBUSY;
+-	else
++	else if (!ret && gpon_ready)
++		ret = -EBUSY;
++	else if (!ret)
+ 		rcu_assign_pointer(dev->xgs_omcc_consumer, consumer);
+ 	mutex_unlock(&dev->xgs_omcc_lock);
+ put:
+@@ -4994,6 +5061,13 @@
+ 	/* Keep the selected QDMA stable while programming shared service state. */
+ 	mutex_lock(&flow_offload_mutex);
+ 	mutex_lock(&dev->xgs_service_lock);
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (dev->epon_llid_mask &&
++	    (config->tcont_count || config->xgem_count))
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (ret)
++		goto unlock;
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	if (dev->gpon_tx_ready)
+ 		ret = -EBUSY;
+@@ -5117,6 +5191,145 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_xgs_qdma_service_clear);
+ 
++int airoha_epon_qdma_llids_apply(struct device_node *np, u32 llid_mask,
++				 u32 report_fec_mask)
++{
++	struct airoha_gdm_dev *dev;
++	struct airoha_qdma *qdma;
++	struct net_device *netdev;
++	unsigned long flags, channel;
++	u32 acquired = 0, old_mask, old_report_fec, old_txchn, new_txchn;
++	bool conflict = false;
++	int ret = 0;
++
++	if (!np || (report_fec_mask & ~llid_mask))
++		return -EINVAL;
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	mutex_lock(&flow_offload_mutex);
++	mutex_lock(&dev->epon_service_lock);
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	if (llid_mask && (dev->gpon_tx_ready || dev->gpon_omcc_ready))
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++	if (ret)
++		goto unlock;
++	spin_lock_irqsave(&dev->xgs_service_state_lock, flags);
++	if (llid_mask && dev->xgs_service_active)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
++	if (ret)
++		goto unlock;
++	mutex_lock(&dev->xgs_omcc_lock);
++	if (llid_mask && rcu_access_pointer(dev->xgs_omcc_consumer))
++		ret = -EBUSY;
++	mutex_unlock(&dev->xgs_omcc_lock);
++	if (ret)
++		goto unlock;
++
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	old_mask = dev->epon_llid_mask;
++	old_report_fec = dev->epon_report_fec_mask;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (old_mask == llid_mask && old_report_fec == report_fec_mask)
++		goto unlock;
++
++	old_txchn = airoha_fe_rr(dev->eth,
++				 REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX));
++	if (!dev->epon_resource_baseline_valid) {
++		if (!llid_mask)
++			goto unlock;
++		dev->epon_gdm2_txchn_baseline = old_txchn;
++		for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++)
++			dev->epon_pse_rsv_baseline[channel] =
++				airoha_fe_get_pse_queue_rsv_pages(
++					dev->eth, FE_PSE_PORT_GDM2, channel);
++	}
++
++	qdma = airoha_qdma_deref(dev);
++	if (!qdma) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++) {
++		if (!(llid_mask & BIT(channel)))
++			continue;
++		if (old_mask & BIT(channel))
++			continue;
++		if (test_and_set_bit(channel, qdma->qos_channel_map)) {
++			conflict = true;
++			break;
++		}
++		acquired |= BIT(channel);
++	}
++	if (conflict) {
++		ret = -EBUSY;
++		goto release_acquired;
++	}
++
++	new_txchn = dev->epon_gdm2_txchn_baseline | llid_mask;
++	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++) {
++		u32 reserve = llid_mask & BIT(channel) ?
++			PSE_QUEUE_RSV_PAGES :
++			dev->epon_pse_rsv_baseline[channel];
++
++		if ((old_txchn ^ new_txchn) & BIT(channel))
++			airoha_fe_rmw(dev->eth,
++				REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), BIT(channel),
++				new_txchn & BIT(channel));
++		ret = airoha_fe_set_pse_oq_rsv(dev->eth, FE_PSE_PORT_GDM2,
++						 channel, reserve);
++		if (ret)
++			goto restore_resources;
++	}
++	airoha_qdma_wr(qdma, QDMA_EPON_REPORT_FEC, report_fec_mask);
++
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	dev->epon_llid_mask = llid_mask;
++	dev->epon_report_fec_mask = report_fec_mask;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++)
++		if ((old_mask & BIT(channel)) && !(llid_mask & BIT(channel)))
++			clear_bit(channel, qdma->qos_channel_map);
++	dev->epon_resource_baseline_valid = llid_mask != 0;
++	goto unlock;
++
++restore_resources:
++	airoha_fe_wr(dev->eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), old_txchn);
++	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++)
++		if (airoha_fe_set_pse_oq_rsv(dev->eth, FE_PSE_PORT_GDM2,
++						channel,
++			old_mask & BIT(channel) ? PSE_QUEUE_RSV_PAGES :
++			dev->epon_pse_rsv_baseline[channel]))
++			netdev_err(netdev,
++				   "failed to restore EPON PSE channel %lu\n",
++				   channel);
++release_acquired:
++	for (channel = 0; channel < AIROHA_EPON_LLID_COUNT; channel++)
++		if (acquired & BIT(channel))
++			clear_bit(channel, qdma->qos_channel_map);
++unlock:
++	mutex_unlock(&dev->epon_service_lock);
++	mutex_unlock(&flow_offload_mutex);
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_epon_qdma_llids_apply);
++
++int airoha_epon_qdma_llids_clear(struct device_node *np)
++{
++	return airoha_epon_qdma_llids_apply(np, 0, 0);
++}
++EXPORT_SYMBOL_GPL(airoha_epon_qdma_llids_clear);
++
+ int airoha_gpon_set_gems(struct device_node *np, const u16 *gems,
+ 			 const u8 *channels, const u8 *directions,
+ 			 unsigned int count)
+@@ -5153,6 +5366,12 @@
+ 	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
+ 	if (ret)
+ 		goto out;
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (count && dev->epon_llid_mask)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (ret)
++		goto out;
+ 
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	dev->gpon_tx_ready = false;
+@@ -5299,6 +5518,12 @@
+ 	spin_unlock_irqrestore(&dev->xgs_service_state_lock, flags);
+ 	if (err)
+ 		goto out;
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (count && dev->epon_llid_mask)
++		err = -EBUSY;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (err)
++		goto out;
+ 
+ 	qdma = airoha_qdma_deref(dev);
+ 	bitmap_zero(acquired, AIROHA_GPON_QOS_CHANNELS);
+@@ -5425,6 +5650,12 @@
+ 		ret = -EBUSY;
+ 		goto unlock;
+ 	}
++	spin_lock_irqsave(&dev->epon_service_state_lock, flags);
++	if (valid && dev->epon_llid_mask)
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&dev->epon_service_state_lock, flags);
++	if (ret)
++		goto unlock;
+ 	spin_lock_irqsave(&dev->gpon_lock, flags);
+ 	dev->gpon_omcc_ready = false;
+ 	dev->gpon_omcc_gem = gem;
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -580,6 +580,10 @@
+ #define AIROHA_XGS_SERVICE_DIRECTION_UPSTREAM	2
+ #define AIROHA_XGS_SERVICE_DIRECTION_BIDIRECTIONAL 3
+ 
++#define AIROHA_EPON_MARK_MASK		GENMASK(31, 5)
++#define AIROHA_EPON_MARK_KEY		0xa1720000
++#define AIROHA_EPON_LLID_COUNT		32
++
+ struct airoha_xgs_service_tcont {
+ 	u8 index;
+ 	u8 valid;
+@@ -669,6 +673,13 @@
+ 	bool xgs_resource_baseline_valid;
+ 	u32 xgs_gdm2_txchn_baseline;
+ 	u16 xgs_pse_rsv_baseline[AIROHA_XGS_SERVICE_MAX_TCONTS];
++	struct mutex epon_service_lock;
++	spinlock_t epon_service_state_lock;
++	u32 epon_llid_mask;
++	u32 epon_report_fec_mask;
++	bool epon_resource_baseline_valid;
++	u32 epon_gdm2_txchn_baseline;
++	u16 epon_pse_rsv_baseline[AIROHA_EPON_LLID_COUNT];
+ 	bool gpon_mode;
+ 	bool gpon_tx_ready;
+ 	bool gpon_omcc_ready;
+@@ -853,6 +864,9 @@
+ int airoha_xgs_qdma_service_apply(struct device_node *np,
+ 				  const struct airoha_xgs_service_config *config);
+ int airoha_xgs_qdma_service_clear(struct device_node *np);
++int airoha_epon_qdma_llids_apply(struct device_node *np, u32 llid_mask,
++				 u32 report_fec_mask);
++int airoha_epon_qdma_llids_clear(struct device_node *np);
+ extern struct mutex flow_offload_mutex;
+ 
+ static inline struct airoha_qdma *

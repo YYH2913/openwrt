@@ -1,0 +1,17 @@
+#!/bin/sh
+
+printf '%s\n' "$*" >> "${AIROHA_OMCI_IP_LOG:?}"
+
+case "$*" in
+	'link show dev lan1'|'link show dev pon') exit 0 ;;
+	'-o link show dev lan1'|'-o link show dev pon')
+		printf '1: %s: <BROADCAST,UP> mtu 1500 state UP\n' "$5"
+		exit 0
+		;;
+	'link show dev '*) exit 1 ;;
+	'-o link show dev '*) exit 1 ;;
+	'-details link show dev '*) exit 1 ;;
+	'link add '*|'link set '*) exit 0 ;;
+esac
+
+exit 0

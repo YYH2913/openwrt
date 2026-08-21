@@ -25,6 +25,14 @@ nokia,xg-040g-md-ubi)
 	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0b:green:lan-3" "lan3" "link tx rx"
 	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:0c:green:lan-4" "lan4" "link tx rx"
 	;;
+axon,xg2010g-xgspon |\
+axon,xg2010g |\
+econet,xg2010g)
+	ucidef_set_led_netdev "pon-activity" "PON activity" "green:activity" "pon" "rx tx"
+	ucidef_set_led_netdev "pon-link" "PON link" "green:wan-online" "pon" "link"
+	ucidef_set_led_netdev "lan-green" "lan" "green:lan" "lan1" "link tx rx"
+	ucidef_set_led_netdev "lan-yellow" "lan" "yellow:lan" "lan1" "link_1000 link_2500 link_5000 link_10000"
+	;;
 esac
 
 board_config_flush

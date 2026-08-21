@@ -1,0 +1,360 @@
+From ff3787639c8a9c48567f395c445aa97500fd7d56 Mon Sep 17 00:00:00 2001
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 18:54:30 +0800
+Subject: [PATCH] net: bridge: add per-port FDB learning limit
+
+A bridge-wide FDB learning limit cannot represent the learning depth of an
+individual MAC bridge port. Add per-port learned-entry accounting and a
+netlink limit so both constraints are enforced together. A zero limit
+remains unlimited.
+
+Keep accounting correct across creation, aging, MAC roaming, userspace
+takeover and external hardware learning. Reject a roam to a full port
+without refreshing the stale entry on its previous port.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+ include/uapi/linux/if_link.h |  16 ++++
+ net/bridge/br_fdb.c          | 162 +++++++++++++++++++++++++++--------
+ net/bridge/br_netlink.c      |  14 ++-
+ net/bridge/br_private.h      |   2 +
+ 4 files changed, 157 insertions(+), 37 deletions(-)
+
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 1fb4314..5e71bd4 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -1051,6 +1051,20 @@ enum {
+  *   backup port that has VLAN tunnel mapping enabled (via the
+  *   *IFLA_BRPORT_VLAN_TUNNEL* option). Setting a value of 0 (default) has
+  *   the effect of not attaching any ID.
++ *
++ * @IFLA_BRPORT_FDB_N_LEARNED
++ *   The number of dynamically learned FDB entries associated with the port.
++ *
++ * @IFLA_BRPORT_FDB_MAX_LEARNED
++ *   Sets the maximum number of dynamically learned FDB entries that may be
++ *   associated with the port. Attempts to learn more entries, including an
++ *   entry roaming from another port, are rejected. This limit is applied in
++ *   addition to the bridge-wide *IFLA_BR_FDB_MAX_LEARNED* limit. Setting a
++ *   value of 0 disables the per-port limit. The default value is 0.
++ *
++ *   Lowering the limit below the current number of learned entries does not
++ *   remove existing entries. New entries can be learned after enough entries
++ *   have aged out or otherwise been removed.
+  */
+ enum {
+ 	IFLA_BRPORT_UNSPEC,
+@@ -1099,6 +1113,8 @@ enum {
+ 	IFLA_BRPORT_NEIGH_VLAN_SUPPRESS,
+ 	IFLA_BRPORT_BACKUP_NHID,
+ 	IFLA_BRPORT_BPDU_FILTER,
++	IFLA_BRPORT_FDB_N_LEARNED,
++	IFLA_BRPORT_FDB_MAX_LEARNED,
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 6eb3ab6..3df20d4 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -312,6 +312,62 @@ static void fdb_del_hw_addr(struct net_bridge *br, const unsigned char *addr)
+ 	}
+ }
+ 
++static bool fdb_port_learn_get(struct net_bridge_port *p)
++{
++	u32 max_learned;
++	int n_learned;
++
++	if (WARN_ON_ONCE(!p))
++		return false;
++
++	max_learned = READ_ONCE(p->fdb_max_learned);
++	n_learned = atomic_inc_return(&p->fdb_n_learned);
++	if (unlikely(max_learned && n_learned > max_learned)) {
++		atomic_dec(&p->fdb_n_learned);
++		return false;
++	}
++
++	return true;
++}
++
++static void fdb_port_learn_put(struct net_bridge_port *p)
++{
++	if (p)
++		atomic_dec(&p->fdb_n_learned);
++}
++
++/* Returns 1 when the destination changed, 0 when it did not, or -ENOSPC. */
++static int fdb_update_dst(struct net_bridge *br,
++			  struct net_bridge_fdb_entry *fdb,
++			  struct net_bridge_port *source,
++			  bool added_by_user)
++{
++	struct net_bridge_port *old_dst = READ_ONCE(fdb->dst);
++
++	lockdep_assert_held_once(&br->hash_lock);
++
++	if (source == old_dst || test_bit(BR_FDB_STICKY, &fdb->flags))
++		return 0;
++
++	if (!added_by_user &&
++	    test_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags) &&
++	    !fdb_port_learn_get(source))
++		return -ENOSPC;
++
++	br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
++	WRITE_ONCE(fdb->dst, source);
++	if (!added_by_user &&
++	    test_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
++		fdb_port_learn_put(old_dst);
++
++	/* Take over a hardware-learned entry. */
++	clear_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++	/* Roaming to an unlocked port also unlocks the entry. */
++	clear_bit(BR_FDB_LOCKED, &fdb->flags);
++
++	return 1;
++}
++
+ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
+ 		       bool swdev_notify)
+ {
+@@ -323,8 +379,10 @@ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
+ 	hlist_del_init_rcu(&f->fdb_node);
+ 	rhashtable_remove_fast(&br->fdb_hash_tbl, &f->rhnode,
+ 			       br_fdb_rht_params);
+-	if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &f->flags))
++	if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &f->flags)) {
+ 		atomic_dec(&br->fdb_n_learned);
++		fdb_port_learn_put(READ_ONCE(f->dst));
++	}
+ 	fdb_notify(br, f, RTM_DELNEIGH, swdev_notify);
+ 	kfree_rcu(f, rcu);
+ }
+@@ -393,6 +451,7 @@ static struct net_bridge_fdb_entry *fdb_create(struct net_bridge *br,
+ 		       !test_bit(BR_FDB_LOCAL, &flags);
+ 	u32 max_learned = READ_ONCE(br->fdb_max_learned);
+ 	struct net_bridge_fdb_entry *fdb;
++	bool port_counted = false;
+ 	int err;
+ 
+ 	if (likely(learned)) {
+@@ -400,12 +459,18 @@ static struct net_bridge_fdb_entry *fdb_create(struct net_bridge *br,
+ 
+ 		if (unlikely(max_learned && n_learned >= max_learned))
+ 			return NULL;
++		if (!fdb_port_learn_get(source))
++			return NULL;
++		port_counted = true;
+ 		__set_bit(BR_FDB_DYNAMIC_LEARNED, &flags);
+ 	}
+ 
+ 	fdb = kmem_cache_alloc(br_fdb_cache, GFP_ATOMIC);
+-	if (!fdb)
++	if (!fdb) {
++		if (port_counted)
++			fdb_port_learn_put(source);
+ 		return NULL;
++	}
+ 
+ 	memcpy(fdb->key.addr.addr, addr, ETH_ALEN);
+ 	WRITE_ONCE(fdb->dst, source);
+@@ -416,6 +481,8 @@ static struct net_bridge_fdb_entry *fdb_create(struct net_bridge *br,
+ 					    br_fdb_rht_params);
+ 	if (err) {
+ 		kmem_cache_free(br_fdb_cache, fdb);
++		if (port_counted)
++			fdb_port_learn_put(source);
+ 		return NULL;
+ 	}
+ 
+@@ -1016,36 +1083,43 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 					source->dev->name, addr, vid);
+ 		} else {
+ 			unsigned long now = jiffies;
++			struct net_bridge_port *old_dst;
++			bool added_by_user;
+ 			bool fdb_modified = false;
++			int dst_changed = 0;
++
++			added_by_user = test_bit(BR_FDB_ADDED_BY_USER, &flags);
++			if (unlikely(added_by_user ||
++				     (source != READ_ONCE(fdb->dst) &&
++				      !test_bit(BR_FDB_STICKY, &fdb->flags)))) {
++				spin_lock(&br->hash_lock);
++				if (hlist_unhashed(&fdb->fdb_node)) {
++					spin_unlock(&br->hash_lock);
++					return;
++				}
++
++				old_dst = READ_ONCE(fdb->dst);
++				dst_changed = fdb_update_dst(br, fdb, source,
++							     added_by_user);
++
++				if (added_by_user) {
++					set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
++					if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED,
++							       &fdb->flags)) {
++						atomic_dec(&br->fdb_n_learned);
++						fdb_port_learn_put(old_dst);
++					}
++				}
++				spin_unlock(&br->hash_lock);
++
++				if (dst_changed < 0)
++					return;
++				fdb_modified = dst_changed > 0;
++			}
+ 
+ 			if (now != READ_ONCE(fdb->updated)) {
+ 				WRITE_ONCE(fdb->updated, now);
+-				fdb_modified = __fdb_mark_active(fdb);
+-			}
+-
+-			/* fastpath: update of existing entry */
+-			if (unlikely(source != READ_ONCE(fdb->dst) &&
+-				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
+-				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
+-				WRITE_ONCE(fdb->dst, source);
+-				fdb_modified = true;
+-				/* Take over HW learned entry */
+-				if (unlikely(test_bit(BR_FDB_ADDED_BY_EXT_LEARN,
+-						      &fdb->flags)))
+-					clear_bit(BR_FDB_ADDED_BY_EXT_LEARN,
+-						  &fdb->flags);
+-				/* Clear locked flag when roaming to an
+-				 * unlocked port.
+-				 */
+-				if (unlikely(test_bit(BR_FDB_LOCKED, &fdb->flags)))
+-					clear_bit(BR_FDB_LOCKED, &fdb->flags);
+-			}
+-
+-			if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
+-				set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+-				if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED,
+-						       &fdb->flags))
+-					atomic_dec(&br->fdb_n_learned);
++				fdb_modified |= __fdb_mark_active(fdb);
+ 			}
+ 			if (unlikely(fdb_modified)) {
+ 				trace_br_fdb_update(br, source, addr, vid, flags);
+@@ -1221,14 +1295,16 @@ static int fdb_add_entry(struct net_bridge *br, struct net_bridge_port *source,
+ 		if (flags & NLM_F_EXCL)
+ 			return -EEXIST;
+ 
++		set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
++		if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags)) {
++			atomic_dec(&br->fdb_n_learned);
++			fdb_port_learn_put(READ_ONCE(fdb->dst));
++		}
++
+ 		if (READ_ONCE(fdb->dst) != source) {
+ 			WRITE_ONCE(fdb->dst, source);
+ 			modified = true;
+ 		}
+-
+-		set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+-		if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
+-			atomic_dec(&br->fdb_n_learned);
+ 	}
+ 
+ 	if (fdb_to_nud(br, fdb) != state) {
+@@ -1576,8 +1652,26 @@ int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ 
+ 		WRITE_ONCE(fdb->updated, jiffies);
+ 
++		/* Entries that become userspace-owned or local stop counting as
++		 * dynamically learned before their destination changes.
++		 */
++		if ((swdev_notify || !p) &&
++		    test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags)) {
++			atomic_dec(&br->fdb_n_learned);
++			fdb_port_learn_put(READ_ONCE(fdb->dst));
++		}
++
+ 		if (READ_ONCE(fdb->dst) != p) {
++			struct net_bridge_port *old_dst = READ_ONCE(fdb->dst);
++
++			if (test_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags) &&
++			    !fdb_port_learn_get(p)) {
++				err = -ENOSPC;
++				goto err_unlock;
++			}
+ 			WRITE_ONCE(fdb->dst, p);
++			if (test_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
++				fdb_port_learn_put(old_dst);
+ 			modified = true;
+ 		}
+ 
+@@ -1599,10 +1693,6 @@ int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ 		if (!p)
+ 			set_bit(BR_FDB_LOCAL, &fdb->flags);
+ 
+-		if ((swdev_notify || !p) &&
+-		    test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
+-			atomic_dec(&br->fdb_n_learned);
+-
+ 		if (modified)
+ 			fdb_notify(br, fdb, RTM_NEWNEIGH, swdev_notify);
+ 	}
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 5efcc72..f9d9087 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -213,6 +213,8 @@ static inline size_t br_port_info_size(void)
+ 		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT */
+ 		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_MCAST_EHT_HOSTS_CNT */
+ 		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_BACKUP_NHID */
++		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_FDB_N_LEARNED */
++		+ nla_total_size(sizeof(u32))	/* IFLA_BRPORT_FDB_MAX_LEARNED */
+ 		+ 0;
+ }
+ 
+@@ -284,7 +286,11 @@ static int br_port_fill_attrs(struct sk_buff *skb,
+ 	    nla_put_u8(skb, IFLA_BRPORT_MAB, !!(p->flags & BR_PORT_MAB)) ||
+ 	    nla_put_u8(skb, IFLA_BRPORT_NEIGH_VLAN_SUPPRESS,
+ 		       !!(p->flags & BR_NEIGH_VLAN_SUPPRESS)) ||
+-	    nla_put_u8(skb, IFLA_BRPORT_BPDU_FILTER, !!(p->flags & BR_BPDU_FILTER)))
++	    nla_put_u8(skb, IFLA_BRPORT_BPDU_FILTER, !!(p->flags & BR_BPDU_FILTER)) ||
++	    nla_put_u32(skb, IFLA_BRPORT_FDB_N_LEARNED,
++			atomic_read(&p->fdb_n_learned)) ||
++	    nla_put_u32(skb, IFLA_BRPORT_FDB_MAX_LEARNED,
++			READ_ONCE(p->fdb_max_learned)))
+ 		return -EMSGSIZE;
+ 
+ 	timerval = br_timer_value(&p->message_age_timer);
+@@ -905,6 +911,8 @@ static const struct nla_policy br_port_policy[IFLA_BRPORT_MAX + 1] = {
+ 	[IFLA_BRPORT_NEIGH_VLAN_SUPPRESS] = NLA_POLICY_MAX(NLA_U8, 1),
+ 	[IFLA_BRPORT_BACKUP_NHID] = { .type = NLA_U32 },
+ 	[IFLA_BRPORT_BPDU_FILTER] = { .type = NLA_U8 },
++	[IFLA_BRPORT_FDB_N_LEARNED] = { .type = NLA_REJECT },
++	[IFLA_BRPORT_FDB_MAX_LEARNED] = { .type = NLA_U32 },
+ };
+ 
+ /* Change the state of the port and notify spanning tree */
+@@ -1030,6 +1038,10 @@ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[],
+ 	if (tb[IFLA_BRPORT_FLUSH])
+ 		br_fdb_delete_by_port(p->br, p, 0, 0);
+ 
++	if (tb[IFLA_BRPORT_FDB_MAX_LEARNED])
++		WRITE_ONCE(p->fdb_max_learned,
++			   nla_get_u32(tb[IFLA_BRPORT_FDB_MAX_LEARNED]));
++
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	if (tb[IFLA_BRPORT_MULTICAST_ROUTER]) {
+ 		u8 mcast_router = nla_get_u8(tb[IFLA_BRPORT_MULTICAST_ROUTER]);
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index b9b2981..ab4fa78 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -443,6 +443,8 @@ struct net_bridge_port {
+ #endif
+ 	u16				group_fwd_mask;
+ 	u16				backup_redirected_cnt;
++	atomic_t			fdb_n_learned;
++	u32				fdb_max_learned;
+ 
+ 	struct bridge_stp_xstats	stp_xstats;
+ };

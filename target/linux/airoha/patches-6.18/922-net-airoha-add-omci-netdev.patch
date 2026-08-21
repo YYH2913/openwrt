@@ -1,0 +1,402 @@
+Subject: [PATCH] net: airoha: add GPON OMCI netdev
+
+Expose GPON OMCC frames through a dedicated omci netdev.  Downstream OAM
+frames are selected using the QDMA metadata and delivered without Ethernet
+protocol parsing.  Upstream frames use the configured OMCC GEM port,
+channel zero, queue seven and the QDMA OAM bit.
+
+The OMCC GEM is controlled by the GPON MAC driver when the OLT sends the
+Configure-Port-ID PLOAM message.  Keep the OMCI netdev carrier in sync with
+that assignment and reject transmission while the parent GPON netdev is
+down.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -859,13 +859,14 @@ static struct sk_buff *airoha_qdma_lro_r
+ static struct sk_buff *airoha_qdma_build_rx_skb(struct airoha_queue *q,
+ 						struct airoha_qdma_desc *desc,
+ 						struct airoha_queue_entry *e,
+-						struct net_device *netdev)
++						struct net_device *netdev,
++						bool raw)
+ {
+ 	u32 msg2 = le32_to_cpu(READ_ONCE(desc->msg2));
+ 	int qid = q - &q->qdma->q_rx[0];
+ 	struct sk_buff *skb;
+ 
+-	if (FIELD_GET(QDMA_ETH_RXMSG_AGG_COUNT_MASK, msg2) > 1) { /* LRO */
++	if (!raw && FIELD_GET(QDMA_ETH_RXMSG_AGG_COUNT_MASK, msg2) > 1) { /* LRO */
+ 		skb = airoha_qdma_lro_rx_skb(q, desc, e);
+ 		if (!skb)
+ 			return NULL;
+@@ -885,7 +886,12 @@ static struct sk_buff *airoha_qdma_build
+ 	skb_mark_for_recycle(skb);
+ 	skb->dev = netdev;
+ 	skb_record_rx_queue(skb, qid);
+-	skb->protocol = eth_type_trans(skb, netdev);
++	if (raw) {
++		skb_reset_mac_header(skb);
++		skb->protocol = 0;
++	} else {
++		skb->protocol = eth_type_trans(skb, netdev);
++	}
+ 
+ 	return skb;
+ }
+@@ -902,8 +908,10 @@ static int airoha_qdma_rx_process(struct
+ 		u32 hash, reason, msg1, desc_ctrl;
+ 		struct airoha_gdm_dev *dev;
+ 		struct net_device *netdev;
++		bool omci = false;
+ 		int data_len, len;
+ 		struct page *page;
++		u32 msg0;
+ 
+ 		desc_ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
+ 		if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
+@@ -928,8 +936,33 @@ static int airoha_qdma_rx_process(struct
+ 			goto free_frag;
+ 
+ 		netdev = netdev_from_priv(dev);
++		msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
++		if (dev->gpon_mode) {
++			unsigned long flags;
++			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
++			u16 configured_gem;
++			bool ready;
++
++			spin_lock_irqsave(&dev->gpon_lock, flags);
++			if (msg0 & QDMA_ETH_TXMSG_OAM_MASK) {
++				ready = dev->gpon_omcc_ready;
++				configured_gem = dev->gpon_omcc_gem;
++				omci = true;
++			} else {
++				ready = dev->gpon_tx_ready;
++				configured_gem = dev->gpon_gem;
++			}
++			spin_unlock_irqrestore(&dev->gpon_lock, flags);
++
++			if (!ready || gem != configured_gem ||
++			    (omci && !dev->omci_dev))
++				goto free_frag;
++			if (omci)
++				netdev = dev->omci_dev;
++		}
+ 		if (!q->skb) { /* first buffer */
+-			q->skb = airoha_qdma_build_rx_skb(q, desc, e, netdev);
++			q->skb = airoha_qdma_build_rx_skb(q, desc, e,
++							  netdev, omci);
+ 			if (!q->skb)
+ 				goto free_frag;
+ 		} else { /* scattered frame */
+@@ -947,24 +980,6 @@ static int airoha_qdma_rx_process(struct
+ 		if (FIELD_GET(QDMA_DESC_MORE_MASK, desc_ctrl))
+ 			continue;
+ 
+-		if (dev->gpon_mode) {
+-			unsigned long flags;
+-			u32 msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
+-			u16 gem = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0);
+-			u16 configured_gem;
+-			bool ready;
+-
+-			spin_lock_irqsave(&dev->gpon_lock, flags);
+-			ready = dev->gpon_tx_ready;
+-			configured_gem = dev->gpon_gem;
+-			spin_unlock_irqrestore(&dev->gpon_lock, flags);
+-
+-			/* OMCI is not an Ethernet frame and must not enter the LAN stack. */
+-			if ((msg0 & QDMA_ETH_TXMSG_OAM_MASK) ||
+-			    !ready || gem != configured_gem)
+-				goto drop_skb;
+-		}
+-
+ 		if (netdev_uses_dsa(netdev)) {
+ 			struct airoha_gdm_port *port = dev->port;
+ 
+@@ -994,11 +1009,13 @@ static int airoha_qdma_rx_process(struct
+ 					     false);
+ 
+ 		done++;
+-		napi_gro_receive(&q->napi, q->skb);
+-		q->skb = NULL;
+-		continue;
+-drop_skb:
+-		dev_kfree_skb(q->skb);
++		if (omci) {
++			netdev->stats.rx_packets++;
++			netdev->stats.rx_bytes += q->skb->len;
++			netif_receive_skb(q->skb);
++		} else {
++			napi_gro_receive(&q->napi, q->skb);
++		}
+ 		q->skb = NULL;
+ 		continue;
+ free_frag:
+@@ -1197,6 +1214,8 @@ static void airoha_qdma_wake_netdev_txqs
+ 
+ 				netif_wake_subqueue(netdev, j);
+ 			}
++			if (dev->omci_dev && qid == AIROHA_NUM_QOS_QUEUES - 1)
++				netif_wake_queue(dev->omci_dev);
+ 		}
+ 	}
+ 	q->txq_stopped = false;
+@@ -2579,10 +2598,11 @@ static int airoha_dev_set_features(struc
+ 	return 0;
+ }
+ 
+-static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+-				   struct net_device *netdev)
++static netdev_tx_t airoha_dev_xmit_common(struct sk_buff *skb,
++					  struct net_device *netdev,
++					  struct airoha_gdm_dev *dev,
++					  bool omci)
+ {
+-	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	u32 nr_frags, tag, msg0, msg1, len;
+ 	u16 gpon_gem = 0;
+ 	u8 gpon_channel = 0;
+@@ -2591,6 +2611,7 @@ static netdev_tx_t airoha_dev_xmit(struc
+ 	struct netdev_queue *txq;
+ 	struct airoha_queue *q;
+ 	LIST_HEAD(tx_list);
++	unsigned int pkt_len = skb->len;
+ 	int i = 0, qid;
+ 	void *data;
+ 	u16 index;
+@@ -2601,17 +2622,21 @@ static netdev_tx_t airoha_dev_xmit(struc
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&dev->gpon_lock, flags);
+-		if (!dev->gpon_tx_ready) {
++		if (omci ? !dev->gpon_omcc_ready : !dev->gpon_tx_ready) {
+ 			spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 			goto error;
+ 		}
+-		gpon_gem = dev->gpon_gem;
+-		gpon_channel = dev->gpon_channel;
++		gpon_gem = omci ? dev->gpon_omcc_gem : dev->gpon_gem;
++		gpon_channel = omci ? 0 : dev->gpon_channel;
+ 		spin_unlock_irqrestore(&dev->gpon_lock, flags);
+ 	}
+ 
+ 	qdma = rcu_dereference(dev->qdma);
+-	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
++	if (unlikely(!qdma))
++		goto error;
++	qid = airoha_qdma_get_txq(qdma, omci ?
++				      AIROHA_NUM_QOS_QUEUES - 1 :
++				      skb_get_queue_mapping(skb));
+ 	tag = dev->gpon_mode ? gpon_gem : airoha_get_dsa_tag(skb, netdev);
+ 
+ 	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, dev->gpon_mode ?
+@@ -2620,13 +2645,15 @@ static netdev_tx_t airoha_dev_xmit(struc
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+ 			  qid % AIROHA_NUM_QOS_QUEUES) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
+-	if (skb->ip_summed == CHECKSUM_PARTIAL)
++	if (omci)
++		msg0 |= QDMA_ETH_TXMSG_OAM_MASK;
++	if (!omci && skb->ip_summed == CHECKSUM_PARTIAL)
+ 		msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TCO_MASK, 1) |
+ 			FIELD_PREP(QDMA_ETH_TXMSG_UCO_MASK, 1) |
+ 			FIELD_PREP(QDMA_ETH_TXMSG_ICO_MASK, 1);
+ 
+ 	/* TSO: fill MSS info in tcp checksum field */
+-	if (skb_is_gso(skb)) {
++	if (!omci && skb_is_gso(skb)) {
+ 		if (skb_cow_head(skb, 0))
+ 			goto error;
+ 
+@@ -2723,6 +2750,10 @@ static netdev_tx_t airoha_dev_xmit(struc
+ 
+ 	spin_unlock_bh(&q->lock);
+ 	rcu_read_unlock();
++	if (omci) {
++		netdev->stats.tx_packets++;
++		netdev->stats.tx_bytes += pkt_len;
++	}
+ 
+ 	return NETDEV_TX_OK;
+ 
+@@ -2743,6 +2774,20 @@ error:
+ 	return NETDEV_TX_OK;
+ }
+ 
++static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
++				   struct net_device *netdev)
++{
++	return airoha_dev_xmit_common(skb, netdev, netdev_priv(netdev), false);
++}
++
++static netdev_tx_t airoha_omci_xmit(struct sk_buff *skb,
++				    struct net_device *netdev)
++{
++	struct airoha_gdm_dev **dev = netdev_priv(netdev);
++
++	return airoha_dev_xmit_common(skb, netdev, *dev, true);
++}
++
+ static void airoha_ethtool_get_drvinfo(struct net_device *netdev,
+ 				       struct ethtool_drvinfo *info)
+ {
+@@ -3670,6 +3715,29 @@ static const struct net_device_ops airoh
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
+ };
+ 
++static int airoha_omci_open(struct net_device *netdev)
++{
++	struct airoha_gdm_dev **dev = netdev_priv(netdev);
++
++	if (!netif_running(netdev_from_priv(*dev)))
++		return -ENETDOWN;
++
++	netif_start_queue(netdev);
++	return 0;
++}
++
++static int airoha_omci_stop(struct net_device *netdev)
++{
++	netif_stop_queue(netdev);
++	return 0;
++}
++
++static const struct net_device_ops airoha_omci_netdev_ops = {
++	.ndo_open		= airoha_omci_open,
++	.ndo_stop		= airoha_omci_stop,
++	.ndo_start_xmit		= airoha_omci_xmit,
++};
++
+ static const struct ethtool_ops airoha_ethtool_ops = {
+ 	.get_drvinfo		= airoha_ethtool_get_drvinfo,
+ 	.get_eth_mac_stats      = airoha_ethtool_get_mac_stats,
+@@ -3946,7 +4014,29 @@ static int airoha_alloc_gdm_device(struc
+ 	spin_lock_init(&dev->gpon_lock);
+ 	dev->gpon_mode = of_property_read_bool(np, "airoha,gpon-mode");
+ 	dev->gpon_tx_ready = false;
++	dev->gpon_omcc_ready = false;
+ 	port->devs[index] = dev;
++	if (dev->gpon_mode) {
++		struct airoha_gdm_dev **omci_priv;
++		struct net_device *omci_dev;
++
++		omci_dev = devm_alloc_etherdev(eth->dev, sizeof(*omci_priv));
++		if (!omci_dev)
++			return -ENOMEM;
++
++		strscpy(omci_dev->name, "omci", IFNAMSIZ);
++		omci_dev->netdev_ops = &airoha_omci_netdev_ops;
++		omci_dev->flags |= IFF_NOARP;
++		omci_dev->flags &= ~IFF_MULTICAST;
++		omci_dev->mtu = 2000;
++		omci_dev->max_mtu = 2000;
++		eth_hw_addr_set(omci_dev, netdev->dev_addr);
++		SET_NETDEV_DEV(omci_dev, eth->dev);
++		netif_carrier_off(omci_dev);
++		omci_priv = netdev_priv(omci_dev);
++		*omci_priv = dev;
++		dev->omci_dev = omci_dev;
++	}
+ 
+ 	return airoha_setup_phylink(netdev);
+ }
+@@ -4052,6 +4142,11 @@ static int airoha_register_gdm_devices(s
+ 			err = register_netdev(netdev_from_priv(dev));
+ 			if (err)
+ 				return err;
++			if (dev->omci_dev) {
++				err = register_netdev(dev->omci_dev);
++				if (err)
++					return err;
++			}
+ 		}
+ 	}
+ 
+@@ -4172,6 +4267,9 @@ error_napi_stop:
+ 				continue;
+ 
+ 			netdev = netdev_from_priv(dev);
++			if (dev->omci_dev &&
++			    dev->omci_dev->reg_state == NETREG_REGISTERED)
++				unregister_netdev(dev->omci_dev);
+ 			if (netdev->reg_state == NETREG_REGISTERED)
+ 				unregister_netdev(netdev);
+ 			if (dev->phylink)
+@@ -4211,6 +4309,8 @@ static void airoha_remove(struct platfor
+ 				continue;
+ 
+ 			netdev = netdev_from_priv(dev);
++			if (dev->omci_dev)
++				unregister_netdev(dev->omci_dev);
+ 			unregister_netdev(netdev);
+ 			phylink_destroy(dev->phylink);
+ 			of_node_put(netdev->dev.of_node);
+@@ -4257,6 +4357,43 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(airoha_gpon_set_gem);
+ 
++int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid)
++{
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!np || gem > 0xfff)
++		return -EINVAL;
++
++	netdev = of_find_net_device_by_node(np);
++	if (!netdev)
++		return -ENODEV;
++
++	dev = netdev_priv(netdev);
++	if (!dev->gpon_mode || !dev->omci_dev) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	spin_lock_irqsave(&dev->gpon_lock, flags);
++	dev->gpon_omcc_ready = false;
++	dev->gpon_omcc_gem = gem;
++	dev->gpon_omcc_ready = valid;
++	spin_unlock_irqrestore(&dev->gpon_lock, flags);
++
++	if (valid)
++		netif_carrier_on(dev->omci_dev);
++	else
++		netif_carrier_off(dev->omci_dev);
++
++out:
++	put_device(&netdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_gpon_set_omcc);
++
+ static const char * const en7581_xsi_rsts_names[] = {
+ 	"hsi0-mac",
+ 	"hsi1-mac",
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -561,9 +561,12 @@ struct airoha_gdm_dev {
+ 
+ 	/* GPON uses the QDMA special-tag and channel fields for GEM/TCONT. */
+ 	spinlock_t gpon_lock;
++	struct net_device *omci_dev;
+ 	bool gpon_mode;
+ 	bool gpon_tx_ready;
++	bool gpon_omcc_ready;
+ 	u16 gpon_gem;
++	u16 gpon_omcc_gem;
+ 	u8 gpon_channel;
+ 
+ 	DECLARE_BITMAP(qos_sq_bmap, AIROHA_NUM_QOS_CHANNELS);
+@@ -715,6 +718,7 @@ bool airoha_is_valid_gdm_dev(struct airo
+ 
+ int airoha_gpon_set_gem(struct device_node *np, u16 gem, u8 channel,
+ 			bool valid);
++int airoha_gpon_set_omcc(struct device_node *np, u16 gem, bool valid);
+ extern struct mutex flow_offload_mutex;
+ 
+ static inline struct airoha_qdma *

@@ -1,0 +1,13 @@
+{
+	"admin/network/airoha-gpon": {
+		"title": "PON Optical Port",
+		"order": 85,
+		"action": {
+			"type": "view",
+			"path": "airoha-gpon"
+		},
+		"depends": {
+			"acl": [ "luci-app-airoha-gpon" ]
+		}
+	}
+}

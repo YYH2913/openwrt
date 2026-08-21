@@ -1,0 +1,84 @@
+#!/bin/sh
+
+. "${AIROHA_FUNCTIONS:-/lib/functions.sh}"
+. "${AIROHA_SYSTEM_FUNCTIONS:-/lib/functions/system.sh}"
+
+factory_partition()
+{
+	if [ -n "${AIROHA_FACTORY_PART:-}" ]; then
+		printf '%s\n' "$AIROHA_FACTORY_PART"
+	else
+		find_mtd_part vendor
+	fi
+}
+
+factory_ascii()
+{
+	local key="$1" part
+
+	part="$(factory_partition)"
+	[ -r "$part" ] || return 1
+	strings "$part" 2>/dev/null |
+		sed -n "s/^${key}=//p" |
+		head -n 1
+}
+
+factory_fsan()
+{
+	local fsan vendor serial
+
+	fsan="$(factory_ascii fsan | tr 'a-z' 'A-Z' | tr -d '[:space:]')"
+	[ "${#fsan}" -eq 12 ] || return 1
+	vendor="${fsan%????????}"
+	serial="${fsan#????}"
+	case "$vendor" in ''|*[!A-Z0-9]*) return 1 ;; esac
+	case "$serial" in ''|*[!0-9A-F]*) return 1 ;; esac
+	printf '%s\n' "$fsan"
+}
+
+factory_wan_mac()
+{
+	local mac
+
+	mac="$(factory_ascii wan_mac)"
+	[ -n "$mac" ] || return 1
+	macaddr_canonicalize "$mac"
+}
+
+board="${AIROHA_BOARD_NAME:-$(board_name)}"
+case "$board" in
+axon,xg2010g-xgspon)
+	pon_mode=xgspon
+	;;
+axon,xg2010g|econet,xg2010g)
+	pon_mode=gpon
+	;;
+*)
+	exit 0
+	;;
+esac
+
+current_mode="$(uci -q get airoha-gpon.main.pon_mode)"
+current_serial="$(uci -q get airoha-gpon.main.serial_number)"
+current_epon_mac="$(uci -q get airoha-gpon.main.epon_onu_mac)"
+factory_serial=
+factory_mac=
+[ -n "$current_serial" ] || factory_serial="$(factory_fsan 2>/dev/null)"
+[ -n "$current_epon_mac" ] || factory_mac="$(factory_wan_mac 2>/dev/null)"
+
+[ "$current_mode" = "$pon_mode" ] &&
+	[ -z "$factory_serial" ] &&
+	[ -z "$factory_mac" ] &&
+	exit 0
+
+uci -q batch <<-EOF
+	set airoha-gpon.main.pon_mode='$pon_mode'
+	${factory_serial:+set airoha-gpon.main.serial_number='$factory_serial'}
+	${factory_mac:+set airoha-gpon.main.epon_onu_mac='$factory_mac'}
+	commit airoha-gpon
+EOF
+
+logger -t airoha-pon-mode "selected $pon_mode for $board"
+[ -z "$factory_serial$factory_mac" ] ||
+	logger -t airoha-pon-mode "seeded missing PON identity from the read-only factory partition"
+exit 0

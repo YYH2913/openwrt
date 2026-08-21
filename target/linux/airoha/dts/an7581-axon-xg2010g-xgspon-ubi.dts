@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#include "an7581-axon-xg2010g-ubi.dts"
+
+/ {
+	model = "Axon Networks XG2010G XGS-PON (OpenWrt UBI layout)";
+	compatible = "axon,xg2010g-xgspon", "axon,xg2010g", "econet,xg2010g",
+		     "econet,en7581", "airoha,an7581", "airoha,en7581";
+};
+
+&en7572 {
+	airoha,pon-mode = "xgspon";
+};
+
+&pon_pcs {
+	airoha,pon-mode = "xgspon";
+};

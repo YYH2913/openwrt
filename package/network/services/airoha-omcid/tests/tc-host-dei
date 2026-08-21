@@ -1,0 +1,28 @@
+#!/bin/bash
+
+set -eu
+
+arguments=()
+while [ "$#" -gt 0 ]; do
+	if [ "$#" -ge 3 ] && [ "$1" = action ] && [ "$2" = vlan ] && [ "$3" = transform ]; then
+		transform=()
+		while [ "$#" -gt 0 ]; do
+			transform+=("$1")
+			control="$1"
+			shift
+			[ "$control" != pipe ] || break
+		done
+		printf '%s\n' "${transform[*]}" >> "${AIROHA_OMCI_TC_TRANSFORM_LOG:?}"
+		continue
+	fi
+	if [ "$1" = dei ] || [ "$1" = vlan_dei ] || [ "$1" = cvlan_dei ]; then
+		[ "$#" -ge 2 ] || exit 1
+		printf '%s %s\n' "$1" "$2" >> "${AIROHA_OMCI_TC_DEI_LOG:?}"
+		shift 2
+		continue
+	fi
+	arguments+=("$1")
+	shift
+done
+
+exec "${AIROHA_OMCI_TC_HOST:-/usr/sbin/tc}" "${arguments[@]}"

@@ -1,0 +1,140 @@
+From: OpenWrt XPON integration
+Subject: [PATCH] net: pcs: airoha: verify XPON quiesce and recovery
+
+The runtime owner must not reprogram the shared PMA while any MAC interface is
+still running. Check every regmap operation at the quiesce/recovery boundary
+and read back both the MAC stop bits and the SDK reset-hold bits. Publish the
+software state only after hardware agrees, retaining the quiesced state when a
+recovery write or readback fails so the caller can retry or roll back safely.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1158,6 +1158,7 @@ int airoha_pcs_xpon_quiesce(struct phyli
+ 	struct airoha_pcs_port *port;
+ 	struct airoha_pcs_priv *priv;
+ 	struct airoha_pcs_maps *maps;
++	u32 stop_mask, value;
+ 	int ret;
+ 
+ 	ret = airoha_pcs_xpon_port(pcs, &port);
+@@ -1169,11 +1170,25 @@ int airoha_pcs_xpon_quiesce(struct phyli
+ 
+ 	rtnl_lock();
+ 	mutex_lock(&priv->recovery_lock);
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			AIROHA_PCS_XFI_RXMPI_STOP |
+-			AIROHA_PCS_XFI_RXMBI_STOP |
+-			AIROHA_PCS_XFI_TXMPI_STOP |
+-			AIROHA_PCS_XFI_TXMBI_STOP);
++	priv->pon_quiesced = false;
++	priv->pon_wan_selected = false;
++	priv->pon_pma_ready = false;
++	stop_mask = AIROHA_PCS_XFI_RXMPI_STOP |
++		    AIROHA_PCS_XFI_RXMBI_STOP |
++		    AIROHA_PCS_XFI_TXMPI_STOP |
++		    AIROHA_PCS_XFI_TXMBI_STOP;
++	ret = regmap_set_bits(maps->pcs_mac,
++			      AIROHA_PCS_XFI_MAC_XFI_GIB_CFG, stop_mask);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			  &value);
++	if (ret)
++		goto unlock;
++	if ((value & stop_mask) != stop_mask) {
++		ret = -EIO;
++		goto unlock;
++	}
+ 	ret = an7581_pcs_xpon_quiesce(priv, port->index);
+ 	if (!ret) {
+ 		priv->pon_quiesced = true;
+@@ -1181,6 +1196,7 @@ int airoha_pcs_xpon_quiesce(struct phyli
+ 		priv->pon_wan_selected = false;
+ 		priv->pon_pma_ready = false;
+ 	}
++unlock:
+ 	mutex_unlock(&priv->recovery_lock);
+ 	rtnl_unlock();
+ 	return ret;
+@@ -1288,6 +1304,7 @@ int airoha_pcs_xpon_recover(struct phyli
+ 	struct airoha_pcs_port *port;
+ 	struct airoha_pcs_priv *priv;
+ 	struct airoha_pcs_maps *maps;
++	u32 stop_mask, value;
+ 	int ret;
+ 
+ 	ret = airoha_pcs_xpon_port(pcs, &port);
+@@ -1305,11 +1322,22 @@ int airoha_pcs_xpon_recover(struct phyli
+ 		goto unlock;
+ 	}
+ 
+-	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			  AIROHA_PCS_XFI_RXMPI_STOP |
+-			  AIROHA_PCS_XFI_RXMBI_STOP |
+-			  AIROHA_PCS_XFI_TXMPI_STOP |
+-			  AIROHA_PCS_XFI_TXMBI_STOP);
++	stop_mask = AIROHA_PCS_XFI_RXMPI_STOP |
++		    AIROHA_PCS_XFI_RXMBI_STOP |
++		    AIROHA_PCS_XFI_TXMPI_STOP |
++		    AIROHA_PCS_XFI_TXMBI_STOP;
++	ret = regmap_clear_bits(maps->pcs_mac,
++				AIROHA_PCS_XFI_MAC_XFI_GIB_CFG, stop_mask);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			  &value);
++	if (ret)
++		goto unlock;
++	if (value & stop_mask) {
++		ret = -EIO;
++		goto unlock;
++	}
+ 	priv->pon_quiesced = false;
+ 	priv->pon_wan_selected = false;
+ 	priv->pon_pma_ready = false;
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -2006,6 +2006,7 @@ int an7581_pcs_xpon_quiesce(struct airoh
+ {
+ 	struct regmap *pcs_pma = priv->pcs_pma[index];
+-	u32 reset_mask;
++	u32 reset_mask, value;
++	int ret;
+ 
+ 	if (priv->pon_mode == AIROHA_PCS_PON_MODE_NONE)
+ 		return -EINVAL;
+@@ -2013,9 +2014,12 @@ int an7581_pcs_xpon_quiesce(struct airoh
+ 
+ 	an7581_pcs_pon_tdc_off(priv, index);
+-	regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
+-			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA |
+-			   AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA,
+-			   AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++	ret = regmap_update_bits(pcs_pma,
++			 AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA,
++			 AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA |
++			 AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA,
++			 AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++	if (ret)
++		return ret;
+ 
+ 	/* SDK XPON_DIG_reset_hold(): hold PMA, TX/RX and both FIFOs. */
+ 	reset_mask = AIROHA_PCS_PMA_SW_TX_FIFO_RST_N |
+@@ -2025,8 +2029,15 @@ int an7581_pcs_xpon_quiesce(struct airoh
+ 		     AIROHA_PCS_PMA_SW_TX_RST_N |
+ 		     AIROHA_PCS_PMA_SW_RX_RST_N |
+ 		     AIROHA_PCS_PMA_SW_RX_FIFO_RST_N;
+-	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET, reset_mask);
+-	return 0;
++	ret = regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
++				reset_mask);
++	if (ret)
++		return ret;
++	ret = regmap_read(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET, &value);
++	if (ret)
++		return ret;
++
++	return value & reset_mask ? -EIO : 0;
+ }
+ 
+ int an7581_pcs_xgspon_rx_quiesce(struct airoha_pcs_priv *priv, int index)

@@ -1,0 +1,159 @@
+#!/bin/sh
+
+# Run the complete directed four-mode acceptance matrix. Each edge remains an
+# independent transactional acceptance operation with its own evidence.
+set -eu
+
+umask 077
+
+edge_program="${AIROHA_XPON_ACCEPT_EDGE:-/usr/sbin/airoha-xpon-accept-edge}"
+collector="${AIROHA_XPON_ACCEPT_COLLECTOR:-/usr/sbin/airoha-xpon-evidence}"
+flock_command="${AIROHA_XPON_ACCEPT_FLOCK:-flock}"
+lock_file="${AIROHA_XPON_ACCEPT_LOCK_FILE:-/var/lock/airoha-xpon-accept-edge.lock}"
+before_edge="${AIROHA_XPON_ACCEPT_BEFORE_EDGE:-}"
+output_directory="${1:-}"
+
+valid_mode() {
+	case "$1" in
+		xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+evidence_field() {
+	local file="$1" name="$2"
+
+	awk -F= -v name="$name" \
+		'$1 == name { print substr($0, length(name) + 2); exit }' "$file"
+}
+
+record_result() {
+	local result="$1" failed_edge="${2:-0}"
+	local failed_from="${3:-}" failed_target="${4:-}"
+
+	{
+		printf 'version=1\n'
+		printf 'result=%s\n' "$result"
+		printf 'start_mode=%s\n' "$start_mode"
+		printf 'completed_edges=%s\n' "$completed_edges"
+		printf 'total_edges=12\n'
+		printf 'failed_edge=%s\n' "$failed_edge"
+		printf 'failed_from_mode=%s\n' "$failed_from"
+		printf 'failed_target_mode=%s\n' "$failed_target"
+		printf 'completed_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} > "$output_directory/result.env"
+}
+
+[ -x "$edge_program" ] || {
+	echo "edge acceptance program is not executable: $edge_program" >&2
+	exit 2
+}
+[ -z "$before_edge" ] || [ -x "$before_edge" ] || {
+	echo "before-edge hook is not executable: $before_edge" >&2
+	exit 2
+}
+
+exec 8>"$lock_file" || {
+	echo "failed to open acceptance lock $lock_file" >&2
+	exit 1
+}
+if ! "$flock_command" -n 8; then
+	echo 'another PON acceptance transaction is running' >&2
+	exit 1
+fi
+
+initial_text="$("$collector")" || {
+	echo 'failed to collect the initial PON state' >&2
+	exit 1
+}
+start_mode="$(printf '%s\n' "$initial_text" |
+	awk -F= '$1 == "runtime_mode" { print $2; exit }')"
+valid_mode "$start_mode" || {
+	echo "current mode $start_mode is outside the four-mode matrix" >&2
+	exit 1
+}
+
+if [ -z "$output_directory" ]; then
+	output_directory="/tmp/airoha-xpon-matrix-${start_mode}-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+[ ! -e "$output_directory" ] || {
+	echo "$output_directory already exists" >&2
+	exit 1
+}
+mkdir -p "$output_directory"
+printf '%s\n' "$initial_text" > "$output_directory/initial.env"
+{
+	printf 'version=1\n'
+	printf 'semantics=all-12-directed-edges-each-exactly-once\n'
+	printf 'start_mode=%s\n' "$start_mode"
+	printf 'total_edges=12\n'
+	printf 'started_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$output_directory/matrix.env"
+
+# A->B->A->C->A->D->B->C->B->D->C->D->A is an Euler circuit of
+# the complete directed graph on four modes. B/C/D retain canonical order.
+remaining=
+for mode in xgpon xgspon epon-10g-1g epon-10g-10g; do
+	[ "$mode" = "$start_mode" ] || remaining="$remaining $mode"
+done
+set -- $remaining
+mode_b="$1"
+mode_c="$2"
+mode_d="$3"
+set -- "$start_mode" "$mode_b" "$start_mode" "$mode_c" \
+	"$start_mode" "$mode_d" "$mode_b" "$mode_c" "$mode_b" \
+	"$mode_d" "$mode_c" "$mode_d" "$start_mode"
+
+source_mode="$1"
+shift
+edge_number=0
+completed_edges=0
+for target_mode in "$@"; do
+	edge_number=$((edge_number + 1))
+	edge_name="$(printf '%02d-%s-to-%s' "$edge_number" \
+		"$source_mode" "$target_mode")"
+	edge_directory="$output_directory/$edge_name"
+
+	if [ -n "$before_edge" ] &&
+		! "$before_edge" "$source_mode" "$target_mode" \
+			"$edge_directory"; then
+		record_result before-edge-hook-failed "$edge_number" \
+			"$source_mode" "$target_mode"
+		echo "before-edge hook failed at $source_mode -> $target_mode; evidence: $output_directory" >&2
+		exit 1
+	fi
+
+	if ! AIROHA_XPON_ACCEPT_FLOCK=: \
+		AIROHA_XPON_ACCEPT_LOCK_FILE="$lock_file" \
+		"$edge_program" "$target_mode" "$edge_directory" >/dev/null; then
+		record_result edge-failed "$edge_number" "$source_mode" "$target_mode"
+		echo "PON matrix stopped at $source_mode -> $target_mode; evidence: $output_directory" >&2
+		exit 1
+	fi
+
+	if [ "$(evidence_field "$edge_directory/result.env" from_mode)" != \
+			"$source_mode" ] ||
+	   [ "$(evidence_field "$edge_directory/result.env" target_mode)" != \
+			"$target_mode" ] ||
+	   [ "$(evidence_field "$edge_directory/result.env" result)" != passed ]; then
+		record_result invalid-edge-evidence "$edge_number" \
+			"$source_mode" "$target_mode"
+		echo "PON matrix received invalid evidence for $source_mode -> $target_mode; evidence: $output_directory" >&2
+		exit 1
+	fi
+
+	completed_edges=$edge_number
+	{
+		printf 'edge_%02d_from=%s\n' "$edge_number" "$source_mode"
+		printf 'edge_%02d_target=%s\n' "$edge_number" "$target_mode"
+		printf 'edge_%02d_result=passed\n' "$edge_number"
+	} >> "$output_directory/edges.env"
+	source_mode="$target_mode"
+done
+
+[ "$completed_edges" -eq 12 ] && [ "$source_mode" = "$start_mode" ] || {
+	record_result incomplete-matrix "$edge_number" "$source_mode" ""
+	exit 1
+}
+record_result passed
+printf '%s\n' "$output_directory"

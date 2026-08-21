@@ -1,0 +1,117 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 18:30:00 +0800
+Subject: [PATCH] net: sched: cls_flower: add VLAN DEI matching
+
+The flow dissector already records the drop eligible indicator for both VLAN
+headers, but flower has no netlink attributes with which to select it.  Export
+outer and inner DEI keys so G.988 extended VLAN rules can combine DEI with
+VID, PCP, protocol and DSCP in one classifier.
+
+Append the attributes to preserve the existing flower netlink ABI.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -561,6 +561,9 @@ enum {
+ 	TCA_FLOWER_KEY_ENC_FLAGS,	/* be32 */
+ 	TCA_FLOWER_KEY_ENC_FLAGS_MASK,	/* be32 */
+ 
++	TCA_FLOWER_KEY_VLAN_DEI,	/* u8 */
++	TCA_FLOWER_KEY_CVLAN_DEI,	/* u8 */
++
+ 	__TCA_FLOWER_MAX,
+ };
+ 
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -658,6 +658,7 @@ static const struct nla_policy fl_policy
+ 	[TCA_FLOWER_KEY_UDP_DST]	= { .type = NLA_U16 },
+ 	[TCA_FLOWER_KEY_VLAN_ID]	= { .type = NLA_U16 },
+ 	[TCA_FLOWER_KEY_VLAN_PRIO]	= { .type = NLA_U8 },
++	[TCA_FLOWER_KEY_VLAN_DEI]	= NLA_POLICY_MAX(NLA_U8, 1),
+ 	[TCA_FLOWER_KEY_VLAN_ETH_TYPE]	= { .type = NLA_U16 },
+ 	[TCA_FLOWER_KEY_ENC_KEY_ID]	= { .type = NLA_U32 },
+ 	[TCA_FLOWER_KEY_ENC_IPV4_SRC]	= { .type = NLA_U32 },
+@@ -714,6 +715,7 @@ static const struct nla_policy fl_policy
+ 	[TCA_FLOWER_KEY_IP_TTL_MASK]	= { .type = NLA_U8 },
+ 	[TCA_FLOWER_KEY_CVLAN_ID]	= { .type = NLA_U16 },
+ 	[TCA_FLOWER_KEY_CVLAN_PRIO]	= { .type = NLA_U8 },
++	[TCA_FLOWER_KEY_CVLAN_DEI]	= NLA_POLICY_MAX(NLA_U8, 1),
+ 	[TCA_FLOWER_KEY_CVLAN_ETH_TYPE]	= { .type = NLA_U16 },
+ 	[TCA_FLOWER_KEY_ENC_IP_TOS]	= { .type = NLA_U8 },
+ 	[TCA_FLOWER_KEY_ENC_IP_TOS_MASK] = { .type = NLA_U8 },
+@@ -1088,7 +1090,7 @@ static int fl_set_key_mpls(struct nlattr
+ static void fl_set_key_vlan(struct nlattr **tb,
+ 			    __be16 ethertype,
+ 			    int vlan_id_key, int vlan_prio_key,
+-			    int vlan_next_eth_type_key,
++			    int vlan_dei_key, int vlan_next_eth_type_key,
+ 			    struct flow_dissector_key_vlan *key_val,
+ 			    struct flow_dissector_key_vlan *key_mask)
+ {
+@@ -1108,6 +1110,10 @@ static void fl_set_key_vlan(struct nlatt
+ 				VLAN_PRIORITY_MASK;
+ 		key_mask->vlan_priority = VLAN_PRIORITY_MASK;
+ 	}
++	if (tb[vlan_dei_key]) {
++		key_val->vlan_dei = nla_get_u8(tb[vlan_dei_key]);
++		key_mask->vlan_dei = 1;
++	}
+ 	if (ethertype) {
+ 		key_val->vlan_tpid = ethertype;
+ 		key_mask->vlan_tpid = cpu_to_be16(~0);
+@@ -1901,6 +1907,7 @@ static int fl_set_key(struct net *net, s
+ 	if (is_vlan_key(tb[TCA_FLOWER_KEY_ETH_TYPE], &ethertype, key, mask, 0)) {
+ 		fl_set_key_vlan(tb, ethertype, TCA_FLOWER_KEY_VLAN_ID,
+ 				TCA_FLOWER_KEY_VLAN_PRIO,
++				TCA_FLOWER_KEY_VLAN_DEI,
+ 				TCA_FLOWER_KEY_VLAN_ETH_TYPE,
+ 				&key->vlan, &mask->vlan);
+ 
+@@ -1909,6 +1916,7 @@ static int fl_set_key(struct net *net, s
+ 			fl_set_key_vlan(tb, ethertype,
+ 					TCA_FLOWER_KEY_CVLAN_ID,
+ 					TCA_FLOWER_KEY_CVLAN_PRIO,
++					TCA_FLOWER_KEY_CVLAN_DEI,
+ 					TCA_FLOWER_KEY_CVLAN_ETH_TYPE,
+ 					&key->cvlan, &mask->cvlan);
+ 			fl_set_key_val(tb, &key->basic.n_proto,
+@@ -3072,7 +3080,7 @@ static int fl_dump_key_ip(struct sk_buff
+ }
+ 
+ static int fl_dump_key_vlan(struct sk_buff *skb,
+-			    int vlan_id_key, int vlan_prio_key,
++			    int vlan_id_key, int vlan_prio_key, int vlan_dei_key,
+ 			    struct flow_dissector_key_vlan *vlan_key,
+ 			    struct flow_dissector_key_vlan *vlan_mask)
+ {
+@@ -3093,6 +3101,12 @@ static int fl_dump_key_vlan(struct sk_bu
+ 		if (err)
+ 			return err;
+ 	}
++	if (vlan_mask->vlan_dei) {
++		err = nla_put_u8(skb, vlan_dei_key,
++				 vlan_key->vlan_dei);
++		if (err)
++			return err;
++	}
+ 	return 0;
+ }
+ 
+@@ -3472,10 +3486,12 @@ static int fl_dump_key(struct sk_buff *s
+ 
+ 	if (fl_dump_key_vlan(skb, TCA_FLOWER_KEY_VLAN_ID,
+-			     TCA_FLOWER_KEY_VLAN_PRIO, &key->vlan, &mask->vlan))
++			     TCA_FLOWER_KEY_VLAN_PRIO, TCA_FLOWER_KEY_VLAN_DEI,
++			     &key->vlan, &mask->vlan))
+ 		goto nla_put_failure;
+ 
+ 	if (fl_dump_key_vlan(skb, TCA_FLOWER_KEY_CVLAN_ID,
+ 			     TCA_FLOWER_KEY_CVLAN_PRIO,
++			     TCA_FLOWER_KEY_CVLAN_DEI,
+ 			     &key->cvlan, &mask->cvlan) ||
+ 	    (mask->cvlan.vlan_tpid &&
+ 	     nla_put_be16(skb, TCA_FLOWER_KEY_VLAN_ETH_TYPE,
+-- 
+2.51.0

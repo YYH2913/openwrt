@@ -1,0 +1,111 @@
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 18:35:00 +0800
+Subject: [PATCH] tc: flower: add VLAN DEI matching
+
+Add vlan_dei and cvlan_dei syntax for the kernel flower classifier's outer
+and inner drop eligible indicator keys.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -561,6 +561,9 @@ enum {
+ 	TCA_FLOWER_KEY_ENC_FLAGS,	/* be32 */
+ 	TCA_FLOWER_KEY_ENC_FLAGS_MASK,	/* be32 */
+ 
++	TCA_FLOWER_KEY_VLAN_DEI,	/* u8 */
++	TCA_FLOWER_KEY_CVLAN_DEI,	/* u8 */
++
+ 	__TCA_FLOWER_MAX,
+ };
+ 
+--- a/tc/f_flower.c
++++ b/tc/f_flower.c
+@@ -56,9 +56,11 @@ static void explain(void)
+ 		"			num_of_vlans VLANS_COUNT |\n"
+ 		"			vlan_id VID |\n"
+ 		"			vlan_prio PRIORITY |\n"
++		"			vlan_dei DEI |\n"
+ 		"			vlan_ethtype [ ipv4 | ipv6 | ETH-TYPE ] |\n"
+ 		"			cvlan_id VID |\n"
+ 		"			cvlan_prio PRIORITY |\n"
++		"			cvlan_dei DEI |\n"
+ 		"			cvlan_ethtype [ ipv4 | ipv6 | ETH-TYPE ] |\n"
+ 		"			pppoe_sid PSID |\n"
+ 		"			ppp_proto [ ipv4 | ipv6 | mpls_uc | mpls_mc | PPP_PROTO ] |\n"
+@@ -1801,5 +1803,21 @@ static int flower_parse_opt(struct filte
+ 			addattr8(n, MAX_MSG,
+ 				 TCA_FLOWER_KEY_VLAN_PRIO, vlan_prio);
++		} else if (matches(*argv, "vlan_dei") == 0) {
++			__u8 vlan_dei;
++
++			NEXT_ARG();
++			if (!eth_type_vlan(tc_proto, num_of_vlans > 0)) {
++				fprintf(stderr, "Can't set \"vlan_dei\" if ethertype isn't 802.1Q or 802.1AD"
++						" and num_of_vlans is 0\n");
++				return -1;
++			}
++			ret = get_u8(&vlan_dei, *argv, 10);
++			if (ret < 0 || vlan_dei & ~0x1) {
++				fprintf(stderr, "Illegal \"vlan_dei\"\n");
++				return -1;
++			}
++			addattr8(n, MAX_MSG,
++				 TCA_FLOWER_KEY_VLAN_DEI, vlan_dei);
+ 		} else if (matches(*argv, "vlan_ethtype") == 0) {
+ 			NEXT_ARG();
+ 			ret = flower_parse_vlan_eth_type(*argv, eth_type,
+@@ -1841,5 +1859,21 @@ static int flower_parse_opt(struct filte
+ 			addattr8(n, MAX_MSG,
+ 				 TCA_FLOWER_KEY_CVLAN_PRIO, cvlan_prio);
++		} else if (matches(*argv, "cvlan_dei") == 0) {
++			__u8 cvlan_dei;
++
++			NEXT_ARG();
++			if (!eth_type_vlan(vlan_ethtype, num_of_vlans > 1)) {
++				fprintf(stderr, "Can't set \"cvlan_dei\" if inner vlan ethertype isn't 802.1Q or 802.1AD"
++						" and num_of_vlans is less than 2\n");
++				return -1;
++			}
++			ret = get_u8(&cvlan_dei, *argv, 10);
++			if (ret < 0 || cvlan_dei & ~0x1) {
++				fprintf(stderr, "Illegal \"cvlan_dei\"\n");
++				return -1;
++			}
++			addattr8(n, MAX_MSG,
++				 TCA_FLOWER_KEY_CVLAN_DEI, cvlan_dei);
+ 		} else if (matches(*argv, "cvlan_ethtype") == 0) {
+ 			NEXT_ARG();
+ 			/* get new ethtype for later parsing */
+@@ -3114,6 +3148,14 @@ static int flower_print_opt(struct filte
+ 			   rta_getattr_u8(attr));
+ 	}
+ 
++	if (tb[TCA_FLOWER_KEY_VLAN_DEI]) {
++		struct rtattr *attr = tb[TCA_FLOWER_KEY_VLAN_DEI];
++
++		print_nl();
++		print_uint(PRINT_ANY, "vlan_dei", "  vlan_dei %d",
++			   rta_getattr_u8(attr));
++	}
++
+ 	if (tb[TCA_FLOWER_KEY_VLAN_ETH_TYPE]) {
+ 		SPRINT_BUF(buf);
+ 		struct rtattr *attr = tb[TCA_FLOWER_KEY_VLAN_ETH_TYPE];
+@@ -3142,6 +3184,14 @@ static int flower_print_opt(struct filte
+ 			   rta_getattr_u8(attr));
+ 	}
+ 
++	if (tb[TCA_FLOWER_KEY_CVLAN_DEI]) {
++		struct rtattr *attr = tb[TCA_FLOWER_KEY_CVLAN_DEI];
++
++		print_nl();
++		print_uint(PRINT_ANY, "cvlan_dei", "  cvlan_dei %d",
++			   rta_getattr_u8(attr));
++	}
++
+ 	if (tb[TCA_FLOWER_KEY_CVLAN_ETH_TYPE]) {
+ 		SPRINT_BUF(buf);
+ 		struct rtattr *attr = tb[TCA_FLOWER_KEY_CVLAN_ETH_TYPE];
+-- 
+2.51.0

@@ -1,0 +1,122 @@
+From fc7019d89c88c34cd8d7dd7786d1d25ac009a3dd Mon Sep 17 00:00:00 2001
+From: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+Date: Tue, 11 Aug 2026 18:59:18 +0800
+Subject: [PATCH] bridge: add per-port FDB learning limit
+
+Synchronize the bridge-port UAPI with the target kernel and expose the
+per-port dynamic FDB count and limit. Allow the limit to be configured with
+bridge link and document that it is enforced alongside the bridge-wide
+limit.
+
+Signed-off-by: XG2010G OpenWrt maintainers <xg2010g@example.invalid>
+---
+ bridge/link.c                | 23 +++++++++++++++++++++++
+ include/uapi/linux/if_link.h |  3 +++
+ man/man8/bridge.8            | 10 ++++++++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/bridge/link.c b/bridge/link.c
+index 1c8faa8..68649fc 100644
+--- a/bridge/link.c
++++ b/bridge/link.c
+@@ -212,6 +212,18 @@ static void print_protinfo(FILE *fp, struct rtattr *attr)
+ 			print_uint(PRINT_ANY, "mcast_max_groups",
+ 				   "mcast_max_groups %u ", rta_getattr_u32(at));
+ 		}
++		if (prtb[IFLA_BRPORT_FDB_N_LEARNED]) {
++			struct rtattr *at = prtb[IFLA_BRPORT_FDB_N_LEARNED];
++
++			print_uint(PRINT_ANY, "fdb_n_learned",
++				   "fdb_n_learned %u ", rta_getattr_u32(at));
++		}
++		if (prtb[IFLA_BRPORT_FDB_MAX_LEARNED]) {
++			struct rtattr *at = prtb[IFLA_BRPORT_FDB_MAX_LEARNED];
++
++			print_uint(PRINT_ANY, "fdb_max_learned",
++				   "fdb_max_learned %u ", rta_getattr_u32(at));
++		}
+ 	} else
+ 		print_stp_state(rta_getattr_u8(attr));
+ }
+@@ -312,6 +324,7 @@ static void usage(void)
+ 		"                               [ bcast_flood {on | off} ]\n"
+ 		"                               [ mcast_to_unicast {on | off} ]\n"
+ 		"                               [ mcast_max_groups MAX_GROUPS ]\n"
++		"                               [ fdb_max_learned MAX_LEARNED ]\n"
+ 		"                               [ neigh_suppress {on | off} ]\n"
+ 		"                               [ neigh_vlan_suppress {on | off} ]\n"
+ 		"                               [ vlan_tunnel {on | off} ]\n"
+@@ -340,7 +353,9 @@ static int brlink_modify(int argc, char **argv)
+ 	};
+ 	char *d = NULL;
+ 	bool backup_nhid_set = false;
++	bool fdb_max_learned_set = false;
+ 	__u32 backup_nhid;
++	__u32 fdb_max_learned;
+ 	int backup_port_idx = -1;
+ 	__s8 neigh_suppress = -1;
+ 	__s8 neigh_vlan_suppress = -1;
+@@ -429,6 +444,11 @@ static int brlink_modify(int argc, char **argv)
+ 			NEXT_ARG();
+ 			if (get_s32(&max_groups, *argv, 0))
+ 				invarg("invalid mcast_max_groups", *argv);
++		} else if (strcmp(*argv, "fdb_max_learned") == 0) {
++			NEXT_ARG();
++			if (get_u32(&fdb_max_learned, *argv, 0))
++				invarg("invalid fdb_max_learned", *argv);
++			fdb_max_learned_set = true;
+ 		} else if (strcmp(*argv, "cost") == 0) {
+ 			NEXT_ARG();
+ 			cost = atoi(*argv);
+@@ -559,6 +579,9 @@ static int brlink_modify(int argc, char **argv)
+ 	if (max_groups >= 0)
+ 		addattr32(&req.n, sizeof(req), IFLA_BRPORT_MCAST_MAX_GROUPS,
+ 			  max_groups);
++	if (fdb_max_learned_set)
++		addattr32(&req.n, sizeof(req), IFLA_BRPORT_FDB_MAX_LEARNED,
++			  fdb_max_learned);
+ 	if (learning >= 0)
+ 		addattr8(&req.n, sizeof(req), IFLA_BRPORT_LEARNING, learning);
+ 	if (learning_sync >= 0)
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index d05f5cc..6a89410 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -1096,6 +1096,9 @@ enum {
+ 	IFLA_BRPORT_MCAST_MAX_GROUPS,
+ 	IFLA_BRPORT_NEIGH_VLAN_SUPPRESS,
+ 	IFLA_BRPORT_BACKUP_NHID,
++	IFLA_BRPORT_BPDU_FILTER,
++	IFLA_BRPORT_FDB_N_LEARNED,
++	IFLA_BRPORT_FDB_MAX_LEARNED,
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+diff --git a/man/man8/bridge.8 b/man/man8/bridge.8
+index fe800d3..496b6a3 100644
+--- a/man/man8/bridge.8
++++ b/man/man8/bridge.8
+@@ -50,6 +50,8 @@ bridge \- show / manipulate bridge addresses and devices
+ .BR mcast_flood " { " on " | " off " } ] [ "
+ .BR mcast_max_groups
+ .IR MAX_GROUPS " ] ["
++.BR fdb_max_learned
++.IR MAX_LEARNED " ] ["
+ .BR mcast_router
+ .IR MULTICAST_ROUTER " ] ["
+ .BR mcast_to_unicast " { " on " | " off " } ] [ "
+@@ -603,6 +605,14 @@ allows will be rejected, whether they are done through netlink (e.g. the
+ has the effect of disabling the limit. The default value is 0. See also the
+ \fBip link\fR option \fBmcast_hash_max\fR.
+ 
++.TP
++.BI fdb_max_learned " MAX_LEARNED "
++Sets the maximum number of dynamically learned FDB entries associated with
++this port. Attempts to learn additional entries, including entries roaming
++from another port, are rejected. This limit is applied in addition to the
++bridge-wide \fBfdb_max_learned\fR limit. Setting a limit to 0 disables the
++per-port limit. Lowering the limit does not remove existing entries.
++
+ .TP
+ .BI mcast_router " MULTICAST_ROUTER "
+ This flag is almost the same as the per-VLAN flag, see below, except its

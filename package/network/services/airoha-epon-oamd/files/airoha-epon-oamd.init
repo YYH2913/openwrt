@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+
+START=96
+STOP=8
+USE_PROCD=1
+
+PROG=/usr/sbin/airoha-epon-oamd
+
+start_service() {
+	local enabled oam_enabled pon_mode
+
+	config_load airoha-gpon
+	config_get_bool enabled main enabled 0
+	config_get pon_mode main pon_mode gpon
+	enabled="${AIROHA_EPON_ENABLED_OVERRIDE:-$enabled}"
+	pon_mode="${AIROHA_EPON_PON_MODE_OVERRIDE:-$pon_mode}"
+	config_load airoha-epon
+	config_get_bool oam_enabled main enabled 1
+	oam_enabled="${AIROHA_EPON_OAM_ENABLED_OVERRIDE:-$oam_enabled}"
+	[ "$enabled" -eq 1 ] && [ "$oam_enabled" -eq 1 ] || return 0
+	case "$pon_mode" in
+		epon-10g-1g|epon-10g-10g) ;;
+		*) return 0 ;;
+	esac
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		--device /dev/airoha-epon-oam \
+		--status /var/run/airoha-epon-oamd/status.json \
+		--ready /var/run/airoha-epon-oamd/ready \
+		--ctc-platform /usr/libexec/airoha-epon-ctc-platform \
+		--pon-mode "$pon_mode"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

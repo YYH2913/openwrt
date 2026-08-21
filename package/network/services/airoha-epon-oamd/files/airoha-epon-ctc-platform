@@ -1,0 +1,1269 @@
+#!/bin/sh
+
+set -u
+
+state_dir="${AIROHA_CTC_STATE_DIR:-/var/run/airoha-epon-oamd/ctc-platform}"
+sys_net="${AIROHA_CTC_SYS_CLASS_NET:-/sys/class/net}"
+ethtool_command="${AIROHA_CTC_ETHTOOL:-/usr/sbin/ethtool}"
+ip_command="${AIROHA_CTC_IP:-/sbin/ip}"
+tc_command="${AIROHA_CTC_TC:-/sbin/tc}"
+nft_command="${AIROHA_CTC_NFT:-/usr/sbin/nft}"
+state_file="$state_dir/effective"
+uncertain_file="$state_dir/uncertain"
+lock_dir="$state_dir/lock"
+upstream_preference=20120
+downstream_preference=20121
+vlan_ingress_preference=20110
+vlan_egress_preference=20111
+vlan_mark_mask=0x00ff000f
+vlan_mark_inverse=0xff00fff0
+nft_table=airoha_ctc
+
+lock() {
+	local attempt=0
+
+	mkdir -p "$state_dir" || return 1
+	while ! mkdir "$lock_dir" 2>/dev/null; do
+		attempt=$((attempt + 1))
+		[ "$attempt" -lt 100 ] || return 1
+		sleep 0.05
+	done
+}
+
+unlock() {
+	rmdir "$lock_dir" 2>/dev/null || true
+}
+
+is_unsigned() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	return 0
+}
+
+valid_pause() {
+	case "$1" in -|0|1) return 0 ;; esac
+	return 1
+}
+
+valid_restart() {
+	case "$1" in -|1) return 0 ;; esac
+	return 1
+}
+
+valid_upstream() {
+	local packed="$1" old_ifs enabled cir cbs ebs
+
+	case "$packed" in -|0) return 0 ;; esac
+	old_ifs="$IFS"; IFS=,
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 4 ] || return 1
+	enabled="$1"; cir="$2"; cbs="$3"; ebs="$4"
+	[ "$enabled" = 1 ] || return 1
+	is_unsigned "$cir" && is_unsigned "$cbs" && is_unsigned "$ebs" || return 1
+	[ "$cir" -gt 0 ] && [ "$cir" -le 16777215 ] &&
+		[ "$cbs" -gt 0 ] && [ "$cbs" -le 16777215 ] &&
+		[ "$ebs" -le 16777215 ]
+}
+
+valid_downstream() {
+	local packed="$1" old_ifs enabled cir pir
+
+	case "$packed" in -|0) return 0 ;; esac
+	old_ifs="$IFS"; IFS=,
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -eq 3 ] || return 1
+	enabled="$1"; cir="$2"; pir="$3"
+	[ "$enabled" = 1 ] || return 1
+	is_unsigned "$cir" && is_unsigned "$pir" || return 1
+	[ "$cir" -gt 0 ] && [ "$cir" -le 16777215 ] &&
+		[ "$pir" -ge "$cir" ] && [ "$pir" -le 16777215 ]
+}
+
+valid_vlan_filter_tag() {
+	local tag="$1" value tpid vid digits
+
+	case "$tag" in 0x????????) ;; *) return 1 ;; esac
+	digits="${tag#0x}"
+	case "$digits" in *[!0-9a-fA-F]*) return 1 ;; esac
+	value=$((tag)); tpid=$(((value >> 16) & 65535)); vid=$((value & 4095))
+	[ "$vid" -ne 4095 ] || return 1
+	[ "$tpid" -eq 33024 ] || [ "$tpid" -eq 34984 ]
+}
+
+valid_vlan_output_tag() {
+	local tag="$1" value
+
+	valid_vlan_filter_tag "$tag" || return 1
+	value=$((tag))
+	[ $(((value >> 16) & 65535)) -eq 33024 ]
+}
+
+valid_vlan() {
+	local packed="$1" old_ifs mode default pair old new count=0
+	local seen_old=" " seen_new=" "
+
+	[ "$packed" != - ] || return 0
+	old_ifs="$IFS"; IFS=,
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -ge 1 ] || return 1
+	mode="$1"; shift
+	case "$mode" in
+		0) [ "$#" -eq 0 ]; return ;;
+		1|2|3|4) ;;
+		*) return 1 ;;
+	esac
+	[ "$#" -ge 1 ] || return 1
+	default="$1"; shift
+	valid_vlan_output_tag "$default" || return 1
+	[ "$mode" != 1 ] || { [ "$#" -eq 0 ]; return; }
+	while [ "$#" -gt 0 ]; do
+		pair="$1"; shift
+		case "$pair" in *=*) ;; *) return 1 ;; esac
+		old="${pair%%=*}"; new="${pair#*=}"
+		valid_vlan_filter_tag "$old" || return 1
+		if [ "$mode" -eq 4 ]; then
+			valid_vlan_filter_tag "$new" || return 1
+		else
+			valid_vlan_output_tag "$new" || return 1
+		fi
+		case "$seen_old" in *" $old "*) return 1 ;; esac
+		seen_old="$seen_old$old "
+		if [ "$mode" -eq 2 ]; then
+			case "$seen_new" in *" $new "*) return 1 ;; esac
+			seen_new="$seen_new$new "
+		elif [ "$mode" -eq 3 ]; then
+			[ $(((old >> 16) & 65535)) -eq 33024 ] || return 1
+		elif [ "$mode" -eq 4 ]; then
+			[ "$old" = "$new" ] || return 1
+		fi
+		count=$((count + 1))
+		[ "$count" -le 8 ] || return 1
+	done
+}
+
+valid_hex_length() {
+	local value="$1" length="$2"
+
+	[ "${#value}" -eq "$length" ] || return 1
+	case "$value" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+}
+
+valid_classification_match() {
+	local packed="$1" field operation value rest length
+
+	case "$packed" in *.*.*) ;; *) return 1 ;; esac
+	field="${packed%%.*}"; rest="${packed#*.}"
+	operation="${rest%%.*}"; value="${rest#*.}"
+	case "$value" in *.*) return 1 ;; esac
+	is_unsigned "$field" && is_unsigned "$operation" || return 1
+	[ "$field" -le 18 ] && [ "$operation" -le 7 ] || return 1
+	case "$field" in
+		0|1) length=12 ;;
+		2|7|8|9|12|18) length=2 ;;
+		3|4|10|11) length=4 ;;
+		5|6) length=8 ;;
+		13) length=6 ;;
+		14|15|16|17) length=32 ;;
+		*) return 1 ;;
+	esac
+	valid_hex_length "$value" "$length" || return 1
+	case "$field" in
+		2) [ $((0x$value)) -le 7 ] ;;
+		8|9) [ $((0x$value)) -le 63 ] ;;
+		12) [ "$value" = 04 ] || [ "$value" = 06 ] ;;
+		13) [ $((0x$value)) -le 1048575 ] ;;
+		16|17)
+			value="$(printf '%s\n' "$value" | sed 's/.*\(..\)$/\1/')"
+			[ $((0x$value)) -le 120 ]
+			;;
+		*) return 0 ;;
+	esac
+}
+
+valid_classification_rule() {
+	local packed="$1" old_ifs result matches precedence queue priority match count=0
+
+	old_ifs="$IFS"; IFS=+
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -ge 1 ] || return 1
+	result="$1"; shift; matches="$*"
+	old_ifs="$IFS"; IFS=,
+	set -- $result
+	IFS="$old_ifs"
+	[ "$#" -eq 3 ] || return 1
+	precedence="$1"; queue="$2"; priority="$3"
+	is_unsigned "$precedence" && is_unsigned "$queue" &&
+		is_unsigned "$priority" || return 1
+	[ "$precedence" -ge 1 ] && [ "$precedence" -le 255 ] &&
+		[ "$queue" -le 7 ] &&
+		{ [ "$priority" -le 7 ] || [ "$priority" -eq 255 ]; } || return 1
+	for match in $matches; do
+		valid_classification_match "$match" || return 1
+		count=$((count + 1))
+		[ "$count" -le 19 ] || return 1
+	done
+}
+
+valid_classification() {
+	local packed="$1" old_ifs rule count=0
+
+	case "$packed" in -|0) return 0 ;; esac
+	old_ifs="$IFS"; IFS=';'
+	set -- $packed
+	IFS="$old_ifs"
+	[ "$#" -ge 1 ] || return 1
+	for rule do
+		valid_classification_rule "$rule" || return 1
+		count=$((count + 1))
+		[ "$count" -le 64 ] || return 1
+	done
+}
+
+validate_effective() {
+	local aging="$1" port
+
+	shift
+	if [ "$aging" != - ]; then
+		is_unsigned "$aging" || return 1
+		[ "$aging" -le 42949672 ] || return 1
+	fi
+	[ "$#" -eq 32 ] || return 1
+	port=1
+	while [ "$port" -le 4 ]; do
+		valid_pause "$1" && valid_upstream "$2" && valid_downstream "$3" &&
+			valid_pause "$4" && valid_pause "$5" && valid_restart "$6" &&
+			valid_vlan "$7" && valid_classification "$8" ||
+			return 1
+		shift 8
+		port=$((port + 1))
+	done
+}
+
+pause_baseline() {
+	printf '%s/pause-lan%s\n' "$state_dir" "$1"
+}
+
+snapshot_pause() {
+	local port="$1" device="lan$1" baseline output autoneg rx tx temporary
+
+	baseline="$(pause_baseline "$port")"
+	[ ! -f "$baseline" ] || return 0
+	output="$("$ethtool_command" -a "$device" 2>/dev/null)" || return 1
+	autoneg="$(printf '%s\n' "$output" | awk '$1 == "Autonegotiate:" { print $2; exit }')"
+	rx="$(printf '%s\n' "$output" | awk '$1 == "RX:" { print $2; exit }')"
+	tx="$(printf '%s\n' "$output" | awk '$1 == "TX:" { print $2; exit }')"
+	case "$autoneg:$rx:$tx" in
+		on:on:on|on:on:off|on:off:on|on:off:off|\
+		off:on:on|off:on:off|off:off:on|off:off:off) ;;
+		*) return 1 ;;
+	esac
+	temporary="$(mktemp "$state_dir/.pause-lan${port}.XXXXXX")" || return 1
+	printf '%s %s %s\n' "$autoneg" "$rx" "$tx" > "$temporary" || return 1
+	mv -f "$temporary" "$baseline"
+}
+
+restore_pause() {
+	local port="$1" device="lan$1" baseline autoneg rx tx
+
+	baseline="$(pause_baseline "$port")"
+	[ -f "$baseline" ] || return 0
+	IFS=' ' read -r autoneg rx tx < "$baseline" || return 1
+	case "$autoneg:$rx:$tx" in
+		on:on:on|on:on:off|on:off:on|on:off:off|\
+		off:on:on|off:on:off|off:off:on|off:off:off) ;;
+		*) return 1 ;;
+	esac
+	"$ethtool_command" -A "$device" autoneg "$autoneg" rx "$rx" tx "$tx"
+}
+
+apply_pause() {
+	local port="$1" wanted="$2" setting
+
+	if [ "$wanted" = - ]; then
+		restore_pause "$port"
+		return
+	fi
+	snapshot_pause "$port" || return 1
+	[ "$wanted" -eq 0 ] && setting=off || setting=on
+	"$ethtool_command" -A "lan$port" autoneg off rx "$setting" tx "$setting"
+}
+
+phy_baseline() {
+	printf '%s/phy-lan%s\n' "$state_dir" "$1"
+}
+
+snapshot_phy() {
+	local port="$1" baseline flags state temporary
+
+	baseline="$(phy_baseline "$port")"
+	[ ! -f "$baseline" ] || return 0
+	flags="$(cat "$sys_net/lan$port/flags")" || return 1
+	case "$flags" in 0x[0-9a-fA-F]*) ;; *) return 1 ;; esac
+	[ $((flags & 1)) -eq 0 ] && state=down || state=up
+	temporary="$(mktemp "$state_dir/.phy-lan${port}.XXXXXX")" || return 1
+	printf '%s\n' "$state" > "$temporary" || return 1
+	mv -f "$temporary" "$baseline"
+}
+
+restore_phy() {
+	local port="$1" baseline state
+
+	baseline="$(phy_baseline "$port")"
+	[ -f "$baseline" ] || return 0
+	state="$(cat "$baseline")" || return 1
+	case "$state" in up|down) ;; *) return 1 ;; esac
+	"$ip_command" link set dev "lan$port" "$state"
+}
+
+apply_phy() {
+	local port="$1" wanted="$2" state
+
+	if [ "$wanted" = - ]; then
+		restore_phy "$port"
+		return
+	fi
+	snapshot_phy "$port" || return 1
+	[ "$wanted" -eq 0 ] && state=down || state=up
+	"$ip_command" link set dev "lan$port" "$state"
+}
+
+autoneg_baseline() {
+	printf '%s/autoneg-lan%s\n' "$state_dir" "$1"
+}
+
+snapshot_autoneg() {
+	local port="$1" device="lan$1" baseline output autoneg speed duplex temporary
+
+	baseline="$(autoneg_baseline "$port")"
+	[ ! -f "$baseline" ] || return 0
+	output="$("$ethtool_command" "$device" 2>/dev/null)" || return 1
+	autoneg="$(printf '%s\n' "$output" |
+		awk '$1 == "Auto-negotiation:" { print $2; exit }')"
+	speed="$(printf '%s\n' "$output" |
+		awk '$1 == "Speed:" { sub(/Mb\/s$/, "", $2); print $2; exit }')"
+	duplex="$(printf '%s\n' "$output" |
+		awk '$1 == "Duplex:" { print tolower($2); exit }')"
+	case "$autoneg" in
+		on) speed=0; duplex=full ;;
+		off)
+			is_unsigned "$speed" || return 1
+			case "$duplex" in full|half) ;; *) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	temporary="$(mktemp "$state_dir/.autoneg-lan${port}.XXXXXX")" || return 1
+	printf '%s %s %s\n' "$autoneg" "$speed" "$duplex" > "$temporary" ||
+		return 1
+	mv -f "$temporary" "$baseline"
+}
+
+restore_autoneg() {
+	local port="$1" baseline autoneg speed duplex
+
+	baseline="$(autoneg_baseline "$port")"
+	[ -f "$baseline" ] || return 0
+	IFS=' ' read -r autoneg speed duplex < "$baseline" || return 1
+	case "$autoneg" in
+		on) "$ethtool_command" -s "lan$port" autoneg on ;;
+		off)
+			is_unsigned "$speed" || return 1
+			case "$duplex" in full|half) ;; *) return 1 ;; esac
+			"$ethtool_command" -s "lan$port" autoneg off \
+				speed "$speed" duplex "$duplex"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+apply_autoneg() {
+	local port="$1" wanted="$2"
+
+	if [ "$wanted" = - ]; then
+		restore_autoneg "$port"
+		return
+	fi
+	snapshot_autoneg "$port" || return 1
+	if [ "$wanted" -eq 0 ]; then
+		"$ethtool_command" -s "lan$port" autoneg off speed 100 duplex full
+	else
+		"$ethtool_command" -s "lan$port" autoneg on
+	fi
+}
+
+apply_autoneg_restart() {
+	local port="$1" wanted="$2"
+
+	[ "$wanted" = - ] && return 0
+	[ "$wanted" = 1 ] || return 1
+	"$ethtool_command" -r "lan$port"
+}
+
+ensure_clsact() {
+	local device="$1"
+
+	"$tc_command" qdisc show dev "$device" 2>/dev/null |
+		grep -q '[[:space:]]clsact[[:space:]]' ||
+		"$tc_command" qdisc add dev "$device" clsact
+}
+
+clear_filter() {
+	local device="$1" hook="$2" preference="$3"
+
+	"$tc_command" filter del dev "$device" "$hook" protocol all \
+		pref "$preference" flower 2>/dev/null || true
+}
+
+vlan_match() {
+	local value=$(( $1 ))
+
+	printf 'ether type 0x%04x @ll,112,16 0x%04x' \
+		"$(((value >> 16) & 65535))" "$((value & 65535))"
+}
+
+vlan_set() {
+	local value=$(( $1 ))
+
+	printf '@ll,96,16 set 0x%04x @ll,112,16 set 0x%04x' \
+		"$(((value >> 16) & 65535))" "$((value & 65535))"
+}
+
+nft_emit() {
+	printf '%s\n' "$1" >> "$2"
+}
+
+format_mac() {
+	printf '%s\n' "$1" | sed 's/../&:/g;s/:$//'
+}
+
+format_ipv4() {
+	local value="$1" first second third fourth
+
+	first="$(printf '%s\n' "$value" | cut -c1-2)"
+	second="$(printf '%s\n' "$value" | cut -c3-4)"
+	third="$(printf '%s\n' "$value" | cut -c5-6)"
+	fourth="$(printf '%s\n' "$value" | cut -c7-8)"
+	printf '%u.%u.%u.%u\n' "$((0x$first))" "$((0x$second))" \
+		"$((0x$third))" "$((0x$fourth))"
+}
+
+format_ipv6() {
+	printf '%s\n' "$1" | sed 's/..../&:/g;s/:$//'
+}
+
+format_ipv6_prefix() {
+	local value="$1" length address
+
+	length="$(printf '%s\n' "$value" | sed 's/.*\(..\)$/\1/')"
+	address="$(printf '%s\n' "$value" | sed 's/..$//')00"
+	printf '%s/%u\n' "$(format_ipv6 "$address")" "$((0x$length))"
+}
+
+format_ipv6_prefix_mask() {
+	local value="$1" length mask= octet byte=0
+
+	length="$(printf '%s\n' "$value" | sed 's/.*\(..\)$/\1/')"
+	length="$((0x$length))"
+	while [ "$byte" -lt 16 ]; do
+		if [ "$length" -ge 8 ]; then
+			octet=255
+			length=$((length - 8))
+		elif [ "$length" -gt 0 ]; then
+			octet=$(((255 << (8 - length)) & 255))
+			length=0
+		else
+			octet=0
+		fi
+		mask="$mask$(printf '%02x' "$octet")"
+		byte=$((byte + 1))
+	done
+	format_ipv6 "$mask"
+}
+
+format_ipv6_prefix_mask_hex() {
+	local value="$1" length mask= octet byte=0
+
+	length="$(printf '%s\n' "$value" | sed 's/.*\(..\)$/\1/')"
+	length="$((0x$length))"
+	while [ "$byte" -lt 16 ]; do
+		if [ "$length" -ge 8 ]; then
+			octet=255
+			length=$((length - 8))
+		elif [ "$length" -gt 0 ]; then
+			octet=$(((255 << (8 - length)) & 255))
+			length=0
+		else
+			octet=0
+		fi
+		mask="$mask$(printf '%02x' "$octet")"
+		byte=$((byte + 1))
+	done
+	printf '%s\n' "$mask"
+}
+
+classification_fixed_condition() {
+	local actual="$1" operation="$2" expected="$3"
+
+	case "$operation" in
+		0|6) printf '%s\n' __false__ ;;
+		1) [ "$actual" -eq "$expected" ] && printf '\n' || printf '%s\n' __false__ ;;
+		2) [ "$actual" -ne "$expected" ] && printf '\n' || printf '%s\n' __false__ ;;
+		3) [ "$actual" -le "$expected" ] && printf '\n' || printf '%s\n' __false__ ;;
+		4) [ "$actual" -ge "$expected" ] && printf '\n' || printf '%s\n' __false__ ;;
+		5|7) printf '\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+classification_value_condition() {
+	local expression="$1" exists="$2" missing="$3" operation="$4" value="$5"
+	local relation
+
+	case "$operation" in
+		0) printf '%s\n' __false__; return ;;
+		5) printf '%s\n' "$exists"; return ;;
+		6) printf '%s\n' "$missing"; return ;;
+		7) printf '\n'; return ;;
+		1) relation='==' ;;
+		2) relation='!=' ;;
+		3) relation='<=' ;;
+		4) relation='>=' ;;
+		*) return 1 ;;
+	esac
+	if [ -n "$exists" ]; then
+		printf '%s %s %s %s\n' "$exists" "$expression" "$relation" "$value"
+	else
+		printf '%s %s %s\n' "$expression" "$relation" "$value"
+	fi
+}
+
+classification_missing_condition() {
+	case "$1" in
+		6|7) printf '\n' ;;
+		0|1|2|3|4|5) printf '%s\n' __false__ ;;
+		*) return 1 ;;
+	esac
+}
+
+classification_present_condition() {
+	classification_value_condition "$1" '' __false__ "$2" "$3"
+}
+
+classification_raw_prefix_condition() {
+	local offset="$1" operation="$2" value="$3" address mask relation
+
+	address="$(printf '%s\n' "$value" | sed 's/..$//')00"
+	mask="$(format_ipv6_prefix_mask_hex "$value")" || return 1
+	case "$operation" in
+		0) printf '%s\n' __false__ ;;
+		1) relation='==' ;;
+		2) relation='!=' ;;
+		3) relation='<=' ;;
+		4) relation='>=' ;;
+		5|7) printf '\n'; return ;;
+		6) printf '%s\n' __false__; return ;;
+		*) return 1 ;;
+	esac
+	printf '@ll,%u,128 & 0x%s %s 0x%s & 0x%s\n' "$offset" "$mask" \
+		"$relation" "$address" "$mask"
+}
+
+classification_ipv6_order_byte() {
+	local value="$1" byte="$2" start
+
+	start=$((byte * 2 + 1))
+	printf '%s\n' "$value" | cut -c"$start-$((start + 1))"
+}
+
+classification_emit_ipv6_order_chain() {
+	local candidate="$1" name="$2" operation="$3" value="$4" offset="$5"
+	local byte expected actual success failure
+
+	nft_emit "add chain bridge $nft_table $name" "$candidate"
+	for byte in 3 2 1 0 7 6 5 4 11 10 9 8 15 14 13 12; do
+		expected=$((0x$(classification_ipv6_order_byte "$value" "$byte")))
+		actual="@ll,$((offset + byte * 8)),8"
+		if [ "$operation" -eq 3 ]; then
+			success='<'
+			failure='>'
+		else
+			success='>'
+			failure='<'
+		fi
+		if { [ "$success" = '<' ] && [ "$expected" -gt 0 ]; } ||
+		   { [ "$success" = '>' ] && [ "$expected" -lt 255 ]; }; then
+			nft_emit "add rule bridge $nft_table $name $actual $success $expected meta mark set meta mark | 0x80000000 return" "$candidate"
+		fi
+		if { [ "$failure" = '<' ] && [ "$expected" -gt 0 ]; } ||
+		   { [ "$failure" = '>' ] && [ "$expected" -lt 255 ]; }; then
+			nft_emit "add rule bridge $nft_table $name $actual $failure $expected return" "$candidate"
+		fi
+	done
+	nft_emit "add rule bridge $nft_table $name meta mark set meta mark | 0x80000000 return" "$candidate"
+}
+
+classification_path_select() {
+	local layout="$1" protocol="$2" mark="$3" ppp_proto_offset version_offset
+	local ihl transport
+
+	classification_logical_tag=0
+	case "$layout" in
+		marked)
+			classification_path_condition="meta mark & $vlan_mark_mask == $mark @ll,96,16 == 0x8100"
+			classification_proto_offset=128
+			;;
+		untagged)
+			classification_path_condition="meta mark & $vlan_mark_mask != $mark @ll,96,16 != 0x8100 @ll,96,16 != 0x88a8 @ll,96,16 != 0x9100"
+			classification_proto_offset=96
+			;;
+		tagged)
+			classification_path_condition="meta mark & $vlan_mark_mask != $mark @ll,96,16 { 0x8100, 0x88a8, 0x9100 } @ll,128,16 != 0x8100 @ll,128,16 != 0x88a8 @ll,128,16 != 0x9100"
+			classification_proto_offset=128
+			classification_logical_tag=1
+			;;
+		qinq)
+			classification_path_condition="meta mark & $vlan_mark_mask != $mark @ll,96,16 { 0x8100, 0x88a8, 0x9100 } @ll,128,16 { 0x8100, 0x88a8, 0x9100 }"
+			classification_proto_offset=160
+			classification_logical_tag=1
+			;;
+		*) return 1 ;;
+	esac
+	classification_ip_kind=0
+	classification_l4_present=0
+	classification_l4_offset=0
+	classification_l3_offset=$((classification_proto_offset + 16))
+	classification_ethtype_fixed=
+	classification_ethtype_expression="@ll,$classification_proto_offset,16"
+	ppp_proto_offset=$((classification_l3_offset + 48))
+	case "$protocol" in
+		any) return 0 ;;
+		nonip)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 != 0x0800 @ll,$classification_proto_offset,16 != 0x86dd @ll,$classification_proto_offset,16 != 0x8864"
+			;;
+		pppother)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 == 0x8864 @ll,$ppp_proto_offset,16 != 0x0021 @ll,$ppp_proto_offset,16 != 0x0057"
+			classification_ethtype_fixed=0x8864
+			;;
+		ipv4|ipv4invalid|ipv4frag|ipv4other|ipv4tcp*|ipv4udp*)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 == 0x0800"
+			classification_ethtype_fixed=0x0800
+			;;
+		ipv6|ipv6invalid|ipv6other|ipv6tcp|ipv6udp)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 == 0x86dd"
+			classification_ethtype_fixed=0x86dd
+			;;
+		ppp4|ppp4invalid|ppp4frag|ppp4other|ppp4tcp*|ppp4udp*)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 == 0x8864 @ll,$ppp_proto_offset,16 == 0x0021"
+			classification_l3_offset=$((classification_l3_offset + 64))
+			classification_ethtype_fixed=0x0800
+			;;
+		ppp6|ppp6invalid|ppp6other|ppp6tcp|ppp6udp)
+			classification_path_condition="$classification_path_condition @ll,$classification_proto_offset,16 == 0x8864 @ll,$ppp_proto_offset,16 == 0x0057"
+			classification_l3_offset=$((classification_l3_offset + 64))
+			classification_ethtype_fixed=0x86dd
+			;;
+		*) return 1 ;;
+	esac
+	version_offset=$classification_l3_offset
+	case "$protocol" in
+		ipv4invalid|ppp4invalid)
+			classification_path_condition="$classification_path_condition @ll,$version_offset,4 != 4"
+			;;
+		ipv6invalid|ppp6invalid)
+			classification_path_condition="$classification_path_condition @ll,$version_offset,4 != 6"
+			;;
+		ipv4*|ppp4*)
+			classification_path_condition="$classification_path_condition @ll,$version_offset,4 == 4"
+			classification_ip_kind=4
+			;;
+		ipv6*|ppp6*)
+			classification_path_condition="$classification_path_condition @ll,$version_offset,4 == 6"
+			classification_ip_kind=6
+			;;
+	esac
+	case "$protocol" in
+		ipv4frag|ppp4frag)
+			classification_path_condition="$classification_path_condition @ll,$((classification_l3_offset + 48)),16 & 0x3fff != 0"
+			;;
+		ipv4other|ppp4other)
+			classification_path_condition="$classification_path_condition @ll,$((classification_l3_offset + 48)),16 & 0x3fff == 0 @ll,$((classification_l3_offset + 72)),8 != 6 @ll,$((classification_l3_offset + 72)),8 != 17"
+			;;
+		ipv4tcp*|ppp4tcp*|ipv4udp*|ppp4udp*)
+			ihl="${protocol##*[a-z]}"
+			case "$protocol" in *tcp*) transport=6 ;; *) transport=17 ;; esac
+			classification_path_condition="$classification_path_condition @ll,$((classification_l3_offset + 48)),16 & 0x3fff == 0 @ll,$((classification_l3_offset + 72)),8 == $transport @ll,$((classification_l3_offset + 4)),4 == $ihl"
+			classification_l4_present=1
+			classification_l4_offset=$((classification_l3_offset + ihl * 32))
+			;;
+		ipv6tcp|ppp6tcp|ipv6udp|ppp6udp)
+			case "$protocol" in *tcp) transport=6 ;; *) transport=17 ;; esac
+			classification_path_condition="$classification_path_condition @ll,$((classification_l3_offset + 48)),8 == $transport"
+			classification_l4_present=1
+			classification_l4_offset=$((classification_l3_offset + 320))
+			;;
+		ipv6other|ppp6other)
+			classification_path_condition="$classification_path_condition @ll,$((classification_l3_offset + 48)),8 != 6 @ll,$((classification_l3_offset + 48)),8 != 17"
+			;;
+	esac
+}
+
+classification_match_condition() {
+	local field="$1" operation="$2" value="$3" set_name="$4" expression offset
+	local expected
+
+	case "$field" in
+		0) classification_present_condition 'ether daddr' "$operation" "$(format_mac "$value")" ;;
+		1) classification_present_condition 'ether saddr' "$operation" "$(format_mac "$value")" ;;
+		2)
+			if [ "$classification_logical_tag" -eq 1 ]; then
+				classification_present_condition '@ll,112,3' "$operation" "$((0x$value))"
+			else
+				classification_fixed_condition 0 "$operation" "$((0x$value))"
+			fi
+			;;
+		3)
+			if [ "$classification_logical_tag" -eq 1 ]; then
+				classification_present_condition '@ll,116,12' "$operation" "$((0x$value))"
+			else
+				classification_fixed_condition 1 "$operation" "$((0x$value))"
+			fi
+			;;
+		4)
+			if [ -n "$classification_ethtype_fixed" ]; then
+				classification_fixed_condition "$((classification_ethtype_fixed))" \
+					"$operation" "$((0x$value))"
+			else
+				classification_present_condition "$classification_ethtype_expression" \
+					"$operation" "0x$value"
+			fi
+			;;
+		5|6|7|8)
+			[ "$classification_ip_kind" -eq 4 ] || {
+				classification_missing_condition "$operation"; return
+			}
+			case "$field" in
+				5) offset=$((classification_l3_offset + 128)); expected="0x$value"; expression="@ll,$offset,32" ;;
+				6) offset=$((classification_l3_offset + 96)); expected="0x$value"; expression="@ll,$offset,32" ;;
+				7) offset=$((classification_l3_offset + 72)); expected="$((0x$value))"; expression="@ll,$offset,8" ;;
+				8) offset=$((classification_l3_offset + 8)); expected="$((0x$value))"; expression="@ll,$offset,6" ;;
+			esac
+			classification_present_condition "$expression" "$operation" "$expected"
+			;;
+		9|13|14|15|16|17|18)
+			[ "$classification_ip_kind" -eq 6 ] || {
+				classification_missing_condition "$operation"; return
+			}
+			case "$field" in
+				9) offset=$((classification_l3_offset + 4)); classification_present_condition "@ll,$offset,8" "$operation" "$((0x$value))" ;;
+				13) offset=$((classification_l3_offset + 12)); classification_present_condition "@ll,$offset,20" "$operation" "0x$value" ;;
+				14|15)
+					[ "$field" -eq 14 ] && offset=$((classification_l3_offset + 192)) || offset=$((classification_l3_offset + 64))
+					if [ "$operation" -eq 3 ] || [ "$operation" -eq 4 ]; then
+						printf '%s\n' __ipv6_order__
+					else
+						classification_present_condition "@ll,$offset,128" "$operation" "0x$value"
+					fi
+					;;
+				16|17)
+					[ "$field" -eq 16 ] && offset=$((classification_l3_offset + 192)) || offset=$((classification_l3_offset + 64))
+					classification_raw_prefix_condition "$offset" "$operation" "$value"
+					;;
+				18) offset=$((classification_l3_offset + 48)); classification_present_condition "@ll,$offset,8" "$operation" "$((0x$value))" ;;
+			esac
+			;;
+		10|11)
+			[ "$classification_l4_present" -eq 1 ] || {
+				classification_missing_condition "$operation"; return
+			}
+			offset=$classification_l4_offset
+			[ "$field" -eq 11 ] && offset=$((offset + 16))
+			classification_present_condition "@ll,$offset,16" "$operation" "$((0x$value))"
+			;;
+		12)
+			[ "$classification_ip_kind" -ne 0 ] || {
+				classification_missing_condition "$operation"; return
+			}
+			classification_fixed_condition "$classification_ip_kind" "$operation" "$((0x$value))"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+classification_emit_rule() {
+	local candidate="$1" port="$2" packed="$3" rule_index="$4"
+	local old_ifs result matches precedence queue priority match field rest
+	local operation value layout protocol protocols mark condition part action skip
+	local match_index needs_protocol=0 needs_l4=0 ihl path_index=0 offset priority_tci
+	local order_chains compare_chain eval_chain
+
+	old_ifs="$IFS"; IFS=+
+	set -- $packed
+	IFS="$old_ifs"
+	result="$1"; shift; matches="$*"
+	old_ifs="$IFS"; IFS=,
+	set -- $result
+	IFS="$old_ifs"
+	precedence="$1"; queue="$2"; priority="$3"
+	mark="$(printf '0x%08x' "$((0x00c70000 | port))")"
+	match_index=0
+	for match in $matches; do
+		field="${match%%.*}"; rest="${match#*.}"
+		operation="${rest%%.*}"; value="${rest#*.}"
+		[ "$field" -lt 4 ] || needs_protocol=1
+		case "$field" in 10|11) needs_l4=1 ;; esac
+		match_index=$((match_index + 1))
+	done
+	if [ "$needs_protocol" -eq 0 ]; then
+		protocols=any
+	elif [ "$needs_l4" -eq 0 ]; then
+		protocols='nonip pppother ipv4 ipv4invalid ipv6 ipv6invalid ppp4 ppp4invalid ppp6 ppp6invalid'
+	else
+		protocols='nonip pppother ipv4invalid ipv6invalid ppp4invalid ppp6invalid ipv4frag ipv4other ipv6other ipv6tcp ipv6udp ppp4frag ppp4other ppp6other ppp6tcp ppp6udp'
+		ihl=0
+		while [ "$ihl" -le 15 ]; do
+			protocols="$protocols ipv4tcp$ihl ipv4udp$ihl ppp4tcp$ihl ppp4udp$ihl"
+			ihl=$((ihl + 1))
+		done
+	fi
+	for layout in marked untagged tagged qinq; do
+		for protocol in $protocols; do
+			path_index=$((path_index + 1))
+			classification_path_select "$layout" "$protocol" "$mark" || return 1
+			condition="$classification_path_condition"
+			order_chains=
+			skip=0
+			match_index=0
+			for match in $matches; do
+				field="${match%%.*}"; rest="${match#*.}"
+				operation="${rest%%.*}"; value="${rest#*.}"
+				part="$(classification_match_condition "$field" "$operation" \
+					"$value" -)" || return 1
+				if [ "$part" = __false__ ]; then
+					skip=1
+					break
+				fi
+				if [ "$part" = __ipv6_order__ ]; then
+					if [ "$field" -eq 14 ]; then
+						offset=$((classification_l3_offset + 192))
+					else
+						offset=$((classification_l3_offset + 64))
+					fi
+					compare_chain="c${port}r${rule_index}p${path_index}m${match_index}"
+					classification_emit_ipv6_order_chain "$candidate" \
+						"$compare_chain" "$operation" "$value" "$offset" ||
+						return 1
+					order_chains="$order_chains${order_chains:+
+}$compare_chain"
+				elif [ -n "$part" ]; then
+					condition="$condition $part"
+				fi
+				match_index=$((match_index + 1))
+			done
+			[ "$skip" -eq 0 ] || continue
+			action="meta priority set $queue"
+			if [ "$priority" -ne 255 ] && [ "$layout" != untagged ]; then
+				priority_tci="$(printf '0x%04x' "$((priority << 13))")"
+				action="$action @ll,112,16 set @ll,112,16 & 0x1fff | $priority_tci"
+			fi
+			if [ -z "$order_chains" ]; then
+				nft_emit "add rule bridge $nft_table classification_lan$port $condition $action return comment \"precedence-$precedence\"" "$candidate"
+				continue
+			fi
+			eval_chain="c${port}r${rule_index}p${path_index}e"
+			nft_emit "add chain bridge $nft_table $eval_chain" "$candidate"
+			old_ifs="$IFS"; IFS='
+'
+			for compare_chain in $order_chains; do
+				nft_emit "add rule bridge $nft_table $eval_chain meta mark set meta mark & 0x7fffffff" "$candidate"
+				nft_emit "add rule bridge $nft_table $eval_chain jump $compare_chain" "$candidate"
+				nft_emit "add rule bridge $nft_table $eval_chain meta mark & 0x80000000 == 0 return" "$candidate"
+			done
+			IFS="$old_ifs"
+			nft_emit "add rule bridge $nft_table $eval_chain return" "$candidate"
+			nft_emit "add rule bridge $nft_table classification_lan$port $condition jump $eval_chain" "$candidate"
+			nft_emit "add rule bridge $nft_table classification_lan$port meta mark & 0x80000000 != 0 meta mark set meta mark & 0x7fffffff $action return comment \"precedence-$precedence\"" "$candidate"
+		done
+	done
+}
+
+classification_emit_port() {
+	local candidate="$1" port="$2" packed="$3" old_ifs rule rule_index=0
+
+	[ "$packed" != - ] || return 0
+	nft_emit "add chain bridge $nft_table classification_lan$port" "$candidate"
+	nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" jump classification_lan$port" "$candidate"
+	if [ "$packed" = 0 ]; then
+		nft_emit "add rule bridge $nft_table classification_lan$port @ll,96,16 { 0x8100, 0x88a8, 0x9100 } meta priority set 0 @ll,112,16 set @ll,112,16 & 0x1fff return" "$candidate"
+		nft_emit "add rule bridge $nft_table classification_lan$port meta priority set 0 return" "$candidate"
+		return 0
+	fi
+	nft_emit "add rule bridge $nft_table classification_lan$port meta mark set meta mark & 0x7fffffff meta priority set 0" "$candidate"
+	nft_emit "add rule bridge $nft_table classification_lan$port meta mark & $vlan_mark_mask != 0x00c7000$port @ll,96,16 { 0x8100, 0x88a8, 0x9100 } meta priority set @ll,112,3 map { 0 : 0, 1 : 1, 2 : 2, 3 : 3, 4 : 4, 5 : 5, 6 : 6, 7 : 7 }" "$candidate"
+	old_ifs="$IFS"; IFS=';'
+	set -- $packed
+	IFS="$old_ifs"
+	for rule do
+		classification_emit_rule "$candidate" "$port" "$rule" "$rule_index" || return 1
+		rule_index=$((rule_index + 1))
+	done
+}
+
+apply_nft_rules() {
+	local candidate active=0 current=0 result=0 port packed old_ifs mode default
+	local classification pair old new mark seen_new new_tci old_tci remaining
+	local nft_arguments="$*"
+
+	candidate="$(mktemp "$state_dir/.vlan.XXXXXX")" || return 1
+	if "$nft_command" list table bridge "$nft_table" >/dev/null 2>&1; then
+		current=1
+		nft_emit "delete table bridge $nft_table" "$candidate"
+	fi
+	port=1
+	while [ "$#" -ge 2 ]; do
+		packed="$1"; classification="$2"; shift 2
+		case "$packed" in -|0) ;; *) active=1 ;; esac
+		[ "$classification" = - ] || active=1
+		port=$((port + 1))
+	done
+	if [ "$active" -eq 1 ]; then
+		nft_emit "add table bridge $nft_table" "$candidate"
+		port=1
+		set -- $nft_arguments
+		while [ "$#" -ge 2 ]; do
+			packed="$1"; shift 2
+			mode="${packed%%,*}"
+			if [ "$mode" = 3 ]; then
+				nft_emit "add map bridge $nft_table n1_lan$port { typeof ether saddr . @ll,112,16 : @ll,112,16; flags dynamic,timeout; timeout 300s; size 32; }" "$candidate"
+			fi
+			port=$((port + 1))
+		done
+		nft_emit "add chain bridge $nft_table prerouting { type filter hook prerouting priority -200; policy accept; }" "$candidate"
+		nft_emit "add chain bridge $nft_table postrouting { type filter hook postrouting priority 200; policy accept; }" "$candidate"
+		port=1
+		set -- $nft_arguments
+		while [ "$#" -ge 2 ]; do
+			packed="$1"; classification="$2"; shift 2
+			remaining="$*"
+			classification_emit_port "$candidate" "$port" "$classification" || {
+				result=1
+				break
+			}
+			mode="${packed%%,*}"
+			case "$mode" in -|0) port=$((port + 1)); continue ;; esac
+			mark="$(printf '0x%08x' "$((0x00c70000 | port))")"
+			nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" meta mark & $vlan_mark_mask == $mark meta mark set meta mark & $vlan_mark_inverse accept" "$candidate"
+			old_ifs="$IFS"; IFS=,
+			set -- $packed
+			IFS="$old_ifs"
+			mode="$1"; default="$2"; shift 2
+			nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" $(vlan_match "$default") meta mark set (meta mark & $vlan_mark_inverse) | $mark accept" "$candidate"
+			case "$mode" in
+				1) ;;
+				2)
+					for pair do
+						old="${pair%%=*}"; new="${pair#*=}"
+						nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" $(vlan_match "$old") $(vlan_set "$new") accept" "$candidate"
+						nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" $(vlan_match "$new") $(vlan_set "$old") accept" "$candidate"
+					done
+					;;
+				3)
+					for pair do
+						old="${pair%%=*}"; new="${pair#*=}"
+						new_tci="$(printf '0x%04x' "$((new & 65535))")"
+						nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" $(vlan_match "$old") update @n1_lan$port { ether saddr . ($new_tci & 0xffff) : @ll,112,16 } $(vlan_set "$new") accept" "$candidate"
+					done
+					seen_new=" "
+					for pair do
+						old="${pair%%=*}"; new="${pair#*=}"
+						case "$seen_new" in *" $new "*) continue ;; esac
+						seen_new="$seen_new$new "
+						new_tci="$(printf '0x%04x' "$((new & 65535))")"
+						old_tci="$(printf '0x%04x' "$((old & 65535))")"
+						nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" $(vlan_match "$new") @ll,112,16 set ether daddr . @ll,112,16 map @n1_lan$port accept" "$candidate"
+						nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" $(vlan_match "$new") @ll,112,16 set $old_tci accept" "$candidate"
+					done
+					;;
+				4)
+					for pair do
+						old="${pair%%=*}"
+						nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" $(vlan_match "$old") accept" "$candidate"
+						nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" $(vlan_match "$old") accept" "$candidate"
+					done
+					;;
+			esac
+			nft_emit "add rule bridge $nft_table prerouting iifname \"lan$port\" drop" "$candidate"
+			nft_emit "add rule bridge $nft_table postrouting oifname \"lan$port\" drop" "$candidate"
+			set -- $remaining
+			port=$((port + 1))
+		done
+	fi
+	if [ "$result" -eq 0 ] && { [ "$current" -eq 1 ] || [ "$active" -eq 1 ]; }; then
+		"$nft_command" -f "$candidate" || result=1
+	fi
+	rm -f "$candidate"
+	return "$result"
+}
+
+clear_vlan_tc() {
+	local port="$1" device="lan$1"
+
+	clear_filter "$device" ingress "$vlan_ingress_preference"
+	clear_filter "$device" egress "$vlan_egress_preference"
+}
+
+apply_vlan_tc() {
+	local port="$1" packed="$2" device="lan$1" mode default value
+	local vid priority dei mark
+
+	clear_vlan_tc "$port"
+	case "$packed" in -|0) return 0 ;; esac
+	mode="${packed%%,*}"
+	default="${packed#*,}"; default="${default%%,*}"
+	value=$((default)); vid=$((value & 4095))
+	priority=$(((value >> 13) & 7)); dei=$(((value >> 12) & 1))
+	mark="$(printf '0x%08x' "$((0x00c70000 | port))")"
+	ensure_clsact "$device" || return 1
+	"$tc_command" filter replace dev "$device" ingress protocol all \
+		pref "$vlan_ingress_preference" flower skip_hw num_of_vlans 0 \
+		action vlan push protocol 802.1Q id "$vid" priority "$priority" \
+		dei "$dei" pipe action skbedit mark "$mark/$vlan_mark_mask" pipe \
+		action continue || return 1
+	"$tc_command" filter replace dev "$device" egress protocol all \
+		pref "$vlan_egress_preference" handle "$mark/$vlan_mark_mask" fw \
+		action vlan pop pipe action skbedit mark "0/$vlan_mark_mask" pipe \
+		action continue
+}
+
+apply_upstream() {
+	local port="$1" packed="$2" device="lan$1" old_ifs enabled cir cbs ebs burst
+
+	clear_filter "$device" ingress "$upstream_preference"
+	case "$packed" in -|0) return 0 ;; esac
+	old_ifs="$IFS"; IFS=,
+	set -- $packed
+	IFS="$old_ifs"
+	enabled="$1"; cir="$2"; cbs="$3"; ebs="$4"
+	[ "$enabled" = 1 ] || return 1
+	burst=$((cbs + ebs))
+	ensure_clsact "$device" || return 1
+	"$tc_command" filter replace dev "$device" ingress protocol all \
+		pref "$upstream_preference" handle "0xc7c00$port" flower skip_hw \
+		action police rate "${cir}kbit" burst "${burst}b" \
+		conform-exceed drop/pipe
+}
+
+apply_downstream() {
+	local port="$1" packed="$2" device="lan$1" old_ifs enabled cir pir
+
+	clear_filter "$device" egress "$downstream_preference"
+	case "$packed" in -|0) return 0 ;; esac
+	old_ifs="$IFS"; IFS=,
+	set -- $packed
+	IFS="$old_ifs"
+	enabled="$1"; cir="$2"; pir="$3"
+	[ "$enabled" = 1 ] || return 1
+	ensure_clsact "$device" || return 1
+	if [ "$pir" -gt "$cir" ]; then
+		"$tc_command" filter replace dev "$device" egress protocol all \
+			pref "$downstream_preference" handle "0xc7d00$port" flower skip_hw \
+			action police rate "${cir}kbit" burst 64kb \
+			peakrate "${pir}kbit" mtu 64kb conform-exceed drop/pipe
+	else
+		"$tc_command" filter replace dev "$device" egress protocol all \
+			pref "$downstream_preference" handle "0xc7d00$port" flower skip_hw \
+			action police rate "${cir}kbit" burst 64kb \
+			conform-exceed drop/pipe
+	fi
+}
+
+valid_bridge_name() {
+	case "$1" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	return 0
+}
+
+lan_bridges() {
+	local port master bridge seen=" "
+
+	for port in 1 2 3 4; do
+		master="$sys_net/lan$port/master"
+		[ -L "$master" ] || continue
+		bridge="$(basename "$(readlink "$master")")"
+		valid_bridge_name "$bridge" || return 1
+		case "$seen" in *" $bridge "*) continue ;; esac
+		[ -f "$sys_net/$bridge/bridge/ageing_time" ] || return 1
+		printf '%s\n' "$bridge"
+		seen="$seen$bridge "
+	done
+}
+
+snapshot_aging() {
+	local baseline="$state_dir/aging" temporary bridge value count=0
+
+	[ ! -f "$baseline" ] || return 0
+	temporary="$(mktemp "$state_dir/.aging.XXXXXX")" || return 1
+	for bridge in $(lan_bridges); do
+		value="$(cat "$sys_net/$bridge/bridge/ageing_time")" || return 1
+		is_unsigned "$value" || return 1
+		printf '%s %s\n' "$bridge" "$value" >> "$temporary" || return 1
+		count=$((count + 1))
+	done
+	[ "$count" -gt 0 ] || return 1
+	mv -f "$temporary" "$baseline"
+}
+
+restore_aging() {
+	local baseline="$state_dir/aging" bridge value result=0
+
+	[ -f "$baseline" ] || return 0
+	while IFS=' ' read -r bridge value; do
+		valid_bridge_name "$bridge" && is_unsigned "$value" &&
+			[ -w "$sys_net/$bridge/bridge/ageing_time" ] || {
+			result=1
+			continue
+		}
+		printf '%s\n' "$value" > "$sys_net/$bridge/bridge/ageing_time" || result=1
+	done < "$baseline"
+	return "$result"
+}
+
+apply_aging() {
+	local seconds="$1" bridge value
+
+	if [ "$seconds" = - ]; then
+		restore_aging
+		return
+	fi
+	snapshot_aging || return 1
+	value=$((seconds * 100))
+	for bridge in $(lan_bridges); do
+		printf '%s\n' "$value" > "$sys_net/$bridge/bridge/ageing_time" || return 1
+	done
+}
+
+physical_apply() {
+	local aging="$1" port=1 pause upstream downstream phy autoneg restart vlan
+	local classification nft_arguments=""
+
+	shift
+	while [ "$port" -le 4 ]; do
+		pause="$1"; upstream="$2"; downstream="$3"
+		phy="$4"; autoneg="$5"; restart="$6"
+		vlan="$7"; classification="$8"
+		apply_pause "$port" "$pause" || return 1
+		apply_upstream "$port" "$upstream" || return 1
+		apply_downstream "$port" "$downstream" || return 1
+		apply_autoneg "$port" "$autoneg" || return 1
+		apply_phy "$port" "$phy" || return 1
+		apply_autoneg_restart "$port" "$restart" || return 1
+		apply_vlan_tc "$port" "$vlan" || return 1
+		nft_arguments="$nft_arguments $vlan $classification"
+		shift 8
+		port=$((port + 1))
+	done
+	apply_aging "$aging" || return 1
+	set -- $nft_arguments
+	apply_nft_rules "$@"
+}
+
+empty_apply() {
+	physical_apply - \
+		- - - - - - - -  - - - - - - - - \
+		- - - - - - - -  - - - - - - - -
+}
+
+physical_apply_state_file() {
+	local file="$1"
+
+	[ -f "$file" ] || { empty_apply; return; }
+	set -- $(cat "$file")
+	[ "$#" -eq 33 ] || return 1
+	physical_apply "$@"
+}
+
+write_state() {
+	local temporary aging port
+
+	temporary="$(mktemp "$state_dir/.effective.XXXXXX")" || return 1
+	aging="$1"; shift
+	printf '%s\n' "$aging" > "$temporary" || return 1
+	port=1
+	while [ "$port" -le 4 ]; do
+		printf '%s\n' "$1" "$2" "$3" "$4" "$5" - "$7" "$8" >> "$temporary" ||
+			return 1
+		shift 8
+		port=$((port + 1))
+	done
+	mv -f "$temporary" "$state_file"
+}
+
+cleanup_baselines() {
+	rm -f "$state_dir"/pause-lan[1-4] "$state_dir"/phy-lan[1-4] \
+		"$state_dir"/autoneg-lan[1-4] "$state_dir/aging"
+}
+
+mark_uncertain() {
+	printf '%s\n' "rollback-failed" > "$uncertain_file"
+}
+
+apply_candidate() {
+	validate_effective "$@" || return 2
+	rm -f "$uncertain_file"
+	if physical_apply "$@"; then
+		if write_state "$@"; then
+			return 0
+		fi
+		if physical_apply_state_file "$state_file"; then
+			return 1
+		fi
+		mark_uncertain
+		return 3
+	fi
+	if physical_apply_state_file "$state_file"; then
+		return 1
+	fi
+	mark_uncertain
+	return 3
+}
+
+apply_stdin() {
+	local value count=0
+
+	while IFS= read -r value; do
+		[ "$count" -lt 33 ] || return 2
+		set -- "$@" "$value"
+		count=$((count + 1))
+	done
+	[ "$count" -eq 33 ] || return 2
+	apply_candidate "$@"
+}
+
+recover() {
+	if ! empty_apply; then
+		mark_uncertain
+		return 3
+	fi
+	rm -f "$state_file" "$uncertain_file"
+	cleanup_baselines
+}
+
+lock || exit 1
+trap 'unlock' EXIT INT TERM
+case "${1:-}" in
+	apply)
+		[ "$#" -eq 34 ] || exit 2
+		shift
+		apply_candidate "$@"
+		;;
+	apply-stdin)
+		[ "$#" -eq 1 ] || exit 2
+		shift
+		apply_stdin
+		;;
+	recover)
+		[ "$#" -eq 1 ] || exit 2
+		recover
+		;;
+	*) exit 2 ;;
+esac

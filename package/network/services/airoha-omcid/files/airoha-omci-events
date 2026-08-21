@@ -1,0 +1,155 @@
+#!/bin/sh
+
+find_gpon() {
+	local path
+	for path in "${AIROHA_OMCI_GPON_ROOT:-/sys/bus/platform/drivers/airoha-gpon}"/*; do
+		[ -f "$path/state" ] || continue
+		echo "$path"
+		return 0
+	done
+	return 1
+}
+
+find_bosa() {
+	local path
+	for path in "${AIROHA_OMCI_BOSA_ROOT:-/sys/bus/i2c/drivers/airoha-en7572}"/*; do
+		[ -f "$path/los" ] || continue
+		echo "$path"
+		return 0
+	done
+	return 1
+}
+
+boot_id="$(cat "${AIROHA_OMCI_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)" || exit 1
+printf '%s\n' "$boot_id" | LC_ALL=C grep -Eq \
+	'^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$' || exit 1
+
+emit_alarm() {
+	local class_id="$1" entity_id="$2" alarm_bit="$3" active=false
+	[ "$4" = 1 ] && active=true
+	printf '{"type":"alarm","class_id":%u,"entity_id":%u,"alarm_bit":%u,"active":%s}\n' \
+		"$class_id" "$entity_id" "$alarm_bit" "$active"
+}
+
+emit_operational_state() {
+	printf '{"type":"avc","class_id":%u,"entity_id":%u,"attributes":{"OperationalState":%u}}\n' \
+		"$1" "$2" "$3"
+}
+
+valid_u16() {
+	case "$1" in *[!0-9]*|'') return 1 ;; esac
+	[ "$1" -le 65535 ]
+}
+
+emit_optical_sample() {
+	local sample value
+	sample="$(cat "$1/optical_diagnostics" 2>/dev/null)" || return
+	[ "$sample" = "$optical_previous" ] && return
+	set -- $sample
+	[ "$#" -eq 5 ] || return
+	for value in "$@"; do
+		valid_u16 "$value" || return
+	done
+	printf '{"type":"optical-sample","class_id":263,"entity_id":32769,"temperature":%u,"supply_voltage":%u,"laser_bias_current":%u,"transmit_power":%u,"receive_power":%u}\n' \
+		"$1" "$2" "$3" "$4" "$5"
+	optical_previous="$sample"
+}
+
+valid_u32() {
+	case "$1" in *[!0-9]*|'') return 1 ;; esac
+	[ "$1" -le 4294967295 ]
+}
+
+valid_u64() {
+	case "$1" in *[!0-9]*|'') return 1 ;; esac
+}
+
+emit_ber_sample() {
+	local sample sequence bip_count interval_ms value
+	sample="$(cat "$1/ber_sample" 2>/dev/null)" || return
+	[ "$sample" = none ] && return
+	[ "$sample" = "$ber_previous" ] && return
+	set -- $sample
+	[ "$#" -eq 3 ] || return
+	[ "${1#sequence=}" != "$1" ] || return
+	[ "${2#bip_count=}" != "$2" ] || return
+	[ "${3#interval_ms=}" != "$3" ] || return
+	sequence="${1#sequence=}"
+	bip_count="${2#bip_count=}"
+	interval_ms="${3#interval_ms=}"
+	valid_u64 "$sequence" || return
+	for value in "$bip_count" "$interval_ms"; do
+		valid_u32 "$value" || return
+	done
+	[ "$interval_ms" -gt 0 ] || return
+	printf '{"type":"ber-sample","class_id":263,"entity_id":32769,"sequence":%s,"bip_count":%u,"interval_ms":%u,"boot_id":"%s"}\n' \
+		"$sequence" "$bip_count" "$interval_ms" "$boot_id"
+	ber_previous="$sample"
+}
+
+gpon_previous=
+lan1_previous=
+lan2_previous=
+lan3_previous=
+lan4_previous=
+optical_previous=
+ber_previous=
+omci_carrier_previous=
+
+while :; do
+	# Autonomous messages are meaningful only after the OLT has assigned the
+	# OMCC GEM and the kernel has raised carrier on the raw OMCI netdev.
+	omci_carrier="$(cat "${AIROHA_OMCI_NET_ROOT:-/sys/class/net}/omci/carrier" 2>/dev/null)"
+	if [ "$omci_carrier" != "$omci_carrier_previous" ]; then
+		if [ "$omci_carrier" = 0 ]; then
+			printf '{"type":"omcc-session-reset"}\n'
+		fi
+		omci_carrier_previous="$omci_carrier"
+	fi
+	if [ "$omci_carrier" != 1 ]; then
+		sleep 1
+		continue
+	fi
+
+	gpon="$(find_gpon)"
+	if [ -n "$gpon" ]; then
+		state="$(cat "$gpon/state" 2>/dev/null)"
+		state="${state%% *}"
+		case "$state" in
+			5) operational=0 ;;
+			[1-7]) operational=1 ;;
+			*) operational= ;;
+		esac
+		if [ -n "$operational" ] && [ "$operational" != "$gpon_previous" ]; then
+			emit_operational_state 256 0 "$operational"
+			gpon_previous="$operational"
+		fi
+		emit_ber_sample "$gpon"
+	fi
+
+	bosa="$(find_bosa)"
+	if [ -n "$bosa" ]; then
+		emit_optical_sample "$bosa"
+	fi
+
+	for port in 1 2 3 4; do
+		carrier="$(cat "${AIROHA_OMCI_NET_ROOT:-/sys/class/net}/lan$port/carrier" 2>/dev/null)"
+		case "$carrier" in
+			0|1) ;;
+			*) continue ;;
+		esac
+		eval "previous=\$lan${port}_previous"
+		[ "$carrier" = "$previous" ] && continue
+		entity_id=$((256 + port))
+		if [ "$carrier" = 1 ]; then
+			emit_alarm 11 "$entity_id" 0 0
+			emit_operational_state 11 "$entity_id" 0
+		else
+			emit_alarm 11 "$entity_id" 0 1
+			emit_operational_state 11 "$entity_id" 1
+		fi
+		eval "lan${port}_previous=\$carrier"
+	done
+
+	sleep 1
+done

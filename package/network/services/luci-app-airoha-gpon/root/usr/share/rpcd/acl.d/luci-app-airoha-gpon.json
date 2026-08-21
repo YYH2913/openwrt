@@ -1,0 +1,15 @@
+{
+	"luci-app-airoha-gpon": {
+		"description": "Grant access to the Airoha PON optical port",
+		"read": {
+			"ubus": {
+				"luci.airoha-gpon": [ "status" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.airoha-gpon": [ "set_config", "set_mode", "xgs_service_clear" ]
+			}
+		}
+	}
+}
