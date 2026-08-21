@@ -13,6 +13,7 @@ board_leds="$openwrt_dir/target/linux/airoha/an7581/base-files/etc/board.d/01_le
 platform_upgrade="$openwrt_dir/target/linux/airoha/an7581/base-files/lib/upgrade/platform.sh"
 uboot_envtools="$openwrt_dir/package/boot/uboot-tools/uboot-envtools/files/airoha_an7581"
 multi_serdes_patch="$openwrt_dir/target/linux/airoha/patches-6.18/165-02-v7.2-net-airoha-Support-multiple-net_devices-for-a-single.patch"
+pcie_reset_patch="$openwrt_dir/target/linux/airoha/patches-6.18/609-02-clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch"
 workspace_dir="$(CDPATH= cd -- "$openwrt_dir/.." && pwd)"
 uboot_dtsi="$workspace_dir/u-boot/arch/arm/dts/xg2010g-u-boot.dtsi"
 uboot_driver="$workspace_dir/u-boot/drivers/net/airoha_eth.c"
@@ -60,6 +61,10 @@ extract_block() {
 	echo "Airoha multi-SerDes patch not found at $multi_serdes_patch" >&2
 	exit 2
 }
+[ -f "$pcie_reset_patch" ] || {
+	echo "Airoha PCIe reset patch not found at $pcie_reset_patch" >&2
+	exit 2
+}
 [ -f "$uboot_dtsi" ] && [ -f "$uboot_driver" ] || {
 	echo "XG2010G U-Boot network sources not found under $workspace_dir/u-boot" >&2
 	exit 2
@@ -92,6 +97,14 @@ printf '%s\n' "$linux_phy_lan3" | grep -Fq 'compatible = "ethernet-phy-ieee802.3
 printf '%s\n' "$linux_phy_lan3" | grep -Fq 'reg = <15>;'
 require_fixed '&gdm2 {' "$board_dts" 'PON GDM2 enablement'
 require_fixed 'openwrt,netdev-name = "pon";' "$board_dts" 'PON netdev'
+require_fixed 'val = assert ? 0 : BIT(id % RST_NR_PER_BANK);' \
+	"$pcie_reset_patch" 'deterministic inverted PCIe reset deassert value'
+require_fixed 'val = assert ? BIT(id % RST_NR_PER_BANK) : 0;' \
+	"$pcie_reset_patch" 'deterministic ordinary PCIe reset value'
+if grep -Fq 'val |= assert ?' "$pcie_reset_patch"; then
+	echo 'PCIe reset update still uses an uninitialized value' >&2
+	exit 1
+fi
 
 # Hardware mode is selected at boot. Keep the existing GPON image and provide
 # a distinct XGS-PON image whose BOSA and PCS agree before either MAC binds.
@@ -188,6 +201,10 @@ fi
 printf '%s\n' "$uboot_switch" | grep -Fq 'status = "okay";'
 printf '%s\n' "$uboot_switch" | grep -Fq 'airoha,phy-poll-start = <5>;'
 printf '%s\n' "$uboot_switch" | grep -Fq 'airoha,phy-poll-end = <15>;'
+printf '%s\n' "$uboot_switch" | grep -Fq \
+	'airoha,recovery-switch-port-mask = <0x10>;'
+printf '%s\n' "$uboot_switch" | grep -Fq \
+	'airoha,recovery-phy-mask = <0x1000>;'
 require_fixed 'eth->gdm4_dual_hsgmii = usb_primary && ofnode_valid(secondary_pcs);' \
 	"$uboot_driver" 'U-Boot GDM4 dual-endpoint parser'
 require_fixed 'AIROHA_FPORT_GDM4_USB' "$uboot_driver" \

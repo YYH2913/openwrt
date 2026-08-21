@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Run the complete directed four-mode acceptance matrix. Each edge remains an
+# Run the complete directed five-mode acceptance matrix. Each edge remains an
 # independent transactional acceptance operation with its own evidence.
 set -eu
 
@@ -15,7 +15,7 @@ output_directory="${1:-}"
 
 valid_mode() {
 	case "$1" in
-		xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -36,7 +36,7 @@ record_result() {
 		printf 'result=%s\n' "$result"
 		printf 'start_mode=%s\n' "$start_mode"
 		printf 'completed_edges=%s\n' "$completed_edges"
-		printf 'total_edges=12\n'
+		printf 'total_edges=20\n'
 		printf 'failed_edge=%s\n' "$failed_edge"
 		printf 'failed_from_mode=%s\n' "$failed_from"
 		printf 'failed_target_mode=%s\n' "$failed_target"
@@ -69,7 +69,7 @@ initial_text="$("$collector")" || {
 start_mode="$(printf '%s\n' "$initial_text" |
 	awk -F= '$1 == "runtime_mode" { print $2; exit }')"
 valid_mode "$start_mode" || {
-	echo "current mode $start_mode is outside the four-mode matrix" >&2
+	echo "current mode $start_mode is outside the five-mode matrix" >&2
 	exit 1
 }
 
@@ -84,25 +84,27 @@ mkdir -p "$output_directory"
 printf '%s\n' "$initial_text" > "$output_directory/initial.env"
 {
 	printf 'version=1\n'
-	printf 'semantics=all-12-directed-edges-each-exactly-once\n'
+	printf 'semantics=all-20-directed-edges-each-exactly-once\n'
 	printf 'start_mode=%s\n' "$start_mode"
-	printf 'total_edges=12\n'
+	printf 'total_edges=20\n'
 	printf 'started_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$output_directory/matrix.env"
 
-# A->B->A->C->A->D->B->C->B->D->C->D->A is an Euler circuit of
-# the complete directed graph on four modes. B/C/D retain canonical order.
+# A->B->A->C->A->D->A->E->B->C->B->D->B->E->C->D->C->E->D->E->A is
+# an Euler circuit of the complete directed graph on five modes.
 remaining=
-for mode in xgpon xgspon epon-10g-1g epon-10g-10g; do
+for mode in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
 	[ "$mode" = "$start_mode" ] || remaining="$remaining $mode"
 done
 set -- $remaining
 mode_b="$1"
 mode_c="$2"
 mode_d="$3"
+mode_e="$4"
 set -- "$start_mode" "$mode_b" "$start_mode" "$mode_c" \
-	"$start_mode" "$mode_d" "$mode_b" "$mode_c" "$mode_b" \
-	"$mode_d" "$mode_c" "$mode_d" "$start_mode"
+	"$start_mode" "$mode_d" "$start_mode" "$mode_e" "$mode_b" \
+	"$mode_c" "$mode_b" "$mode_d" "$mode_b" "$mode_e" "$mode_c" \
+	"$mode_d" "$mode_c" "$mode_e" "$mode_d" "$mode_e" "$start_mode"
 
 source_mode="$1"
 shift
@@ -151,7 +153,7 @@ for target_mode in "$@"; do
 	source_mode="$target_mode"
 done
 
-[ "$completed_edges" -eq 12 ] && [ "$source_mode" = "$start_mode" ] || {
+[ "$completed_edges" -eq 20 ] && [ "$source_mode" = "$start_mode" ] || {
 	record_result incomplete-matrix "$edge_number" "$source_mode" ""
 	exit 1
 }

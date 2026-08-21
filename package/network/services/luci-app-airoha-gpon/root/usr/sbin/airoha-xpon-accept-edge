@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Execute and record one directed edge among the four 10G PON modes. The
+# Execute and record one directed edge among all five supported PON modes. The
 # transactional LuCI RPC remains the only writer; evidence never contains
 # registration credentials.
 set -eu
@@ -20,12 +20,12 @@ target_mode="${1:-}"
 output_directory="${2:-}"
 
 usage() {
-	echo "usage: $0 {xgpon|xgspon|epon-10g-1g|epon-10g-10g} [new-output-directory]" >&2
+	echo "usage: $0 {gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g} [new-output-directory]" >&2
 }
 
 valid_mode() {
 	case "$1" in
-		xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
+		gpon|xgpon|xgspon|epon-10g-1g|epon-10g-10g) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -72,6 +72,7 @@ switch_mode() {
 	local mode="$1" request response success
 
 	case "$mode" in
+		gpon) request='{"pon_mode":"gpon"}' ;;
 		xgpon) request='{"pon_mode":"xgpon"}' ;;
 		xgspon) request='{"pon_mode":"xgspon"}' ;;
 		epon-10g-1g) request='{"pon_mode":"epon-10g-1g"}' ;;
@@ -104,10 +105,26 @@ common_ready() {
 }
 
 mode_ready() {
-	local file="$1" mode="$2" require_commit="$3" mpcp_state
+	local file="$1" mode="$2" require_commit="$3" mpcp_state state safety optical
 
 	common_ready "$file" "$mode" "$require_commit" || return 1
 	case "$mode" in
+		gpon)
+			[ "$(evidence_field "$file" gpon_enabled)" = 1 ] || return 1
+			state="$(evidence_field "$file" gpon_state)"
+			case "$state" in '5 O5-operation') ;; *) return 1 ;; esac
+			safety=" $(evidence_field "$file" gpon_safety_status) "
+			case "$safety" in *' ready=1 '*) ;; *) return 1 ;; esac
+			case "$safety" in *' rogue_fault=0 '*) ;; *) return 1 ;; esac
+			case "$safety" in *' olt_disabled=0 '*) ;; *) return 1 ;; esac
+			optical=" $(evidence_field "$file" gpon_optical_link) "
+			case "$optical" in *' los=0 '*) ;; *) return 1 ;; esac
+			case "$optical" in *' lof=0 '*) ;; *) return 1 ;; esac
+			case "$optical" in *' phy_ready=1 '*) ;; *) return 1 ;; esac
+			[ "$(evidence_field "$file" control_state)" = online ] &&
+				[ "$(evidence_field "$file" control_pon_mode)" = gpon ] &&
+				[ "$(evidence_field "$file" platform_state)" = applied ]
+			;;
 		xgpon|xgspon)
 			[ "$(evidence_field "$file" xgspon_enabled)" = 1 ] &&
 				[ "$(evidence_field "$file" xgspon_state)" = registered ] &&
@@ -187,7 +204,7 @@ before_text="$("$collector")" || {
 current_mode="$(printf '%s\n' "$before_text" |
 	awk -F= '$1 == "runtime_mode" { print $2; exit }')"
 valid_mode "$current_mode" || {
-	echo "current mode $current_mode is outside the four-mode matrix" >&2
+	echo "current mode $current_mode is outside the five-mode matrix" >&2
 	exit 1
 }
 [ "$current_mode" != "$target_mode" ] || {

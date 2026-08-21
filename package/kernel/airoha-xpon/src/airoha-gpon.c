@@ -2302,6 +2302,57 @@ static ssize_t gem_counters_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(gem_counters);
 
+static ssize_t counter_evidence_show(struct device *dev,
+				     struct device_attribute *attribute,
+				     char *buf)
+{
+	struct en7581_gpon *priv = dev_get_drvdata(dev);
+	u64 rx_frames = 0, rx_bytes = 0, tx_frames = 0, tx_bytes = 0;
+	unsigned long gem;
+	unsigned int active = 0;
+	ssize_t ret;
+
+	mutex_lock(&priv->lock);
+	for_each_set_bit(gem, priv->data_gems, EN7581_GPON_MAX_GEMS) {
+		u64 value;
+
+		ret = en7581_gpon_read_gem_counter(priv, gem,
+						   EN7581_GPON_GEM_RX_FRAMES,
+						   &value);
+		if (ret)
+			goto unlock;
+		rx_frames += value;
+		ret = en7581_gpon_read_gem_counter(priv, gem,
+						   EN7581_GPON_GEM_RX_PAYLOAD_BYTES,
+						   &value);
+		if (ret)
+			goto unlock;
+		rx_bytes += value;
+		ret = en7581_gpon_read_gem_counter(priv, gem,
+						   EN7581_GPON_GEM_TX_FRAMES,
+						   &value);
+		if (ret)
+			goto unlock;
+		tx_frames += value;
+		ret = en7581_gpon_read_gem_counter(priv, gem,
+						   EN7581_GPON_GEM_TX_PAYLOAD_BYTES,
+						   &value);
+		if (ret)
+			goto unlock;
+		tx_bytes += value;
+		active++;
+	}
+
+	ret = sysfs_emit(buf,
+		"version=1 counter_reset=0 active_gems=%u rx_frames=%llu rx_payload_bytes=%llu tx_frames=%llu tx_payload_bytes=%llu\n",
+		active, rx_frames, rx_bytes, tx_frames, tx_bytes);
+
+unlock:
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+static DEVICE_ATTR_RO(counter_evidence);
+
 static ssize_t fec_counters_show(struct device *dev,
 				 struct device_attribute *attribute, char *buf)
 {
@@ -2404,6 +2455,7 @@ static struct attribute *en7581_gpon_attrs[] = {
 	&dev_attr_safety_status.attr,
 	&dev_attr_last_ploam.attr,
 	&dev_attr_gem_counters.attr,
+	&dev_attr_counter_evidence.attr,
 	&dev_attr_fec_counters.attr,
 	&dev_attr_optical_link.attr,
 	&dev_attr_ber_sample.attr,

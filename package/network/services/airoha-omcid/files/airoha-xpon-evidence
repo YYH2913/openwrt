@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Read-only four-mode target evidence collector. It never changes PON state or
+# Read-only five-mode target evidence collector. It never changes PON state or
 # emits ONU serial numbers, passwords, Registration-IDs, keys, or packet data.
 set -eu
 
@@ -190,6 +190,7 @@ case "$driver" in
 		emit_file gpon "$protocol" equalization_delay
 		emit_file gpon "$protocol" tconts
 		emit_file gpon "$protocol" data_gems
+		emit_file gpon "$protocol" counter_evidence
 		emit_file gpon "$protocol" safety_status
 		emit_file gpon "$protocol" optical_link
 		emit_file gpon "$protocol" ber_sample
@@ -237,6 +238,19 @@ emit_file net "$net_path/statistics" rx_errors
 emit_file net "$net_path/statistics" tx_errors
 
 case "$driver" in
+	gpon)
+		printf 'pon_counter_source=gpon-gem-data-payload\n'
+		printf 'pon_counter_reset=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" counter_reset)"
+		printf 'pon_rx_counter=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" \
+				rx_payload_bytes)"
+		printf 'pon_rx_counter_unit=bytes\n'
+		printf 'pon_tx_counter=%s\n' \
+			"$(pair_field "$protocol/counter_evidence" \
+				tx_payload_bytes)"
+		printf 'pon_tx_counter_unit=bytes\n'
+		;;
 	xgspon)
 		printf 'pon_counter_source=xgs-mac-session-non-idle-bytes\n'
 		printf 'pon_counter_reset=0\n'

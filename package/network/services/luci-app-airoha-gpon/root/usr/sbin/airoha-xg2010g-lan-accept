@@ -1,0 +1,215 @@
+#!/bin/sh
+
+# Record one XG2010G four-LAN acceptance sample. Full-rate link and bridge
+# checks are enabled by default; byte thresholds can additionally require
+# simultaneous bidirectional traffic on every port.
+set -eu
+
+umask 077
+
+sysfs_root="${AIROHA_LAN_ACCEPT_SYSFS_ROOT:-/sys}"
+board_file="${AIROHA_LAN_ACCEPT_BOARD_FILE:-/tmp/sysinfo/board_name}"
+sleep_command="${AIROHA_LAN_ACCEPT_SLEEP:-sleep}"
+flock_command="${AIROHA_LAN_ACCEPT_FLOCK:-flock}"
+lock_file="${AIROHA_LAN_ACCEPT_LOCK_FILE:-/var/lock/airoha-xg2010g-lan-accept.lock}"
+require_bridge="${AIROHA_LAN_ACCEPT_REQUIRE_BRIDGE:-1}"
+require_links="${AIROHA_LAN_ACCEPT_REQUIRE_LINKS:-1}"
+require_full_rate="${AIROHA_LAN_ACCEPT_REQUIRE_FULL_RATE:-1}"
+minimum_rx="${AIROHA_LAN_ACCEPT_MIN_RX_BYTES:-0}"
+minimum_tx="${AIROHA_LAN_ACCEPT_MIN_TX_BYTES:-0}"
+sample_seconds="${AIROHA_LAN_ACCEPT_SAMPLE_SECONDS:-5}"
+output_directory="${1:-}"
+failure_reason=none
+
+unsigned_integer() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_flag() {
+	case "$1" in 0|1) return 0 ;; *) return 1 ;; esac
+}
+
+read_value() {
+	local path="$1" fallback="${2:-unknown}" value
+
+	value="$(cat "$path" 2>/dev/null || true)"
+	[ -n "$value" ] && printf '%s\n' "$value" || printf '%s\n' "$fallback"
+}
+
+expected_speed() {
+	case "$1" in
+		lan1|lan2) printf '%s\n' 10000 ;;
+		lan3) printf '%s\n' 2500 ;;
+		lan4) printf '%s\n' 1000 ;;
+	esac
+}
+
+record_result() {
+	local result="$1"
+
+	{
+		printf 'version=1\n'
+		printf 'result=%s\n' "$result"
+		printf 'failure_reason=%s\n' "$failure_reason"
+		printf 'ports=lan1,lan2,lan3,lan4\n'
+		printf 'expected_speeds_mbps=10000,10000,2500,1000\n'
+		printf 'require_bridge=%s\n' "$require_bridge"
+		printf 'require_links=%s\n' "$require_links"
+		printf 'require_full_rate=%s\n' "$require_full_rate"
+		printf 'minimum_rx_bytes_per_port=%s\n' "$minimum_rx"
+		printf 'minimum_tx_bytes_per_port=%s\n' "$minimum_tx"
+		printf 'sample_seconds=%s\n' "$sample_seconds"
+		printf 'completed_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	} > "$output_directory/result.env"
+}
+
+fail_acceptance() {
+	failure_reason="$1"
+	record_result failed
+	echo "XG2010G LAN acceptance failed: $failure_reason; evidence: $output_directory" >&2
+	exit 1
+}
+
+valid_flag "$require_bridge" && valid_flag "$require_links" &&
+	valid_flag "$require_full_rate" || {
+	echo 'LAN acceptance flags must be 0 or 1' >&2
+	exit 2
+}
+unsigned_integer "$minimum_rx" && unsigned_integer "$minimum_tx" &&
+	unsigned_integer "$sample_seconds" && [ "$sample_seconds" -le 3600 ] || {
+	echo 'LAN acceptance thresholds and sample time must be unsigned integers' >&2
+	exit 2
+}
+
+exec 9>"$lock_file" || {
+	echo "failed to open LAN acceptance lock $lock_file" >&2
+	exit 1
+}
+if ! "$flock_command" -n 9; then
+	echo 'another LAN acceptance transaction is running' >&2
+	exit 1
+fi
+
+board="$(read_value "$board_file")"
+case "$board" in
+	axon,xg2010g-xgspon|axon,xg2010g|econet,xg2010g) ;;
+	*)
+		echo "unsupported board $board" >&2
+		exit 1
+		;;
+esac
+
+if [ -z "$output_directory" ]; then
+	output_directory="/tmp/airoha-xg2010g-lan-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+[ ! -e "$output_directory" ] || {
+	echo "$output_directory already exists" >&2
+	exit 1
+}
+mkdir -p "$output_directory"
+: > "$output_directory/initial.env"
+: > "$output_directory/final.env"
+printf 'version=1\nboard=%s\n' "$board" >> "$output_directory/initial.env"
+
+seen_ifindices=' '
+for port in lan1 lan2 lan3 lan4; do
+	path="$sysfs_root/class/net/$port"
+	[ -d "$path" ] || fail_acceptance "$port-missing"
+
+	ifindex="$(read_value "$path/ifindex" 0)"
+	unsigned_integer "$ifindex" && [ "$ifindex" -gt 0 ] ||
+		fail_acceptance "$port-invalid-ifindex"
+	case "$seen_ifindices" in
+		*" $ifindex "*) fail_acceptance "$port-duplicate-ifindex" ;;
+	esac
+	seen_ifindices="$seen_ifindices$ifindex "
+
+	master_path="$(readlink -f "$path/master" 2>/dev/null || true)"
+	master="${master_path##*/}"
+	[ -n "$master_path" ] || master=none
+	if [ "$require_bridge" -eq 1 ] && [ "$master" != br-lan ]; then
+		fail_acceptance "$port-not-in-br-lan"
+	fi
+
+	carrier="$(read_value "$path/carrier" 0)"
+	case "$carrier" in 0|1) ;; *) fail_acceptance "$port-invalid-carrier" ;; esac
+	if [ "$require_links" -eq 1 ] && [ "$carrier" -ne 1 ]; then
+		fail_acceptance "$port-link-down"
+	fi
+
+	speed="$(read_value "$path/speed" 0)"
+	unsigned_integer "$speed" || speed=0
+	wanted_speed="$(expected_speed "$port")"
+	if [ "$require_full_rate" -eq 1 ] &&
+		{ [ "$carrier" -ne 1 ] || [ "$speed" -lt "$wanted_speed" ]; }; then
+		fail_acceptance "$port-below-full-rate"
+	fi
+
+	duplex="$(read_value "$path/duplex")"
+	if [ "$carrier" -eq 1 ] && [ "$duplex" != full ]; then
+		fail_acceptance "$port-not-full-duplex"
+	fi
+	operstate="$(read_value "$path/operstate")"
+	phy_id="$(read_value "$path/phydev/phy_id")"
+	rx_bytes="$(read_value "$path/statistics/rx_bytes" 0)"
+	tx_bytes="$(read_value "$path/statistics/tx_bytes" 0)"
+	unsigned_integer "$rx_bytes" && unsigned_integer "$tx_bytes" ||
+		fail_acceptance "$port-invalid-counters"
+
+	eval "before_rx_$port=\$rx_bytes"
+	eval "before_tx_$port=\$tx_bytes"
+	{
+		printf '%s_ifindex=%s\n' "$port" "$ifindex"
+		printf '%s_master=%s\n' "$port" "$master"
+		printf '%s_carrier=%s\n' "$port" "$carrier"
+		printf '%s_operstate=%s\n' "$port" "$operstate"
+		printf '%s_speed_mbps=%s\n' "$port" "$speed"
+		printf '%s_expected_speed_mbps=%s\n' "$port" "$wanted_speed"
+		printf '%s_duplex=%s\n' "$port" "$duplex"
+		printf '%s_phy_id=%s\n' "$port" "$phy_id"
+		printf '%s_rx_bytes=%s\n' "$port" "$rx_bytes"
+		printf '%s_tx_bytes=%s\n' "$port" "$tx_bytes"
+	} >> "$output_directory/initial.env"
+done
+
+pon_path="$sysfs_root/class/net/pon"
+[ -d "$pon_path" ] || fail_acceptance pon-missing
+pon_ifindex="$(read_value "$pon_path/ifindex" 0)"
+unsigned_integer "$pon_ifindex" && [ "$pon_ifindex" -gt 0 ] ||
+	fail_acceptance pon-invalid-ifindex
+case "$seen_ifindices" in
+	*" $pon_ifindex "*) fail_acceptance pon-shares-lan-ifindex ;;
+esac
+printf 'pon_ifindex=%s\n' "$pon_ifindex" >> "$output_directory/initial.env"
+
+"$sleep_command" "$sample_seconds"
+
+for port in lan1 lan2 lan3 lan4; do
+	path="$sysfs_root/class/net/$port"
+	rx_bytes="$(read_value "$path/statistics/rx_bytes" 0)"
+	tx_bytes="$(read_value "$path/statistics/tx_bytes" 0)"
+	unsigned_integer "$rx_bytes" && unsigned_integer "$tx_bytes" ||
+		fail_acceptance "$port-invalid-final-counters"
+	eval "before_rx=\$before_rx_$port"
+	eval "before_tx=\$before_tx_$port"
+	[ "$rx_bytes" -ge "$before_rx" ] && [ "$tx_bytes" -ge "$before_tx" ] ||
+		fail_acceptance "$port-counter-reset"
+	rx_delta=$((rx_bytes - before_rx))
+	tx_delta=$((tx_bytes - before_tx))
+	[ "$rx_delta" -ge "$minimum_rx" ] ||
+		fail_acceptance "$port-rx-threshold-not-met"
+	[ "$tx_delta" -ge "$minimum_tx" ] ||
+		fail_acceptance "$port-tx-threshold-not-met"
+	{
+		printf '%s_rx_bytes=%s\n' "$port" "$rx_bytes"
+		printf '%s_tx_bytes=%s\n' "$port" "$tx_bytes"
+		printf '%s_rx_delta=%s\n' "$port" "$rx_delta"
+		printf '%s_tx_delta=%s\n' "$port" "$tx_delta"
+	} >> "$output_directory/final.env"
+done
+
+record_result passed
+printf '%s\n' "$output_directory"

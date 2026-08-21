@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=airoha-omcid
 PKG_VERSION:=0.31.0
-PKG_RELEASE:=26
+PKG_RELEASE:=27
 
 # Development checkout. Replace this URL with the public standalone repository
 # before publishing feeds or release artifacts.

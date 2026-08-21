@@ -55,6 +55,8 @@ for attribute in state onu_id omcc_id equalization_delay tconts data_gems \
 	safety_status optical_link ber_sample stats; do
 	write_value "$gpon/$attribute" "gpon-$attribute"
 done
+write_value "$gpon/counter_evidence" \
+	'version=1 counter_reset=0 active_gems=1 rx_frames=20 rx_payload_bytes=1200 tx_frames=40 tx_payload_bytes=2400'
 
 write_value "$xgspon/enabled" 1
 write_value "$xgspon/control_abi_version" 3
@@ -110,7 +112,16 @@ for mode in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
 	expect 'bosa_fault_locked=0'
 	expect 'net_rx_bytes=10'
 	case "$driver" in
-		gpon) expect 'gpon_state=gpon-state' ;;
+		gpon)
+			expect 'gpon_state=gpon-state'
+			expect 'gpon_counter_evidence=version=1 counter_reset=0 active_gems=1 rx_frames=20 rx_payload_bytes=1200 tx_frames=40 tx_payload_bytes=2400'
+			expect 'pon_counter_source=gpon-gem-data-payload'
+			expect 'pon_counter_reset=0'
+			expect 'pon_rx_counter=1200'
+			expect 'pon_rx_counter_unit=bytes'
+			expect 'pon_tx_counter=2400'
+			expect 'pon_tx_counter_unit=bytes'
+			;;
 		xgspon)
 			expect "xgspon_pon_mode=$mode"
 			expect 'xgspon_to1_evidence=xgs-to1_evidence'
@@ -151,4 +162,4 @@ if grep -Eq 'emit_file .* (serial_number|password|registration_id)( |$)' \
 	exit 1
 fi
 
-echo 'Four-mode read-only XPON target evidence collector: OK'
+echo 'Five-mode read-only XPON target evidence collector: OK'

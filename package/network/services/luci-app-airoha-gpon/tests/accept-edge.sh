@@ -20,7 +20,7 @@ cat > "$temporary/bin/ubus" <<'EOF'
 request="${4:-}"
 [ "${3:-}" = set_mode ] || exit 1
 mode=
-for candidate in xgpon xgspon epon-10g-1g epon-10g-10g; do
+for candidate in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
 	case "$request" in *\"pon_mode\"*\"$candidate\"*) mode="$candidate" ;; esac
 done
 [ -n "$mode" ] || exit 1
@@ -62,6 +62,17 @@ printf 'version=1\nruntime_mode=%s\nbosa_mode_match=1\n' "$mode"
 printf 'core_switch_state=switching=0 stage=18 error=0 committed=1 rollback_failed=0 tx_disabled=0 fault_locked=0\n'
 printf 'bosa_fault_locked=0\nbosa_los=0\nbosa_tx_disable=0\n'
 case "$mode" in
+	gpon)
+		printf 'gpon_enabled=1\n'
+		if [ "${AIROHA_TEST_UNREADY_MODE:-}" = "$mode" ]; then
+			printf 'gpon_state=4 O4-ranging\n'
+		else
+			printf 'gpon_state=5 O5-operation\n'
+		fi
+		printf 'gpon_safety_status=ready=1 rogue_fault=0 olt_disabled=0\n'
+		printf 'gpon_optical_link=los=0 lof=0 phy_ready=1\n'
+		printf 'control_state=online\ncontrol_pon_mode=gpon\nplatform_state=applied\n'
+		;;
 	xgpon|xgspon)
 		printf 'xgspon_enabled=1\n'
 		if [ "${AIROHA_TEST_UNREADY_MODE:-}" = "$mode" ]; then
@@ -85,6 +96,14 @@ case "$mode" in
 		;;
 esac
 case "$mode" in
+	gpon)
+		net_rx=$((800 + sequence * net_step))
+		net_tx=$((1600 + sequence * net_step))
+		pon_rx=$((800 + sequence * pon_step))
+		pon_tx=$((1600 + sequence * pon_step))
+		printf 'pon_counter_source=gpon-gem-data-payload\n'
+		printf 'pon_rx_counter_unit=bytes\npon_tx_counter_unit=bytes\n'
+		;;
 	xgpon)
 		net_rx=$((1000 + sequence * net_step))
 		net_tx=$((2000 + sequence * net_step))
@@ -142,8 +161,8 @@ run_program() {
 }
 
 edge_count=0
-for previous in xgpon xgspon epon-10g-1g epon-10g-10g; do
-	for target in xgpon xgspon epon-10g-1g epon-10g-10g; do
+for previous in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
+	for target in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
 		[ "$previous" != "$target" ] || continue
 		edge_count=$((edge_count + 1))
 		success="$temporary/edge-$edge_count"
@@ -165,7 +184,7 @@ for previous in xgpon xgspon epon-10g-1g epon-10g-10g; do
 		fi
 	done
 done
-[ "$edge_count" -eq 12 ]
+[ "$edge_count" -eq 20 ]
 
 printf '%s\n' xgpon > "$state"
 : > "$ubus_log"
@@ -182,6 +201,20 @@ fi
 grep -Fx 'result=target-not-ready-runtime-rolled-back' \
 	"$timeout_output/result.env" >/dev/null
 grep -Fx 'runtime_mode=xgpon' "$timeout_output/rollback.env" >/dev/null
+
+printf '%s\n' xgspon > "$state"
+: > "$ubus_log"
+gpon_timeout="$temporary/gpon-timeout"
+if AIROHA_TEST_UNREADY_MODE=gpon \
+	AIROHA_XPON_ACCEPT_TIMEOUT=2 \
+		run_program gpon "$gpon_timeout" >/dev/null 2>&1; then
+	echo 'GPON target outside O5 passed edge acceptance' >&2
+	exit 1
+fi
+[ "$(cat "$state")" = xgspon ]
+grep -Fx 'result=target-not-ready-runtime-rolled-back' \
+	"$gpon_timeout/result.env" >/dev/null
+grep -Fx 'runtime_mode=xgspon' "$gpon_timeout/rollback.env" >/dev/null
 
 printf '%s\n' xgpon > "$state"
 : > "$ubus_log"
@@ -219,6 +252,24 @@ grep -Fx 'pon_rx_counter_unit=bytes' "$traffic_pass/result.env" >/dev/null
 grep -Fx 'pon_tx_counter_unit=frames' "$traffic_pass/result.env" >/dev/null
 grep -Fx 'pon_rx_delta=100' "$traffic_pass/result.env" >/dev/null
 grep -Fx 'pon_tx_delta=1' "$traffic_pass/result.env" >/dev/null
+
+printf '%s\n' xgspon > "$state"
+printf '%s\n' 0 > "$temporary/counter"
+: > "$ubus_log"
+gpon_traffic="$temporary/gpon-traffic-pass"
+AIROHA_TEST_NET_STEP=100 \
+AIROHA_TEST_PON_STEP=100 \
+AIROHA_XPON_ACCEPT_TIMEOUT=3 \
+AIROHA_XPON_ACCEPT_MIN_RX_BYTES=50 \
+AIROHA_XPON_ACCEPT_MIN_TX_BYTES=50 \
+	run_program gpon "$gpon_traffic" >/dev/null
+grep -Fx 'result=passed' "$gpon_traffic/result.env" >/dev/null
+grep -Fx 'pon_counter_source=gpon-gem-data-payload' \
+	"$gpon_traffic/result.env" >/dev/null
+grep -Fx 'pon_rx_counter_unit=bytes' "$gpon_traffic/result.env" >/dev/null
+grep -Fx 'pon_tx_counter_unit=bytes' "$gpon_traffic/result.env" >/dev/null
+grep -Fx 'pon_rx_delta=100' "$gpon_traffic/result.env" >/dev/null
+grep -Fx 'pon_tx_delta=100' "$gpon_traffic/result.env" >/dev/null
 
 printf '%s\n' xgpon > "$state"
 printf '%s\n' 0 > "$temporary/counter"
@@ -295,4 +346,4 @@ if run_program xgpon "$temporary/same" >/dev/null 2>&1; then
 fi
 [ ! -s "$ubus_log" ]
 
-printf '%s\n' 'Four-mode on-target directed-edge acceptance transaction: OK'
+printf '%s\n' 'Five-mode on-target directed-edge acceptance transaction: OK'

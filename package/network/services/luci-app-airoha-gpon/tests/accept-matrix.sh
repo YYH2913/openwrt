@@ -56,18 +56,18 @@ run_matrix() {
 		sh "$program" "$@"
 }
 
-for start in xgpon xgspon epon-10g-1g epon-10g-10g; do
+for start in gpon xgpon xgspon epon-10g-1g epon-10g-10g; do
 	output="$temporary/success-$start"
 	printf '%s\n' "$start" > "$state"
 	: > "$edge_log"
 	run_matrix "$output" >/dev/null
 	[ "$(cat "$state")" = "$start" ]
-	[ "$(wc -l < "$edge_log")" -eq 12 ]
-	[ "$(sort -u "$edge_log" | wc -l)" -eq 12 ]
+	[ "$(wc -l < "$edge_log")" -eq 20 ]
+	[ "$(sort -u "$edge_log" | wc -l)" -eq 20 ]
 	grep -Fx 'result=passed' "$output/result.env" >/dev/null
-	grep -Fx 'completed_edges=12' "$output/result.env" >/dev/null
-	grep -Fx 'total_edges=12' "$output/result.env" >/dev/null
-	[ "$(find "$output" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 12 ]
+	grep -Fx 'completed_edges=20' "$output/result.env" >/dev/null
+	grep -Fx 'total_edges=20' "$output/result.env" >/dev/null
+	[ "$(find "$output" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 20 ]
 	if grep -R -E 'HWTC12345678|subscriber' "$output" >/dev/null; then
 		echo 'matrix evidence exposed registration identity' >&2
 		exit 1
@@ -77,30 +77,30 @@ done
 printf '%s\n' xgpon > "$state"
 : > "$edge_log"
 failed="$temporary/failed"
-if AIROHA_TEST_FAIL_EDGE='xgpon>epon-10g-1g' run_matrix "$failed" \
+if AIROHA_TEST_FAIL_EDGE='xgpon>gpon' run_matrix "$failed" \
 		>/dev/null 2>&1; then
 	echo 'failed directed edge did not stop the matrix' >&2
 	exit 1
 fi
 [ "$(cat "$state")" = xgpon ]
-[ "$(wc -l < "$edge_log")" -eq 3 ]
+[ "$(wc -l < "$edge_log")" -eq 1 ]
 grep -Fx 'result=edge-failed' "$failed/result.env" >/dev/null
-grep -Fx 'completed_edges=2' "$failed/result.env" >/dev/null
-grep -Fx 'failed_edge=3' "$failed/result.env" >/dev/null
+grep -Fx 'completed_edges=0' "$failed/result.env" >/dev/null
+grep -Fx 'failed_edge=1' "$failed/result.env" >/dev/null
 
 printf '%s\n' xgpon > "$state"
 : > "$edge_log"
 : > "$hook_log"
 hook_failed="$temporary/hook-failed"
 if AIROHA_XPON_ACCEPT_BEFORE_EDGE="$temporary/bin/hook" \
-	AIROHA_TEST_FAIL_HOOK='xgpon>epon-10g-1g' \
+	AIROHA_TEST_FAIL_HOOK='xgpon>gpon' \
 		run_matrix "$hook_failed" >/dev/null 2>&1; then
 	echo 'failed before-edge hook did not stop the matrix' >&2
 	exit 1
 fi
 [ "$(cat "$state")" = xgpon ]
-[ "$(wc -l < "$edge_log")" -eq 2 ]
-[ "$(wc -l < "$hook_log")" -eq 3 ]
+[ "$(wc -l < "$edge_log")" -eq 0 ]
+[ "$(wc -l < "$hook_log")" -eq 1 ]
 grep -Fx 'result=before-edge-hook-failed' "$hook_failed/result.env" >/dev/null
 
 printf '%s\n' xgpon > "$state"
@@ -132,4 +132,4 @@ wait "$lock_pid"
 lock_pid=
 [ ! -e "$temporary/concurrent" ]
 
-echo 'Four-mode on-target 12-edge acceptance matrix: OK'
+echo 'Five-mode on-target 20-edge acceptance matrix: OK'
