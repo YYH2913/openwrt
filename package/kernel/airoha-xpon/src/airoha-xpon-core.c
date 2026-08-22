@@ -169,6 +169,44 @@ static int airoha_xpon_validate_runtime_mode(struct airoha_xpon_core *core,
 	return airoha_xpon_validate_bosa_mode(core, mode);
 }
 
+static int airoha_xpon_prepare_initial_mode(struct airoha_xpon_core *core,
+					    enum airoha_xpon_mode mode)
+{
+	enum airoha_pcs_xpon_mode pcs_mode;
+	int cleanup_ret;
+	int ret;
+
+	ret = airoha_xpon_to_pcs_mode(mode, &pcs_mode);
+	if (ret)
+		return ret;
+	ret = airoha_pcs_xpon_quiesce(core->pcs);
+	if (ret)
+		return ret;
+	ret = airoha_pcs_xpon_select_wan(core->pcs, pcs_mode);
+	if (ret)
+		goto fail_closed;
+	ret = airoha_pcs_xpon_set_mode(core->pcs, pcs_mode);
+	if (ret)
+		goto fail_closed;
+	ret = airoha_xpon_validate_bosa_mode(core, mode);
+	if (ret)
+		goto fail_closed;
+	ret = airoha_pcs_xpon_recover(core->pcs);
+	if (ret)
+		goto fail_closed;
+	ret = airoha_xpon_validate_runtime_mode(core, mode);
+	if (!ret)
+		return 0;
+
+fail_closed:
+	cleanup_ret = airoha_pcs_xpon_quiesce(core->pcs);
+	if (cleanup_ret)
+		dev_err(core->dev,
+			"failed to quiesce PCS after initial mode error: %d\n",
+			cleanup_ret);
+	return ret;
+}
+
 static struct airoha_xpon_backend *
 airoha_xpon_find_backend(struct airoha_xpon_core *core,
 			 enum airoha_xpon_mode mode)
@@ -1023,10 +1061,10 @@ static int airoha_xpon_core_probe(struct platform_device *pdev)
 	ret = airoha_en7572_set_tx_enabled(core->bosa, false);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to force TX disabled\n");
-	ret = airoha_xpon_validate_runtime_mode(core, core->current_mode);
+	ret = airoha_xpon_prepare_initial_mode(core, core->current_mode);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "PON hardware mode validation failed\n");
+				     "failed to initialize PON hardware mode\n");
 	ret = airoha_xpon_clear_dying_gasp(core);
 	if (ret)
 		return dev_err_probe(dev, ret,

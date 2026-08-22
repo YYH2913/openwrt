@@ -8,6 +8,7 @@ pcs_patch="$openwrt_dir/target/linux/airoha/patches-6.18/608-net-pcs-airoha-add-
 pcs_runtime_patch="$openwrt_dir/target/linux/airoha/patches-6.18/609-net-pcs-airoha-add-runtime-xpon-modes.patch"
 pcs_stage_patch="$openwrt_dir/target/linux/airoha/patches-6.18/610-net-pcs-airoha-split-xpon-wan-selection.patch"
 pcs_validation_patch="$openwrt_dir/target/linux/airoha/patches-6.18/614-net-pcs-airoha-validate-runtime-xpon-mode.patch"
+pcs_unlock_patch="$openwrt_dir/target/linux/airoha/patches-6.18/615-net-pcs-airoha-handle-unlocked-pon-receiver.patch"
 driver="$openwrt_dir/package/kernel/airoha-xpon/src/airoha-xgspon.c"
 board_dts="$openwrt_dir/target/linux/airoha/dts/an7581-axon-xg2010g-ubi.dts"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/en7581-xgs-pcs.XXXXXX")"
@@ -27,6 +28,10 @@ trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 }
 [ -f "$pcs_validation_patch" ] || {
 	echo "runtime PCS validation patch not found at $pcs_validation_patch" >&2
+	exit 2
+}
+[ -f "$pcs_unlock_patch" ] || {
+	echo "PON receiver unlock patch not found at $pcs_unlock_patch" >&2
 	exit 2
 }
 
@@ -60,6 +65,10 @@ require_fixed '0xA436' "$tmp_dir/en7581_pma.c" 'SDK XGS lock window start'
 require_fixed '0xA4FF' "$tmp_dir/en7581_pma.c" 'SDK XGS lock window end'
 require_fixed 'void XPON_DIG_reset_release(void)' "$tmp_dir/en7581_pma.c" \
 	'SDK XPON digital reset release sequence'
+require_fixed 'if(pon_phy_get_los_status()==1)' "$tmp_dir/en7581_pma.c" \
+	'SDK no-downstream-light branch'
+require_fixed 'gpPhyPriv->pma_init_done= FALSE;' "$tmp_dir/en7581_pma.c" \
+	'SDK unlocked receiver state'
 require_fixed 'EN7581_XPON_PMA_SW_RST_SET, 6, 6, 0x01' \
 	"$tmp_dir/en7581_pma.c" 'SDK TX FIFO reset release'
 require_fixed 'EN7581_XPON_PMA_SW_RST_SET, 5, 5, 0x01' \
@@ -96,6 +105,10 @@ require_fixed 'target_begin = 0xa436;' "$pcs_patch" 'OpenWrt lock window start'
 require_fixed 'target_end = 0xa4ff;' "$pcs_patch" 'OpenWrt lock window end'
 require_fixed 'an7581_pcs_pon_tdc_off' "$pcs_patch" 'shared PON TDC off sequence'
 require_fixed 'an7581_pcs_pon_tdc_on' "$pcs_patch" 'shared PON TDC on sequence'
+require_fixed 'an7581_pcs_fl_out_diff' "$pcs_unlock_patch" \
+	'unsigned-safe CDR frequency distance'
+require_fixed 'keeping TX gated until optical sync' "$pcs_unlock_patch" \
+	'no-light PON receiver state'
 
 # The public runtime proof must re-read every owner-defining hardware layer.
 require_fixed 'int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,' \

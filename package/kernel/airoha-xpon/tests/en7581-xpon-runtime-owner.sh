@@ -79,6 +79,8 @@ require_fixed 'airoha_xpon_backend_ready(priv->symmetric_backend)' "$epon" \
 	'10G/10G EPON post-endpoint owner claim'
 require_fixed 'airoha_pcs_xpon_select_wan(context->core->pcs,' "$core" \
 	'hardware-backed WAN-selection transaction stage'
+require_fixed 'airoha_xpon_prepare_initial_mode(core, core->current_mode);' \
+	"$core" 'boot-time PCS mode transaction'
 require_fixed 'airoha_pcs_xpon_validate_mode(core->pcs, pcs_mode);' "$core" \
 	'PCS hardware proof before owner publication'
 require_fixed 'return airoha_en7572_validate_mode(core->bosa, mode);' "$core" \
@@ -101,6 +103,20 @@ require_fixed 'failed_stage=%u' "$core" \
 	'observable failed transaction stage'
 require_fixed 'return en7581_epon_stop_path(priv);' "$epon" \
 	'EPON datapath stop without overwriting the saved enable state'
+
+initial_mode_body="$(sed -n \
+	'/^static int airoha_xpon_prepare_initial_mode(/,/^}/p' "$core")"
+printf '%s\n' "$initial_mode_body" | awk '
+	/airoha_pcs_xpon_quiesce\(core->pcs\)/ && step == 0 { step = 1 }
+	/airoha_pcs_xpon_select_wan\(core->pcs, pcs_mode\)/ && step == 1 { step = 2 }
+	/airoha_pcs_xpon_set_mode\(core->pcs, pcs_mode\)/ && step == 2 { step = 3 }
+	/airoha_pcs_xpon_recover\(core->pcs\)/ && step == 3 { step = 4 }
+	/airoha_xpon_validate_runtime_mode\(core, mode\)/ && step == 4 { step = 5 }
+	END { exit step == 5 ? 0 : 1 }
+' || {
+	echo 'initial PON mode must run the complete PCS transaction before validation' >&2
+	exit 1
+}
 
 [ "$(grep -Fc 'return en7581_epon_stop_path(priv);' "$epon")" -eq 2 ] || {
 	echo 'EPON block and stop callbacks must share only the path-stop primitive' >&2
