@@ -110,8 +110,8 @@ if grep -Fq 'val |= assert ?' "$pcie_reset_patch"; then
 	exit 1
 fi
 
-# Hardware mode is selected at boot. Keep the existing GPON image and provide
-# a distinct XGS-PON image whose BOSA and PCS agree before either MAC binds.
+# Hardware mode is selected at boot. The generic XG2010G image defaults to
+# XGS-PON; a distinct image keeps the XGS compatible name for upgrades.
 require_fixed '#include "an7581-axon-xg2010g-ubi.dts"' "$xgspon_dts" \
 	'XGS-PON board inheritance'
 require_fixed 'compatible = "axon,xg2010g-xgspon"' "$xgspon_dts" \
@@ -122,17 +122,13 @@ require_fixed 'define Device/axon_xg2010g-xgspon-ubi' "$image_makefile" \
 require_fixed 'DEVICE_DTS := an7581-axon-xg2010g-xgspon-ubi' "$image_makefile" \
 	'XGS-PON image DT selection'
 require_fixed 'SUPPORTED_DEVICES := axon,xg2010g axon,xg2010g-xgspon econet,xg2010g' \
-	"$image_makefile" 'GPON image cross-mode sysupgrade compatibility'
+	"$image_makefile" 'generic image cross-mode sysupgrade compatibility'
 require_fixed 'SUPPORTED_DEVICES := axon,xg2010g-xgspon axon,xg2010g econet,xg2010g' \
 	"$image_makefile" 'XGS-PON image cross-mode sysupgrade compatibility'
-require_fixed 'axon,xg2010g-xgspon)' "$pon_mode_defaults" \
-	'XGS-PON UCI board match'
+require_fixed 'axon,xg2010g-xgspon|axon,xg2010g|econet,xg2010g)' \
+	"$pon_mode_defaults" 'all XG2010G UCI board matches'
 require_fixed 'pon_mode=xgspon' "$pon_mode_defaults" \
-	'XGS-PON UCI mode selection'
-require_fixed 'axon,xg2010g|econet,xg2010g)' "$pon_mode_defaults" \
-	'GPON UCI board match'
-require_fixed 'pon_mode=gpon' "$pon_mode_defaults" \
-	'GPON UCI mode selection'
+	'XGS-PON default UCI mode selection'
 require_fixed './files/99-airoha-pon-mode $(1)/etc/uci-defaults/' "$omcid_makefile" \
 	'PON mode defaults package installation'
 

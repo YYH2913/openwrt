@@ -214,6 +214,6 @@ recovery_release_line="$(awk '/airoha_pcs_xpon_recover/ { print NR; exit }' \
 	exit 1
 }
 
-require_fixed 'airoha,pon-mode = "gpon";' "$openwrt_dir/target/linux/airoha/dts/an7581-axon-xg2010g-ubi.dts" 'fail-closed board default'
+require_fixed 'airoha,pon-mode = "xgspon";' "$openwrt_dir/target/linux/airoha/dts/an7581-axon-xg2010g-ubi.dts" 'fail-closed XGS-PON board default'
 
 echo 'EN7581 XGS-PON PCS parameters match the recovered SDK evidence'

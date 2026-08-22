@@ -1356,8 +1356,8 @@ require_fixed 'airoha_xgs_omcc_transmit(priv->ethernet_np' "$driver" \
 	'upstream OMCC QDMA transmit boundary'
 require_fixed '+kmod-crypto-cmac' "$package_makefile" 'kernel CMAC dependency'
 require_fixed '+kmod-crypto-ecb' "$package_makefile" 'kernel AES-ECB dependency'
-require_fixed 'airoha,pon-mode = "gpon";' "$board_dts" \
-	'fail-closed board default'
+require_fixed 'airoha,pon-mode = "xgspon";' "$board_dts" \
+	'fail-closed XGS-PON board default'
 require_fixed 'bosa-controller = <&en7572>;' "$board_dts" \
 	'XGS BOSA mode gate'
 require_fixed 'airoha,pcs = <&pon_pcs>;' "$board_dts" \

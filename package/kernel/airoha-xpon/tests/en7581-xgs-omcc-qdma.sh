@@ -126,7 +126,7 @@ require_fixed '#define AIROHA_XGS_OMCC_CAP_US_MIC_SIGNED' "$omcc_header" \
 	'reserved upstream-MIC capability bit'
 require_fixed 'ethernet = <&gdm2>;' "$board_dts" \
 	'XGS OMCC QDMA consumer phandle'
-require_fixed 'airoha,pon-mode = "gpon";' "$board_dts" \
-	'fail-closed board default mode'
+require_fixed 'airoha,pon-mode = "xgspon";' "$board_dts" \
+	'fail-closed XGS-PON board default mode'
 
 echo 'EN7581 XGS OMCC QDMA receive path matches SDK metadata and remains fail-closed'

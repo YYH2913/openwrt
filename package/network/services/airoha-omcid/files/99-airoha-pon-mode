@@ -47,11 +47,8 @@ factory_wan_mac()
 
 board="${AIROHA_BOARD_NAME:-$(board_name)}"
 case "$board" in
-axon,xg2010g-xgspon)
+axon,xg2010g-xgspon|axon,xg2010g|econet,xg2010g)
 	pon_mode=xgspon
-	;;
-axon,xg2010g|econet,xg2010g)
-	pon_mode=gpon
 	;;
 *)
 	exit 0

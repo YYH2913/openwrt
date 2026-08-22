@@ -286,7 +286,8 @@
 		compatible = "airoha,en7572";
 		reg = <0x50>;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
-		airoha,pon-mode = "gpon";
+		/* XG2010G boots in XGS-PON; other supported modes switch at runtime. */
+		airoha,pon-mode = "xgspon";
 		nvmem-cells = <&en7572_bob_gpon>, <&en7572_bob_xgspon>;
 		nvmem-cell-names = "calibration-gpon", "calibration-10g";
 		airoha,pm-firmware = "airoha/xg2010g/en7572-A60993.pm";
@@ -342,7 +343,7 @@
 
 &pon_pcs {
 	status = "okay";
-	airoha,pon-mode = "gpon";
+	airoha,pon-mode = "xgspon";
 };
 
 &gdm1 {
