@@ -388,14 +388,15 @@
 	pinctrl-0 = <&mdio_pins>;
 };
 
-&gsw_port1 {
+/* XG2010G LAN4 is switch port4, backed by internal PHY12. */
+&gsw_port4 {
 	status = "okay";
 	label = "lan4";
 };
 
-&gsw_phy1 {
+&gsw_phy4 {
 	status = "okay";
-	interrupts = <1>;
+	interrupts = <4>;
 };
 
 &mdio {

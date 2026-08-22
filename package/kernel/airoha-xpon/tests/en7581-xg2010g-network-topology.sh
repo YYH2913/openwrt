@@ -75,7 +75,8 @@ extract_block() {
 linux_gdm3="$(extract_block 'gdm3: ethernet@3 {' "$board_dts")"
 linux_gdm4="$(extract_block '&gdm4 {' "$board_dts")"
 linux_gdm1="$(extract_block '&gdm1 {' "$board_dts")"
-linux_lan4="$(extract_block '&gsw_port1 {' "$board_dts")"
+linux_lan4="$(extract_block '&gsw_port4 {' "$board_dts")"
+linux_lan4_phy="$(extract_block '&gsw_phy4 {' "$board_dts")"
 linux_phy_lan1="$(extract_block 'rtl8261_lan1: ethernet-phy@5 {' "$board_dts")"
 linux_phy_lan2="$(extract_block 'rtl8261_lan2: ethernet-phy@8 {' "$board_dts")"
 linux_phy_lan3="$(extract_block 'en8811h: ethernet-phy@f {' "$board_dts")"
@@ -89,6 +90,9 @@ printf '%s\n' "$linux_gdm4" | grep -Fq 'pcs-handle = <&usb_pcs>;'
 printf '%s\n' "$linux_gdm1" | grep -Fq 'status = "okay";'
 printf '%s\n' "$linux_lan4" | grep -Fq 'status = "okay";'
 printf '%s\n' "$linux_lan4" | grep -Fq 'label = "lan4";'
+printf '%s\n' "$linux_lan4_phy" | grep -Fq 'interrupts = <4>;'
+require_fixed 'gsw_phy4: ethernet-phy@c' "$openwrt_dir/target/linux/airoha/dts/an7581.dtsi" \
+	'LAN4 internal PHY12 declaration'
 printf '%s\n' "$linux_phy_lan1" | grep -Fq 'reg = <5>;'
 printf '%s\n' "$linux_phy_lan1" | grep -Fq 'reset-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_LOW>;'
 printf '%s\n' "$linux_phy_lan2" | grep -Fq 'reg = <8>;'
