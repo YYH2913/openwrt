@@ -2275,6 +2275,13 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	ret = airoha_xgs_encode_upstream_ploam_fifo(
+		upstream_frame, AIROHA_XGS_PLOAM_KEY_INDEX_0, upstream_fifo);
+	if (ret || crypto_memneq(upstream_fifo, expected_acknowledge_fifo,
+				 sizeof(upstream_fifo))) {
+		ret = ret ?: -EBADMSG;
+		goto out;
+	}
 	ret = airoha_xgs_aes_ecb_encrypt(keys.kek, data_key, wrapped_key);
 	if (ret || crypto_memneq(wrapped_key, expected_wrapped_key,
 				 sizeof(wrapped_key))) {
@@ -2300,13 +2307,6 @@ static int __init airoha_xgs_security_init(void)
 	ret = airoha_xgs_encode_upstream_ploam_fifo(
 		upstream_frame, AIROHA_XGS_PLOAM_KEY_INDEX_0, upstream_fifo);
 	if (ret || crypto_memneq(upstream_fifo, expected_key_report_fifo,
-				 sizeof(upstream_fifo))) {
-		ret = ret ?: -EBADMSG;
-		goto out;
-	}
-	ret = airoha_xgs_encode_upstream_ploam_fifo(
-		upstream_frame, AIROHA_XGS_PLOAM_KEY_INDEX_0, upstream_fifo);
-	if (ret || crypto_memneq(upstream_fifo, expected_acknowledge_fifo,
 				 sizeof(upstream_fifo))) {
 		ret = ret ?: -EBADMSG;
 		goto out;

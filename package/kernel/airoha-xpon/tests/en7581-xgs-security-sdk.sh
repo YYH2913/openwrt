@@ -632,6 +632,14 @@ require_fixed '0x01230a44, 0x04560100' "$security" \
 	'Assign Alloc-ID fixed content vector'
 require_fixed '0x79dd442d, 0x40ea1ae5' "$security" \
 	'Assign Alloc-ID fixed MIC vector'
+acknowledge_block="$(sed -n \
+	'/ret = airoha_xgs_build_acknowledge_ploam(/,/ret = airoha_xgs_aes_ecb_encrypt/p' \
+	"$security")"
+printf '%s\n' "$acknowledge_block" | grep -Fq \
+	'expected_acknowledge_fifo' || {
+	echo 'Acknowledge PLOAM must be encoded before the next security vector' >&2
+	exit 1
+}
 require_fixed 'AIROHA_XGS_ALLOC_ID_RESERVED' "$security" \
 	'Assign Alloc-ID receiver-side high-bit masking'
 require_fixed 'AIROHA_XGS_ALLOC_ID_PADDING_OFFSET' "$security" \
