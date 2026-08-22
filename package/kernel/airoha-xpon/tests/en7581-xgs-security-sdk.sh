@@ -783,6 +783,8 @@ reject_fixed 'sg_init_one(&destination, output' "$security" \
 	'AES-ECB scatterlist must not reference a caller output buffer'
 require_fixed '"3141592653589793"' "$security" \
 	'existing-key proof label'
+require_fixed '0xd2, 0x51, 0xea, 0x4c, 0x97, 0x6e, 0x7a, 0x71' \
+	"$security" 'data-key proof vector for 00..0f test key'
 require_fixed '0x00000001, 0x03ff0100, 0x564e4452, 0x00112233' \
 	"$security" 'Serial Number 11-word FIFO vector'
 require_fixed '0x00000000, 0x01230222, 0x00010203, 0x04050607' \

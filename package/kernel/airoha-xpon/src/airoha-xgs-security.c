@@ -1457,8 +1457,9 @@ static int __init airoha_xgs_security_init(void)
 		0x80, 0x65, 0x69, 0x50, 0xd1, 0x2d, 0x3a, 0x30,
 	};
 	static const u8 expected_key_proof[AIROHA_XGS_KEY_SIZE] = {
-		0x39, 0x97, 0xda, 0x87, 0x65, 0xbe, 0x74, 0x9e,
-		0xb5, 0xd3, 0xc6, 0x68, 0xf0, 0x4d, 0xb5, 0x72,
+		/* CMAC(KEK, 00..0f || "3141592653589793"). */
+		0xd2, 0x51, 0xea, 0x4c, 0x97, 0x6e, 0x7a, 0x71,
+		0xca, 0x7f, 0x09, 0xc9, 0x83, 0xf6, 0x37, 0xd8,
 	};
 	static const u8 expected_key_report[AIROHA_XGS_PLOAM_FRAME_SIZE] = {
 		0x01, 0x23, 0x05, 0x55, 0x00, 0x01, 0x00, 0x00,
@@ -1575,8 +1576,10 @@ static int __init airoha_xgs_security_init(void)
 	u8 key_proof[AIROHA_XGS_KEY_SIZE];
 	size_t authenticated_omci_len;
 	size_t signed_omci_len;
+	const char *stage = "start";
 	int i, ret;
 
+	stage = "registration-msk";
 	ret = airoha_xgs_derive_registration_msk(registration_id,
 						 registration_msk);
 	if (ret || crypto_memneq(registration_msk, expected_registration_msk,
@@ -1584,12 +1587,14 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "shared-keys";
 	ret = airoha_xgs_derive_shared_keys(msk, serial, pon_tag, &keys);
 	if (!ret && crypto_memneq(&keys, &expected, sizeof(keys)))
 		ret = -EBADMSG;
 	if (ret)
 		goto out;
 
+	stage = "ploam-mic";
 	ret = airoha_xgs_ploam_mic(keys.ploam, AIROHA_XGS_DOWNSTREAM,
 				    downstream_ploam, ploam_mic);
 	if (!ret && crypto_memneq(ploam_mic, expected_downstream_ploam_mic,
@@ -1604,6 +1609,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = -EBADMSG;
 	if (ret)
 		goto out;
+	stage = "initial-profile";
 	ret = airoha_xgs_authenticate_initial_profile(initial_profile,
 						      authenticated_pon_tag);
 	if (!ret && crypto_memneq(authenticated_pon_tag, pon_tag,
@@ -1669,6 +1675,7 @@ static int __init airoha_xgs_security_init(void)
 		goto out;
 	}
 
+	stage = "profile-altered";
 	/* Operational Profile updates are authenticated with the caller-selected
 	 * current PLOAM key and preserve the address/sequence needed for ACK. */
 	memcpy(altered_profile, initial_profile, sizeof(altered_profile));
@@ -1697,6 +1704,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "profile-operational";
 	airoha_xgs_copy_default_ploam_key(default_ploam);
 	ret = airoha_xgs_authenticate_profile_words_mode_key(
 		profile_words, default_ploam, true, &profile);
@@ -1705,6 +1713,7 @@ static int __init airoha_xgs_security_init(void)
 		goto out;
 	}
 	ret = 0;
+	stage = "assign-onu-id";
 	ret = airoha_xgs_authenticate_assign_onu_id_words(
 		assign_onu_id_words, default_ploam, serial, &assigned_onu_id,
 		&assign_sequence);
@@ -1750,6 +1759,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret == -EPROTO ? -EBADMSG : ret;
 		goto out;
 	}
+	stage = "request-registration";
 	ret = airoha_xgs_authenticate_request_registration_words(
 		request_registration_words, keys.ploam, 0x123,
 		&request_sequence);
@@ -1789,6 +1799,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "ranging-time";
 	ret = airoha_xgs_authenticate_ranging_time_words(
 		ranging_time_words, keys.ploam, 0x123, &ranging);
 	if (ret || ranging.equalization_delay != 0x00123456 ||
@@ -1904,6 +1915,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "deactivate-onu";
 	ret = airoha_xgs_authenticate_deactivate_onu_id_words(
 		deactivate_onu_id_words, keys.ploam, 0x123,
 		&deactivate_sequence);
@@ -1939,6 +1951,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "disable-serial";
 	memset(altered_control_frame, 0, sizeof(altered_control_frame));
 	put_unaligned_be16(AIROHA_XGS_BROADCAST_XGS_ONU_ID,
 			   altered_control_frame);
@@ -1997,6 +2010,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret == -ENOMSG ? -EBADMSG : ret;
 		goto out;
 	}
+	stage = "sleep-allow";
 	memset(altered_control_frame, 0, sizeof(altered_control_frame));
 	put_unaligned_be16(0x123, altered_control_frame);
 	altered_control_frame[2] = AIROHA_XGS_SLEEP_ALLOW_MESSAGE_ID;
@@ -2050,6 +2064,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret == -EPROTO ? -EBADMSG : ret;
 		goto out;
 	}
+	stage = "alloc-and-key-control";
 	ret = airoha_xgs_authenticate_assign_alloc_id_words(
 		assign_alloc_id_words, keys.ploam, 0x123, &assignment);
 	if (ret || assignment.alloc_id != 0x456 ||
@@ -2209,6 +2224,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret == -EPROTO ? -EBADMSG : ret;
 		goto out;
 	}
+	stage = "serial-number";
 	ret = airoha_xgs_build_serial_number_ploam(
 		serial, 0x12345678, AIROHA_XPON_MODE_XGPON, upstream_frame);
 	if (ret || crypto_memneq(upstream_frame,
@@ -2252,6 +2268,7 @@ static int __init airoha_xgs_security_init(void)
 			goto out;
 		}
 	}
+	stage = "registration-and-ack";
 	ret = airoha_xgs_build_registration_ploam(
 		keys.ploam, 0x123, 0x22, message_registration_id,
 		upstream_frame);
@@ -2282,6 +2299,7 @@ static int __init airoha_xgs_security_init(void)
 		ret = ret ?: -EBADMSG;
 		goto out;
 	}
+	stage = "key-wrap";
 	ret = airoha_xgs_aes_ecb_encrypt(keys.kek, data_key, wrapped_key);
 	if (ret || crypto_memneq(wrapped_key, expected_wrapped_key,
 				 sizeof(wrapped_key))) {
@@ -2296,6 +2314,7 @@ static int __init airoha_xgs_security_init(void)
 	}
 	memset(altered_control_frame, 0, sizeof(altered_control_frame));
 	memcpy(altered_control_frame, wrapped_key, sizeof(wrapped_key));
+	stage = "key-report";
 	ret = airoha_xgs_build_key_report(
 		keys.ploam, 0x123, 0x55, AIROHA_XGS_KEY_REPORT_GENERATE, 1,
 		altered_control_frame, upstream_frame);
@@ -2372,6 +2391,7 @@ static int __init airoha_xgs_security_init(void)
 		goto out;
 	}
 
+	stage = "omci";
 	ret = airoha_xgs_omci_mic(keys.omci, AIROHA_XGS_DOWNSTREAM,
 				   downstream_omci, sizeof(downstream_omci),
 				   omci_mic);
@@ -2507,8 +2527,8 @@ out:
 	memzero_explicit(upstream_fifo, sizeof(upstream_fifo));
 	memzero_explicit(&keys, sizeof(keys));
 	if (ret)
-		pr_err("Airoha XGS-PON G.9807.1 security self-test failed: %d\n",
-		       ret);
+		pr_err("Airoha XGS-PON G.9807.1 security self-test failed: %d (stage=%s)\n",
+		       ret, stage);
 	return ret;
 }
 module_init(airoha_xgs_security_init);
