@@ -330,6 +330,11 @@
 	status = "okay";
 };
 
+/* The physical PCIe controllers are unused; their PHY overlaps pcie_pcs. */
+&pciephy {
+	status = "disabled";
+};
+
 &usb_pcs {
 	/* USB Multi-SerDes lane is used by the 2.5G LAN PHY. */
 	status = "okay";

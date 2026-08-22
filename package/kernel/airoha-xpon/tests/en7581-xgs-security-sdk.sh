@@ -763,6 +763,16 @@ require_fixed 'airoha_xgs_build_key_report' "$security" \
 	'trusted Key Report builder'
 require_fixed 'crypto_alloc_sync_skcipher("ecb(aes)", 0, 0)' "$security" \
 	'synchronous KEK AES-ECB implementation'
+require_fixed 'source_buffer = kmemdup' "$security" \
+	'AES-ECB source must use page-backed storage for scatterwalk'
+require_fixed 'destination_buffer = kzalloc' "$security" \
+	'AES-ECB destination must use page-backed storage for scatterwalk'
+require_fixed 'kfree_sensitive(destination_buffer)' "$security" \
+	'AES-ECB temporary destination must be scrubbed'
+reject_fixed 'sg_init_one(&source, input' "$security" \
+	'AES-ECB scatterlist must not reference a caller stack buffer'
+reject_fixed 'sg_init_one(&destination, output' "$security" \
+	'AES-ECB scatterlist must not reference a caller output buffer'
 require_fixed '"3141592653589793"' "$security" \
 	'existing-key proof label'
 require_fixed '0x00000001, 0x03ff0100, 0x564e4452, 0x00112233' \

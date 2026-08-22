@@ -6,6 +6,7 @@
 #include <crypto/utils.h>
 #include <linux/err.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/scatterlist.h>
 #include <linux/unaligned.h>
@@ -128,6 +129,8 @@ int airoha_xgs_aes_ecb_encrypt(
 	struct crypto_sync_skcipher *tfm;
 	struct skcipher_request *request;
 	struct scatterlist source, destination;
+	u8 *source_buffer = NULL;
+	u8 *destination_buffer = NULL;
 	int ret;
 
 	if (!output)
@@ -147,17 +150,35 @@ int airoha_xgs_aes_ecb_encrypt(
 	ret = crypto_sync_skcipher_setkey(tfm, key, AIROHA_XGS_KEY_SIZE);
 	if (ret)
 		goto out_request;
-	sg_init_one(&source, input, AIROHA_XGS_KEY_SIZE);
-	sg_init_one(&destination, output, AIROHA_XGS_KEY_SIZE);
+
+	/*
+	 * Scatterlists must point at linear, page-backed memory.  Callers of
+	 * this helper include the module self-test, which uses VMAP_STACK on
+	 * arm64; passing those stack addresses to sg_init_one() makes the
+	 * crypto walk derive an invalid struct page and panic in
+	 * flush_dcache_page().
+	 */
+	source_buffer = kmemdup(input, AIROHA_XGS_KEY_SIZE, GFP_KERNEL);
+	destination_buffer = kzalloc(AIROHA_XGS_KEY_SIZE, GFP_KERNEL);
+	if (!source_buffer || !destination_buffer) {
+		ret = -ENOMEM;
+		goto out_request;
+	}
+	sg_init_one(&source, source_buffer, AIROHA_XGS_KEY_SIZE);
+	sg_init_one(&destination, destination_buffer, AIROHA_XGS_KEY_SIZE);
 	skcipher_request_set_sync_tfm(request, tfm);
 	skcipher_request_set_callback(request, 0, NULL, NULL);
 	skcipher_request_set_crypt(request, &source, &destination,
 				    AIROHA_XGS_KEY_SIZE, NULL);
 	ret = crypto_skcipher_encrypt(request);
+	if (!ret)
+		memcpy(output, destination_buffer, AIROHA_XGS_KEY_SIZE);
 out_request:
 	skcipher_request_free(request);
 out_tfm:
 	crypto_free_sync_skcipher(tfm);
+	kfree_sensitive(destination_buffer);
+	kfree_sensitive(source_buffer);
 	if (ret)
 		memzero_explicit(output, AIROHA_XGS_KEY_SIZE);
 	return ret;
