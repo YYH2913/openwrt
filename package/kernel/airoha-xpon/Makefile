@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=airoha-xpon
-PKG_RELEASE:=53
+PKG_RELEASE:=61
 PKG_LICENSE:=GPL-2.0-only AND LicenseRef-Airoha-Proprietary
 
 include $(INCLUDE_DIR)/package.mk
@@ -91,9 +91,10 @@ endef
 define Package/airoha-en7572-firmware/description
 	 EN7572 MD32 PM/DM firmware, the GPON base optical table and the 10G optical
 	 table recovered from the XG2010G backup's live rootfs overlay. The 10G table
-	 contains a validated XG/XGS A2 eye. A separately named experimental table
-	 copies the A2 optical data into A0 for temporary XE/XES hardware testing;
-	 it is not a substitute for device-specific A0 calibration.
+	 contains a validated XG/XGS A2 eye. Separately named experimental tables
+	 copy the A2 optical data into A0 for boards whose factory A0 record is
+	 unavailable; they remain explicit fallbacks and are not substitutes for
+	 device-specific calibration.
 endef
 
 define Build/Prepare
@@ -120,6 +121,9 @@ define Package/airoha-en7572-firmware/install
 	$(SHELL) ./scripts/en7572-a2-as-a0.sh \
 		./firmware/airoha/xg2010g/en7572-bob-xgspon.bin \
 		$(1)/lib/firmware/airoha/xg2010g/en7572-bob-a2-as-a0.bin
+	$(SHELL) ./scripts/en7572-a2-as-a0.sh \
+		./firmware/airoha/xg2010g/en7572-bob-xgspon.bin \
+		$(1)/lib/firmware/airoha/xg2010g/en7572-bob-gpon-a2-as-a0.bin
 endef
 
 $(eval $(call KernelPackage,airoha-en7572))

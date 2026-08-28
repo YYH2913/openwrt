@@ -2,7 +2,9 @@
 /* EN7581 runtime XPON mode owner. */
 
 #include <linux/device.h>
+#include <linux/capability.h>
 #include <linux/err.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/list.h>
 #include <linux/mfd/syscon.h>
@@ -16,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 #include "airoha-en7572.h"
 #include "airoha-xpon-claim-transaction.h"
@@ -25,6 +28,17 @@
 
 #define EN7581_SCU_DMTC			0x84
 #define EN7581_SCU_DYING_GASP_STATUS	BIT(16)
+#define EN7581_CHIP_SCU_FORCE_GPIO32_EN	0x22c
+#define EN7581_FACTORY_TX_BEN_FORCE	BIT(9)
+#define EN7581_FACTORY_TX_BEN_VALUE	BIT(0)
+#define EN7581_FACTORY_TX_BEN_MASK	(EN7581_FACTORY_TX_BEN_FORCE | \
+					 EN7581_FACTORY_TX_BEN_VALUE)
+#define EN7581_FACTORY_TX_BEN_DEFAULT_RAW_OFF	false
+#define AIROHA_FACTORY_TX_TOKEN	"XG2010G-OPTICAL-TEST"
+#define AIROHA_FACTORY_TX_MIN_MS	10
+#define AIROHA_FACTORY_TX_MAX_MS	5000
+#define AIROHA_FACTORY_TX_1270_NM	1270
+#define AIROHA_FACTORY_TX_1310_NM	1310
 
 struct airoha_xpon_core {
 	struct device *dev;
@@ -32,8 +46,10 @@ struct airoha_xpon_core {
 	struct list_head backends;
 	struct mutex switch_lock;
 	struct regmap *scu;
+	struct regmap *chip_scu;
 	struct phylink_pcs *pcs;
 	struct airoha_en7572 *bosa;
+	struct gpio_desc *factory_tx_ben;
 	struct airoha_xpon_backend *current_backend;
 	enum airoha_xpon_mode current_mode;
 	struct airoha_xpon_switch_state state;
@@ -44,6 +60,18 @@ struct airoha_xpon_core {
 	int last_error;
 	bool switching;
 	bool removing;
+	bool factory_tx_test_allowed;
+	bool factory_tx_test_active;
+	bool factory_tx_ben_enabled;
+	bool factory_tx_ben_forced;
+	bool factory_tx_force_saved;
+	bool factory_tx_ben_active_high;
+	bool factory_tx_ben_polarity_valid;
+	u32 factory_tx_saved_force_gpio32_en;
+	unsigned int factory_tx_wavelength;
+	unsigned int factory_tx_duration_ms;
+	unsigned long factory_tx_deadline;
+	struct delayed_work factory_tx_work;
 };
 
 struct airoha_xpon_backend {
@@ -92,7 +120,8 @@ airoha_xpon_backend_ops_valid(const struct airoha_xpon_backend_ops *ops)
 	return ops && ops->block_traffic && ops->clear_session &&
 	       ops->mask_irqs && ops->synchronize_irqs &&
 	       ops->stop_datapath && ops->stop_mac && ops->start_mac &&
-	       ops->start_datapath && ops->unmask_irqs;
+	       ops->start_datapath && ops->unmask_irqs &&
+	       ops->activation_enabled;
 }
 
 static int airoha_xpon_to_pcs_mode(enum airoha_xpon_mode mode,
@@ -163,6 +192,23 @@ static int airoha_xpon_validate_runtime_mode(struct airoha_xpon_core *core,
 	if (ret)
 		return ret;
 	ret = airoha_pcs_xpon_validate_mode(core->pcs, pcs_mode);
+	if (ret)
+		return ret;
+
+	return airoha_xpon_validate_bosa_mode(core, mode);
+}
+
+static int airoha_xpon_validate_factory_tx_mode(
+		struct airoha_xpon_core *core, enum airoha_xpon_mode mode)
+{
+	enum airoha_pcs_xpon_mode pcs_mode;
+	int ret;
+
+	ret = airoha_xpon_to_pcs_mode(mode, &pcs_mode);
+	if (ret)
+		return ret;
+	/* RX_REV_0 may adapt without changing the validated TX launch path. */
+	ret = airoha_pcs_xpon_validate_tx_mode(core->pcs, pcs_mode);
 	if (ret)
 		return ret;
 
@@ -528,7 +574,7 @@ static int airoha_xpon_core_claim_backend(
 	struct airoha_xpon_core *core = backend->core;
 	int ret;
 
-	if (core->removing || core->switching)
+	if (core->removing || core->switching || core->factory_tx_test_active)
 		return -EBUSY;
 	if (!backend->ready || backend->mode != core->current_mode)
 		return 0;
@@ -690,11 +736,15 @@ static int airoha_xpon_switch_rollback(void *data,
 {
 	struct airoha_xpon_switch_context *context = data;
 	bool target_start_attempted;
+	bool previous_cleanup_required;
 
 	target_start_attempted =
 		airoha_xpon_switch_target_start_attempted(failed_stage);
+	previous_cleanup_required =
+		airoha_xpon_switch_previous_cleanup_required(failed_stage);
 	return airoha_xpon_rollback_transaction(&airoha_xpon_core_rollback_ops,
-		context, previous_mode, target_start_attempted);
+		context, previous_mode, target_start_attempted,
+		previous_cleanup_required);
 }
 
 static void airoha_xpon_switch_fault_lock(void *data)
@@ -771,7 +821,7 @@ static int airoha_xpon_core_switch(struct airoha_xpon_core *core,
 	struct airoha_xpon_backend *target;
 	int ret;
 
-	if (core->removing || core->switching)
+	if (core->removing || core->switching || core->factory_tx_test_active)
 		return -EBUSY;
 	if (airoha_en7572_fault_locked(core->bosa))
 		return -EIO;
@@ -795,6 +845,318 @@ static int airoha_xpon_core_switch(struct airoha_xpon_core *core,
 	core->switching = false;
 	return ret;
 }
+
+static unsigned int airoha_xpon_factory_tx_wavelength(
+		enum airoha_xpon_mode mode)
+{
+	switch (mode) {
+	case AIROHA_XPON_MODE_GPON:
+		return AIROHA_FACTORY_TX_1310_NM;
+	case AIROHA_XPON_MODE_XGPON:
+	case AIROHA_XPON_MODE_XGSPON:
+	case AIROHA_XPON_MODE_EPON_10G_1G:
+	case AIROHA_XPON_MODE_EPON_10G_10G:
+		return AIROHA_FACTORY_TX_1270_NM;
+	default:
+		return 0;
+	}
+}
+
+static int airoha_xpon_factory_tx_ben_set_raw(struct airoha_xpon_core *core,
+						bool raw_value)
+{
+	int value;
+
+	/* The PMA polarity is independent of the GPIO descriptor polarity. */
+	gpiod_set_raw_value_cansleep(core->factory_tx_ben, raw_value);
+	value = gpiod_get_raw_value_cansleep(core->factory_tx_ben);
+	if (value < 0)
+		return value;
+
+	return value == raw_value ? 0 : -EIO;
+}
+
+static int airoha_xpon_factory_tx_ben_set(
+		struct airoha_xpon_core *core, bool enable)
+{
+	bool raw_value;
+
+	if (!core->factory_tx_ben_polarity_valid)
+		return -EIO;
+	raw_value = enable ? core->factory_tx_ben_active_high :
+		!core->factory_tx_ben_active_high;
+	return airoha_xpon_factory_tx_ben_set_raw(core, raw_value);
+}
+
+static int airoha_xpon_factory_tx_ben_disable_locked(
+		struct airoha_xpon_core *core)
+{
+	u32 value;
+	int ret, restore_ret = 0;
+
+	/* Deassert GPIO41 before releasing the Chip-SCU force. */
+	if (core->factory_tx_ben_polarity_valid)
+		ret = airoha_xpon_factory_tx_ben_set(core, false);
+	else
+		ret = airoha_xpon_factory_tx_ben_set_raw(
+			core, EN7581_FACTORY_TX_BEN_DEFAULT_RAW_OFF);
+	if (!ret)
+		core->factory_tx_ben_enabled = false;
+
+	if (core->factory_tx_force_saved) {
+		restore_ret = regmap_update_bits(
+			core->chip_scu, EN7581_CHIP_SCU_FORCE_GPIO32_EN,
+			EN7581_FACTORY_TX_BEN_MASK,
+			core->factory_tx_saved_force_gpio32_en &
+				EN7581_FACTORY_TX_BEN_MASK);
+		if (!restore_ret)
+			restore_ret = regmap_read(
+				core->chip_scu,
+				EN7581_CHIP_SCU_FORCE_GPIO32_EN, &value);
+		if (!restore_ret &&
+		    (value & EN7581_FACTORY_TX_BEN_MASK) !=
+		    (core->factory_tx_saved_force_gpio32_en &
+			     EN7581_FACTORY_TX_BEN_MASK))
+			restore_ret = -EIO;
+		if (!restore_ret) {
+			core->factory_tx_ben_forced = false;
+			core->factory_tx_force_saved = false;
+		}
+	}
+
+	return ret ? ret : restore_ret;
+}
+
+static int airoha_xpon_factory_tx_ben_enable_locked(
+		struct airoha_xpon_core *core)
+{
+	u32 value;
+	int ret, restore_ret;
+
+	ret = airoha_xpon_factory_tx_ben_set(core, false);
+	if (ret)
+		return ret;
+	core->factory_tx_ben_enabled = false;
+
+	ret = regmap_read(core->chip_scu,
+			  EN7581_CHIP_SCU_FORCE_GPIO32_EN,
+			  &core->factory_tx_saved_force_gpio32_en);
+	if (ret)
+		return ret;
+	core->factory_tx_force_saved = true;
+	if (core->factory_tx_saved_force_gpio32_en &
+	    EN7581_FACTORY_TX_BEN_FORCE) {
+		ret = -EBUSY;
+		goto restore;
+	}
+
+	/* Vendor sequence always forces GPIO32 to 0x201.  PMA bit8 only
+	 * controls the external GPIO41 polarity. */
+	ret = regmap_update_bits(core->chip_scu,
+				 EN7581_CHIP_SCU_FORCE_GPIO32_EN,
+				 EN7581_FACTORY_TX_BEN_MASK,
+				 EN7581_FACTORY_TX_BEN_MASK);
+	if (ret)
+		goto restore;
+	core->factory_tx_ben_forced = true;
+	ret = regmap_read(core->chip_scu,
+			  EN7581_CHIP_SCU_FORCE_GPIO32_EN, &value);
+	if (ret || (value & EN7581_FACTORY_TX_BEN_MASK) !=
+		    EN7581_FACTORY_TX_BEN_MASK) {
+		ret = ret ? ret : -EIO;
+		goto restore;
+	}
+
+	/* GPIO41 is the last physical gate in the vendor TX sequence. */
+	ret = airoha_xpon_factory_tx_ben_set(core, true);
+	if (ret)
+		goto restore;
+	core->factory_tx_ben_enabled = true;
+	return 0;
+
+restore:
+	restore_ret = airoha_xpon_factory_tx_ben_disable_locked(core);
+	return restore_ret ? restore_ret : ret;
+}
+
+static void airoha_xpon_factory_tx_disable_locked(
+		struct airoha_xpon_core *core)
+{
+	int ret, ben_ret;
+
+	if (!core->factory_tx_test_active && !core->factory_tx_ben_forced &&
+	    !core->factory_tx_ben_enabled && !core->factory_tx_force_saved)
+		return;
+
+	/* Deassert BEN before restoring the data path, then assert TX_DISABLE. */
+	ben_ret = airoha_xpon_factory_tx_ben_disable_locked(core);
+	if (ben_ret)
+		airoha_en7572_emergency_disable(core->bosa);
+	ret = airoha_pcs_xpon_factory_tx(core->pcs, false,
+						 core->factory_tx_wavelength);
+	airoha_en7572_factory_tx_disable(core->bosa);
+	if (ben_ret || ret) {
+		dev_err(core->dev,
+			"failed to disable factory optical TX: BEN %d, PCS %d\n",
+			ben_ret, ret);
+		airoha_en7572_emergency_disable(core->bosa);
+	}
+	core->factory_tx_test_active = false;
+	if (!ben_ret)
+		core->factory_tx_ben_polarity_valid = false;
+	core->factory_tx_wavelength = 0;
+	core->factory_tx_duration_ms = 0;
+	core->factory_tx_deadline = 0;
+}
+
+static void airoha_xpon_factory_tx_workfn(struct work_struct *work)
+{
+	struct airoha_xpon_core *core = container_of(to_delayed_work(work),
+						    struct airoha_xpon_core,
+						    factory_tx_work);
+
+	mutex_lock(&core->switch_lock);
+	airoha_xpon_factory_tx_disable_locked(core);
+	mutex_unlock(&core->switch_lock);
+}
+
+static ssize_t factory_tx_test_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct airoha_xpon_core *core = dev_get_drvdata(dev);
+	unsigned long remaining = 0;
+	unsigned int wavelength;
+	bool allowed, active, ben_enabled, ben_forced;
+	bool ben_active_high, ben_polarity_valid;
+	bool protocol_enabled, tx_disabled;
+
+	mutex_lock(&core->switch_lock);
+	if (core->factory_tx_test_active &&
+	    time_before(jiffies, core->factory_tx_deadline))
+		remaining = jiffies_to_msecs(core->factory_tx_deadline - jiffies);
+	allowed = core->factory_tx_test_allowed;
+	active = core->factory_tx_test_active;
+	ben_enabled = core->factory_tx_ben_enabled;
+	ben_forced = core->factory_tx_ben_forced;
+	ben_active_high = core->factory_tx_ben_active_high;
+	ben_polarity_valid = core->factory_tx_ben_polarity_valid;
+	wavelength = core->factory_tx_wavelength;
+	protocol_enabled = core->current_backend &&
+		core->current_backend->ops->activation_enabled(
+			core->current_backend->context);
+	tx_disabled = airoha_en7572_tx_is_disabled(core->bosa);
+	mutex_unlock(&core->switch_lock);
+	return sysfs_emit(buf,
+			"allowed=%u active=%u wavelength_nm=%u remaining_ms=%lu tx_disabled=%u ben_enabled=%u ben_forced=%u ben_active_high=%u ben_polarity_valid=%u protocol_enabled=%u\n",
+			allowed, active, wavelength, remaining, tx_disabled,
+			ben_enabled, ben_forced, ben_active_high,
+			ben_polarity_valid, protocol_enabled);
+}
+
+static ssize_t factory_tx_test_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct airoha_xpon_core *core = dev_get_drvdata(dev);
+	char token[40], command[16], extra;
+	unsigned int wavelength, duration, expected;
+	const char *failure_stage = "preflight";
+	int fields, ret;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+	if (!core->factory_tx_test_allowed)
+		return -EOPNOTSUPP;
+
+	fields = sscanf(buf, "%39s %15s %u %c", token, command, &duration,
+			&extra);
+	if (fields < 2 || strcmp(token, AIROHA_FACTORY_TX_TOKEN))
+		return -EINVAL;
+
+	mutex_lock(&core->switch_lock);
+	if (!strcmp(command, "off")) {
+		if (fields != 2)
+			ret = -EINVAL;
+		else {
+			/* A manual stop wins over a queued expiry callback. */
+			cancel_delayed_work(&core->factory_tx_work);
+			airoha_xpon_factory_tx_disable_locked(core);
+			ret = 0;
+		}
+		goto out;
+	}
+
+	if (fields != 3 || kstrtouint(command, 10, &wavelength) ||
+	    duration < AIROHA_FACTORY_TX_MIN_MS ||
+	    duration > AIROHA_FACTORY_TX_MAX_MS ||
+	    core->removing || core->switching || core->factory_tx_test_active ||
+	    !core->current_backend ||
+	    core->current_backend->ops->activation_enabled(
+		    core->current_backend->context) ||
+	    !airoha_en7572_tx_is_disabled(core->bosa)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	expected = airoha_xpon_factory_tx_wavelength(core->current_mode);
+	if (!expected || wavelength != expected) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* Do not energize the laser if PCS/BOSA state drifted out of sync. */
+	failure_stage = "PCS/BOSA mode validation";
+	ret = airoha_xpon_validate_factory_tx_mode(core, core->current_mode);
+	if (ret)
+		goto out;
+	/* Read PMA BURST_EN_INV before touching any physical BEN gate. */
+	failure_stage = "PCS BEN polarity readback";
+	core->factory_tx_ben_polarity_valid = false;
+	ret = airoha_pcs_xpon_get_ben_active_high(
+		core->pcs, &core->factory_tx_ben_active_high);
+	if (ret)
+		goto out;
+	core->factory_tx_ben_polarity_valid = true;
+
+	/* Prepare BOSA and PCS while GPIO41 BEN remains physically closed. */
+	failure_stage = "BOSA factory enable";
+	ret = airoha_en7572_factory_tx_enable(core->bosa);
+	if (ret)
+		goto out;
+	failure_stage = "PCS factory enable";
+	ret = airoha_pcs_xpon_factory_tx(core->pcs, true, wavelength);
+	if (ret) {
+		/* A PCS I/O failure must require an explicit fault clear. */
+		airoha_en7572_emergency_disable(core->bosa);
+		goto out;
+	}
+	failure_stage = "external BEN gate";
+	ret = airoha_xpon_factory_tx_ben_enable_locked(core);
+	if (ret) {
+		int restore_ret;
+
+		/* GPIO38 lockout wins if the final physical gate cannot be verified. */
+		airoha_en7572_emergency_disable(core->bosa);
+		restore_ret = airoha_pcs_xpon_factory_tx(core->pcs, false,
+							wavelength);
+		if (restore_ret)
+			dev_err(core->dev,
+				"failed to restore PCS after BEN error: %d\n",
+				restore_ret);
+		goto out;
+	}
+	core->factory_tx_test_active = true;
+	core->factory_tx_wavelength = wavelength;
+	core->factory_tx_duration_ms = duration;
+	core->factory_tx_deadline = jiffies + msecs_to_jiffies(duration);
+	mod_delayed_work(system_wq, &core->factory_tx_work,
+			msecs_to_jiffies(duration));
+out:
+	if (ret)
+		dev_err(core->dev, "factory optical TX failed at %s: %pe\n",
+			failure_stage, ERR_PTR(ret));
+	mutex_unlock(&core->switch_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(factory_tx_test);
 
 static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
@@ -886,6 +1248,7 @@ static DEVICE_ATTR_RO(dying_gasp);
 
 static struct attribute *airoha_xpon_core_attrs[] = {
 	&dev_attr_mode.attr,
+	&dev_attr_factory_tx_test.attr,
 	&dev_attr_available_modes.attr,
 	&dev_attr_switch_state.attr,
 	&dev_attr_dying_gasp.attr,
@@ -979,6 +1342,8 @@ void airoha_xpon_backend_unregister(struct airoha_xpon_backend *backend)
 	mutex_lock(&core->switch_lock);
 	backend->ready = false;
 	if (core->current_backend == backend) {
+		cancel_delayed_work(&core->factory_tx_work);
+		airoha_xpon_factory_tx_disable_locked(core);
 		airoha_en7572_emergency_disable(core->bosa);
 		if (airoha_xpon_backend_quiesce(backend))
 			dev_err(backend->dev,
@@ -998,6 +1363,34 @@ bool airoha_xpon_backend_is_active(struct airoha_xpon_backend *backend)
 }
 EXPORT_SYMBOL_GPL(airoha_xpon_backend_is_active);
 
+int airoha_xpon_backend_activation_lock(struct airoha_xpon_backend *backend)
+{
+	struct airoha_xpon_core *core;
+	int ret = 0;
+
+	if (!backend)
+		return -EINVAL;
+	core = backend->core;
+	mutex_lock(&core->switch_lock);
+	if (core->removing || core->switching || core->factory_tx_test_active)
+		ret = -EBUSY;
+	else if (core->current_backend != backend)
+		ret = -EHOSTDOWN;
+	if (ret)
+		mutex_unlock(&core->switch_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(airoha_xpon_backend_activation_lock);
+
+void airoha_xpon_backend_activation_unlock(
+		struct airoha_xpon_backend *backend)
+{
+	if (backend)
+		mutex_unlock(&backend->core->switch_lock);
+}
+EXPORT_SYMBOL_GPL(airoha_xpon_backend_activation_unlock);
+
 static void airoha_xpon_bosa_put(void *data)
 {
 	airoha_en7572_put(data);
@@ -1015,6 +1408,9 @@ static int airoha_xpon_core_probe(struct platform_device *pdev)
 	if (!core)
 		return -ENOMEM;
 	core->dev = dev;
+	core->factory_tx_test_allowed = device_property_read_bool(dev,
+						"airoha,allow-factory-tx-test");
+	INIT_DELAYED_WORK(&core->factory_tx_work, airoha_xpon_factory_tx_workfn);
 	INIT_LIST_HEAD(&core->backends);
 	mutex_init(&core->switch_lock);
 	core->state.stage = AIROHA_XPON_SWITCH_IDLE;
@@ -1025,6 +1421,18 @@ static int airoha_xpon_core_probe(struct platform_device *pdev)
 	if (IS_ERR(core->scu))
 		return dev_err_probe(dev, PTR_ERR(core->scu),
 				     "failed to map XPON SCU\n");
+	if (core->factory_tx_test_allowed) {
+		core->chip_scu = syscon_regmap_lookup_by_phandle(
+			dev->of_node, "airoha,chip-scu");
+		if (IS_ERR(core->chip_scu))
+			return dev_err_probe(dev, PTR_ERR(core->chip_scu),
+					     "failed to map factory TX Chip SCU\n");
+		core->factory_tx_ben = devm_gpiod_get(
+			dev, "factory-tx-ben", GPIOD_OUT_LOW);
+		if (IS_ERR(core->factory_tx_ben))
+			return dev_err_probe(dev, PTR_ERR(core->factory_tx_ben),
+					     "failed to acquire factory TX BEN GPIO\n");
+	}
 	core->dying_gasp_irq = platform_get_irq_byname(pdev, "dying-gasp");
 	if (core->dying_gasp_irq < 0)
 		return core->dying_gasp_irq;
@@ -1090,8 +1498,14 @@ static void airoha_xpon_core_remove(struct platform_device *pdev)
 {
 	struct airoha_xpon_core *core = platform_get_drvdata(pdev);
 
-	mutex_lock(&airoha_xpon_cores_lock);
+	mutex_lock(&core->switch_lock);
 	core->removing = true;
+	mutex_unlock(&core->switch_lock);
+	cancel_delayed_work_sync(&core->factory_tx_work);
+	mutex_lock(&core->switch_lock);
+	airoha_xpon_factory_tx_disable_locked(core);
+	mutex_unlock(&core->switch_lock);
+	mutex_lock(&airoha_xpon_cores_lock);
 	list_del(&core->node);
 	mutex_unlock(&airoha_xpon_cores_lock);
 	airoha_en7572_emergency_disable(core->bosa);
@@ -1102,6 +1516,13 @@ static void airoha_xpon_core_shutdown(struct platform_device *pdev)
 {
 	struct airoha_xpon_core *core = platform_get_drvdata(pdev);
 
+	mutex_lock(&core->switch_lock);
+	core->removing = true;
+	mutex_unlock(&core->switch_lock);
+	cancel_delayed_work_sync(&core->factory_tx_work);
+	mutex_lock(&core->switch_lock);
+	airoha_xpon_factory_tx_disable_locked(core);
+	mutex_unlock(&core->switch_lock);
 	airoha_en7572_emergency_disable(core->bosa);
 }
 

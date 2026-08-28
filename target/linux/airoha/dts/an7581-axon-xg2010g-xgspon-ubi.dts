@@ -10,6 +10,8 @@
 
 &en7572 {
 	airoha,pon-mode = "xgspon";
+	/* This board's factory GPON A0 ART record is erased. */
+	airoha,calibration-gpon-a2-as-a0;
 };
 
 &pon_pcs {

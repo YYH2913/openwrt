@@ -204,6 +204,17 @@ enum en7581_gpon_state {
 	EN7581_GPON_STATE_O7,
 };
 
+enum en7581_gpon_init_stage {
+	EN7581_GPON_INIT_NEVER,
+	EN7581_GPON_INIT_PRECHECK,
+	EN7581_GPON_INIT_MAC_IRQ_MASK,
+	EN7581_GPON_INIT_SESSION_RESET,
+	EN7581_GPON_INIT_PHY_SETTINGS,
+	EN7581_GPON_INIT_ROGUE_IRQ,
+	EN7581_GPON_INIT_SCU_GPIO,
+	EN7581_GPON_INIT_READY,
+};
+
 enum en7581_gpon_gem_counter {
 	EN7581_GPON_GEM_RX_FRAMES,
 	EN7581_GPON_GEM_RX_PAYLOAD_BYTES,
@@ -216,7 +227,7 @@ struct en7581_gpon {
 	void __iomem *base;
 	void __iomem *phy_csr;
 	void __iomem *pma;
-	struct regmap *scu;
+	struct regmap *chip_scu;
 	struct airoha_en7572 *bosa;
 	struct device_node *ethernet_np;
 	int mac_irq;
@@ -269,6 +280,18 @@ struct en7581_gpon {
 	bool lof;
 	bool phy_ready;
 	bool popup_reranging;
+	enum en7581_gpon_init_stage init_stage;
+	enum airoha_xpon_mode init_bosa_mode;
+	bool init_bosa_ready;
+	bool init_tx_disabled;
+	int init_error;
+	u32 init_phy_setting;
+	u32 init_errcnt_enable;
+	u32 init_pma_setting_0;
+	u32 init_pma_setting_1;
+	u32 init_pma_interrupt_enable;
+	u32 init_scu_gpio_force;
+	u64 init_attempts;
 	u64 irq_count;
 	u64 phy_irq_count;
 	u64 ploam_rx_count;
@@ -282,6 +305,31 @@ struct en7581_gpon {
 	u64 to2_timeout_count;
 	u64 popup_recovery_count;
 };
+
+static const char *
+en7581_gpon_init_stage_name(enum en7581_gpon_init_stage stage)
+{
+	switch (stage) {
+	case EN7581_GPON_INIT_NEVER:
+		return "never";
+	case EN7581_GPON_INIT_PRECHECK:
+		return "precheck";
+	case EN7581_GPON_INIT_MAC_IRQ_MASK:
+		return "mac-irq-mask";
+	case EN7581_GPON_INIT_SESSION_RESET:
+		return "session-reset";
+	case EN7581_GPON_INIT_PHY_SETTINGS:
+		return "phy-settings";
+	case EN7581_GPON_INIT_ROGUE_IRQ:
+		return "rogue-irq";
+	case EN7581_GPON_INIT_SCU_GPIO:
+		return "scu-gpio";
+	case EN7581_GPON_INIT_READY:
+		return "ready";
+	default:
+		return "invalid";
+	}
+}
 
 static u32 en7581_gpon_get_state(struct en7581_gpon *priv);
 static int en7581_gpon_xpon_mask_irqs(void *context);
@@ -1331,6 +1379,7 @@ static int en7581_gpon_phy_init(struct en7581_gpon *priv)
 	u32 value;
 	int ret;
 
+	priv->init_stage = EN7581_GPON_INIT_PHY_SETTINGS;
 	writel(EN7581_EN7572_PHY_SETTING,
 	       priv->phy_csr + EN7581_PHY_CSR_XPON_SETTING);
 	value = readl(priv->phy_csr + EN7581_PHY_CSR_ERRCNT_EN);
@@ -1344,35 +1393,65 @@ static int en7581_gpon_phy_init(struct en7581_gpon *priv)
 	writel(EN7581_EN7572_PMA_SETTING_1,
 	       priv->pma + EN7581_PMA_XPON_SETTING_1);
 
-	if (readl(priv->phy_csr + EN7581_PHY_CSR_XPON_SETTING) !=
-	    EN7581_EN7572_PHY_SETTING ||
-	    !(readl(priv->phy_csr + EN7581_PHY_CSR_ERRCNT_EN) &
-	      EN7581_PHY_ERRCNT_BIP_ENABLE) ||
-	    readl(priv->pma + EN7581_PMA_XPON_SETTING_0) !=
-	    EN7581_EN7572_PMA_SETTING_0 ||
-	    readl(priv->pma + EN7581_PMA_XPON_SETTING_1) !=
-	    EN7581_EN7572_PMA_SETTING_1)
+	priv->init_phy_setting =
+		readl(priv->phy_csr + EN7581_PHY_CSR_XPON_SETTING);
+	priv->init_errcnt_enable =
+		readl(priv->phy_csr + EN7581_PHY_CSR_ERRCNT_EN);
+	priv->init_pma_setting_0 =
+		readl(priv->pma + EN7581_PMA_XPON_SETTING_0);
+	priv->init_pma_setting_1 =
+		readl(priv->pma + EN7581_PMA_XPON_SETTING_1);
+	if (priv->init_phy_setting != EN7581_EN7572_PHY_SETTING ||
+	    !(priv->init_errcnt_enable & EN7581_PHY_ERRCNT_BIP_ENABLE) ||
+	    priv->init_pma_setting_0 != EN7581_EN7572_PMA_SETTING_0 ||
+	    priv->init_pma_setting_1 != EN7581_EN7572_PMA_SETTING_1) {
+		dev_err(priv->dev,
+			"GPON PHY setting readback failed: phy=0x%08x expected=0x%08x errcnt=0x%08x pma0=0x%08x expected0=0x%08x pma1=0x%08x expected1=0x%08x\n",
+			priv->init_phy_setting, EN7581_EN7572_PHY_SETTING,
+			priv->init_errcnt_enable, priv->init_pma_setting_0,
+			EN7581_EN7572_PMA_SETTING_0,
+			priv->init_pma_setting_1, EN7581_EN7572_PMA_SETTING_1);
 		return -EIO;
+	}
 
+	priv->init_stage = EN7581_GPON_INIT_ROGUE_IRQ;
 	value = readl(priv->pma + EN7581_PMA_XPON_INT_STA_0);
 	writel(value | EN7581_PMA_ROGUE_ONU,
 	       priv->pma + EN7581_PMA_XPON_INT_STA_0);
 	value = readl(priv->pma + EN7581_PMA_XPON_INT_EN_0);
 	writel(value | EN7581_PMA_ROGUE_ONU,
 	       priv->pma + EN7581_PMA_XPON_INT_EN_0);
-	if (!(readl(priv->pma + EN7581_PMA_XPON_INT_EN_0) &
-	      EN7581_PMA_ROGUE_ONU))
+	priv->init_pma_interrupt_enable =
+		readl(priv->pma + EN7581_PMA_XPON_INT_EN_0);
+	if (!(priv->init_pma_interrupt_enable & EN7581_PMA_ROGUE_ONU)) {
+		dev_err(priv->dev,
+			"GPON rogue-ONU interrupt readback failed: enable=0x%08x required=0x%08x\n",
+			priv->init_pma_interrupt_enable,
+			(u32)EN7581_PMA_ROGUE_ONU);
 		return -EIO;
+	}
 
-	ret = regmap_update_bits(priv->scu, EN7581_SCU_FORCE_GPIO32_EN,
+	priv->init_stage = EN7581_GPON_INIT_SCU_GPIO;
+	ret = regmap_update_bits(priv->chip_scu, EN7581_SCU_FORCE_GPIO32_EN,
 				 EN7581_SCU_FORCE_GPIO41_EN, 0);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev,
+			"failed to release GPON GPIO41 force-enable: %d\n", ret);
 		return ret;
-	ret = regmap_read(priv->scu, EN7581_SCU_FORCE_GPIO32_EN, &value);
-	if (ret)
+	}
+	ret = regmap_read(priv->chip_scu, EN7581_SCU_FORCE_GPIO32_EN, &value);
+	if (ret) {
+		dev_err(priv->dev,
+			"failed to read GPON GPIO41 force-enable: %d\n", ret);
 		return ret;
-	if (value & EN7581_SCU_FORCE_GPIO41_EN)
+	}
+	priv->init_scu_gpio_force = value;
+	if (value & EN7581_SCU_FORCE_GPIO41_EN) {
+		dev_err(priv->dev,
+			"GPON GPIO41 force-enable remained set: scu=0x%08x mask=0x%08x\n",
+			value, (u32)EN7581_SCU_FORCE_GPIO41_EN);
 		return -EIO;
+	}
 
 	writel(EN7581_PHY_INT_MASK,
 	       priv->phy_csr + EN7581_PHY_CSR_XPON_INT_CLEAR);
@@ -1487,14 +1566,22 @@ static int en7581_gpon_hw_init(struct en7581_gpon *priv)
 {
 	int ret;
 
+	priv->init_stage = EN7581_GPON_INIT_MAC_IRQ_MASK;
 	ret = en7581_gpon_set_mac_irq_enable(priv, 0);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev, "failed to mask GPON MAC interrupts: %d\n",
+			ret);
 		return ret;
+	}
 	en7581_gpon_write(priv, EN7581_GPON_INT_STATUS, U32_MAX);
 
+	priv->init_stage = EN7581_GPON_INIT_SESSION_RESET;
 	ret = en7581_gpon_reset_session(priv, EN7581_GPON_STATE_O1);
-	if (ret)
+	if (ret) {
+		dev_err(priv->dev, "failed to reset GPON session during init: %d\n",
+			ret);
 		return ret;
+	}
 	en7581_gpon_update_bits(priv, EN7581_GPON_GBL_CFG,
 				EN7581_GPON_DBA_BLOCK_MASK,
 				FIELD_PREP(EN7581_GPON_DBA_BLOCK_MASK,
@@ -1602,14 +1689,21 @@ static ssize_t enabled_store(struct device *dev,
 	ret = kstrtobool(buf, &enabled);
 	if (ret)
 		return ret;
-	if (!airoha_xpon_backend_is_active(priv->xpon_backend))
-		return -EHOSTDOWN;
-	if (enabled && !priv->serial_set)
-		return -ENODATA;
-	if (enabled && !priv->safety_ready)
-		return -EOPNOTSUPP;
-	if (enabled && READ_ONCE(priv->rogue_fault))
-		return -EIO;
+	ret = airoha_xpon_backend_activation_lock(priv->xpon_backend);
+	if (ret)
+		return ret;
+	if (enabled && !priv->serial_set) {
+		ret = -ENODATA;
+		goto unlock_owner;
+	}
+	if (enabled && !priv->safety_ready) {
+		ret = -EOPNOTSUPP;
+		goto unlock_owner;
+	}
+	if (enabled && READ_ONCE(priv->rogue_fault)) {
+		ret = -EIO;
+		goto unlock_owner;
+	}
 
 	mutex_lock(&priv->lock);
 	if (enabled == priv->enabled && (enabled || !priv->rogue_fault))
@@ -1666,6 +1760,9 @@ out:
 	mutex_unlock(&priv->lock);
 	if (ret)
 		airoha_en7572_set_tx_enabled(priv->bosa, false);
+
+unlock_owner:
+	airoha_xpon_backend_activation_unlock(priv->xpon_backend);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_RW(enabled);
@@ -2217,6 +2314,31 @@ static ssize_t safety_status_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(safety_status);
 
+static ssize_t init_status_show(struct device *dev,
+				struct device_attribute *attribute, char *buf)
+{
+	struct en7581_gpon *priv = dev_get_drvdata(dev);
+	const struct airoha_xpon_mode_descriptor *mode;
+	ssize_t len;
+
+	mutex_lock(&priv->lock);
+	mode = airoha_xpon_mode_descriptor(priv->init_bosa_mode);
+	len = sysfs_emit(buf,
+		"attempts=%llu stage=%s error=%d bosa_mode=%s bosa_ready=%u tx_disabled=%u ",
+		priv->init_attempts, en7581_gpon_init_stage_name(priv->init_stage),
+		priv->init_error, mode ? mode->name : "invalid",
+		priv->init_bosa_ready, priv->init_tx_disabled);
+	len += sysfs_emit_at(buf, len,
+		"phy_setting=0x%08x errcnt_enable=0x%08x pma_setting0=0x%08x pma_setting1=0x%08x pma_interrupt_enable=0x%08x scu_gpio_force=0x%08x\n",
+		priv->init_phy_setting, priv->init_errcnt_enable,
+		priv->init_pma_setting_0, priv->init_pma_setting_1,
+		priv->init_pma_interrupt_enable, priv->init_scu_gpio_force);
+	mutex_unlock(&priv->lock);
+
+	return len;
+}
+static DEVICE_ATTR_RO(init_status);
+
 static ssize_t last_ploam_show(struct device *dev,
 			       struct device_attribute *attribute, char *buf)
 {
@@ -2453,6 +2575,7 @@ static struct attribute *en7581_gpon_attrs[] = {
 	&dev_attr_data_gem.attr,
 	&dev_attr_data_gems.attr,
 	&dev_attr_safety_status.attr,
+	&dev_attr_init_status.attr,
 	&dev_attr_last_ploam.attr,
 	&dev_attr_gem_counters.attr,
 	&dev_attr_counter_evidence.attr,
@@ -2619,19 +2742,45 @@ static int en7581_gpon_xpon_stop_mac(void *context)
 static int en7581_gpon_xpon_start_mac(void *context)
 {
 	struct en7581_gpon *priv = context;
+	const struct airoha_xpon_mode_descriptor *mode;
 	int ret;
 
-	if (airoha_en7572_get_mode(priv->bosa) != AIROHA_XPON_MODE_GPON ||
-	    !airoha_en7572_is_ready(priv->bosa) ||
-	    !airoha_en7572_tx_is_disabled(priv->bosa))
-		return -EIO;
 	mutex_lock(&priv->lock);
+	priv->init_attempts++;
+	priv->init_stage = EN7581_GPON_INIT_PRECHECK;
+	priv->init_error = 0;
+	priv->init_bosa_mode = airoha_en7572_get_mode(priv->bosa);
+	priv->init_bosa_ready = airoha_en7572_is_ready(priv->bosa);
+	priv->init_tx_disabled = airoha_en7572_tx_is_disabled(priv->bosa);
+	priv->init_phy_setting = 0;
+	priv->init_errcnt_enable = 0;
+	priv->init_pma_setting_0 = 0;
+	priv->init_pma_setting_1 = 0;
+	priv->init_pma_interrupt_enable = 0;
+	priv->init_scu_gpio_force = 0;
+	if (priv->init_bosa_mode != AIROHA_XPON_MODE_GPON ||
+	    !priv->init_bosa_ready || !priv->init_tx_disabled) {
+		mode = airoha_xpon_mode_descriptor(priv->init_bosa_mode);
+		ret = -EIO;
+		dev_err(priv->dev,
+			"GPON start precheck failed: bosa_mode=%s ready=%u tx_disabled=%u\n",
+			mode ? mode->name : "invalid", priv->init_bosa_ready,
+			priv->init_tx_disabled);
+		goto out;
+	}
 	priv->hardware_selected = true;
 	ret = en7581_gpon_hw_init(priv);
 	if (!ret)
 		ret = en7581_gpon_phy_init(priv);
-	if (ret)
+	if (ret) {
 		priv->hardware_selected = false;
+		dev_err(priv->dev, "GPON hardware init failed at %s: %d\n",
+			en7581_gpon_init_stage_name(priv->init_stage), ret);
+	} else {
+		priv->init_stage = EN7581_GPON_INIT_READY;
+	}
+out:
+	priv->init_error = ret;
 	mutex_unlock(&priv->lock);
 	return ret;
 }
@@ -2713,6 +2862,13 @@ out:
 	return ret;
 }
 
+static bool en7581_gpon_xpon_activation_enabled(void *context)
+{
+	struct en7581_gpon *priv = context;
+
+	return READ_ONCE(priv->enabled);
+}
+
 static const struct airoha_xpon_backend_ops en7581_gpon_xpon_ops = {
 	.block_traffic = en7581_gpon_xpon_block_traffic,
 	.clear_session = en7581_gpon_xpon_clear_session,
@@ -2724,6 +2880,7 @@ static const struct airoha_xpon_backend_ops en7581_gpon_xpon_ops = {
 	.start_datapath = en7581_gpon_xpon_start_datapath,
 	.unmask_irqs = en7581_gpon_xpon_unmask_irqs,
 	.mode_committed = en7581_gpon_xpon_mode_committed,
+	.activation_enabled = en7581_gpon_xpon_activation_enabled,
 };
 
 static void en7581_gpon_xpon_unregister(void *data)
@@ -2752,6 +2909,7 @@ static int en7581_gpon_probe(struct platform_device *pdev)
 
 	priv->dev = dev;
 	priv->hardware_selected = false;
+	priv->init_bosa_mode = AIROHA_XPON_MODE_INVALID;
 	mutex_init(&priv->lock);
 	INIT_DELAYED_WORK(&priv->activation_work,
 			  en7581_gpon_activation_work);
@@ -2767,11 +2925,11 @@ static int en7581_gpon_probe(struct platform_device *pdev)
 	if (IS_ERR(priv->pma))
 		return dev_err_probe(dev, PTR_ERR(priv->pma),
 				     "failed to map PON PMA\n");
-	priv->scu = syscon_regmap_lookup_by_phandle(dev->of_node,
-						    "airoha,scu");
-	if (IS_ERR(priv->scu))
-		return dev_err_probe(dev, PTR_ERR(priv->scu),
-				     "failed to find SCU syscon\n");
+	priv->chip_scu = syscon_regmap_lookup_by_phandle(dev->of_node,
+							 "airoha,chip-scu");
+	if (IS_ERR(priv->chip_scu))
+		return dev_err_probe(dev, PTR_ERR(priv->chip_scu),
+				     "failed to find Chip SCU syscon\n");
 
 	priv->idle_gem_threshold = EN7581_GPON_IDLE_GEM_THRESHOLD;
 	ret = device_property_read_u32(dev, "airoha,idle-gem-threshold",

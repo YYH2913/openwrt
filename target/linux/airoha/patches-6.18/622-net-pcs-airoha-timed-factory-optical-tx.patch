@@ -1,0 +1,314 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Wed, 26 Aug 2026 17:00:00 +0800
+Subject: [PATCH] net: pcs: airoha: add guarded factory optical TX API
+
+
+Expose the EN7581 XPON continuous-TX pattern through an opt-in API used by
+the XPON owner. The owner coordinates this API with the EN7572 TX-disable
+GPIO and supplies the timeout, so no standalone register or GPIO interface
+can leave the laser enabled. Follow the vendor out-of-timeslot test sequence
+and force OUTBEN only after the continuous data path is ready; on expiry,
+remove OUTBEN before restoring the data path.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1492,6 +1492,12 @@
+ #define   AIROHA_PCS_PMA_FBCK_LOCK		BIT(0)
+ #define AIROHA_PCS_PMA_XPON_TX_RATE_CTRL	0x580
+ #define   AIROHA_PCS_PMA_PON_TX_RATE_CTRL	GENMASK(1, 0)
++#define AIROHA_PCS_PMA_XPON_SETTING_0	0x270
++#define   AIROHA_PCS_PMA_BURST_EN_INV	BIT(8)
++#define AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1	0x404
++#define   AIROHA_PCS_PMA_TX_FORCE_NORMAL_MODE	BIT(24)
++#define AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2	0x408
++#define   AIROHA_PCS_PMA_TX_FORCE_CONT_MODE	GENMASK(31, 16)
+ #define AIROHA_PCS_PMA_MD32_MEM_CLK_CTRL	0x60c
+-#define   AIROHA_PCS_PMA_MD32PM_CK_SEL		GENMASK(31, 0)
++#define   AIROHA_PCS_PMA_MD32PM_CK_SEL		GENMASK(1, 0)
+ #define AIROHA_PCS_PMA_PXP_JCPLL_SDM_SCAN	0x768
+@@ -1714,6 +1718,12 @@
+ 	bool pon_quiesced;
+ 	bool pon_wan_selected;
+ 	bool pon_pma_ready;
++	bool factory_tx_test_active;
++	unsigned int factory_tx_port;
++	u32 factory_tx_saved_force1;
++	u32 factory_tx_saved_force2;
++	u32 factory_tx_saved_tx_dly_ctrl;
++	u32 factory_tx_saved_md32_clk_ctrl;
+ 	enum airoha_pcs_pon_mode pon_mode;
+ };
+ 
+
+--- a/include/linux/pcs/pcs-airoha.h
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -2,6 +2,8 @@
+ #ifndef __LINUX_PCS_AIROHA_H
+ #define __LINUX_PCS_AIROHA_H
+ 
++#include <linux/types.h>
++
+ struct phylink_pcs;
+ 
+ enum airoha_pcs_xpon_mode {
+@@ -24,5 +26,9 @@
+ int airoha_pcs_xpon_set_mode(struct phylink_pcs *pcs,
+ 			     enum airoha_pcs_xpon_mode mode);
+ int airoha_pcs_xpon_recover(struct phylink_pcs *pcs);
++int airoha_pcs_xpon_factory_tx(struct phylink_pcs *pcs, bool enable,
++				       unsigned int wavelength);
++int airoha_pcs_xpon_get_ben_active_high(struct phylink_pcs *pcs,
++					bool *active_high);
+ 
+ #endif /* __LINUX_PCS_AIROHA_H */
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -20,6 +20,225 @@
+ 
+ #include "pcs-airoha.h"
+ 
++#define AIROHA_FACTORY_TX_1270_NM	1270
++#define AIROHA_FACTORY_TX_1310_NM	1310
++
++static int airoha_pcs_xpon_port(struct phylink_pcs *pcs,
++				struct airoha_pcs_port **port);
++
++static unsigned int
++airoha_pcs_factory_tx_wavelength(enum airoha_pcs_pon_mode mode)
++{
++	switch (mode) {
++	case AIROHA_PCS_PON_MODE_GPON:
++		return AIROHA_FACTORY_TX_1310_NM;
++	case AIROHA_PCS_PON_MODE_XGPON:
++	case AIROHA_PCS_PON_MODE_XGSPON:
++	case AIROHA_PCS_PON_MODE_EPON_10G_1G:
++	case AIROHA_PCS_PON_MODE_EPON_10G_10G:
++		return AIROHA_FACTORY_TX_1270_NM;
++	default:
++		return 0;
++	}
++}
++
++int airoha_pcs_xpon_get_ben_active_high(struct phylink_pcs *pcs,
++						bool *active_high)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	struct regmap *pma;
++	u32 value;
++	int ret;
++
++	if (!active_high)
++		return -EINVAL;
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++	if (priv->data->port_type != AIROHA_PCS_PON)
++		return -EINVAL;
++	pma = priv->pcs_pma[port->index];
++	if (!pma)
++		return -ENODEV;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (priv->factory_tx_test_active)
++		ret = -EBUSY;
++	else if (priv->pon_quiesced)
++		/* PMA readiness is a setup-stage flag; after recover(),
++		 * pon_quiesced=0 is the valid running-state condition. */
++		ret = -EAGAIN;
++	else {
++		ret = regmap_read(pma, AIROHA_PCS_PMA_XPON_SETTING_0,
++				  &value);
++		/* An unmapped MMIO window commonly reads as these sentinel values. */
++		if (!ret && (value == (u32)~0U || value == 0xdeadbeefU))
++			ret = -EIO;
++		if (!ret)
++			*active_high = !(value & AIROHA_PCS_PMA_BURST_EN_INV);
++	}
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_get_ben_active_high);
++
++static int airoha_pcs_factory_tx_restore_locked(struct airoha_pcs_priv *priv)
++{
++	struct regmap *pma;
++	int ret, force1_ret, force2_ret, clock_ret;
++
++	if (!priv->factory_tx_test_active)
++		return 0;
++	pma = priv->pcs_pma[priv->factory_tx_port];
++	/* Remove the optical BEN force before restoring the data source. */
++	ret = regmap_write(pma, AIROHA_PCS_PMA_TX_DLY_CTRL,
++			   priv->factory_tx_saved_tx_dly_ctrl);
++	force1_ret = regmap_write(pma, AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1,
++				  priv->factory_tx_saved_force1);
++	force2_ret = regmap_write(pma, AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2,
++				  priv->factory_tx_saved_force2);
++	clock_ret = regmap_write(pma, AIROHA_PCS_PMA_MD32_MEM_CLK_CTRL,
++				 priv->factory_tx_saved_md32_clk_ctrl);
++	if (!ret)
++		ret = force1_ret;
++	if (!ret)
++		ret = force2_ret;
++	if (!ret)
++		ret = clock_ret;
++	if (ret) {
++		regmap_update_bits(pma, AIROHA_PCS_PMA_TX_DLY_CTRL,
++				   AIROHA_PCS_PMA_OUTBEN_DATA_MODE,
++				   FIELD_PREP(AIROHA_PCS_PMA_OUTBEN_DATA_MODE,
++					      0x1));
++		regmap_set_bits(pma, AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1,
++				AIROHA_PCS_PMA_TX_FORCE_NORMAL_MODE);
++		regmap_clear_bits(pma, AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2,
++				  AIROHA_PCS_PMA_TX_FORCE_CONT_MODE);
++	}
++	priv->factory_tx_test_active = false;
++	return ret;
++}
++
++int airoha_pcs_xpon_factory_tx(struct phylink_pcs *pcs, bool enable,
++				       unsigned int wavelength)
++{
++	struct airoha_pcs_port *port;
++	struct airoha_pcs_priv *priv;
++	struct regmap *pma;
++	unsigned int expected;
++	int ret = 0, restore_ret;
++	u32 value;
++
++	ret = airoha_pcs_xpon_port(pcs, &port);
++	if (ret)
++		return ret;
++	priv = port->priv;
++
++	rtnl_lock();
++	mutex_lock(&priv->recovery_lock);
++	if (!enable) {
++		ret = airoha_pcs_factory_tx_restore_locked(priv);
++		goto unlock;
++	}
++	if (priv->factory_tx_test_active || priv->pon_quiesced) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	expected = airoha_pcs_factory_tx_wavelength(priv->pon_mode);
++	if (!expected || wavelength != expected) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	pma = priv->pcs_pma[port->index];
++	if (!pma) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	ret = regmap_read(pma,
++			  AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1,
++			  &priv->factory_tx_saved_force1);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(pma,
++			  AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2,
++			  &priv->factory_tx_saved_force2);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(pma, AIROHA_PCS_PMA_TX_DLY_CTRL,
++			  &priv->factory_tx_saved_tx_dly_ctrl);
++	if (ret)
++		goto unlock;
++	ret = regmap_read(pma, AIROHA_PCS_PMA_MD32_MEM_CLK_CTRL,
++			  &priv->factory_tx_saved_md32_clk_ctrl);
++	if (ret)
++		goto unlock;
++	priv->factory_tx_port = port->index;
++	priv->factory_tx_test_active = true;
++	ret = regmap_update_bits(pma, AIROHA_PCS_PMA_MD32_MEM_CLK_CTRL,
++				   AIROHA_PCS_PMA_MD32PM_CK_SEL,
++				   FIELD_PREP(AIROHA_PCS_PMA_MD32PM_CK_SEL,
++					      0x3));
++	if (ret)
++		goto restore;
++	ret = regmap_clear_bits(pma,
++				AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1,
++				AIROHA_PCS_PMA_TX_FORCE_NORMAL_MODE);
++	if (ret)
++		goto restore;
++	ret = regmap_set_bits(pma,
++			      AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2,
++			      AIROHA_PCS_PMA_TX_FORCE_CONT_MODE);
++	if (ret)
++		goto restore;
++	ret = regmap_read(pma, AIROHA_PCS_PMA_MD32_MEM_CLK_CTRL,
++			  &value);
++	if (ret || (value & AIROHA_PCS_PMA_MD32PM_CK_SEL) !=
++		    FIELD_PREP(AIROHA_PCS_PMA_MD32PM_CK_SEL, 0x3)) {
++		ret = ret ? ret : -EIO;
++		goto restore;
++	}
++	ret = regmap_read(pma,
++			  AIROHA_PCS_PMA_DA_XPON_TX_FORCE_1, &value);
++	if (ret || (value & AIROHA_PCS_PMA_TX_FORCE_NORMAL_MODE)) {
++		ret = ret ? ret : -EIO;
++		goto restore;
++	}
++	ret = regmap_read(pma,
++			  AIROHA_PCS_PMA_DA_XPON_TX_FORCE_2, &value);
++	if (ret || (value & AIROHA_PCS_PMA_TX_FORCE_CONT_MODE) !=
++		    AIROHA_PCS_PMA_TX_FORCE_CONT_MODE) {
++		ret = ret ? ret : -EIO;
++		goto restore;
++	}
++	/* This is the final optical gate in the vendor non-timeslot sequence. */
++	ret = regmap_update_bits(pma, AIROHA_PCS_PMA_TX_DLY_CTRL,
++				   AIROHA_PCS_PMA_OUTBEN_DATA_MODE,
++				   FIELD_PREP(AIROHA_PCS_PMA_OUTBEN_DATA_MODE,
++					      0x2));
++	if (ret)
++		goto restore;
++	ret = regmap_read(pma, AIROHA_PCS_PMA_TX_DLY_CTRL, &value);
++	if (ret || (value & AIROHA_PCS_PMA_OUTBEN_DATA_MODE) !=
++		    FIELD_PREP(AIROHA_PCS_PMA_OUTBEN_DATA_MODE, 0x2)) {
++		ret = ret ? ret : -EIO;
++		goto restore;
++	}
++	goto unlock;
++restore:
++	restore_ret = airoha_pcs_factory_tx_restore_locked(priv);
++	if (restore_ret)
++		ret = restore_ret;
++unlock:
++	mutex_unlock(&priv->recovery_lock);
++	rtnl_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_factory_tx);
++
+ static void airoha_pcs_setup_scu_eth(struct airoha_pcs_priv *priv,
+ 				     phy_interface_t interface)
+ {
+@@ -1432,6 +1488,11 @@
+ 
+ 	rtnl_lock();
+ 	mutex_lock(&priv->recovery_lock);
++	if (priv->factory_tx_test_active) {
++		ret = airoha_pcs_factory_tx_restore_locked(priv);
++		if (ret)
++			goto unlock;
++	}
+ 	priv->pon_quiesced = false;
+ 	priv->pon_wan_selected = false;
+ 	priv->pon_pma_ready = false;
+@@ -2024,6 +2203,9 @@
+ 	int i;
+ 
+ 	fwnode_pcs_del_provider(dev_fwnode(&pdev->dev));
++	mutex_lock(&priv->recovery_lock);
++	airoha_pcs_factory_tx_restore_locked(priv);
++	mutex_unlock(&priv->recovery_lock);
+ 
+ 	rtnl_lock();
+ 

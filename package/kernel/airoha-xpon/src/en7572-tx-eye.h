@@ -16,7 +16,10 @@
 #define EN7572_ERC_DAC			0x0fff0000U
 #define EN7572_TIA_CTRL			0x0130
 #define EN7572_TIA_CURRENT		0x00000001U
-#define EN7572_TIA_GAIN_BW		0x00003f00U
+#define EN7572_TIA_GAIN			0x00000700U
+#define EN7572_TIA_BANDWIDTH		0x00003800U
+#define EN7572_TIA_GAIN_BW		(EN7572_TIA_GAIN | \
+					 EN7572_TIA_BANDWIDTH)
 #define EN7572_PGA_CTRL			0x013c
 #define EN7572_PGA_CAP			0x00000060U
 #define EN7572_PGA_GAIN			0x00070000U
@@ -134,6 +137,26 @@ en7572_tx_eye_mismatch(const struct en7572_tx_eye_fingerprint *expected,
 		mismatch |= EN7572_TX_EYE_MISMATCH_TSSI;
 	if ((expected->loop_ctrl ^ actual->loop_ctrl) & EN7572_LOOP_ENABLE)
 		mismatch |= EN7572_TX_EYE_MISMATCH_LOOP;
+
+	return mismatch;
+}
+
+/*
+ * Once the receive loop is running, MD32 may retune TIA bandwidth according
+ * to the downstream optical input. The host still owns and validates TIA
+ * current and gain; the complete field is checked immediately after an eye is
+ * selected, before this runtime-only comparison is used.
+ */
+static inline unsigned int
+en7572_tx_eye_runtime_mismatch(
+		const struct en7572_tx_eye_fingerprint *expected,
+		const struct en7572_tx_eye_fingerprint *actual)
+{
+	unsigned int mismatch = en7572_tx_eye_mismatch(expected, actual);
+
+	if (!((expected->tia_ctrl ^ actual->tia_ctrl) &
+	      (EN7572_TIA_CURRENT | EN7572_TIA_GAIN)))
+		mismatch &= ~EN7572_TX_EYE_MISMATCH_TIA;
 
 	return mismatch;
 }

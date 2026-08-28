@@ -47,8 +47,11 @@ factory_wan_mac()
 
 board="${AIROHA_BOARD_NAME:-$(board_name)}"
 case "$board" in
-axon,xg2010g-xgspon|axon,xg2010g|econet,xg2010g)
-	pon_mode=xgspon
+axon,xg2010g-xgspon)
+	default_mode=xgspon
+	;;
+axon,xg2010g|econet,xg2010g)
+	default_mode=gpon
 	;;
 *)
 	exit 0
@@ -58,6 +61,7 @@ esac
 current_mode="$(uci -q get airoha-gpon.main.pon_mode)"
 current_serial="$(uci -q get airoha-gpon.main.serial_number)"
 current_epon_mac="$(uci -q get airoha-gpon.main.epon_onu_mac)"
+pon_mode="${current_mode:-$default_mode}"
 factory_serial=
 factory_mac=
 [ -n "$current_serial" ] || factory_serial="$(factory_fsan 2>/dev/null)"

@@ -27,7 +27,8 @@ epon_rollback_fail_closed=0
 find_gpon() {
 	local path
 
-	for path in "$sysfs_root"/bus/platform/drivers/airoha-gpon/*; do
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-gpon/* \
+		"$sysfs_root"/devices/platform/*gpon*; do
 		[ -f "$path/enabled" ] || continue
 		echo "$path"
 		return 0
@@ -39,7 +40,8 @@ find_gpon() {
 find_xgspon() {
 	local path
 
-	for path in "$sysfs_root"/bus/platform/drivers/airoha-xgspon/*; do
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-xgspon/* \
+		"$sysfs_root"/devices/platform/*xgspon*; do
 		[ -f "$path/enabled" ] || continue
 		echo "$path"
 		return 0
@@ -51,7 +53,8 @@ find_xgspon() {
 find_epon() {
 	local path
 
-	for path in "$sysfs_root"/bus/platform/drivers/airoha-en7581-epon/*; do
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-en7581-epon/* \
+		"$sysfs_root"/devices/platform/*epon*; do
 		[ -f "$path/enabled" ] || continue
 		echo "$path"
 		return 0
@@ -63,7 +66,8 @@ find_epon() {
 find_xpon() {
 	local path
 
-	for path in "$sysfs_root"/bus/platform/drivers/airoha-xpon-core/*; do
+	for path in "$sysfs_root"/bus/platform/drivers/airoha-xpon-core/* \
+		"$sysfs_root"/devices/platform/*xpon-controller*; do
 		[ -f "$path/mode" ] || continue
 		echo "$path"
 		return 0
@@ -765,6 +769,34 @@ monitor_manual_gem() {
 	done
 }
 
+wait_for_selected_backend() {
+	local attempt path=
+
+	for attempt in $(seq 1 60); do
+		case "$pon_mode" in
+			gpon)
+				path="$(find_gpon 2>/dev/null || true)"
+				;;
+			xgpon|xgspon)
+				path="$(find_xgspon 2>/dev/null || true)"
+				;;
+			epon-10g-1g|epon-10g-10g)
+				path="$(find_epon 2>/dev/null || true)"
+				;;
+			*)
+				return 1
+				;;
+		esac
+		if [ -n "$path" ] && [ -r "$path/enabled" ]; then
+			return 0
+		fi
+		sleep 1
+	done
+
+	echo "airoha-xpon: selected $pon_mode backend did not become ready" >&2
+	return 1
+}
+
 case "${1:-}" in
 	monitor)
 		read_config
@@ -780,6 +812,7 @@ case "${1:-}" in
 			echo "airoha-xpon: runtime owner sysfs device not found" >&2
 			exit 1
 		}
+		wait_for_selected_backend || exit 1
 		gpon="$(find_gpon 2>/dev/null || true)"
 		xgspon="$(find_xgspon 2>/dev/null || true)"
 		epon="$(find_epon 2>/dev/null || true)"

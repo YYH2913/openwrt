@@ -7,6 +7,7 @@
  * firmware, nvmem, GPIO and sysfs interfaces.
  */
 
+#include <linux/bitfield.h>
 #include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
@@ -14,6 +15,7 @@
 #include <linux/i2c.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/property.h>
@@ -50,6 +52,17 @@
 #define EN7572_ALARM_FLAGS		0x0070
 #define EN7572_WARNING_FLAGS		0x0074
 
+/* Runtime TX state maintained by the EN7572 MD32. */
+#define EN7572_CSR_IAV			0x03c4
+#define   EN7572_CSR_IAV_VALUE		GENMASK(12, 0)
+#define EN7572_CSR_IBIAS_IMOD		0x03c8
+#define   EN7572_CSR_IBIAS		GENMASK(11, 0)
+#define   EN7572_CSR_IMOD		GENMASK(27, 16)
+#define EN7572_TX_STATUS		0x03e0
+#define   EN7572_TX_STATUS_DISABLED	BIT(8)
+#define EN7572_SYSTEM_STATUS		0x0488
+#define   EN7572_SYSTEM_STATUS_BEN	BIT(0)
+
 /* SFF-8472 compatible real-time diagnostics maintained by the MD32. */
 #define EN7572_DIAGNOSTICS_REG		0x0060
 #define EN7572_DIAGNOSTICS_SIZE		10
@@ -61,7 +74,22 @@
 #define EN7572_DEFAULT_PM_FW		"airoha/xg2010g/en7572-A60993.pm"
 #define EN7572_DEFAULT_DM_FW		"airoha/xg2010g/en7572-A60993.dm"
 #define EN7572_DEFAULT_GPON_BOB_FW	"airoha/xg2010g/en7572-bob-gpon.bin"
+#define EN7572_DEFAULT_GPON_A2_AS_A0_FW \
+					"airoha/xg2010g/en7572-bob-gpon-a2-as-a0.bin"
 #define EN7572_DEFAULT_10G_BOB_FW	"airoha/xg2010g/en7572-bob-xgspon.bin"
+
+#define EN7572_ART_A0_CALIBRATION_OFFSET	0x51000
+#define EN7572_ART_A2_CALIBRATION_OFFSET	0x52000
+
+/*
+ * The EN7572 MD32 can settle the analog TX eye asynchronously after the
+ * control registers are programmed.  A one-shot readback can therefore see
+ * a transient TIA value and incorrectly fail probe.  Keep the check strict,
+ * but allow a short, bounded settling window before declaring a fault.
+ */
+#define EN7572_TX_EYE_VERIFY_RETRIES	20
+#define EN7572_TX_EYE_VERIFY_DELAY_US	5000
+
 
 struct airoha_en7572 {
 	struct i2c_client *a0;
@@ -74,7 +102,10 @@ struct airoha_en7572 {
 	bool fault_locked;
 	bool calibration_valid;
 	bool calibration_from_nvmem;
+	bool calibration_from_mtd;
+	bool calibration_gpon_a2_as_a0;
 	bool calibration_a2_as_a0;
+	bool factory_tx_test_active;
 	u16 id1;
 	u16 id2;
 	u8 fw_version;
@@ -231,23 +262,36 @@ static int en7572_read_tx_eye(struct airoha_en7572 *priv,
 	return en7572_read_le32(priv->a2, EN7572_LOOP_CTRL, &eye->loop_ctrl);
 }
 
-static int en7572_verify_tx_eye(struct airoha_en7572 *priv, const u8 *bank)
+static int en7572_verify_tx_eye(struct airoha_en7572 *priv, const u8 *bank,
+				bool runtime)
 {
 	struct en7572_tx_eye_fingerprint expected, actual;
-	unsigned int mismatch;
-	int ret;
+	unsigned int mismatch = 0;
+	unsigned int attempt;
+	int ret = 0;
 
 	en7572_tx_eye_from_bank(bank, &expected);
-	ret = en7572_read_tx_eye(priv, &actual);
-	if (ret)
-		return ret;
+	for (attempt = 0; attempt < EN7572_TX_EYE_VERIFY_RETRIES; attempt++) {
+		ret = en7572_read_tx_eye(priv, &actual);
+		if (ret)
+			return ret;
 
-	mismatch = en7572_tx_eye_mismatch(&expected, &actual);
-	if (!mismatch)
-		return 0;
+		mismatch = runtime ?
+			en7572_tx_eye_runtime_mismatch(&expected, &actual) :
+			en7572_tx_eye_mismatch(&expected, &actual);
+		if (!mismatch)
+			return 0;
+
+		if (attempt + 1 < EN7572_TX_EYE_VERIFY_RETRIES)
+			usleep_range(EN7572_TX_EYE_VERIFY_DELAY_US,
+				     EN7572_TX_EYE_VERIFY_DELAY_US + 2000);
+	}
 
 	dev_err_ratelimited(&priv->a0->dev,
-			    "active TX-eye readback mismatch: %#x\n", mismatch);
+			    "active TX-eye readback mismatch after %u attempts: "
+			    "%#x (expected tia=%#x actual=%#x)\n",
+			    EN7572_TX_EYE_VERIFY_RETRIES, mismatch,
+			    expected.tia_ctrl, actual.tia_ctrl);
 	return -EIO;
 }
 
@@ -255,6 +299,10 @@ static int en7572_calibration_bank_for_mode(enum airoha_xpon_mode mode,
 						     unsigned int *bank)
 {
 	switch (mode) {
+	case AIROHA_XPON_MODE_GPON:
+		/* GPON uses the dedicated A0 TX eye in the EN7572 BOB table. */
+		*bank = EN7572_BOB_BANK_A0;
+		return 0;
 	case AIROHA_XPON_MODE_XGPON:
 	case AIROHA_XPON_MODE_XGSPON:
 		/* SDK LDDLA mode 0 (XG/XGS) selects the A2 TX eye. */
@@ -285,21 +333,75 @@ static void en7572_set_calibration_source(struct airoha_en7572 *priv,
 	const struct airoha_xpon_mode_descriptor *descriptor;
 
 	descriptor = airoha_xpon_mode_descriptor(mode);
-	if (en7572_mode_uses_shared_10g_bob(mode) &&
+	if (mode == AIROHA_XPON_MODE_GPON &&
 	    bank == EN7572_BOB_BANK_A0 &&
-	    !priv->calibration_from_nvmem && priv->calibration_a2_as_a0)
+	    !priv->calibration_from_nvmem &&
+	    !priv->calibration_from_mtd && priv->calibration_gpon_a2_as_a0)
+		strscpy(priv->calibration_source, "experimental-a2-copy:gpon-a0",
+			sizeof(priv->calibration_source));
+	else if (en7572_mode_uses_shared_10g_bob(mode) &&
+	    bank == EN7572_BOB_BANK_A0 &&
+	    !priv->calibration_from_nvmem &&
+	    !priv->calibration_from_mtd && priv->calibration_a2_as_a0)
 		strscpy(priv->calibration_source, "experimental-a2-copy:a0",
 			sizeof(priv->calibration_source));
 	else if (en7572_mode_uses_shared_10g_bob(mode))
 		snprintf(priv->calibration_source,
 			 sizeof(priv->calibration_source), "%s:10g:%s",
+			 priv->calibration_from_mtd ? "mtd-art" :
 			 priv->calibration_from_nvmem ? "nvmem" : "firmware",
 			 bank == EN7572_BOB_BANK_A2 ? "a2" : "a0");
 	else
 		snprintf(priv->calibration_source,
 			 sizeof(priv->calibration_source), "%s:%s",
+			 priv->calibration_from_mtd ? "mtd-art" :
 			 priv->calibration_from_nvmem ? "nvmem" : "firmware",
 			 descriptor ? descriptor->name : "invalid");
+}
+
+/*
+ * Older kernels (and some vendor DTBs) expose ART as an NVMEM provider but do
+ * not populate its fixed-layout cells. Read the same read-only factory record
+ * directly as a compatibility fallback. Erased or malformed records are
+ * rejected and the normal firmware fallback remains in force.
+ */
+static int en7572_load_calibration_from_mtd(struct airoha_en7572 *priv,
+						    u8 *bob, unsigned int bank)
+{
+	struct mtd_info *mtd;
+	const loff_t offset = bank == EN7572_BOB_BANK_A2 ?
+		EN7572_ART_A2_CALIBRATION_OFFSET : EN7572_ART_A0_CALIBRATION_OFFSET;
+	u8 record[EN7572_BOB_FACTORY_RECORD_SIZE];
+	size_t retlen = 0;
+	int ret;
+
+	mtd = get_mtd_device_nm("art");
+	if (IS_ERR(mtd))
+		return PTR_ERR(mtd);
+	if (offset > mtd->size ||
+	    sizeof(record) > mtd->size - offset) {
+		put_mtd_device(mtd);
+		return -EINVAL;
+	}
+
+	ret = mtd_read(mtd, offset, sizeof(record), &retlen, record);
+	put_mtd_device(mtd);
+	if (ret && ret != -EUCLEAN)
+		return ret;
+	if (retlen != sizeof(record) ||
+	    !en7572_calibration_factory_record_bank_valid(record,
+								 sizeof(record), bank))
+		return -ENODATA;
+
+	memcpy(bob, record, EN7572_BOB_SIZE);
+	priv->calibration_bank = bank;
+	priv->calibration_from_nvmem = false;
+	priv->calibration_from_mtd = true;
+	en7572_set_calibration_source(priv, priv->pon_mode, bank);
+	dev_info(&priv->a0->dev, "loaded ART calibration bank %s at %#x\n",
+		 bank == EN7572_BOB_BANK_A2 ? "A2" : "A0", (unsigned int)offset);
+
+	return 0;
 }
 
 static int en7572_load_firmware(struct airoha_en7572 *priv, const char *property,
@@ -349,15 +451,23 @@ static int en7572_load_calibration(struct airoha_en7572 *priv, u8 *bob)
 	size_t len;
 	int ret;
 
+	priv->calibration_from_nvmem = false;
+	priv->calibration_from_mtd = false;
+
 	descriptor = airoha_xpon_mode_descriptor(priv->pon_mode);
 	if (!descriptor)
 		return -EINVAL;
 
 	switch (priv->pon_mode) {
 	case AIROHA_XPON_MODE_GPON:
-		name = EN7572_DEFAULT_GPON_BOB_FW;
+		name = priv->calibration_gpon_a2_as_a0 ?
+			EN7572_DEFAULT_GPON_A2_AS_A0_FW :
+			EN7572_DEFAULT_GPON_BOB_FW;
 		property = "airoha,calibration-gpon-firmware";
 		cell_name = "calibration-gpon";
+		/* The SDK's GPON path consumes the A0 TX-eye record. */
+		required_bank = EN7572_BOB_BANK_A0;
+		require_bank = true;
 		break;
 	case AIROHA_XPON_MODE_XGPON:
 	case AIROHA_XPON_MODE_XGSPON:
@@ -376,8 +486,14 @@ static int en7572_load_calibration(struct airoha_en7572 *priv, u8 *bob)
 	}
 
 	cell = NULL;
-	/* The explicit lab override must not be shadowed by an A2-only ART cell. */
-	if (!(priv->calibration_a2_as_a0 && require_bank) &&
+	/*
+	 * The lab override exists only to provide a temporary A0 bank for the
+	 * 10G-EPON modes. GPON has its own A0 record and must still prefer a
+	 * device-specific calibration cell when one is available.
+	 */
+	if (!(priv->calibration_a2_as_a0 &&
+	      en7572_mode_uses_shared_10g_bob(priv->pon_mode) && require_bank &&
+	      required_bank == EN7572_BOB_BANK_A0) &&
 	    device_property_present(dev, "nvmem-cells"))
 		cell = nvmem_cell_get(dev, cell_name);
 	if (cell && !IS_ERR(cell)) {
@@ -399,6 +515,7 @@ static int en7572_load_calibration(struct airoha_en7572 *priv, u8 *bob)
 					memcpy(bob, data, EN7572_BOB_SIZE);
 					priv->calibration_bank = required_bank;
 					priv->calibration_from_nvmem = true;
+					priv->calibration_from_mtd = false;
 					en7572_set_calibration_source(priv,
 						priv->pon_mode, required_bank);
 				kfree(data);
@@ -418,7 +535,18 @@ static int en7572_load_calibration(struct airoha_en7572 *priv, u8 *bob)
 			 cell_name, ERR_CAST(cell));
 	}
 
-	device_property_read_string(dev, property, &name);
+	if (require_bank) {
+		ret = en7572_load_calibration_from_mtd(priv, bob, required_bank);
+		if (!ret)
+			return 0;
+		if (ret != -ENODATA && ret != -ENOENT && ret != -ENODEV)
+			dev_warn(dev, "failed to read ART calibration: %pe\n",
+				 ERR_PTR(ret));
+	}
+	/* The explicit GPON lab fallback must win over the board's normal A0 path. */
+	if (priv->pon_mode != AIROHA_XPON_MODE_GPON ||
+	    !priv->calibration_gpon_a2_as_a0)
+		device_property_read_string(dev, property, &name);
 	ret = request_firmware(&firmware, name, dev);
 	if (ret) {
 		dev_err(dev, "failed to load fallback calibration %s: %pe\n",
@@ -445,6 +573,7 @@ static int en7572_load_calibration(struct airoha_en7572 *priv, u8 *bob)
 	memcpy(bob, firmware->data, EN7572_BOB_SIZE);
 	priv->calibration_bank = required_bank;
 	priv->calibration_from_nvmem = false;
+	priv->calibration_from_mtd = false;
 	en7572_set_calibration_source(priv, priv->pon_mode, required_bank);
 
 out:
@@ -486,13 +615,24 @@ static int en7572_select_tx_eye(struct airoha_en7572 *priv, const u8 *bob,
 	if (ret)
 		goto disable_ben;
 
-	ret = en7572_update_bits(priv, EN7572_TIA_CTRL,
-		EN7572_TIA_CURRENT | EN7572_TIA_GAIN_BW, eye.tia_ctrl);
+	/*
+	 * Keep the SDK AdaptivePon() ordering: TIA_CUR is committed before
+	 * ERC, while the gain/bandwidth fields are written afterwards.  The
+	 * EN7572 MD32 may rewrite the gain field when ERC is changed, so folding
+	 * these writes together leaves a stale/non-selected TIA value on hardware.
+	 */
+	ret = en7572_update_bits(priv, EN7572_TIA_CTRL, EN7572_TIA_CURRENT,
+				 eye.tia_ctrl);
 	if (ret)
 		goto disable_ben;
 
 	ret = en7572_update_bits(priv, EN7572_ERC_CTRL,
 		EN7572_ERC_CDAC | EN7572_ERC_DAC, eye.erc_ctrl);
+	if (ret)
+		goto disable_ben;
+
+	ret = en7572_update_bits(priv, EN7572_TIA_CTRL, EN7572_TIA_GAIN_BW,
+				 eye.tia_ctrl);
 	if (ret)
 		goto disable_ben;
 
@@ -517,7 +657,8 @@ static int en7572_select_tx_eye(struct airoha_en7572 *priv, const u8 *bob,
 		en7572_field_value(EN7572_BEN_MODE, EN7572_BEN_NORMAL));
 	if (ret)
 		goto disable_ben;
-	ret = en7572_verify_tx_eye(priv, bank);
+	/* Prove every programmed field before MD32 can adapt the RX bandwidth. */
+	ret = en7572_verify_tx_eye(priv, bank, false);
 	if (ret)
 		goto disable_ben;
 	priv->calibration_bank = bank_index;
@@ -784,7 +925,7 @@ int airoha_en7572_validate_mode(struct airoha_en7572 *priv,
 	}
 
 	bank = priv->calibration + bank_index * EN7572_BOB_BANK_SIZE;
-	ret = en7572_verify_tx_eye(priv, bank);
+	ret = en7572_verify_tx_eye(priv, bank, true);
 
 unlock:
 	mutex_unlock(&priv->lock);
@@ -852,6 +993,11 @@ int airoha_en7572_set_mode(struct airoha_en7572 *priv,
 		ret = 0;
 		goto unlock;
 	}
+	/* The XPON owner restores the PCS force registers before BOSA shutdown. */
+	if (READ_ONCE(priv->factory_tx_test_active)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	/* A planned mode change disables TX without latching a safety fault. */
 	ret = airoha_en7572_set_tx_enabled(priv, false);
@@ -906,7 +1052,9 @@ int airoha_en7572_set_tx_enabled(struct airoha_en7572 *priv, bool enabled)
 		return -ENODEV;
 
 	spin_lock_irqsave(&priv->tx_lock, flags);
-	if (enabled && (!READ_ONCE(priv->initialized) || priv->fault_locked)) {
+	if (enabled && READ_ONCE(priv->factory_tx_test_active)) {
+		ret = -EBUSY;
+	} else if (enabled && (!READ_ONCE(priv->initialized) || priv->fault_locked)) {
 		ret = priv->fault_locked ? -EIO : -EAGAIN;
 	} else {
 		gpiod_set_value(priv->tx_disable, !enabled);
@@ -917,6 +1065,45 @@ int airoha_en7572_set_tx_enabled(struct airoha_en7572 *priv, bool enabled)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(airoha_en7572_set_tx_enabled);
+
+int airoha_en7572_factory_tx_enable(struct airoha_en7572 *priv)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!priv)
+		return -ENODEV;
+
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	if (!READ_ONCE(priv->initialized) || priv->fault_locked)
+		ret = priv->fault_locked ? -EIO : -EAGAIN;
+	else if (priv->factory_tx_test_active || !priv->tx_is_disabled)
+		ret = -EBUSY;
+	else {
+		priv->factory_tx_test_active = true;
+		gpiod_set_value(priv->tx_disable, 0);
+		WRITE_ONCE(priv->tx_is_disabled, false);
+	}
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(airoha_en7572_factory_tx_enable);
+
+void airoha_en7572_factory_tx_disable(struct airoha_en7572 *priv)
+{
+	unsigned long flags;
+
+	if (!priv)
+		return;
+
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	priv->factory_tx_test_active = false;
+	gpiod_set_value(priv->tx_disable, 1);
+	WRITE_ONCE(priv->tx_is_disabled, true);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(airoha_en7572_factory_tx_disable);
 
 int airoha_en7572_clear_fault(struct airoha_en7572 *priv)
 {
@@ -946,6 +1133,7 @@ void airoha_en7572_emergency_disable(struct airoha_en7572 *priv)
 
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	priv->fault_locked = true;
+	priv->factory_tx_test_active = false;
 	gpiod_set_value(priv->tx_disable, 1);
 	WRITE_ONCE(priv->tx_is_disabled, true);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
@@ -1098,6 +1286,55 @@ unlock:
 }
 static DEVICE_ATTR_RO(optical_diagnostics);
 
+static ssize_t tx_diagnostics_show(struct device *dev,
+				   struct device_attribute *attribute, char *buf)
+{
+	struct airoha_en7572 *priv = dev_get_drvdata(dev);
+	u32 dcl_ctrl2, csr_iav, csr_ibias_imod, tx_status, system_status;
+	int ret;
+
+	mutex_lock(&priv->lock);
+	if (!priv->initialized) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	ret = en7572_read_le32(priv->a2, EN7572_DCL_CTRL2, &dcl_ctrl2);
+	if (ret)
+		goto unlock;
+	ret = en7572_read_le32(priv->a2, EN7572_CSR_IAV, &csr_iav);
+	if (ret)
+		goto unlock;
+	ret = en7572_read_le32(priv->a2, EN7572_CSR_IBIAS_IMOD,
+				&csr_ibias_imod);
+	if (ret)
+		goto unlock;
+	ret = en7572_read_le32(priv->a2, EN7572_TX_STATUS, &tx_status);
+	if (ret)
+		goto unlock;
+	ret = en7572_read_le32(priv->a2, EN7572_SYSTEM_STATUS,
+				&system_status);
+unlock:
+	mutex_unlock(&priv->lock);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf,
+		"dcl_ctrl2=0x%08x configured_iav=%u configured_imod=%u "
+		"csr_iav=0x%08x actual_iav=%u csr_ibias_imod=0x%08x "
+		"actual_ibias=%u actual_imod=%u tx_status=0x%08x "
+		"tx_disabled=%u system_status=0x%08x ben=%u\n",
+		dcl_ctrl2, FIELD_GET(EN7572_DCL_IAV, dcl_ctrl2),
+		FIELD_GET(EN7572_DCL_IMOD, dcl_ctrl2), csr_iav,
+		(unsigned int)FIELD_GET(EN7572_CSR_IAV_VALUE, csr_iav),
+		csr_ibias_imod,
+		(unsigned int)FIELD_GET(EN7572_CSR_IBIAS, csr_ibias_imod),
+		(unsigned int)FIELD_GET(EN7572_CSR_IMOD, csr_ibias_imod),
+		tx_status,
+		!!(tx_status & EN7572_TX_STATUS_DISABLED), system_status,
+		!!(system_status & EN7572_SYSTEM_STATUS_BEN));
+}
+static DEVICE_ATTR_RO(tx_diagnostics);
+
 static struct attribute *en7572_attrs[] = {
 	&dev_attr_initialized.attr,
 	&dev_attr_pon_mode.attr,
@@ -1110,6 +1347,7 @@ static struct attribute *en7572_attrs[] = {
 	&dev_attr_tx_disable.attr,
 	&dev_attr_fault_locked.attr,
 	&dev_attr_optical_diagnostics.attr,
+	&dev_attr_tx_diagnostics.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(en7572);
@@ -1132,6 +1370,11 @@ static int en7572_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	priv->a0 = client;
+	priv->calibration_gpon_a2_as_a0 = device_property_read_bool(dev,
+						"airoha,calibration-gpon-a2-as-a0");
+	if (priv->calibration_gpon_a2_as_a0)
+		dev_warn(dev,
+			 "using experimental GPON A2-to-A0 calibration fallback\n");
 	priv->calibration_a2_as_a0 = device_property_read_bool(dev,
 					"airoha,calibration-10g-a2-as-a0");
 	if (priv->calibration_a2_as_a0)

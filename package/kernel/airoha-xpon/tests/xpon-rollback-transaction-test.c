@@ -15,6 +15,7 @@ struct simulation {
 	unsigned int previous_cleanup_count;
 	bool fail_previous_cleanup;
 	bool expect_target_cleanup;
+	bool expect_previous_cleanup;
 	bool pcs_order_violation;
 	bool owner_committed;
 	bool mode_validated;
@@ -55,7 +56,8 @@ static int quiesce_pcs(void *context)
 	if (simulation->expect_target_cleanup) {
 		if (!simulation->target_cleanup_count)
 			simulation->pcs_order_violation = true;
-	} else if (!simulation->previous_cleanup_count) {
+	} else if (simulation->expect_previous_cleanup &&
+		   !simulation->previous_cleanup_count) {
 		simulation->pcs_order_violation = true;
 	}
 	return operation(simulation);
@@ -126,31 +128,36 @@ static const struct airoha_xpon_rollback_ops operations = {
 	} \
 } while (0)
 
-static int check_success(bool target_started)
+static int check_success(enum airoha_xpon_mode previous_mode,
+			 bool target_started, bool previous_cleanup_required)
 {
 	struct simulation simulation = {
 		.expect_target_cleanup = target_started,
+		.expect_previous_cleanup = previous_cleanup_required,
 		.mode = AIROHA_XPON_MODE_EPON_10G_10G,
 	};
 	unsigned int expected_operations = target_started ? 11 : 10;
 	int ret;
 
 	ret = airoha_xpon_rollback_transaction(&operations, &simulation,
-		AIROHA_XPON_MODE_XGSPON, target_started);
+		previous_mode, target_started,
+		previous_cleanup_required);
 	CHECK(!ret);
 	CHECK(simulation.operation == expected_operations);
 	CHECK(simulation.disable_tx_count == 1);
 	CHECK(simulation.target_cleanup_count == (unsigned int)target_started);
-	CHECK(simulation.previous_cleanup_count == (unsigned int)!target_started);
+	CHECK(simulation.previous_cleanup_count ==
+	      (unsigned int)previous_cleanup_required);
 	CHECK(!simulation.pcs_order_violation);
 	CHECK(simulation.owner_committed);
 	CHECK(simulation.mode_validated);
 	CHECK(!simulation.owner_commit_order_violation);
-	CHECK(simulation.mode == AIROHA_XPON_MODE_XGSPON);
+	CHECK(simulation.mode == previous_mode);
 	return 0;
 }
 
-static int check_every_failure(bool target_started)
+static int check_every_failure(bool target_started,
+			       bool previous_cleanup_required)
 {
 	unsigned int fail_at, operations_count = target_started ? 11 : 10;
 	unsigned int start_operation = target_started ? 7 : 6;
@@ -159,19 +166,21 @@ static int check_every_failure(bool target_started)
 		struct simulation simulation = {
 			.fail_at = fail_at,
 			.expect_target_cleanup = target_started,
+			.expect_previous_cleanup = previous_cleanup_required,
 			.mode = AIROHA_XPON_MODE_EPON_10G_1G,
 		};
 		bool previous_start_attempted = fail_at >= start_operation;
 		int ret;
 
 		ret = airoha_xpon_rollback_transaction(&operations, &simulation,
-			AIROHA_XPON_MODE_XGPON, target_started);
+			AIROHA_XPON_MODE_XGPON, target_started,
+			previous_cleanup_required);
 		CHECK(ret == TEST_ERROR);
 		CHECK(simulation.operation == fail_at);
 		CHECK(simulation.target_cleanup_count ==
 		      (unsigned int)target_started);
 		CHECK(simulation.previous_cleanup_count ==
-		      (unsigned int)(!target_started) +
+		      (unsigned int)previous_cleanup_required +
 		      (unsigned int)previous_start_attempted);
 		CHECK(!simulation.pcs_order_violation);
 		CHECK(simulation.disable_tx_count ==
@@ -192,7 +201,7 @@ static int check_cleanup_failure_preserves_original(void)
 	};
 
 	CHECK(airoha_xpon_rollback_transaction(&operations, &simulation,
-		AIROHA_XPON_MODE_XGSPON, true) == TEST_ERROR);
+		AIROHA_XPON_MODE_XGSPON, true, false) == TEST_ERROR);
 	CHECK(simulation.previous_cleanup_count == 1);
 	CHECK(simulation.disable_tx_count == 2);
 	return 0;
@@ -202,10 +211,11 @@ static int check_early_cleanup_failure_stops_before_pcs(void)
 {
 	struct simulation simulation = {
 		.fail_previous_cleanup = true,
+		.expect_previous_cleanup = true,
 	};
 
 	CHECK(airoha_xpon_rollback_transaction(&operations, &simulation,
-		AIROHA_XPON_MODE_XGPON, false) == CLEANUP_ERROR);
+		AIROHA_XPON_MODE_XGPON, false, true) == CLEANUP_ERROR);
 	CHECK(simulation.operation == 0);
 	CHECK(simulation.previous_cleanup_count == 1);
 	CHECK(simulation.target_cleanup_count == 0);
@@ -214,12 +224,44 @@ static int check_early_cleanup_failure_stops_before_pcs(void)
 	return 0;
 }
 
+static int check_middle_failure_skips_inaccessible_backends(void)
+{
+	struct simulation simulation = {
+		.fail_previous_cleanup = true,
+	};
+
+	CHECK(!airoha_xpon_rollback_transaction(&operations, &simulation,
+		AIROHA_XPON_MODE_XGSPON, false, false));
+	CHECK(simulation.previous_cleanup_count == 0);
+	CHECK(simulation.target_cleanup_count == 0);
+	CHECK(!simulation.pcs_order_violation);
+	CHECK(simulation.owner_committed);
+	return 0;
+}
+
+static int check_conflicting_cleanup_rejected(void)
+{
+	struct simulation simulation = { 0 };
+
+	CHECK(airoha_xpon_rollback_transaction(&operations, &simulation,
+		AIROHA_XPON_MODE_XGSPON, true, true) == -EINVAL);
+	CHECK(simulation.disable_tx_count == 0);
+	return 0;
+}
+
 int main(void)
 {
-	if (check_success(false) || check_success(true) ||
-	    check_every_failure(false) || check_every_failure(true) ||
+	if (check_success(AIROHA_XPON_MODE_XGSPON, false, true) ||
+	    check_success(AIROHA_XPON_MODE_XGSPON, false, false) ||
+	    check_success(AIROHA_XPON_MODE_XGSPON, true, false) ||
+	    check_success(AIROHA_XPON_MODE_GPON, false, true) ||
+	    check_every_failure(false, true) ||
+	    check_every_failure(false, false) ||
+	    check_every_failure(true, false) ||
 	    check_cleanup_failure_preserves_original() ||
-	    check_early_cleanup_failure_stops_before_pcs())
+	    check_early_cleanup_failure_stops_before_pcs() ||
+	    check_middle_failure_skips_inaccessible_backends() ||
+	    check_conflicting_cleanup_rejected())
 		return 1;
 
 	puts("XPON production rollback callback matrix: OK");

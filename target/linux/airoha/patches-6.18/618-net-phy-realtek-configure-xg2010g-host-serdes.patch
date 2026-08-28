@@ -1,0 +1,120 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Mon, 24 Aug 2026 11:15:00 +0800
+Subject: [PATCH] net: phy: realtek: preserve RTL8261 vendor host SerDes mode
+
+The RTL8261 patch table owns the host-side SDS mode and its per-speed
+options.  Match the working vendor loader by leaving that state intact and
+only releasing the PMA-side autonegotiation disable after the table loads.
+Reprogramming the host mode and indirect SerDes options here changes SDS
+5.0 from 0x100d to 0x000c and leaves the AN7581 XFI receiver seeing invalid
+symbols even though the copper side reports link.
+
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2428,6 +2428,92 @@ static int rtl826x_config_serdes_polarity(struct phy_device *phydev)
+ 				      mask, set);
+ }
+ 
++static void rtl826x_log_host_serdes_state(struct phy_device *phydev);
++
++static int rtl826x_config_host_serdes_usxgmii(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	int ret;
++
++	if (!device_property_read_bool(dev, "realtek,host-serdes-usxgmii"))
++		return 0;
++
++	/* The vendor driver applies these host-side SDS controls after the
++	 * patch table. Without them the copper side may negotiate while the
++	 * AN7581 USXGMII receiver never observes host link status. */
++	/* Stock rtk-ms-phy writes VEND1 register 0x19 with value 0x0154.
++	 * Keep the reg/value order explicit: phy_write_mmd() takes
++	 * (devad, regnum, val). */
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x19, 0x0154);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x1a, 0x020c);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x1b, 0x0001);
++	if (ret < 0)
++		return ret;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x1c, 0x020c);
++	if (ret < 0)
++		return ret;
++
++	/* Release the PMA-side reset/disable left by the vendor table. */
++	ret = phy_clear_bits_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_CTRL1, BIT(11));
++	if (ret < 0)
++		return ret;
++
++	rtl826x_log_host_serdes_state(phydev);
++	return 0;
++}
++
++static int rtl826x_read_host_sds(struct phy_device *phydev, u16 page, u16 reg)
++{
++	int ret, i;
++
++	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x143,
++			    0x8000 | ((reg & 0x1f) << 6) | (page & 0x3f));
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < 100; i++) {
++		ret = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x143);
++		if (ret < 0)
++			return ret;
++		if (!(ret & BIT(15)))
++			return phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x142);
++		udelay(10);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static void rtl826x_log_host_serdes_state(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	int sds50, sds710, sds612, sds63;
++	int c1, r19, r1a, r1b, r1c, pma;
++
++	sds50 = rtl826x_read_host_sds(phydev, 5, 0);
++	sds710 = rtl826x_read_host_sds(phydev, 7, 0x10);
++	sds612 = rtl826x_read_host_sds(phydev, 6, 0x12);
++	sds63 = rtl826x_read_host_sds(phydev, 6, 3);
++	c1 = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0xc1);
++	r19 = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x19);
++	r1a = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x1a);
++	r1b = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x1b);
++	r1c = phy_read_mmd(phydev, MDIO_MMD_VEND1, 0x1c);
++	pma = phy_read_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_CTRL1);
++
++	dev_info(dev,
++		 "XG2010G host state SDS[5:0]=%04x SDS[7:10]=%04x "
++		 "SDS[6:12]=%04x SDS[6:3]=%04x VEND[c1=%04x "
++		 "19=%04x 1a=%04x 1b=%04x 1c=%04x] PMA_CTRL1=%04x\\n",
++		 sds50, sds710, sds612, sds63, c1, r19, r1a, r1b, r1c, pma);
++}
++
+ static int rtl826x_config_init(struct phy_device *phydev)
+ {
+ 	const unsigned int max_dereset_tries = 5;
+@@ -2473,7 +2559,11 @@ static int rtl826x_config_init(struct phy_device *phydev)
+ 		return ret;
+ 	}
+ 
+-	return rtl826x_config_serdes_polarity(phydev);
++	ret = rtl826x_config_serdes_polarity(phydev);
++	if (ret < 0)
++		return ret;
++
++	return rtl826x_config_host_serdes_usxgmii(phydev);
+ }
+ 
+ static int rtl826x_suspend(struct phy_device *phydev)

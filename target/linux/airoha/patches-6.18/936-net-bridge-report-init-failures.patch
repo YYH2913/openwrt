@@ -1,0 +1,110 @@
+From 6e4a9c8d9a6f4d7f8d9d5af3f4c4f0b4c3a2d1e0 Mon Sep 17 00:00:00 2001
+From: OpenWrt Airoha maintainers <openwrt@example.invalid>
+Date: Sun, 23 Aug 2026 02:00:00 +0800
+Subject: [PATCH] net: bridge: report initialization failures on Airoha
+
+The AN7581 image previously exposed no bridge rtnl kind while bridge code
+was present in vmlinux. Report the exact registration stage and errno so
+platform-specific failures remain diagnosable without changing semantics.
+
+---
+ net/bridge/br.c        | 31 +++++++++++++++++++++++++++++--
+ net/bridge/br_netlink.c | 13 +++++++++++--
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -435,32 +435,46 @@
+ 	}
+ 
+ 	err = br_fdb_init();
+-	if (err)
++	if (err) {
++		pr_err("bridge: FDB init failed: %d\n", err);
+ 		goto err_out;
++	}
+ 
+ 	err = register_pernet_subsys(&br_net_ops);
+-	if (err)
++	if (err) {
++		pr_err("bridge: per-net registration failed: %d\n", err);
+ 		goto err_out1;
++	}
+ 
+ 	err = br_nf_core_init();
+-	if (err)
++	if (err) {
++		pr_err("bridge: netfilter core init failed: %d\n", err);
+ 		goto err_out2;
++	}
+ 
+ 	err = register_netdevice_notifier(&br_device_notifier);
+-	if (err)
++	if (err) {
++		pr_err("bridge: netdevice notifier registration failed: %d\n", err);
+ 		goto err_out3;
++	}
+ 
+ 	err = register_switchdev_notifier(&br_switchdev_notifier);
+-	if (err)
++	if (err) {
++		pr_err("bridge: switchdev notifier registration failed: %d\n", err);
+ 		goto err_out4;
++	}
+ 
+ 	err = register_switchdev_blocking_notifier(&br_switchdev_blocking_notifier);
+-	if (err)
++	if (err) {
++		pr_err("bridge: blocking switchdev notifier registration failed: %d\n", err);
+ 		goto err_out5;
++	}
+ 
+ 	err = br_netlink_init();
+-	if (err)
++	if (err) {
++		pr_err("bridge: netlink/rtnl registration failed: %d\n", err);
+ 		goto err_out6;
++	}
+ 
+	brioctl_set(br_ioctl_stub);
+ 
+@@ -474,6 +488,7 @@
+ 		"need this.\n");
+ #endif
+ 
++	pr_info("bridge: initialized; rtnl kind=bridge\n");
+ 	return 0;
+ 
+ err_out6:
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -1936,16 +1936,22 @@
+ 	int err;
+ 
+ 	err = br_vlan_rtnl_init();
+-	if (err)
++	if (err) {
++		pr_err("bridge: VLAN rtnl handler registration failed: %d\n", err);
+ 		goto out;
++	}
+ 
+ 	err = rtnl_af_register(&br_af_ops);
+-	if (err)
++	if (err) {
++		pr_err("bridge: AF_BRIDGE registration failed: %d\n", err);
+ 		goto out_vlan;
++	}
+ 
+ 	err = rtnl_link_register(&br_link_ops);
+-	if (err)
++	if (err) {
++		pr_err("bridge: rtnl link kind registration failed: %d\n", err);
+ 		goto out_af;
++	}
+ 
+ 	return 0;
+ 
+-- 
+2.39.0

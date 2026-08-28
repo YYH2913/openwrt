@@ -8,6 +8,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/phy/phy.h>
 #include "an7581.dtsi"
 
 / {
@@ -46,7 +47,7 @@
 		bosa-controller = <&en7572>;
 		airoha,xpon-controller = <&xpon_controller>;
 		airoha,pcs = <&pon_pcs>;
-		airoha,scu = <&scuclk>;
+		airoha,chip-scu = <&chip_scu>;
 		ethernet = <&gdm2>;
 		airoha,idle-gem-threshold = <0x1a>;
 		status = "okay";
@@ -94,6 +95,10 @@
 		bosa-controller = <&en7572>;
 		pcs-handle = <&pon_pcs>;
 		airoha,scu = <&scuclk>;
+		airoha,chip-scu = <&chip_scu>;
+		factory-tx-ben-gpios = <&en7581_pinctrl 41 GPIO_ACTIVE_HIGH>;
+		/* Expose only the bounded, token-protected factory TX test ABI. */
+		airoha,allow-factory-tx-test;
 		status = "okay";
 	};
 
@@ -292,6 +297,12 @@
 		nvmem-cell-names = "calibration-gpon", "calibration-10g";
 		airoha,pm-firmware = "airoha/xg2010g/en7572-A60993.pm";
 		airoha,dm-firmware = "airoha/xg2010g/en7572-A60993.dm";
+		/*
+		 * This board's ART GPON record may be erased. Prefer a valid
+		 * ART/NVMEM record, then use the recovered stock GPON A0 table.
+		 */
+		airoha,calibration-gpon-firmware =
+			"airoha/xg2010g/en7572-bob-gpon.bin";
 		/* Temporary lab table: A2 optical data is mirrored into A0. */
 		airoha,calibration-10g-firmware =
 			"airoha/xg2010g/en7572-bob-a2-as-a0.bin";
@@ -313,9 +324,10 @@
 		lan2_port: ethernet-port@5 {
 			compatible = "airoha,eth-port";
 			reg = <5>;
-			managed = "in-band-status";
+			/* Use USXGMII in-band status while RTL8261 handles copper AN. */
 			phy-handle = <&rtl8261_lan2>;
 			phy-mode = "usxgmii";
+			managed = "in-band-status";
 			pcs-handle = <&pcie_pcs 1>;
 			openwrt,netdev-name = "lan2";
 		};
@@ -329,6 +341,10 @@
 &pcie_pcs {
 	/* WiFi2/PCIe1 Multi-SerDes lane is wired to the second 10G PHY. */
 	status = "okay";
+	/* Neither physical PCIe controller is used on this board. */
+	airoha,disable-pcie-mode;
+	/* XG2010G uses the vendor PCIe1 RX PR/CDR calibration flow. */
+	airoha,manual-rx-calibration;
 };
 
 /* The physical PCIe controllers are unused; their PHY overlaps pcie_pcs. */
@@ -370,9 +386,10 @@
 	lan1_port: ethernet-port@0 {
 		compatible = "airoha,eth-port";
 		reg = <0>;
-		managed = "in-band-status";
+		/* Use USXGMII in-band status while RTL8261 handles copper AN. */
 		phy-handle = <&rtl8261_lan1>;
 		phy-mode = "usxgmii";
+		managed = "in-band-status";
 		pcs-handle = <&eth_pcs>;
 		openwrt,netdev-name = "lan1";
 	};
@@ -380,7 +397,6 @@
 	lan3_port: ethernet-port@1 {
 		compatible = "airoha,eth-port";
 		reg = <1>;
-		managed = "in-band-status";
 		phy-handle = <&en8811h>;
 		phy-mode = "2500base-x";
 		pcs-handle = <&usb_pcs>;
@@ -413,6 +429,10 @@
 		reset-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <200000>;
 		reset-deassert-us = <200000>;
+		/* The board routes both RTL8261 host SerDes pairs crossed. */
+		tx-polarity = <PHY_POL_INVERT>;
+		rx-polarity = <PHY_POL_INVERT>;
+		realtek,host-serdes-usxgmii;
 	};
 
 	/* XG2010G LAN2: RTL8261 on the WiFi2/PCIe1 Multi-SerDes lane. */
@@ -422,6 +442,10 @@
 		reset-gpios = <&en7581_pinctrl 27 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <200000>;
 		reset-deassert-us = <200000>;
+		/* The board routes both RTL8261 host SerDes pairs crossed. */
+		tx-polarity = <PHY_POL_INVERT>;
+		rx-polarity = <PHY_POL_INVERT>;
+		realtek,host-serdes-usxgmii;
 	};
 
 	/* XG2010G LAN3: Airoha EN8811H on the USB Multi-SerDes lane. */

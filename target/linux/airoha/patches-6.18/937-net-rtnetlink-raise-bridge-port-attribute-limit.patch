@@ -1,0 +1,31 @@
+From 4d83f4e84cfd4e8e9c1a7a7a6f2d9b0f6a0c9d11 Mon Sep 17 00:00:00 2001
+From: OpenWrt Airoha maintainers <openwrt@example.invalid>
+Date: Sun, 23 Aug 2026 03:00:00 +0800
+Subject: [PATCH] net: rtnetlink: accept current bridge port attributes
+
+The 6.18 UAPI exposes bridge-port attributes through
+IFLA_BRPORT_BACKUP_NHID (IFLA_BRPORT_MAX == 47), while rtnetlink still
+uses the older RTNL_SLAVE_MAX_TYPE value of 45.  The sanity check in
+rtnl_link_register() consequently rejects the built-in bridge link kind
+with -EINVAL, leaving no bridge rtnl device available to netifd.
+
+Keep the bound in sync with the UAPI so bridge initialization succeeds.
+
+---
+ net/core/rtnetlink.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -63,7 +63,7 @@
+ #include "dev.h"
+ 
+ #define RTNL_MAX_TYPE		50
+-#define RTNL_SLAVE_MAX_TYPE	45
++#define RTNL_SLAVE_MAX_TYPE	47
+ 
+ struct rtnl_link {
+ 	rtnl_doit_func	doit;
+-- 
+2.39.0

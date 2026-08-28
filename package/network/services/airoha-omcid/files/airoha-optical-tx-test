@@ -1,0 +1,222 @@
+#!/bin/sh
+set -eu
+
+factory_token='XG2010G-OPTICAL-TEST'
+
+usage() {
+	cat >&2 <<EOF
+Usage:
+  $0 status
+  $0 diagnostics
+  $0 prepare {1270|1310}
+  $0 start {1270|1310} duration_ms
+  $0 start $factory_token {1270|1310} duration_ms
+  $0 --confirm {1270|1310} duration_ms
+  $0 --confirm $factory_token {1270|1310} duration_ms
+  $0 off
+EOF
+}
+
+sysfs_root="${AIROHA_OPTICAL_TX_SYSFS_ROOT:-/sys}"
+core="$sysfs_root/devices/platform/xpon-controller"
+factory_path="$core/factory_tx_test"
+mode_path="$core/mode"
+
+require_root() {
+	[ "$(id -u)" -eq 0 ] || {
+		echo "must run as root" >&2
+		exit 1
+	}
+}
+
+mode_for_wavelength() {
+	case "$1" in
+		1270) echo xgspon ;;
+		1310) echo gpon ;;
+		*) echo "unsupported test wavelength: $1" >&2; return 2 ;;
+	esac
+}
+
+show_diagnostics() {
+	local base path
+
+	if [ -r "$mode_path" ]; then
+		printf 'mode: '
+		cat "$mode_path"
+	fi
+	if [ -r "$factory_path" ]; then
+		printf 'factory TX: '
+		cat "$factory_path"
+	fi
+	if [ -r "$core/switch_state" ]; then
+		printf 'mode switch: '
+		cat "$core/switch_state"
+	fi
+	for path in \
+		"$sysfs_root"/bus/i2c/drivers/airoha-en7572/*/tx_diagnostics; do
+		[ -r "$path" ] || continue
+		base="${path%/tx_diagnostics}"
+		if [ -r "$base/calibration_source" ]; then
+			printf 'BOSA calibration: '
+			cat "$base/calibration_source"
+		fi
+		printf 'EN7572 TX: '
+		cat "$path"
+		break
+	done
+	for path in \
+		"$sysfs_root"/bus/platform/drivers/airoha-gpon/*/init_status \
+		"$sysfs_root"/devices/platform/*gpon*/init_status; do
+		[ -r "$path" ] || continue
+		printf 'GPON init: '
+		cat "$path"
+		break
+	done
+}
+
+require_inactive_protocols() {
+	local found=0 path value
+
+	for path in \
+		"$sysfs_root"/bus/platform/drivers/airoha-gpon/*/enabled \
+		"$sysfs_root"/bus/platform/drivers/airoha-xgspon/*/enabled \
+		"$sysfs_root"/bus/platform/drivers/airoha-en7581-epon/*/enabled; do
+		[ -r "$path" ] || continue
+		found=$((found + 1))
+		value="$(cat "$path")" || return 1
+		case "$value" in
+			0) ;;
+			1)
+				echo "refusing factory mode switch while protocol is enabled: $path" >&2
+				return 4
+				;;
+			*)
+				echo "invalid protocol state in $path: $value" >&2
+				return 1
+				;;
+		esac
+	done
+	[ "$found" -gt 0 ] || {
+		echo "XPON protocol state interfaces unavailable" >&2
+		return 1
+	}
+}
+
+prepare_wavelength() {
+	local wavelength="$1" required_mode current_mode state
+
+	require_root
+	required_mode="$(mode_for_wavelength "$wavelength")" || exit $?
+	[ -w "$mode_path" ] || { echo "XPON mode interface unavailable" >&2; exit 1; }
+	[ -r "$factory_path" ] || { echo "factory TX interface unavailable" >&2; exit 1; }
+	state="$(cat "$factory_path")"
+	case " $state " in *' active=0 '*) ;; *) echo "factory TX is already active" >&2; exit 4 ;; esac
+	case " $state " in *' tx_disabled=1'*) ;; *) echo "optical TX is not disabled" >&2; exit 4 ;; esac
+	require_inactive_protocols || exit $?
+
+	current_mode="$(cat "$mode_path")"
+	if [ "$current_mode" = "$required_mode" ]; then
+		echo "nominal $wavelength nm mode is already prepared; optical TX remains disabled"
+		return 0
+	fi
+	if ! printf '%s\n' "$required_mode" > "$mode_path"; then
+		echo "failed to prepare nominal $wavelength nm mode ($required_mode)" >&2
+		show_diagnostics >&2
+		return 1
+	fi
+	[ "$(cat "$mode_path")" = "$required_mode" ] || {
+		echo "XPON mode did not commit to $required_mode" >&2
+		show_diagnostics >&2
+		return 1
+	}
+	if [ -r "$core/switch_state" ]; then
+		state="$(cat "$core/switch_state")"
+		case " $state " in *' switching=0 '*) ;; *) show_diagnostics >&2; return 1 ;; esac
+		case " $state " in *' error=0 '*) ;; *) show_diagnostics >&2; return 1 ;; esac
+		case " $state " in *' committed=1 '*) ;; *) show_diagnostics >&2; return 1 ;; esac
+		case " $state " in *' rollback_failed=0 '*) ;; *) show_diagnostics >&2; return 1 ;; esac
+	fi
+	echo "prepared nominal $wavelength nm mode ($required_mode); optical TX remains disabled"
+}
+
+case "${1:-}" in
+	-h|--help|help)
+		[ "$#" -eq 1 ] || { usage; exit 2; }
+		usage
+		exit 0
+		;;
+	status)
+		[ "$#" -eq 1 ] || { usage; exit 2; }
+		[ -r "$factory_path" ] || { echo "factory TX interface unavailable" >&2; exit 1; }
+		cat "$factory_path"
+		exit 0
+		;;
+	diagnostics)
+		[ "$#" -eq 1 ] || { usage; exit 2; }
+		show_diagnostics
+		exit 0
+		;;
+	prepare)
+		[ "$#" -eq 2 ] || { usage; exit 2; }
+		prepare_wavelength "$2"
+		exit 0
+		;;
+	off|stop|disable)
+		[ "$#" -eq 1 ] || { usage; exit 2; }
+		require_root
+		[ -w "$factory_path" ] || { echo "factory TX interface unavailable" >&2; exit 1; }
+		printf '%s off\n' "$factory_token" > "$factory_path"
+		exit 0
+		;;
+	start|emit|on|--confirm)
+		# The short form keeps the original interface.  The long form makes
+		# the confirmation token visible to automation without allowing an
+		# arbitrary token to reach the kernel ABI.
+		if [ "$#" -eq 3 ]; then
+			wavelength="$2"
+			duration="$3"
+		elif [ "$#" -eq 4 ] && [ "$2" = "$factory_token" ]; then
+			wavelength="$3"
+			duration="$4"
+		else
+			usage
+			exit 2
+		fi
+		;;
+	*)
+		usage
+		exit 2
+		;;
+esac
+
+require_root
+
+# All write paths converge here, so the kernel's fixed confirmation token,
+# mode gate and bounded timer remain in force for both interactive and scripted
+# invocations.
+required_mode="$(mode_for_wavelength "$wavelength")" || exit $?
+case "$duration" in
+	''|*[!0-9]*) echo "duration must be an integer in milliseconds" >&2; exit 2 ;;
+esac
+[ "$duration" -ge 10 ] && [ "$duration" -le 5000 ] || {
+	echo "duration must be between 10 and 5000 ms" >&2
+	exit 2
+}
+
+[ -w "$factory_path" ] || { echo "factory TX interface unavailable" >&2; exit 1; }
+
+[ -r "$mode_path" ] || { echo "XPON mode interface unavailable" >&2; exit 1; }
+current_mode="$(cat "$mode_path")"
+[ "$current_mode" = "$required_mode" ] || {
+	echo "current mode is $current_mode; switch to $required_mode first" >&2
+	exit 3
+}
+require_inactive_protocols || exit $?
+
+cleanup() {
+	printf 'XG2010G-OPTICAL-TEST off\n' > "$factory_path" 2>/dev/null || true
+}
+trap cleanup HUP INT TERM
+printf 'XG2010G-OPTICAL-TEST %s %s\n' "$wavelength" "$duration" > "$factory_path"
+echo "requested nominal $wavelength nm optical TX for $duration ms; kernel timer will disable it"
+sleep 1

@@ -1,0 +1,45 @@
+From 06f5da0af9d2a18008cc4c9001da95fb1db2a23c Mon Sep 17 00:00:00 2001
+From: OpenWrt XG2010G maintainers <openwrt-devel@lists.openwrt.org>
+Date: Sun, 23 Aug 2026 12:55:00 +0800
+Subject: [PATCH] net: airoha: defer FE MAC programming for random addresses
+
+Multi-interface Airoha devices generate independent random addresses for
+ports without a device-tree MAC.  Their ndo_init callbacks run after the
+first device has registered, so the FE hardware check rejects each later
+random OUI before userspace can install the factory addresses.
+
+Do not program the shared FE MAC registers from an address that is still
+marked NET_ADDR_RANDOM, and ignore random peers when a permanent address is
+installed.  Once userspace assigns the first factory address it becomes the
+reference for subsequent ports, so the existing common-MSB requirement and
+LSB range programming stay enforced for configured addresses.
+
+Signed-off-by: OpenWrt XG2010G maintainers <openwrt-devel@lists.openwrt.org>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -244,6 +244,11 @@ static int airoha_set_macaddr(struct air
+ 	u32 reg, val, lmin, lmax;
+ 	int i;
+ 
++	/* Random probe-time addresses must not define the shared FE OUI. */
++	if (netdev_from_priv(dev)->addr_assign_type == NET_ADDR_RANDOM &&
++	    ether_addr_equal(addr, netdev_from_priv(dev)->dev_addr))
++		return 0;
++
+ 	eth_zero_addr(ref_addr);
+ 	lmin = (addr[3] << 16) | (addr[4] << 8) | addr[5];
+ 	lmax = lmin;
+@@ -271,7 +277,9 @@ static int airoha_set_macaddr(struct air
+ 			netdev = netdev_from_priv(iter_dev);
+ 			if (netdev->reg_state != NETREG_REGISTERED)
+ 				continue;
++			if (netdev->addr_assign_type == NET_ADDR_RANDOM)
++				continue;
+ 
+ 			ether_addr_copy(ref_addr, netdev->dev_addr);
+ 			val = (netdev->dev_addr[3] << 16) |
+ 			      (netdev->dev_addr[4] << 8) | netdev->dev_addr[5];

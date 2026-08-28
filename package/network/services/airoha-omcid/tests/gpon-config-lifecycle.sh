@@ -5,6 +5,7 @@ set -eu
 openwrt_root="${1:?OpenWrt tree path is required}"
 package="$openwrt_root/package/network/services/airoha-omcid"
 program="$package/files/airoha-gpon-config"
+init_script="$package/files/airoha-gpon-config.init"
 functions="$package/tests/gpon-config-functions"
 temporary="$(mktemp -d)"
 gpon="$temporary/sys/bus/platform/drivers/airoha-gpon/gpon0"
@@ -18,6 +19,23 @@ cleanup() {
 	rm -rf "$temporary"
 }
 trap cleanup EXIT INT TERM
+
+grep -Fq 'procd_set_param command /bin/sh "$PROG" monitor' "$init_script" || {
+	echo 'PON monitor must use an explicit shell under procd' >&2
+	exit 1
+}
+if grep -Eq 'procd_set_param (stdout|stderr)' "$init_script"; then
+	echo 'PON monitor must not enable procd libsetlbf logging' >&2
+	exit 1
+fi
+grep -Fq 'wait_for_selected_backend || exit 1' "$program" || {
+	echo 'PON monitor must wait for the selected backend before syncing' >&2
+	exit 1
+}
+grep -Fq 'devices/platform/*xgspon*' "$program" || {
+	echo 'PON monitor must support direct platform-device sysfs paths' >&2
+	exit 1
+}
 
 mkdir -p "$gpon" "$xgspon" "$epon" "$xpon"
 printf '0\n' > "$gpon/enabled"

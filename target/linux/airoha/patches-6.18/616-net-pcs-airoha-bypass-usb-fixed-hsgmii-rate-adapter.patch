@@ -1,0 +1,38 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Mon, 24 Aug 2026 10:35:00 +0800
+Subject: [PATCH] net: pcs: airoha: bypass rate adapter for USB fixed HSGMII
+
+The AN7581 USB Multi-SerDes lane runs at the same fixed 2.5 Gbit/s rate
+on both sides when used in 2500BASE-X mode.  Enabling the rate adapter in
+this configuration prevents received traffic from reaching the XSI path.
+
+Match the vendor SDK configuration by disabling the adapter and enabling
+its RX/TX bypass paths.  Limit this to the USB PCS so that Ethernet, PCIe
+and PON 2500BASE-X users keep their existing rate-adaptation behaviour.
+
+Signed-off-by: XG2010G OpenWrt Port <xg2010g@example.invalid>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -547,11 +547,16 @@ static int airoha_pcs_config(struct phyl
+ 	/* Configure Interrupt for various modes */
+ 	airoha_pcs_interrupt_init(priv, index, interface);
+ 
+-	rate_adapt = AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN |
+-		     AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN;
++	if (data->port_type == AIROHA_PCS_USB &&
++	    interface == PHY_INTERFACE_MODE_2500BASEX)
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
++			     AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS;
++	else
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN |
++			     AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN;
+ 
+	if (interface == PHY_INTERFACE_MODE_SGMII)
+		rate_adapt |= AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
+			      AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS;
+
+	/* AN Auto Settings (Rate Adaptation) */

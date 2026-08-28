@@ -9,6 +9,7 @@
 #define ROLLBACK_ERROR (-124)
 
 static const enum airoha_xpon_mode switch_modes[] = {
+	AIROHA_XPON_MODE_GPON,
 	AIROHA_XPON_MODE_XGPON,
 	AIROHA_XPON_MODE_XGSPON,
 	AIROHA_XPON_MODE_EPON_10G_1G,
@@ -341,14 +342,19 @@ static int check_every_operation_failure(void)
 	return 0;
 }
 
-static int check_target_cleanup_policy(void)
+static int check_rollback_cleanup_policy(void)
 {
 	enum airoha_xpon_switch_stage stage;
 
 	for (stage = AIROHA_XPON_SWITCH_IDLE;
-	     stage <= AIROHA_XPON_SWITCH_COMMITTED; stage++)
+	     stage <= AIROHA_XPON_SWITCH_COMMITTED; stage++) {
 		CHECK(airoha_xpon_switch_target_start_attempted(stage) ==
 		      (stage >= AIROHA_XPON_SWITCH_MAC_STARTED));
+		CHECK(airoha_xpon_switch_previous_cleanup_required(stage) ==
+		      (stage < AIROHA_XPON_SWITCH_PCS_QUIESCED));
+		CHECK(!(airoha_xpon_switch_target_start_attempted(stage) &&
+			airoha_xpon_switch_previous_cleanup_required(stage)));
+	}
 	return 0;
 }
 
@@ -435,10 +441,10 @@ int main(void)
 	if (check_descriptors() || check_success_matrix() ||
 	    check_every_operation_failure() || check_rollback_failure() ||
 	    check_broken_tx_disable() || check_same_mode_rejected() ||
-	    check_target_cleanup_policy() ||
+	    check_rollback_cleanup_policy() ||
 	    check_protocol_activation_after_commit())
 		return 1;
 
-	puts("XPON 12-way directed switch matrix and fail-closed transaction: OK");
+	puts("XPON 20-way directed switch matrix and fail-closed transaction: OK");
 	return 0;
 }

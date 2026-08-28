@@ -18,6 +18,20 @@ static int expect_mismatch(const char *name,
 	return 1;
 }
 
+static int expect_runtime_mismatch(const char *name,
+			   const struct en7572_tx_eye_fingerprint *expected,
+			   const struct en7572_tx_eye_fingerprint *actual,
+			   unsigned int wanted)
+{
+	unsigned int mismatch = en7572_tx_eye_runtime_mismatch(expected, actual);
+
+	if (mismatch == wanted)
+		return 0;
+	fprintf(stderr, "%s: got runtime mismatch %#x, want %#x\n", name,
+		mismatch, wanted);
+	return 1;
+}
+
 int main(void)
 {
 	struct en7572_tx_eye_fingerprint expected, actual;
@@ -87,6 +101,21 @@ int main(void)
 	actual.pga_ctrl ^= 1U << 31;
 	actual.loop_ctrl ^= 1U << 31;
 	failed += expect_mismatch("unowned bits", &expected, &actual, 0);
+
+	actual = expected;
+	actual.tia_ctrl ^= EN7572_TIA_BANDWIDTH;
+	failed += expect_mismatch("adaptive TIA bandwidth", &expected, &actual,
+		EN7572_TX_EYE_MISMATCH_TIA);
+	failed += expect_runtime_mismatch("adaptive TIA bandwidth", &expected,
+		&actual, 0);
+	actual = expected;
+	actual.tia_ctrl ^= EN7572_TIA_GAIN;
+	failed += expect_runtime_mismatch("stable TIA gain", &expected, &actual,
+		EN7572_TX_EYE_MISMATCH_TIA);
+	actual = expected;
+	actual.tia_ctrl ^= EN7572_TIA_CURRENT;
+	failed += expect_runtime_mismatch("stable TIA current", &expected,
+		&actual, EN7572_TX_EYE_MISMATCH_TIA);
 
 	actual = expected;
 	actual.ben_ctrl ^= EN7572_BEN_MODE;

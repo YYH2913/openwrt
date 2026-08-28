@@ -1,0 +1,112 @@
+From: OpenWrt XPON integration
+Subject: [PATCH] net: pcs: airoha: separate factory TX validation
+
+The receive analog front end may adapt after mode commit. Keep the complete
+mode validator for protocol ownership while allowing the factory TX path to
+ignore only the known adaptive RX_REV_0 field. All TX profile, WAN, MAC and
+reset checks remain mandatory before a physical gate is opened.
+
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1433,8 +1433,9 @@
+ }
+ 
+ static int
+-airoha_pcs_xpon_verify_mode(struct airoha_pcs_priv *priv, int index,
+-			    enum airoha_pcs_pon_mode mode)
++airoha_pcs_xpon_verify_mode_scope(struct airoha_pcs_priv *priv, int index,
++				    enum airoha_pcs_pon_mode mode,
++				    bool allow_adaptive_rx)
+ {
+ 	struct airoha_pcs_xpon_profile profile;
+ 	struct regmap *pma = priv->pcs_pma[index];
+@@ -1503,8 +1504,10 @@
+ 	AIROHA_XPON_VERIFY(pma, AIROHA_PCS_PMA_PXP_FE_GAIN_CTRL,
+ 		mask, expected);
+ 	expected = FIELD_PREP(AIROHA_PCS_ANA_RX_REV_0, profile.rx_rev_0);
+-	AIROHA_XPON_VERIFY(priv->pcs_ana, AIROHA_PCS_ANA_PXP_RX_REV_0,
+-		AIROHA_PCS_ANA_RX_REV_0, expected);
++	if (!allow_adaptive_rx) {
++		AIROHA_XPON_VERIFY(priv->pcs_ana, AIROHA_PCS_ANA_PXP_RX_REV_0,
++			AIROHA_PCS_ANA_RX_REV_0, expected);
++	}
+ 	AIROHA_XPON_VERIFY(pma, AIROHA_PCS_PMA_DIG_RESERVE_12,
+ 		AIROHA_PCS_PMA_RESERVE_12_FEOS_0,
+ 		AIROHA_PCS_PMA_RESERVE_12_FEOS_0);
+@@ -1516,6 +1519,20 @@
+ 	return 0;
+ }
+ 
++static int
++airoha_pcs_xpon_verify_mode(struct airoha_pcs_priv *priv, int index,
++				    enum airoha_pcs_pon_mode mode)
++{
++	return airoha_pcs_xpon_verify_mode_scope(priv, index, mode, false);
++}
++
++static int
++airoha_pcs_xpon_verify_tx_mode(struct airoha_pcs_priv *priv, int index,
++				       enum airoha_pcs_pon_mode mode)
++{
++	return airoha_pcs_xpon_verify_mode_scope(priv, index, mode, true);
++}
++
+ static int airoha_pcs_xpon_wan_sel(enum airoha_pcs_pon_mode mode,
+ 				    u32 *wan_sel)
+ {
+@@ -1562,8 +1579,9 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_pcs_xpon_get_mode);
+ 
+-int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,
+-				   enum airoha_pcs_xpon_mode mode)
++static int airoha_pcs_xpon_validate_mode_scope(struct phylink_pcs *pcs,
++					 enum airoha_pcs_xpon_mode mode,
++					 bool allow_adaptive_rx)
+ {
+ 	struct airoha_pcs_port *port;
+ 	struct airoha_pcs_priv *priv;
+@@ -1609,7 +1627,9 @@
+ 		ret = -EIO;
+ 		goto unlock;
+ 	}
+-	ret = airoha_pcs_xpon_verify_mode(priv, port->index, internal);
++	ret = allow_adaptive_rx ?
++		airoha_pcs_xpon_verify_tx_mode(priv, port->index, internal) :
++		airoha_pcs_xpon_verify_mode(priv, port->index, internal);
+ 	if (ret)
+ 		goto unlock;
+ 	ret = regmap_read(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+@@ -1631,8 +1651,21 @@
+ 	rtnl_unlock();
+ 	return ret;
+ }
++
++int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,
++				   enum airoha_pcs_xpon_mode mode)
++{
++	return airoha_pcs_xpon_validate_mode_scope(pcs, mode, false);
++}
+ EXPORT_SYMBOL_GPL(airoha_pcs_xpon_validate_mode);
+ 
++int airoha_pcs_xpon_validate_tx_mode(struct phylink_pcs *pcs,
++				      enum airoha_pcs_xpon_mode mode)
++{
++	return airoha_pcs_xpon_validate_mode_scope(pcs, mode, true);
++}
++EXPORT_SYMBOL_GPL(airoha_pcs_xpon_validate_tx_mode);
++
+ int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs)
+ {
+ 	struct airoha_pcs_port *port;
+--- a/include/linux/pcs/pcs-airoha.h
++++ b/include/linux/pcs/pcs-airoha.h
+@@ -20,6 +20,8 @@
+ 			     enum airoha_pcs_xpon_mode *mode);
+ int airoha_pcs_xpon_validate_mode(struct phylink_pcs *pcs,
+ 				   enum airoha_pcs_xpon_mode mode);
++int airoha_pcs_xpon_validate_tx_mode(struct phylink_pcs *pcs,
++				      enum airoha_pcs_xpon_mode mode);
+ int airoha_pcs_xpon_quiesce(struct phylink_pcs *pcs);
+ int airoha_pcs_xpon_select_wan(struct phylink_pcs *pcs,
+ 			       enum airoha_pcs_xpon_mode mode);

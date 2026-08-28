@@ -25,6 +25,21 @@ require_fixed() {
 	}
 }
 
+require_order() {
+	first="$1"
+	second="$2"
+	file="$3"
+	description="$4"
+	first_line="$(grep -nF -- "$first" "$file" | head -n 1 | cut -d: -f1)"
+	second_line="$(grep -nF -- "$second" "$file" | head -n 1 | cut -d: -f1)"
+
+	if [ -z "$first_line" ] || [ -z "$second_line" ] ||
+	   [ "$first_line" -ge "$second_line" ]; then
+		echo "invalid order for $description" >&2
+		exit 1
+	fi
+}
+
 require_fixed 'xpon_controller: xpon-controller {' "$board_dts" \
 	'XPON runtime owner node'
 [ "$(grep -Fc 'airoha,xpon-controller = <&xpon_controller>;' "$board_dts")" -eq 3 ] || {
@@ -77,6 +92,15 @@ require_fixed 'airoha_xpon_backend_ready(priv->asymmetric_backend)' "$epon" \
 	'10G/1G EPON post-endpoint owner claim'
 require_fixed 'airoha_xpon_backend_ready(priv->symmetric_backend)' "$epon" \
 	'10G/10G EPON post-endpoint owner claim'
+require_order 'devm_add_action_or_reset(dev, en7581_gpon_bosa_put' \
+	'devm_add_action_or_reset(dev, en7581_gpon_xpon_unregister' "$gpon" \
+	'GPON unregister before BOSA reference release'
+require_order 'devm_add_action_or_reset(dev, en7581_xgspon_bosa_put' \
+	'devm_add_action_or_reset(dev, en7581_xgspon_xpon_unregister' "$xgs" \
+	'XG/XGS-PON unregister before BOSA reference release'
+require_order 'devm_add_action_or_reset(dev, en7581_epon_bosa_put' \
+	'devm_add_action_or_reset(dev, en7581_epon_backend_unregister' "$epon" \
+	'EPON unregister before BOSA reference release'
 require_fixed 'airoha_pcs_xpon_select_wan(context->core->pcs,' "$core" \
 	'hardware-backed WAN-selection transaction stage'
 require_fixed 'airoha_xpon_prepare_initial_mode(core, core->current_mode);' \
@@ -103,6 +127,20 @@ require_fixed 'failed_stage=%u' "$core" \
 	'observable failed transaction stage'
 require_fixed 'return en7581_epon_stop_path(priv);' "$epon" \
 	'EPON datapath stop without overwriting the saved enable state'
+
+unregister_body="$(sed -n \
+	'/^void airoha_xpon_backend_unregister(/,/^}/p' "$core")"
+printf '%s\n' "$unregister_body" | awk '
+	/cancel_delayed_work\(&core->factory_tx_work\)/ && step == 0 { step = 1 }
+	/airoha_xpon_factory_tx_disable_locked\(core\)/ && step == 1 { step = 2 }
+	/airoha_en7572_emergency_disable\(core->bosa\)/ && step == 2 { step = 3 }
+	/airoha_xpon_backend_quiesce\(backend\)/ && step == 3 { step = 4 }
+	/WRITE_ONCE\(core->current_backend, NULL\)/ && step == 4 { step = 5 }
+	END { exit step == 5 ? 0 : 1 }
+' || {
+	echo 'active backend unregister must restore factory PCS state, lock out BOSA, quiesce the backend, then clear owner' >&2
+	exit 1
+}
 
 initial_mode_body="$(sed -n \
 	'/^static int airoha_xpon_prepare_initial_mode(/,/^}/p' "$core")"

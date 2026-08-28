@@ -22,4 +22,3 @@ endef
 
 $(eval $(call KernelPackage,pwm-airoha))
 
-

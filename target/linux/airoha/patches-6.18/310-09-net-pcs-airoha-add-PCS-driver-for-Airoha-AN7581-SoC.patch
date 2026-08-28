@@ -69,7 +69,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 +endif
 --- /dev/null
 +++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
-@@ -0,0 +1,1313 @@
+@@ -0,0 +1,1318 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Copyright (c) 2024 AIROHA Inc
@@ -1010,8 +1010,12 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 +					const char *name, struct regmap **regmap)
 +{
 +	struct regmap_config regmap_config = { };
++	struct resource *res;
 +	void *base;
 +
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res || resource_size(res) < sizeof(u32))
++		return -EINVAL;
 +	base = devm_platform_ioremap_resource_byname(pdev, name);
 +	if (IS_ERR(base))
 +		return PTR_ERR(base);
@@ -1020,6 +1024,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 +	regmap_config.reg_bits = 32,
 +	regmap_config.val_bits = 32,
 +	regmap_config.reg_stride = 4,
++	regmap_config.max_register = resource_size(res) - sizeof(u32);
 +
 +	*regmap = devm_regmap_init_mmio(&pdev->dev, base, &regmap_config);
 +

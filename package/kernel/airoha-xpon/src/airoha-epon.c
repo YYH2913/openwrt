@@ -365,6 +365,17 @@ static bool en7581_epon_active(struct en7581_epon *priv)
 	       airoha_xpon_backend_is_active(priv->symmetric_backend);
 }
 
+static struct airoha_xpon_backend *
+en7581_epon_active_backend(struct en7581_epon *priv)
+{
+	if (airoha_xpon_backend_is_active(priv->asymmetric_backend))
+		return priv->asymmetric_backend;
+	if (airoha_xpon_backend_is_active(priv->symmetric_backend))
+		return priv->symmetric_backend;
+
+	return NULL;
+}
+
 static void en7581_epon_purge_oam_rx(struct en7581_epon *priv)
 {
 	struct en7581_epon_oam_rx *rx, *next;
@@ -3218,6 +3229,13 @@ static int en7581_epon_mode_committed(void *context)
 	return 0;
 }
 
+static bool en7581_epon_activation_enabled(void *context)
+{
+	struct en7581_epon *priv = context;
+
+	return READ_ONCE(priv->enabled);
+}
+
 static const struct airoha_xpon_backend_ops en7581_epon_ops = {
 	.block_traffic = en7581_epon_block_traffic,
 	.clear_session = en7581_epon_clear_session,
@@ -3229,6 +3247,7 @@ static const struct airoha_xpon_backend_ops en7581_epon_ops = {
 	.start_datapath = en7581_epon_start_datapath,
 	.unmask_irqs = en7581_epon_unmask_irqs,
 	.mode_committed = en7581_epon_mode_committed,
+	.activation_enabled = en7581_epon_activation_enabled,
 };
 
 static ssize_t enabled_show(struct device *dev,
@@ -3244,10 +3263,15 @@ static ssize_t enabled_store(struct device *dev,
 			     const char *buf, size_t count)
 {
 	struct en7581_epon *priv = dev_get_drvdata(dev);
+	struct airoha_xpon_backend *backend;
 	bool active, enabled;
 	int ret = 0;
 
 	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	backend = en7581_epon_active_backend(priv);
+	ret = airoha_xpon_backend_activation_lock(backend);
 	if (ret)
 		return ret;
 	mutex_lock(&priv->lock);
@@ -3264,7 +3288,7 @@ static ssize_t enabled_store(struct device *dev,
 	}
 	mutex_unlock(&priv->lock);
 	if (ret || !active)
-		return ret ? ret : count;
+		goto out;
 
 	if (enabled) {
 		ret = en7581_epon_unmask_irqs(priv);
@@ -3282,7 +3306,7 @@ static ssize_t enabled_store(struct device *dev,
 			priv->enabled = false;
 			mutex_unlock(&priv->lock);
 		}
-		return ret ? ret : count;
+		goto out;
 	}
 
 	en7581_epon_mask_irqs(priv);
@@ -3294,6 +3318,9 @@ static ssize_t enabled_store(struct device *dev,
 	ret = en7581_epon_clear_sessions_locked(priv);
 	mutex_unlock(&priv->lock);
 	airoha_en7572_set_tx_enabled(priv->bosa, false);
+
+out:
+	airoha_xpon_backend_activation_unlock(backend);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_RW(enabled);

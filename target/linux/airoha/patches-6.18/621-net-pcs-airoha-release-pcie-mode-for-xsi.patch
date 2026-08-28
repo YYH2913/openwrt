@@ -1,0 +1,40 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Tue, 25 Aug 2026 16:50:00 +0800
+Subject: [PATCH] net: pcs: airoha: release PCIe mode before XSI bring-up
+
+AN7581 defaults the shared PCIe SerDes lanes to PCIe controller mode.  A
+board that routes those lanes to an Ethernet XSI must release the PCIe mode
+before the PCS analog bring-up.  Otherwise the PHY sees a 10.3125 GHz clock
+but no valid USXGMII symbols and the in-band link can never come up.
+
+Keep the behavior opt-in because another board may use one shared lane for
+Ethernet while retaining a physical PCIe controller on the other lane.
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha.h b/drivers/net/pcs/airoha/pcs-airoha.h
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -27,6 +27,8 @@
+ #define   AIROHA_SCU_WAN_SEL_SGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x10)
+ #define   AIROHA_SCU_WAN_SEL_HSGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x11)
+ #define   AIROHA_SCU_WAN_SEL_USXGMII		FIELD_PREP_CONST(AIROHA_SCU_WAN_SEL, 0x12)
++#define AIROHA_SCU_PCIC				0x88
++#define   AIROHA_SCU_PCIC_PCIE_CTRL		GENMASK(7, 0)
+ #define AIROHA_SCU_SSR3				0x94
+ #define   AIROHA_SCU_ETH_XSI_SEL		GENMASK(14, 13)
+ #define   AIROHA_SCU_ETH_XSI_USXGMII		FIELD_PREP_CONST(AIROHA_SCU_ETH_XSI_SEL, 0x1)
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -142,6 +142,12 @@ static void an7581_pcs_setup_scu_pcie(struct airoha_pcs_priv *priv,
+ 					   AIROHA_SCU_PCIE_XSI1_SEL,
+ 					   xsi_sel);
+ 	}
++
++	/* The XSI and PCIe controllers share these SerDes lanes. */
++	if (device_property_read_bool(priv->dev,
++				      "airoha,disable-pcie-mode"))
++		regmap_clear_bits(priv->scu, AIROHA_SCU_PCIC,
++				  AIROHA_SCU_PCIC_PCIE_CTRL);
+ }
+ 
+ static void an7583_pcs_setup_scu_pcie(struct airoha_pcs_priv *priv,

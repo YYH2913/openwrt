@@ -1,0 +1,18 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Mon, 24 Aug 2026 11:45:00 +0800
+Subject: [PATCH] net: airoha: enable standard PHY ioctl handling
+
+Pass SIOCGMIIREG and SIOCSMIIREG through phylib so diagnostic tools can
+inspect the Clause 22 and Clause 45 registers behind Airoha netdevs.
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3156,6 +3156,7 @@
+ 	.ndo_get_stats64        = airoha_dev_get_stats64,
+ 	.ndo_set_mac_address	= airoha_dev_set_macaddr,
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
++	.ndo_eth_ioctl		= phy_do_ioctl_running,
+ };
+ 
+ static const struct ethtool_ops airoha_ethtool_ops = {

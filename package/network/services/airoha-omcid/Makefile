@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=airoha-omcid
 PKG_VERSION:=0.31.0
-PKG_RELEASE:=27
+PKG_RELEASE:=31
 
 # Development checkout. Replace this URL with the public standalone repository
 # before publishing feeds or release artifacts.
@@ -59,6 +59,7 @@ define Package/airoha-omcid/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/airoha-mcastd $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/airoha-xgspon-evidence $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/airoha-xpon-evidence $(1)/usr/sbin/
+	$(INSTALL_BIN) ./files/airoha-optical-tx-test $(1)/usr/sbin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/airoha-omcid.init $(1)/etc/init.d/airoha-omcid
 	$(INSTALL_BIN) ./files/airoha-gpon-config.init $(1)/etc/init.d/airoha-gpon-config

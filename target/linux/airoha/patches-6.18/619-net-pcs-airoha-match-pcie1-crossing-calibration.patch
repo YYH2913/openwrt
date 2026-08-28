@@ -1,0 +1,242 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Mon, 24 Aug 2026 11:40:00 +0800
+Subject: [PATCH] net: pcs: airoha: match PCIe1 crossing calibration
+
+Use the vendor PCIe1 crossing-point IDAC search instead of the generic
+closest-only greedy search. Also return the PCIe PIEYE and PR LPF controls
+to auto mode after latching the calibrated FLL bands and report the final
+state.
+
+diff --git a/drivers/net/pcs/airoha/pcs-an7581.c b/drivers/net/pcs/airoha/pcs-an7581.c
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -1666,6 +1666,81 @@
+ 	return fl_out > target ? fl_out - target : target - fl_out;
+ }
+ 
++static u32 an7581_pcs_rx_prcal_idac_pcie(struct airoha_pcs_priv *priv,
++					 int index, u32 target_fl_out,
++					 unsigned int *selected_fl_out)
++{
++	unsigned int best_diff = UINT_MAX;
++	unsigned int best_fl_out = 0;
++	unsigned int upper_fl_out;
++	u32 best_idac = 0;
++	u32 upper_idac;
++	int bit;
++	u32 i;
++
++	for (i = 0; i < 8; i++) {
++		u32 idac = FIELD_PREP(AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC_MAJOR, i);
++		unsigned int sample;
++		unsigned int diff;
++
++		sample = an7581_pcs_apply_cdr_pr_idac(priv, index, idac);
++		diff = an7581_pcs_fl_out_diff(sample, target_fl_out);
++		if (diff < best_diff) {
++			best_diff = diff;
++			best_fl_out = sample;
++			best_idac = idac;
++		}
++	}
++
++	/* FL_OUT decreases as IDAC increases. Approach the target from above
++	 * so setting a high minor bit cannot hide better lower-bit combinations.
++	 */
++	upper_idac = best_idac;
++	upper_fl_out = best_fl_out;
++	if (upper_fl_out < target_fl_out && upper_idac >= BIT(8)) {
++		u32 idac = upper_idac - BIT(8);
++		unsigned int sample;
++
++		sample = an7581_pcs_apply_cdr_pr_idac(priv, index, idac);
++		if (sample >= target_fl_out) {
++			upper_idac = idac;
++			upper_fl_out = sample;
++		}
++	}
++
++	if (upper_fl_out >= target_fl_out) {
++		for (bit = 7; bit >= 0; bit--) {
++			u32 idac = upper_idac | BIT(bit);
++			unsigned int sample;
++
++			sample = an7581_pcs_apply_cdr_pr_idac(priv, index, idac);
++			if (sample >= target_fl_out) {
++				upper_idac = idac;
++				upper_fl_out = sample;
++			}
++		}
++
++		best_idac = upper_idac;
++		best_fl_out = upper_fl_out;
++		best_diff = an7581_pcs_fl_out_diff(best_fl_out, target_fl_out);
++		if (best_idac < FIELD_MAX(AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC)) {
++			u32 idac = best_idac + 1;
++			unsigned int sample;
++			unsigned int diff;
++
++			sample = an7581_pcs_apply_cdr_pr_idac(priv, index, idac);
++			diff = an7581_pcs_fl_out_diff(sample, target_fl_out);
++			if (diff < best_diff) {
++				best_idac = idac;
++				best_fl_out = sample;
++			}
++		}
++	}
++
++	*selected_fl_out = best_fl_out;
++	return best_idac;
++}
++
+ static u32 an7581_pcs_rx_prcal_idac_major(struct airoha_pcs_priv *priv,
+ 					  int index, u32 target_fl_out)
+ {
+@@ -1910,42 +1985,54 @@
+ 	 * Finally fine tune for the remaining bits to find the one that
+ 	 * produce the closest signal level.
+ 	 */
+-	cdr_pr_idac_major = an7581_pcs_rx_prcal_idac_major(priv, index, target_fl_out);
+-
+-	cdr_pr_idac = an7581_pcs_rx_prcal_idac_minor(priv, index,
+-						     target_fl_out, cdr_pr_idac_major);
+-
+-	fl_out = an7581_pcs_apply_cdr_pr_idac(priv, index, cdr_pr_idac);
+-	fl_out_diff = an7581_pcs_fl_out_diff(fl_out, target_fl_out);
+-	if (fl_out_diff > 100) {
+-		u32 pr_idac_major = FIELD_GET(AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC_MAJOR,
+-					      cdr_pr_idac_major);
+-		unsigned int fl_out_tmp, fl_out_diff_tmp;
+-		u32 cdr_pr_idac_tmp;
+-
+-		if (pr_idac_major > 0) {
+-			cdr_pr_idac_tmp = FIELD_PREP(AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC_MAJOR,
+-						     pr_idac_major - 1);
+-
+-			dev_dbg(priv->dev, "Fl Out is %d far from target %d with Pr Idac %x. Trying with Pr Idac %x.\n",
+-				fl_out_diff, target_fl_out, cdr_pr_idac_major, cdr_pr_idac_tmp);
+-
+-			cdr_pr_idac_tmp = an7581_pcs_rx_prcal_idac_minor(priv, index,
+-									 target_fl_out,
+-									 cdr_pr_idac_tmp);
+-
+-			fl_out_tmp = an7581_pcs_apply_cdr_pr_idac(priv, index,
+-								  cdr_pr_idac_tmp);
+-			fl_out_diff_tmp = an7581_pcs_fl_out_diff(fl_out_tmp,
+-								       target_fl_out);
+-			if (fl_out_diff_tmp < fl_out_diff) {
+-				fl_out = fl_out_tmp;
+-				fl_out_diff = fl_out_diff_tmp;
+-				cdr_pr_idac = cdr_pr_idac_tmp;
++	if (priv->data->port_type == AIROHA_PCS_PCIE) {
++		cdr_pr_idac = an7581_pcs_rx_prcal_idac_pcie(priv, index,
++							     target_fl_out, &fl_out);
++		fl_out_diff = an7581_pcs_fl_out_diff(fl_out, target_fl_out);
++	} else {
++		cdr_pr_idac_major = an7581_pcs_rx_prcal_idac_major(priv, index,
++							       target_fl_out);
++		cdr_pr_idac = an7581_pcs_rx_prcal_idac_minor(priv, index,
++							 target_fl_out,
++							 cdr_pr_idac_major);
++
++		fl_out = an7581_pcs_apply_cdr_pr_idac(priv, index, cdr_pr_idac);
++		fl_out_diff = an7581_pcs_fl_out_diff(fl_out, target_fl_out);
++		if (fl_out_diff > 100) {
++			u32 pr_idac_major;
++			unsigned int fl_out_tmp, fl_out_diff_tmp;
++			u32 cdr_pr_idac_tmp;
++
++			pr_idac_major = FIELD_GET(AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC_MAJOR,
++						  cdr_pr_idac_major);
++			if (pr_idac_major > 0) {
++				cdr_pr_idac_tmp = FIELD_PREP(
++					AIROHA_PCS_PMA_FORCE_CDR_PR_IDAC_MAJOR,
++					pr_idac_major - 1);
++
++				dev_dbg(priv->dev, "Fl Out is %d far from target %d with Pr Idac %x. Trying with Pr Idac %x.\n",
++					fl_out_diff, target_fl_out,
++					cdr_pr_idac_major, cdr_pr_idac_tmp);
++
++				cdr_pr_idac_tmp = an7581_pcs_rx_prcal_idac_minor(
++					priv, index, target_fl_out, cdr_pr_idac_tmp);
++				fl_out_tmp = an7581_pcs_apply_cdr_pr_idac(
++					priv, index, cdr_pr_idac_tmp);
++				fl_out_diff_tmp = an7581_pcs_fl_out_diff(
++					fl_out_tmp, target_fl_out);
++				if (fl_out_diff_tmp < fl_out_diff) {
++					fl_out = fl_out_tmp;
++					fl_out_diff = fl_out_diff_tmp;
++					cdr_pr_idac = cdr_pr_idac_tmp;
++				}
+ 			}
+ 		}
+ 	}
+-	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
++	if (priv->data->port_type == AIROHA_PCS_PCIE)
++		dev_info(priv->dev,
++			 "PCIe PCS CDR calibration: idac=%#x fl_out=%#x target=%#x diff=%u\n",
++			 cdr_pr_idac, fl_out, target_fl_out, fl_out_diff);
++	else if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
+ 		dev_info_ratelimited(priv->dev,
+ 			"PON CDR calibration: idac=%#x fl_out=%#x target=%#x diff=%u\n",
+ 			cdr_pr_idac, fl_out, target_fl_out, fl_out_diff);
+@@ -1957,9 +2044,17 @@
+ 	/* Setup Load Band */
+ 	regmap_field_write(pcs_ana_fields[AN7581_PCS_CDR_PR_INJ_FORCE_OFF], 0x0);
+ 
+-	/* Disable force of LPF C previously enabled */
+-	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_LPF_C_EN,
+-			  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_LPF_C_EN);
++	/* PCIe1 returns both PR LPF controls to the vendor auto-mode state. */
++	if (priv->data->port_type == AIROHA_PCS_PCIE)
++		regmap_clear_bits(pcs_pma,
++				  AIROHA_PCS_PMA_PXP_CDR_PR_LPF_C_EN,
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_LPF_R_EN |
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_LPF_C_EN |
++				  AIROHA_PCS_PMA_FORCE_DA_CDR_PR_LPF_C_EN);
++	else
++		regmap_clear_bits(pcs_pma,
++				  AIROHA_PCS_PMA_PXP_CDR_PR_LPF_C_EN,
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_LPF_C_EN);
+ 
+ 	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
+ 			  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_IDAC);
+@@ -1995,8 +2090,16 @@
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_PIEYE_PWDB,
+ 			AIROHA_PCS_PMA_FORCE_DA_CDR_PR_PWDB);
+ 
+-	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_PIEYE_PWDB,
+-			  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_PWDB);
++	if (priv->data->port_type == AIROHA_PCS_PCIE)
++		regmap_clear_bits(pcs_pma,
++				  AIROHA_PCS_PMA_PXP_CDR_PR_PIEYE_PWDB,
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_PWDB |
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_PIEYE_PWDB |
++				  AIROHA_PCS_PMA_FORCE_DA_CDR_PR_PIEYE_PWDB);
++	else
++		regmap_clear_bits(pcs_pma,
++				  AIROHA_PCS_PMA_PXP_CDR_PR_PIEYE_PWDB,
++				  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_PWDB);
+ 
+ 	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_SW_RST_SET,
+ 			  AIROHA_PCS_PMA_SW_REF_RST_N);
+@@ -2290,6 +2393,19 @@
+ 		dev_dbg(priv->dev, "No FBCK Lock from FreqDet module, retry calibration.\n");
+ 		goto retry_calibration;
+ 	}
++	if (priv->data->port_type == AIROHA_PCS_PCIE) {
++		u32 seq_dis, fll1, fllb, bands, load;
++
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_RX_CTRL_SEQUENCE_DISB_CTRL_1,
++			    &seq_dis);
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_RX_FLL_1, &fll1);
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_RX_FLL_B, &fllb);
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_13, &bands);
++		regmap_read(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_14, &load);
++		dev_info(priv->dev,
++			 "PCIe PCS RX state: freqdet=%08x seq=%08x fll1=%08x fllb=%08x bands=%08x load=%08x\n",
++			 val, seq_dis, fll1, fllb, bands, load);
++	}
+ 
+ 	return 0;
+ }

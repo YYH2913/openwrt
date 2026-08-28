@@ -22,6 +22,7 @@ struct airoha_xpon_backend_ops {
 	int (*start_datapath)(void *context);
 	int (*unmask_irqs)(void *context);
 	int (*mode_committed)(void *context);
+	bool (*activation_enabled)(void *context);
 };
 
 struct airoha_xpon_backend *
@@ -33,5 +34,7 @@ airoha_xpon_backend_register(struct device *dev,
 int airoha_xpon_backend_ready(struct airoha_xpon_backend *backend);
 void airoha_xpon_backend_unregister(struct airoha_xpon_backend *backend);
 bool airoha_xpon_backend_is_active(struct airoha_xpon_backend *backend);
+int airoha_xpon_backend_activation_lock(struct airoha_xpon_backend *backend);
+void airoha_xpon_backend_activation_unlock(struct airoha_xpon_backend *backend);
 
 #endif

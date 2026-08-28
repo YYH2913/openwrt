@@ -21,6 +21,8 @@ int airoha_en7572_validate_mode(struct airoha_en7572 *bosa,
 int airoha_en7572_set_mode(struct airoha_en7572 *bosa,
 			  enum airoha_xpon_mode mode);
 int airoha_en7572_set_tx_enabled(struct airoha_en7572 *bosa, bool enabled);
+int airoha_en7572_factory_tx_enable(struct airoha_en7572 *bosa);
+void airoha_en7572_factory_tx_disable(struct airoha_en7572 *bosa);
 int airoha_en7572_clear_fault(struct airoha_en7572 *bosa);
 void airoha_en7572_emergency_disable(struct airoha_en7572 *bosa);
 

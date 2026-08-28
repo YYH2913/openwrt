@@ -694,6 +694,17 @@ static bool en7581_xgspon_backend_active(struct en7581_xgspon *priv)
 	       airoha_xpon_backend_is_active(priv->xgspon_backend);
 }
 
+static struct airoha_xpon_backend *
+en7581_xgspon_active_backend(struct en7581_xgspon *priv)
+{
+	if (airoha_xpon_backend_is_active(priv->xgpon_backend))
+		return priv->xgpon_backend;
+	if (airoha_xpon_backend_is_active(priv->xgspon_backend))
+		return priv->xgspon_backend;
+
+	return NULL;
+}
+
 static int en7581_xgspon_set_mac_irq_enable(struct en7581_xgspon *priv,
 						    u32 mask)
 {
@@ -6651,14 +6662,19 @@ static ssize_t enabled_show(struct device *dev,
 }
 
 static ssize_t enabled_store(struct device *dev,
-			     struct device_attribute *attribute,
-			     const char *buf, size_t count)
+				     struct device_attribute *attribute,
+				     const char *buf, size_t count)
 {
 	struct en7581_xgspon *priv = dev_get_drvdata(dev);
+	struct airoha_xpon_backend *backend;
 	bool enabled;
 	int irq_ret, ret;
 
 	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+	backend = en7581_xgspon_active_backend(priv);
+	ret = airoha_xpon_backend_activation_lock(backend);
 	if (ret)
 		return ret;
 
@@ -6697,6 +6713,7 @@ static ssize_t enabled_store(struct device *dev,
 	mutex_unlock(&priv->lock);
 	if (!enabled)
 		en7581_xgspon_disable_tx(priv);
+	airoha_xpon_backend_activation_unlock(backend);
 
 	return ret ? ret : count;
 }
@@ -8020,6 +8037,13 @@ static int en7581_xgspon_xpon_mode_committed(void *context)
 	return 0;
 }
 
+static bool en7581_xgspon_xpon_activation_enabled(void *context)
+{
+	struct en7581_xgspon *priv = context;
+
+	return READ_ONCE(priv->enabled);
+}
+
 static const struct airoha_xpon_backend_ops en7581_xgspon_xpon_ops = {
 	.block_traffic = en7581_xgspon_xpon_block_traffic,
 	.clear_session = en7581_xgspon_xpon_clear_session,
@@ -8031,6 +8055,7 @@ static const struct airoha_xpon_backend_ops en7581_xgspon_xpon_ops = {
 	.start_datapath = en7581_xgspon_xpon_start_datapath,
 	.unmask_irqs = en7581_xgspon_xpon_unmask_irqs,
 	.mode_committed = en7581_xgspon_xpon_mode_committed,
+	.activation_enabled = en7581_xgspon_xpon_activation_enabled,
 };
 
 static void en7581_xgspon_xpon_unregister(void *data)

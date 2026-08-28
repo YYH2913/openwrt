@@ -45,20 +45,25 @@ static inline bool airoha_xpon_rollback_ops_valid(
 
 static inline int airoha_xpon_rollback_transaction(
 		const struct airoha_xpon_rollback_ops *ops, void *context,
-		enum airoha_xpon_mode previous_mode, bool target_start_attempted)
+		enum airoha_xpon_mode previous_mode, bool target_start_attempted,
+		bool previous_cleanup_required)
 {
 	int cleanup_error, ret;
 
 	if (!airoha_xpon_rollback_ops_valid(ops) ||
-	    !airoha_xpon_mode_valid(previous_mode))
+	    !airoha_xpon_mode_valid(previous_mode) ||
+	    (target_start_attempted && previous_cleanup_required))
 		return -EINVAL;
 
 	ops->disable_tx(context);
 	if (target_start_attempted) {
 		ret = ops->quiesce_target(context);
-	} else {
+	} else if (previous_cleanup_required) {
 		/* Early failures may leave the old MAC, data path or IRQs live. */
 		ret = ops->quiesce_previous(context);
+	} else {
+		/* The old backend is already stopped and the target has not started. */
+		ret = 0;
 	}
 	if (ret)
 		return ret;

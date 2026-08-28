@@ -120,6 +120,13 @@ static inline bool airoha_xpon_switch_target_start_attempted(
 	       failed_stage <= AIROHA_XPON_SWITCH_COMMITTED;
 }
 
+static inline bool airoha_xpon_switch_previous_cleanup_required(
+		enum airoha_xpon_switch_stage failed_stage)
+{
+	/* A failed stop callback can leave the previous backend partly live. */
+	return failed_stage < AIROHA_XPON_SWITCH_PCS_QUIESCED;
+}
+
 /*
  * Hardware reconfiguration keeps optical TX disabled through the ownership
  * commit. Shared IRQ handlers gate on that owner, so commit it before unmasking

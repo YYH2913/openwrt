@@ -1,0 +1,121 @@
+From: XG2010G OpenWrt Port <xg2010g@example.invalid>
+Date: Mon, 24 Aug 2026 11:00:00 +0800
+Subject: [PATCH] net: pcs: airoha: complete PCIe1 XG2010G bring-up
+
+Complete the vendor PCIe1 rate and calibration handoff used by XG2010G.
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha.h b/drivers/net/pcs/airoha/pcs-airoha.h
+index fae6da9..eeaf4ed 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -217,6 +217,8 @@
+ #define   AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS BIT(26)
+ #define   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN	BIT(4)
+ #define   AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN	BIT(0)
++#define   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_USXGMII_PCH_MODE BIT(11)
++#define   AIROHA_PCS_HSGMII_RATE_ADAPT_TX_USXGMII_PCH_MODE BIT(10)
+ #define AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_1	0x4
+ #define   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR GENMASK(20, 16)
+ #define   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR GENMASK(28, 24)
+@@ -1606,6 +1608,12 @@
+ #define   AIROHA_PCS_PMA_FORCE_DA_RX_SIGDET_CAL_EN BIT(0)
+ #define AIROHA_PCS_PMA_DIG_RESERVE_12		0x8b8
+ #define   AIROHA_PCS_PMA_RESERVE_12_FEOS_0	BIT(0)
++#define AIROHA_PCS_PMA_DIG_RESERVE_13		0x8bc
++#define   AIROHA_PCS_PMA_FLL_IDAC_PCIEG1	GENMASK(10, 0)
++#define   AIROHA_PCS_PMA_FLL_IDAC_PCIEG2	GENMASK(26, 16)
++#define AIROHA_PCS_PMA_DIG_RESERVE_14		0x8c0
++#define   AIROHA_PCS_PMA_FLL_LOAD_EN		BIT(16)
++#define   AIROHA_PCS_PMA_FLL_LOAD_APPLY	BIT(20)
+ #define AIROHA_PCS_PMA_DIG_RESERVE_24		0x8fc
+ #define   AIROHA_PCS_PMA_FORCE_RX_GEARBOX	BIT(12)
+ #define   AIROHA_PCS_PMA_FORCE_SEL_RX_GEARBOX	BIT(8)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index d4e8337..7896ecf 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -559,6 +559,12 @@ static int airoha_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 		rate_adapt |= AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
+ 			      AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS;
+ 
++	if (data->port_type == AIROHA_PCS_PCIE)
++		regmap_clear_bits(maps->hsgmii_rate_adp,
++				  AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_0,
++				  AIROHA_PCS_HSGMII_RATE_ADAPT_RX_USXGMII_PCH_MODE |
++				  AIROHA_PCS_HSGMII_RATE_ADAPT_TX_USXGMII_PCH_MODE);
++
+ 	/* AN Auto Settings (Rate Adaptation) */
+ 	regmap_update_bits(maps->hsgmii_rate_adp, AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_0,
+ 			   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
+@@ -1888,6 +1894,9 @@ static int airoha_pcs_probe(struct platform_device *pdev)
+ 		/* PON modes require the SDK frequency target on every revision. */
+ 		priv->manual_rx_calib = true;
+ 	}
++	if (data->port_type == AIROHA_PCS_PCIE &&
++	    device_property_read_bool(dev, "airoha,manual-rx-calibration"))
++		priv->manual_rx_calib = true;
+ 
+ 	if (data->port_type == AIROHA_PCS_USB ||
+ 	    device_is_compatible(dev, "airoha,an7583-pcs-pcie")) {
+
+diff --git a/drivers/net/pcs/airoha/pcs-an7581.c b/drivers/net/pcs/airoha/pcs-an7581.c
+index de1474e..75aa62e 100644
+--- a/drivers/net/pcs/airoha/pcs-an7581.c
++++ b/drivers/net/pcs/airoha/pcs-an7581.c
+@@ -1143,7 +1143,15 @@ static void an7581_pcs_tx_bringup(struct airoha_pcs_priv *priv,
+ 				      ckin_divisor) |
+ 			   FIELD_PREP(AIROHA_PCS_PMA_FORCE_DA_TX_TERM_SEL, 0x0));
+ 
+-	if (priv->data->port_type != AIROHA_PCS_PCIE) {
++	if (priv->data->port_type == AIROHA_PCS_PCIE) {
++		/* PCIe exposes a second rate-control register in each lane. */
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TX_RATE_CTRL,
++				   AIROHA_PCS_PMA_FORCE_SEL_DA_TX_RATE_CTRL |
++				   AIROHA_PCS_PMA_FORCE_DA_TX_RATE_CTRL,
++				   AIROHA_PCS_PMA_FORCE_SEL_DA_TX_RATE_CTRL |
++				   FIELD_PREP(AIROHA_PCS_PMA_FORCE_DA_TX_RATE_CTRL,
++					      tx_rate_ctrl));
++	} else {
+ 		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_PXP_TX_RATE_CTRL,
+ 				   AIROHA_PCS_PMA_FORCE_SEL_DA_TX_RATE_CTRL |
+ 				   AIROHA_PCS_PMA_FORCE_DA_TX_RATE_CTRL,
+@@ -1956,6 +1964,24 @@ static void an7581_pcs_rx_prcal(struct airoha_pcs_priv *priv,
+ 	regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_PXP_CDR_PR_IDAC,
+ 			  AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_PR_IDAC);
+ 
++	if (priv->data->port_type == AIROHA_PCS_PCIE) {
++		/* PCIe1's FLL uses a separate Gen1/Gen2 band latch. */
++		regmap_update_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_13,
++				   AIROHA_PCS_PMA_FLL_IDAC_PCIEG1 |
++				   AIROHA_PCS_PMA_FLL_IDAC_PCIEG2,
++				   FIELD_PREP(AIROHA_PCS_PMA_FLL_IDAC_PCIEG1,
++					      cdr_pr_idac) |
++				   FIELD_PREP(AIROHA_PCS_PMA_FLL_IDAC_PCIEG2,
++					      cdr_pr_idac));
++		regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_14,
++				AIROHA_PCS_PMA_FLL_LOAD_EN);
++		regmap_clear_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_14,
++				  AIROHA_PCS_PMA_FLL_LOAD_APPLY);
++		udelay(10);
++		regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_DIG_RESERVE_14,
++				AIROHA_PCS_PMA_FLL_LOAD_APPLY);
++	}
++
+ 	regmap_set_bits(pcs_pma, AIROHA_PCS_PMA_RX_FLL_B,
+ 			AIROHA_PCS_PMA_LOAD_EN);
+ 
+@@ -2212,6 +2238,11 @@ retry_calibration:
+ 
+ 	an7581_pcs_cdr_reset(priv, index, interface, false);
+ 
++	if (priv->data->port_type == AIROHA_PCS_PCIE)
++		regmap_clear_bits(pcs_pma,
++				  AIROHA_PCS_PMA_RX_CTRL_SEQUENCE_DISB_CTRL_1,
++				  AIROHA_PCS_PMA_DISB_RX_SDCAL_EN);
++
+ 	if (priv->pon_mode != AIROHA_PCS_PON_MODE_NONE)
+ 		an7581_pcs_pon_tdc_on(priv, index);
+ 
+
+
