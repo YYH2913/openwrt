@@ -282,3 +282,35 @@ msgstr "%d天 %d小时"
 #: htdocs/luci-static/resources/status-glass.js:243
 msgid "%dh %dm"
 msgstr "%d小时 %d分钟"
+
+msgid "Balanced"
+msgstr "平衡"
+
+msgid ""
+"Balanced keeps blur on primary navigation and overlays. Reduced disables "
+"backdrop blur and most motion."
+msgstr "平衡模式仅在主导航和浮层保留模糊。精简模式会关闭背景模糊和大部分动效。"
+
+msgid "Effects profile"
+msgstr "效果档位"
+
+msgid "Expecting: %s"
+msgstr "期望：%s"
+
+msgid "Full"
+msgstr "完整"
+
+msgid "Invalid hexadecimal value"
+msgstr "无效的十六进制值"
+
+msgid "Main navigation"
+msgstr "主导航"
+
+msgid "Reduced"
+msgstr "精简"
+
+msgid "Sub-navigation"
+msgstr "子导航"
+
+msgid "a number between 0 and 1"
+msgstr "0 到 1 之间的数值"

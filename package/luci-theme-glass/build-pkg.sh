@@ -27,6 +27,7 @@ mkdir -p "$DATA_DIR/usr/share/ucode/luci/template/themes/glass"
 mkdir -p "$DATA_DIR/usr/share/rpcd/acl.d"
 mkdir -p "$DATA_DIR/usr/share/luci/menu.d"
 mkdir -p "$DATA_DIR/etc/uci-defaults"
+mkdir -p "$DATA_DIR/etc/init.d"
 mkdir -p "$DATA_DIR/etc/config"
 mkdir -p "$DATA_DIR/etc/opkg/keys"
 mkdir -p "$DATA_DIR/etc/apk/keys"
@@ -42,6 +43,8 @@ cp ucode/template/themes/glass/version "$DATA_DIR/usr/share/ucode/luci/template/
 cp root/usr/share/rpcd/acl.d/luci-theme-glass.json "$DATA_DIR/usr/share/rpcd/acl.d/"
 cp root/usr/share/luci/menu.d/luci-theme-glass.json "$DATA_DIR/usr/share/luci/menu.d/"
 cp root/etc/uci-defaults/30_luci-theme-glass "$DATA_DIR/etc/uci-defaults/"
+cp root/etc/init.d/glass-translation-cache "$DATA_DIR/etc/init.d/"
+chmod 0755 "$DATA_DIR/etc/init.d/glass-translation-cache"
 cp root/etc/config/glass "$DATA_DIR/etc/config/"
 cp root/etc/opkg/keys/* "$DATA_DIR/etc/opkg/keys/" 2>/dev/null || true
 cp root/etc/apk/keys/* "$DATA_DIR/etc/apk/keys/" 2>/dev/null || true

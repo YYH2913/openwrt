@@ -11,10 +11,54 @@
 
   /* Read theme config */
   let glass_mode = 'normal';
+  let glass_effects = 'balanced';
+  let glass_primary = '#007AFF';
+  let glass_dark_primary = '#0A84FF';
+  let glass_blur = '20';
+  let glass_transparency = '0.72';
+  let glass_blur_dark = '25';
+  let glass_transparency_dark = '0.30';
+  let glass_font_size = '14';
   let cfg = cursor();
   if (access('/etc/config/glass')) {
-    glass_mode = cfg.get_first('glass', 'global', 'mode') ?? glass_mode;
+    glass_mode              = cfg.get_first('glass', 'global', 'mode')              ?? glass_mode;
+    glass_effects           = cfg.get_first('glass', 'global', 'effects')           ?? glass_effects;
+    glass_primary           = cfg.get_first('glass', 'global', 'primary')           ?? glass_primary;
+    glass_dark_primary      = cfg.get_first('glass', 'global', 'dark_primary')      ?? glass_dark_primary;
+    glass_blur              = cfg.get_first('glass', 'global', 'blur')              ?? glass_blur;
+    glass_transparency      = cfg.get_first('glass', 'global', 'transparency')      ?? glass_transparency;
+    glass_blur_dark         = cfg.get_first('glass', 'global', 'blur_dark')         ?? glass_blur_dark;
+    glass_transparency_dark = cfg.get_first('glass', 'global', 'transparency_dark') ?? glass_transparency_dark;
+    glass_font_size         = cfg.get_first('glass', 'global', 'font_size')         ?? glass_font_size;
   }
+
+  if (!(glass_mode in ['normal', 'light', 'dark']))
+    glass_mode = 'normal';
+  if (!(glass_effects in ['balanced', 'full', 'reduced']))
+    glass_effects = 'balanced';
+  if (!match(glass_primary, /^#[0-9a-fA-F]{6}$/))
+    glass_primary = '#007AFF';
+  if (!match(glass_dark_primary, /^#[0-9a-fA-F]{6}$/))
+    glass_dark_primary = '#0A84FF';
+  if (!match(glass_blur, /^([0-9]|[1-4][0-9]|50)$/))
+    glass_blur = '20';
+  if (!match(glass_blur_dark, /^([0-9]|[1-4][0-9]|50)$/))
+    glass_blur_dark = '25';
+  if (!match(glass_transparency, /^(0(\.[0-9]{1,2})?|1(\.0{1,2})?)$/))
+    glass_transparency = '0.72';
+  if (!match(glass_transparency_dark, /^(0(\.[0-9]{1,2})?|1(\.0{1,2})?)$/))
+    glass_transparency_dark = '0.30';
+  if (!(glass_font_size in ['13', '14', '16', '18']))
+    glass_font_size = '14';
+
+  const glass_primary_rgb = sprintf('%d, %d, %d',
+    int(substr(glass_primary, 1, 2), 16),
+    int(substr(glass_primary, 3, 2), 16),
+    int(substr(glass_primary, 5, 2), 16));
+  const glass_dark_primary_rgb = sprintf('%d, %d, %d',
+    int(substr(glass_dark_primary, 1, 2), 16),
+    int(substr(glass_dark_primary, 3, 2), 16),
+    int(substr(glass_dark_primary, 5, 2), 16));
 
   /* Find background media */
   let bg_src = null;
@@ -40,15 +84,44 @@
   }
 -%}
 <!DOCTYPE html>
-<html lang="{{ dispatcher.lang }}">
+<html lang="{{ dispatcher.lang }}" data-glass-effects="{{ glass_effects }}" data-has-background="{{ bg_src ? '1' : '0' }}">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" id="meta-theme-color" content="{{ glass_mode == 'dark' ? '#2c2e3a' : '#f5f5f7' }}">
   <title>{{ _('Login') }} - {{ hostname }} - LuCI</title>
-  <link rel="icon" href="{{ media }}/img/glass-logo.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ media }}/css/cascade.css">
-  <link id="dark-styles" rel="stylesheet" href="{{ media }}/css/dark.css" media="{% if (glass_mode == 'dark'): %}all{% elif (glass_mode == 'light'): %}not all{% else %}(prefers-color-scheme: dark){% endif %}">
+  <link rel="icon" href="{{ media }}/img/glass-logo.svg?v={{ glass_version }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ media }}/css/cascade.css?v={{ glass_version }}">
+  <link id="dark-styles" rel="stylesheet" href="{{ media }}/css/dark.css?v={{ glass_version }}" media="{% if (glass_mode == 'dark'): %}all{% elif (glass_mode == 'light'): %}not all{% else %}(prefers-color-scheme: dark){% endif %}">
+  <style>
+    html { font-size: {{ glass_font_size }}px; }
+    :root {
+      --color-primary: {{ glass_primary }};
+      --color-primary-rgb: {{ glass_primary_rgb }};
+      --glass-blur: {{ glass_blur }}px;
+      --glass-bg: rgba(255, 255, 255, {{ glass_transparency }});
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --color-primary: {{ glass_dark_primary }};
+        --color-primary-rgb: {{ glass_dark_primary_rgb }};
+        --glass-blur: {{ glass_blur_dark }}px;
+        --glass-bg: rgba(38, 38, 42, {{ glass_transparency_dark }});
+      }
+    }
+    [data-theme="dark"] {
+      --color-primary: {{ glass_dark_primary }};
+      --color-primary-rgb: {{ glass_dark_primary_rgb }};
+      --glass-blur: {{ glass_blur_dark }}px;
+      --glass-bg: rgba(38, 38, 42, {{ glass_transparency_dark }});
+    }
+    [data-theme="light"] {
+      --color-primary: {{ glass_primary }};
+      --color-primary-rgb: {{ glass_primary_rgb }};
+      --glass-blur: {{ glass_blur }}px;
+      --glass-bg: rgba(255, 255, 255, {{ glass_transparency }});
+    }
+  </style>
   <script>
   (function(){
     var d=document.getElementById('dark-styles'),m=document.getElementById('meta-theme-color'),s;
@@ -89,19 +162,19 @@
   </svg>
 </button>
 
-<div id="bg-wrap">
+<div id="bg-wrap" aria-hidden="true">
   {% if (bg_src && bg_type == 'video'): %}
-  <video autoplay muted loop playsinline>
+  <video autoplay muted loop playsinline preload="metadata" disablepictureinpicture>
     <source src="{{ bg_src }}">
   </video>
   {% elif (bg_src): %}
-  <img src="{{ bg_src }}" alt="">
+  <img src="{{ bg_src }}" alt="" decoding="async" fetchpriority="low">
   {% endif %}
 </div>
 
 <div class="login-wrap">
   <div class="login-card">
-    <img class="login-logo" src="{{ media }}/img/glass-logo.svg" alt="Logo">
+    <img class="login-logo" src="{{ media }}/img/glass-logo.svg?v={{ glass_version }}" alt="{{ hostname }}">
     <h1 class="login-title">{{ hostname }}</h1>
     <p class="login-subtitle">{{ _('Sign in to continue') }}</p>
     <p class="login-version">GlassTheme v{{ glass_version }}</p>
@@ -157,6 +230,21 @@
       else{d.media='(prefers-color-scheme: dark)';if(m)m.content=window.matchMedia('(prefers-color-scheme: dark)').matches?'#2c2e3a':'#f5f5f7'}
       btn.title=labels[next];btn.setAttribute('aria-label',labels[next]);
     });
+  })();
+
+  (function(){
+    var video=document.querySelector('#bg-wrap video');
+    if(!video)return;
+    var reduceMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+    function syncVideo(){
+      var pause=document.hidden||reduceMotion.matches||document.documentElement.dataset.glassEffects==='reduced';
+      if(pause)video.pause();
+      else{var playback=video.play();if(playback&&playback.catch)playback.catch(function(){});}
+    }
+    document.addEventListener('visibilitychange',syncVideo);
+    if(reduceMotion.addEventListener)reduceMotion.addEventListener('change',syncVideo);
+    else reduceMotion.addListener(syncVideo);
+    syncVideo();
   })();
 </script>
 

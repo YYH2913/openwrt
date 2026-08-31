@@ -22,8 +22,8 @@
 
   /* ---- Colors — Light mode ---- */
   --color-primary: #007AFF;
-  --color-primary-hover: #0066d6;
-  --color-primary-active: #004fad;
+  --color-primary-hover: color-mix(in srgb, var(--color-primary) 84%, #000);
+  --color-primary-active: color-mix(in srgb, var(--color-primary) 68%, #000);
   --color-primary-rgb: 0, 122, 255;
 
   --color-success: #34C759;
@@ -51,6 +51,9 @@
   --glass-bg-hover: rgba(255, 255, 255, 0.82);
   --glass-bg-strong: rgba(255, 255, 255, 0.85);
   --glass-border: rgba(255, 255, 255, 0.45);
+  --glass-chrome-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  --glass-panel-filter: none;
+  --glass-detail-filter: none;
   --glass-shadow: 0 2px 16px rgba(0, 0, 0, 0.06),
     0 0 1px rgba(0, 0, 0, 0.08);
   --glass-shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.10),
@@ -65,10 +68,10 @@
   --content-padding: 24px;
 
   /* ---- Radius ---- */
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 20px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
   --radius-full: 9999px;
 
   /* ---- Spacing ---- */
@@ -83,7 +86,7 @@
   /* ---- Transitions ---- */
   --transition-fast: 0.15s ease;
   --transition-normal: 0.25s ease;
-  --transition-slow: 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-slow: 0.28s cubic-bezier(0.16, 1, 0.3, 1);
 
   /* ---- Z-index ---- */
   --z-dropdown: 100;

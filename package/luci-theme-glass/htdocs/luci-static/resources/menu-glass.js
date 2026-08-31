@@ -3,14 +3,15 @@
 'require ui';
 
 return baseclass.extend({
+	sliderCleanups: null,
+
 	__init__: function() {
-		/* A page restored from the back/forward cache may retain the exit
-		 * animation class and otherwise remain fully transparent. */
-		window.addEventListener('pageshow', function() {
-			document.body.classList.remove('page-leaving');
+		var self = this;
+		this.sliderCleanups = [];
+		L.resolveDefault(ui.menu.load(), null).then(function(tree) {
+			if (tree)
+				self.render(tree);
 		});
-		document.body.classList.remove('page-leaving');
-		ui.menu.load().then(L.bind(this.render, this));
 	},
 
 	/* Icon SVG paths for top-level sidebar categories (stroke-based, 24x24 viewBox) */
@@ -36,6 +37,10 @@ return baseclass.extend({
 	render: function(tree) {
 		var container = document.getElementById('sidebar-nav');
 		if (!container) return;
+
+		for (var cleanup of this.sliderCleanups)
+			cleanup();
+		this.sliderCleanups = [];
 
 		/* Clear existing menu elements to prevent duplicates on re-render (e.g. Save & Apply) */
 		container.innerHTML = '';
@@ -113,6 +118,18 @@ return baseclass.extend({
 		var slider = E('div', { 'class': 'tab-slider' });
 		container.insertBefore(slider, container.firstChild);
 		var self = this;
+		var frame = null;
+
+		function position(animate) {
+			if (frame != null)
+				cancelAnimationFrame(frame);
+
+			frame = requestAnimationFrame(function() {
+				frame = null;
+				var active = container.querySelector('.header-tab.active, .sub-tab.active');
+				self.positionTabSlider(container, slider, active, animate);
+			});
+		}
 
 		/* Page links use native navigation; in-page tabs only move the slider. */
 		var tabs = container.querySelectorAll('.header-tab, .sub-tab');
@@ -127,10 +144,19 @@ return baseclass.extend({
 		}
 
 		/* Position on active tab */
-		requestAnimationFrame(function() {
-			var active = container.querySelector('.header-tab.active, .sub-tab.active');
-			self.positionTabSlider(container, slider, active, false);
-		});
+		position(false);
+
+		/* Keep the selector aligned after font loading, viewport changes and
+		 * translated labels alter tab widths. */
+		if (window.ResizeObserver) {
+			var observer = new ResizeObserver(function() { position(false); });
+			observer.observe(container);
+			this.sliderCleanups.push(function() { observer.disconnect(); });
+		} else {
+			var resize = function() { position(false); };
+			window.addEventListener('resize', resize);
+			this.sliderCleanups.push(function() { window.removeEventListener('resize', resize); });
+		}
 
 		return slider;
 	},
@@ -148,7 +174,8 @@ return baseclass.extend({
 			var item = E('a', {
 				'class': 'header-tab' + (isActive ? ' active' : ''),
 				'href': L.url(child.name),
-				'data-name': child.name
+				'data-name': child.name,
+				'aria-current': isActive ? 'page' : null
 			}, [ _(child.title) ]);
 
 			container.appendChild(item);
@@ -176,10 +203,13 @@ return baseclass.extend({
 				? L.url(url, child.name, subChildren[0].name)
 				: L.url(url, child.name);
 
+			var submenuId = 'glass-nav-' + i;
 			var item = E('a', {
 				'class': 'nav-item' + (isActive ? ' open' : ''),
 				'href': linkUrl,
-				'data-name': child.name
+				'data-name': child.name,
+				'aria-expanded': hasChildren ? (isActive ? 'true' : 'false') : null,
+				'aria-controls': hasChildren ? submenuId : null
 			}, [
 				E('span', { 'class': 'nav-label' }, [ _(child.title) ])
 			]);
@@ -204,7 +234,10 @@ return baseclass.extend({
 
 			if (hasChildren) {
 				var subMenu = E('div', {
-					'class': 'nav-sub' + (isActive ? ' open' : '')
+					'class': 'nav-sub' + (isActive ? ' open' : ''),
+					'id': submenuId,
+					'aria-hidden': isActive ? 'false' : 'true',
+					'inert': isActive ? null : ''
 				});
 
 				/* Sliding highlight indicator */
@@ -217,7 +250,8 @@ return baseclass.extend({
 
 					var subItem = E('a', {
 						'class': 'nav-item' + (isSubActive ? ' active' : ''),
-						'href': L.url(url, child.name, sub.name)
+						'href': L.url(url, child.name, sub.name),
+						'aria-current': isSubActive ? 'page' : null
 					}, [
 						E('span', { 'class': 'nav-label' }, [ _(sub.title) ])
 					]);
@@ -246,15 +280,27 @@ return baseclass.extend({
 
 				/* Bind click handler to toggle submenu */
 				(function(navItem, subEl) {
+					function toggleSubmenu() {
+						var open = !subEl.classList.contains('open');
+						subEl.classList.toggle('open', open);
+						navItem.classList.toggle('open', open);
+						navItem.setAttribute('aria-expanded', open ? 'true' : 'false');
+						subEl.setAttribute('aria-hidden', open ? 'false' : 'true');
+						if (open) subEl.removeAttribute('inert');
+						else subEl.setAttribute('inert', '');
+					}
+
 					navItem.addEventListener('click', function(ev) {
+						if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey)
+							return;
 						ev.preventDefault();
-						var isOpen = subEl.classList.contains('open');
-						if (isOpen) {
-							subEl.classList.remove('open');
-							navItem.classList.remove('open');
-						} else {
-							subEl.classList.add('open');
-							navItem.classList.add('open');
+						toggleSubmenu();
+					});
+
+					navItem.addEventListener('keydown', function(ev) {
+						if (ev.key === ' ') {
+							ev.preventDefault();
+							toggleSubmenu();
 						}
 					});
 				})(item, subMenu);
@@ -269,13 +315,12 @@ return baseclass.extend({
 		if (!container) return E([]);
 
 		var children = ui.menu.getChildren(tree);
-		var activeNode = null;
-
 		if (children.length == 0)
 			return E([]);
 
 		/* Clear any CBI tabs that footer.ut added before menu loaded */
 		container.innerHTML = '';
+		container.setAttribute('data-source', 'menu');
 		container.classList.remove('active');
 		document.body.classList.remove('has-sub-nav');
 
@@ -285,11 +330,9 @@ return baseclass.extend({
 
 			container.appendChild(E('a', {
 				'class': 'sub-tab' + (isActive ? ' active' : ''),
-				'href': L.url(url, child.name)
+				'href': L.url(url, child.name),
+				'aria-current': isActive ? 'page' : null
 			}, [ _(child.title) ]));
-
-			if (isActive)
-				activeNode = child;
 		}
 
 		container.classList.add('active');
