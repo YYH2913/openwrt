@@ -132,10 +132,17 @@ set_xr1710g_wan_clientid_default() {
 
 	config_get clientid wan clientid
 	config_get sendclientid wan sendclientid
-	[ -z "$clientid$sendclientid" ] || return 0
+	[ -z "$clientid" ] || return 0
 
-	# Keep pre-25.12 MAC-based DHCP identity for upstream compatibility.
-	uci set network.wan.sendclientid='none'
+	case "$sendclientid" in
+	''|none)
+		# "none" suppresses option 61; "hardware" keeps the MAC-based ID.
+		uci set network.wan.sendclientid='hardware'
+		;;
+	*)
+		return 0
+		;;
+	esac
 	migrated=1
 }
 
