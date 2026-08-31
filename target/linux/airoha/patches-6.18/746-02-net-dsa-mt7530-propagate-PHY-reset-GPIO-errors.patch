@@ -1,0 +1,76 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Mon, 31 Aug 2026 15:00:00 +0800
+Subject: [PATCH] net: dsa: mt7530: propagate PHY reset GPIO errors
+
+The mt7530 MDIO workaround deasserts child PHY reset GPIOs before
+registering the bus, because phylib otherwise reads the PHY ID before it
+acquires each child's reset line.  It currently treats every GPIO lookup
+error as if the optional property were absent.
+
+In particular, ignoring -EPROBE_DEFER lets the MDIO scan run while the
+GPIO provider is not ready and can leave the PHY permanently undiscovered.
+Treat only -ENOENT as an absent reset GPIO; this also keeps the normal
+fwnode lookup support for the legacy reset-gpio spelling.  For every other
+error, propagate acquisition failure and abort MDIO registration so DSA
+probe can retry once its dependency is available.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -2286,7 +2286,7 @@ mt7530_free_mdio_irq(struct mt7530_priv
+ 	}
+ }
+ 
+-static void
++static int
+ mt7530_mdio_predeassert_phy_resets(struct device *dev, struct device_node *mnp)
+ {
+ 	struct device_node *child;
+@@ -2294,12 +2294,21 @@ mt7530_mdio_predeassert_phy_resets(struc
+ 
+ 	for_each_available_child_of_node(mnp, child) {
+ 		struct gpio_desc *gpiod;
++		int ret;
+ 
+ 		gpiod = fwnode_gpiod_get_index(of_fwnode_handle(child),
+ 					       "reset", 0, GPIOD_OUT_LOW,
+ 					       "mt7530-mdio-scan");
+-		if (IS_ERR_OR_NULL(gpiod))
+-			continue;
++		if (IS_ERR(gpiod)) {
++			if (PTR_ERR(gpiod) == -ENOENT)
++				continue;
++
++			ret = dev_err_probe(dev, PTR_ERR(gpiod),
++					    "failed to pre-deassert reset for PHY %pOFn\n",
++					    child);
++			of_node_put(child);
++			return ret;
++		}
+ 
+ 		/* fwnode_gpiod_get_index with GPIOD_OUT_LOW already drove
+ 		 * the line low (deasserted, since reset-gpios in DTS is
+@@ -2316,6 +2325,8 @@ mt7530_mdio_predeassert_phy_resets(struc
+ 		dev_dbg(dev, "pre-deasserted reset for PHY %pOFn\n",
+ 			child);
+ 	}
++
++	return 0;
+ }
+ 
+ static int
+@@ -2355,8 +2366,11 @@ mt7530_setup_mdio(struct mt7530_priv *pr
+ 	if (priv->irq_domain && !mnp)
+ 		mt7530_setup_mdio_irq(priv);
+ 
+-	if (mnp)
+-		mt7530_mdio_predeassert_phy_resets(dev, mnp);
++	if (mnp) {
++		ret = mt7530_mdio_predeassert_phy_resets(dev, mnp);
++		if (ret)
++			goto out;
++	}
+ 
+ 	ret = devm_of_mdiobus_register(dev, bus, mnp);
+ 	if (ret) {
