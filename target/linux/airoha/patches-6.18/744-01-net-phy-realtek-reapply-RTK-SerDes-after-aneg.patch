@@ -1,0 +1,139 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Fri, 28 Aug 2026 12:00:00 +0800
+Subject: [PATCH] net: phy: realtek: replay RTK SerDes after copper AN
+
+Expose the optional RTL826x host-SerDes flow_s sequence and replay it
+once after copper Clause 45 auto-negotiation reports a live link.  The
+transition through 0x8003 is held for 10--12 ms before restoring the
+board-specific 0x80aa and 0x5078 values.  Keep this first step limited to
+the one-shot AN completion action; carrier-dependent retries are added by
+the follow-up patch.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+Index: linux-6.18.44/drivers/net/phy/realtek/phy_patch_rtl826x.c
+===================================================================
+--- linux-6.18.44.orig/drivers/net/phy/realtek/phy_patch_rtl826x.c
++++ linux-6.18.44/drivers/net/phy/realtek/phy_patch_rtl826x.c
+@@ -117,6 +117,36 @@ static int rtl826x_phy_patch_sds_modify(
+ 	return rtl826x_phy_patch_sds_set(phydev, sds_page, sds_reg, (ret & ~mask) | data);
+ }
+ 
++int rtl826x_phy_patch_rtk_serdes(struct phy_device *phydev)
++{
++	struct rtl826x_priv *priv = phydev->priv;
++	int ret;
++
++	if (!priv || !priv->patch_rtk_serdes)
++		return 0;
++
++	/* A value transition is intentional even when the final value already
++	 * matches. Keep 0x8003 active long enough for the Host AN state to
++	 * settle before restoring the tuned value. Do not reset the running
++	 * DTE XS.
++	 */
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x07, 0x10, 0x8003);
++	if (ret < 0)
++		return ret;
++
++	usleep_range(10000, 12000);
++
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x07, 0x10, 0x80aa);
++	if (ret < 0)
++		return ret;
++
++	ret = rtl826x_phy_patch_sds_set(phydev, 0x06, 0x12, 0x5078);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
+ static int rtl826x_phy_patch_op(struct phy_device *phydev, const struct rtlgen_hwpatch *patch)
+ {
+ 	u32 mask = GENMASK(patch->msb, patch->lsb);
+Index: linux-6.18.44/drivers/net/phy/realtek/phy_patch_rtl826x.h
+===================================================================
+--- linux-6.18.44.orig/drivers/net/phy/realtek/phy_patch_rtl826x.h
++++ linux-6.18.44/drivers/net/phy/realtek/phy_patch_rtl826x.h
+@@ -7,5 +7,6 @@
+ 
+ int rtl8261n_phy_patch_db_init(struct phy_device *phydev);
+ int rtl8264b_phy_patch_db_init(struct phy_device *phydev);
++int rtl826x_phy_patch_rtk_serdes(struct phy_device *phydev);
+ 
+ #endif
+Index: linux-6.18.44/drivers/net/phy/realtek/realtek.h
+===================================================================
+--- linux-6.18.44.orig/drivers/net/phy/realtek/realtek.h
++++ linux-6.18.44/drivers/net/phy/realtek/realtek.h
+@@ -10,6 +10,7 @@
+ 
+ struct rtl826x_priv {
+ 	struct rtlgen_phy_patch_db *patch;
++	bool rtk_serdes_replayed:1;
+ 	bool enable_pma_low_power:1;
+ 	bool patch_rtk_serdes:1;
+ };
+Index: linux-6.18.44/drivers/net/phy/realtek/realtek_main.c
+===================================================================
+--- linux-6.18.44.orig/drivers/net/phy/realtek/realtek_main.c
++++ linux-6.18.44/drivers/net/phy/realtek/realtek_main.c
+@@ -2528,11 +2528,14 @@ static int rtl825xb_get_features(struct
+ 
+ static int rtl826x_config_aneg(struct phy_device *phydev)
+ {
++	struct rtl826x_priv *priv = phydev->priv;
+ 	bool changed = false;
+ 	u16 reg;
+ 	int ret;
+ 
+ 	phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
++	if (priv && priv->patch_rtk_serdes)
++		priv->rtk_serdes_replayed = false;
+ 	if (phydev->autoneg == AUTONEG_DISABLE)
+ 		return genphy_c45_pma_setup_forced(phydev);
+ 
+@@ -2564,6 +2567,8 @@ static int rtl826x_config_aneg(struct ph
+ 
+ static int rtl826x_read_status(struct phy_device *phydev)
+ {
++	struct rtl826x_priv *priv = phydev->priv;
++	bool aneg_done = phydev->autoneg == AUTONEG_DISABLE;
+ 	int status;
+ 	int ret;
+ 
+@@ -2594,7 +2599,32 @@ static int rtl826x_read_status(struct ph
+ 			return ret;
+ 	}
+ 
+-	return genphy_c45_read_mdix(phydev);
++	ret = genphy_c45_read_mdix(phydev);
++	if (ret)
++		return ret;
++
++	if (!priv || !priv->patch_rtk_serdes || priv->rtk_serdes_replayed)
++		return 0;
++
++	if (!aneg_done) {
++		ret = genphy_c45_aneg_done(phydev);
++		if (ret < 0)
++			return ret;
++		aneg_done = ret > 0;
++	}
++
++	if (!phydev->link || !aneg_done)
++		return 0;
++
++	ret = rtl826x_phy_patch_rtk_serdes(phydev);
++	if (ret < 0)
++		return ret;
++
++	priv->rtk_serdes_replayed = true;
++	phydev_info(phydev,
++		    "replayed RTK SerDes flow_s 0x8003->0x80aa/0x5078 after copper AN\n");
++
++	return 0;
+ }
+ 
+ static int rtl826x_config_intr(struct phy_device *phydev)

@@ -1,0 +1,105 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 9 Aug 2026 00:00:00 +0800
+Subject: [PATCH] net: pcs: airoha: track PCS state per port
+
+The Airoha PCS driver stores the active interface in shared private
+state even though one controller can expose multiple PCS ports. It also
+needs to rerun analog and digital initialization after phylink enters
+pre_config, because an attached PHY can be reset across ndo_stop() and
+ndo_open().
+
+Move the interface and initialized state into airoha_pcs_port. Reuse an
+initialized path only for an unchanged interface, and invalidate it from
+pre_config so the following configuration performs a complete bring-up.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -574,26 +574,29 @@ static int airoha_pcs_config(struct phyl
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	const struct airoha_pcs_match_data *data;
+ 	struct airoha_pcs_maps *maps;
++	bool initialized;
+ 	int index = port->index;
+ 	u32 rate_adapt;
+ 	int ret;
+ 
+ 	maps = &priv->maps[port->index];
+-	priv->interface = interface;
+ 	data = priv->data;
++	initialized = port->initialized && port->interface == interface;
+ 
+-	/* Apply Analog and Digital configuration for PCS */
+-	if (data->bringup) {
+-		ret = data->bringup(priv, index, interface);
+-		if (ret)
+-			return ret;
+-	}
++	if (!initialized) {
++		/* Apply Analog and Digital configuration for PCS */
++		if (data->bringup) {
++			ret = data->bringup(priv, index, interface);
++			if (ret)
++				return ret;
++		}
+ 
+-	/* Set final configuration for various modes */
+-	airoha_pcs_init(priv, index, interface);
++		/* Set final configuration for various modes */
++		airoha_pcs_init(priv, index, interface);
+ 
+-	/* Configure Interrupt for various modes */
+-	airoha_pcs_interrupt_init(priv, index, interface);
++		/* Configure Interrupt for various modes */
++		airoha_pcs_interrupt_init(priv, index, interface);
++	}
+ 
+ 	rate_adapt = AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN |
+ 		     AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN;
+@@ -778,6 +781,9 @@ static int airoha_pcs_config(struct phyl
+ 				AIROHA_PCS_XFI_TX_FC_EN | AIROHA_PCS_XFI_RX_FC_EN :
+ 				0);
+ 
++	port->interface = interface;
++	port->initialized = true;
++
+ 	return 0;
+ }
+ 
+@@ -789,7 +795,7 @@ static void airoha_pcs_an_restart(struct
+ 
+ 	maps = &priv->maps[port->index];
+ 
+-	switch (priv->interface) {
++	switch (port->interface) {
+ 	case PHY_INTERFACE_MODE_SGMII:
+ 	case PHY_INTERFACE_MODE_1000BASEX:
+ 	case PHY_INTERFACE_MODE_2500BASEX:
+@@ -958,6 +964,7 @@ static void airoha_pcs_pre_config(struct
+ 	struct airoha_pcs_maps *maps;
+ 
+ 	maps = &priv->maps[port->index];
++	port->initialized = false;
+ 
+ 	/* Select HSGMII or USXGMII in SCU regs */
+ 	airoha_pcs_setup_scu(priv, port->index, interface);
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1642,7 +1642,6 @@ struct airoha_pcs_maps {
+ struct airoha_pcs_priv {
+ 	struct device *dev;
+ 	const struct airoha_pcs_match_data *data;
+-	phy_interface_t interface;
+ 
+ 	struct airoha_pcs_port *ports;
+ 
+@@ -1665,6 +1664,8 @@ struct airoha_pcs_priv {
+ struct airoha_pcs_port {
+ 	struct airoha_pcs_priv *priv;
+ 	int index;
++	phy_interface_t interface;
++	bool initialized;
+ 
+ 	struct phylink_pcs pcs;
+ };

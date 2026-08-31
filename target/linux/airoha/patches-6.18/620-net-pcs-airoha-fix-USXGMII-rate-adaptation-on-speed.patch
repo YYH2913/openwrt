@@ -1,7 +1,6 @@
 From: Ryan Chen <rchen14b@gmail.com>
 Date: Thu, 06 Mar 2026 12:00:00 -0600
-Subject: [PATCH 1/2] net: pcs: airoha: fix USXGMII rate adaptation on speed
- changes
+Subject: [PATCH] net: pcs: airoha: fix USXGMII rate adaptation on speed changes
 
 The USXGMII rate adaptation code in airoha_pcs_link_up() is inside an
 else branch that only executes when neg_mode is not
@@ -17,13 +16,99 @@ forced-mode speed configuration remain gated on their respective
 negotiation modes as before.
 
 Signed-off-by: Ryan Chen <rchen14b@gmail.com>
----
- drivers/net/pcs/airoha/pcs-airoha-common.c | 127 +++++++++++---------
- 1 file changed, 69 insertions(+), 58 deletions(-)
-
+[yyh: factor speed programming into a checked helper and retain the
+ resolved-speed update after the per-port PCS rework]
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 --- a/drivers/net/pcs/airoha/pcs-airoha-common.c
 +++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
-@@ -747,63 +747,66 @@ static void airoha_pcs_link_up(struct ph
+@@ -491,6 +491,80 @@ static void airoha_pcs_get_state(struct
+ 	}
+ }
+ 
++static void airoha_pcs_set_rate_adaptation(struct airoha_pcs_maps *maps,
++					   bool bypass)
++{
++	u32 rate_adapt = AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN |
++			 AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN;
++
++	if (bypass)
++		rate_adapt |= AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
++			      AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS;
++
++	regmap_update_bits(maps->hsgmii_rate_adp,
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_0,
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_BYPASS |
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_TX_BYPASS |
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_RX_EN |
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_TX_EN,
++			   rate_adapt);
++}
++
++static int airoha_pcs_set_usxgmii_speed(struct airoha_pcs_maps *maps,
++					int speed)
++{
++	bool bypass;
++	u32 mode;
++	u32 rate_adapt;
++
++	switch (speed) {
++	case SPEED_10000:
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_10000;
++		mode = AIROHA_PCS_USXGMII_MODE_10000;
++		bypass = true;
++		break;
++	case SPEED_5000:
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_5000;
++		mode = AIROHA_PCS_USXGMII_MODE_5000;
++		bypass = false;
++		break;
++	case SPEED_2500:
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_2500;
++		mode = AIROHA_PCS_USXGMII_MODE_2500;
++		bypass = false;
++		break;
++	case SPEED_1000:
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_1000;
++		mode = AIROHA_PCS_USXGMII_MODE_1000;
++		bypass = false;
++		break;
++	case SPEED_100:
++		rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_100;
++		mode = AIROHA_PCS_USXGMII_MODE_100;
++		bypass = false;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	airoha_pcs_set_rate_adaptation(maps, bypass);
++
++	regmap_update_bits(maps->usxgmii_pcs,
++			   AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
++			   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE |
++			   AIROHA_PCS_USXGMII_MODE,
++			   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE | mode);
++
++	regmap_update_bits(maps->hsgmii_rate_adp,
++			   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
++			   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
++			   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
++			   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
++			   rate_adapt);
++
++	return 0;
++}
++
+ static int airoha_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			     phy_interface_t interface,
+ 			     const unsigned long *advertising,
+@@ -743,67 +817,32 @@ static void airoha_pcs_link_up(struct ph
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	const struct airoha_pcs_match_data *data;
+ 	struct airoha_pcs_maps *maps;
++	int ret = 0;
+ 
  	maps = &priv->maps[port->index];
  	data = priv->data;
  
@@ -82,6 +167,7 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 -						   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
 -						   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
 -						   rate_adapt);
+-		}
 +	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED &&
 +	    interface == PHY_INTERFACE_MODE_SGMII) {
 +		regmap_update_bits(maps->hsgmii_rate_adp,
@@ -98,50 +184,23 @@ Signed-off-by: Ryan Chen <rchen14b@gmail.com>
 +				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_WR_THR, 0xf) |
 +				   FIELD_PREP(AIROHA_PCS_HSGMII_RATE_ADAPT_RX_AFIFO_RD_THR, 0x5));
 +	}
-+
+ 
 +	if (interface == PHY_INTERFACE_MODE_USXGMII ||
 +	    interface == PHY_INTERFACE_MODE_10GBASER) {
-+		u32 mode;
-+		u32 rate_adapt;
-+
-+		switch (speed) {
-+		case SPEED_10000:
-+			rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_10000;
-+			mode = AIROHA_PCS_USXGMII_MODE_10000;
-+			break;
-+		case SPEED_5000:
-+			rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_5000;
-+			mode = AIROHA_PCS_USXGMII_MODE_5000;
-+			break;
-+		case SPEED_2500:
-+			rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_2500;
-+			mode = AIROHA_PCS_USXGMII_MODE_2500;
-+			break;
-+		case SPEED_1000:
-+			rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_1000;
-+			mode = AIROHA_PCS_USXGMII_MODE_1000;
-+			break;
-+		case SPEED_100:
-+			rate_adapt = AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_100;
-+			mode = AIROHA_PCS_USXGMII_MODE_100;
-+			break;
- 		}
- 
-+		regmap_update_bits(maps->usxgmii_pcs,
-+				   AIROHA_PCS_USXGMII_PCS_AN_CONTROL_7,
-+				   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE |
-+				   AIROHA_PCS_USXGMII_MODE,
-+				   AIROHA_PCS_USXGMII_RATE_UPDATE_MODE | mode);
-+
-+		regmap_update_bits(maps->hsgmii_rate_adp,
-+				   AIROHA_PCS_HSGMII_RATE_ADAPT_CTRL_11,
-+				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
-+				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE,
-+				   AIROHA_PCS_HSGMII_RATE_ADPT_FORCE_RATE_ADAPT_MODE_EN |
-+				   rate_adapt);
-+	}
-+
-+	if (neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
++		ret = airoha_pcs_set_usxgmii_speed(maps, speed);
++	} else if (neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED) {
  		if (interface == PHY_INTERFACE_MODE_SGMII ||
  		    interface == PHY_INTERFACE_MODE_1000BASEX) {
  			u32 force_speed;
+@@ -879,6 +918,11 @@ static void airoha_pcs_link_up(struct ph
+ 		}
+ 	}
+ 
++	if (ret)
++		dev_warn_ratelimited(priv->dev,
++				     "unsupported %s speed %d\n",
++				     phy_modes(interface), speed);
++
+ 	if (data->link_up)
+ 		data->link_up(priv, port->index);
+ 
