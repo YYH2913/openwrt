@@ -1,0 +1,103 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: harden NPU RX descriptor validation
+
+Validate descriptor packet counts and fragment lengths before touching skb state. Drop malformed descriptors so a corrupt NPU cannot overrun RX buffers or stall the ring.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/npu.c
++++ b/npu.c
+@@ -65,12 +65,31 @@ void mt76_npu_queue_cleanup(struct mt76_
+ 	spin_unlock_bh(&q->lock);
+ }
+ 
++static void mt76_npu_drop_rx(struct mt76_dev *dev, struct mt76_queue *q,
++			     int nframes)
++{
++	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++
++	while (nframes-- > 0 && q->queued > 0) {
++		struct mt76_queue_entry *e = &q->entry[q->tail];
++
++		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
++					e->dma_len[0],
++					page_pool_get_dma_dir(q->page_pool));
++		mt76_put_page_pool_buf(e->buf, false);
++		WRITE_ONCE(desc[q->tail].ctrl, 0);
++		WRITE_ONCE(desc[q->tail].info, 0);
++		q->tail = (q->tail + 1) % q->ndesc;
++		q->queued--;
++	}
++}
++
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 					struct mt76_queue *q,
+ 					u32 *info)
+ {
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+-	int i, nframes, index = q->tail;
++	int i, nframes, max_len, index = q->tail;
+ 	struct sk_buff *skb = NULL;
+ 	u32 ctrl;
+ 
+@@ -85,8 +104,13 @@ static struct sk_buff *mt76_npu_dequeue(
+ 	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK,
+ 			    READ_ONCE(desc[index].info));
+ 	nframes = max_t(int, nframes, 1);
+-	if (nframes > q->queued)
++	if (nframes > q->queued) {
++		dev_warn_ratelimited(dev->dev,
++				     "invalid NPU RX packet count %d (queued %d)\n",
++				     nframes, q->queued);
++		mt76_npu_drop_rx(dev, q, 1);
+ 		return NULL;
++	}
+ 
+ 	for (i = 1; i < nframes; i++) {
+ 		index = (index + 1) % q->ndesc;
+@@ -97,6 +121,33 @@ static struct sk_buff *mt76_npu_dequeue(
+ 	dma_rmb();
+ 
+ 	index = q->tail;
++	max_len = q->buf_size - SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	if (max_len <= 0 || nframes > 1 + MAX_SKB_FRAGS) {
++		dev_warn_ratelimited(dev->dev,
++				     "invalid NPU RX packet shape (count %d, size %d)\n",
++				     nframes, q->buf_size);
++		mt76_npu_drop_rx(dev, q, nframes);
++		return NULL;
++	}
++
++	/* Validate every producer-controlled length before transferring a page
++	 * to an skb.  A corrupt descriptor must not overrun the linear buffer or
++	 * leave a page stranded in the ring. */
++	for (i = 0; i < nframes; i++) {
++		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
++					READ_ONCE(desc[index].ctrl));
++
++		if (!len || len > max_len) {
++			dev_warn_ratelimited(dev->dev,
++					     "invalid NPU RX fragment length %d (max %d)\n",
++					     len, max_len);
++			mt76_npu_drop_rx(dev, q, nframes);
++			return NULL;
++		}
++		index = (index + 1) % q->ndesc;
++	}
++
++	index = q->tail;
+ 
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+@@ -109,8 +160,10 @@ static struct sk_buff *mt76_npu_dequeue(
+ 
+ 		if (!skb) {
+ 			skb = napi_build_skb(e->buf, q->buf_size);
+-			if (!skb)
++			if (!skb) {
++				mt76_npu_drop_rx(dev, q, nframes);
+ 				return NULL;
++			}
+ 
+ 			__skb_put(skb, len);
+ 			skb_reset_mac_header(skb);
