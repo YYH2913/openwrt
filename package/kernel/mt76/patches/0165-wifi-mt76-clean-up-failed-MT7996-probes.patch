@@ -1,0 +1,102 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: clean up failed MT7996 probes
+
+Unwind the DMA, NAPI, PHY, firmware and NPU state created before a PCI probe error. Keep the cleanup separate from final device freeing so PCI IRQ and WED resources are released in their original layer, and make partial coredump and firmware teardown safe.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/mt7996/coredump.c
++++ b/mt7996/coredump.c
+@@ -247,6 +247,7 @@ int mt7996_coredump_register(struct mt79
+ 
+ 		crash_data->memdump_buf = vzalloc(crash_data->memdump_buf_len);
+ 		if (!crash_data->memdump_buf) {
++			dev->coredump.crash_data = NULL;
+ 			vfree(crash_data);
+ 			return -ENOMEM;
+ 		}
+@@ -257,6 +258,9 @@ int mt7996_coredump_register(struct mt79
+ 
+ void mt7996_coredump_unregister(struct mt7996_dev *dev)
+ {
++	if (!dev->coredump.crash_data)
++		return;
++
+ 	if (dev->coredump.crash_data->memdump_buf) {
+ 		vfree(dev->coredump.crash_data->memdump_buf);
+ 		dev->coredump.crash_data->memdump_buf = NULL;
+@@ -266,4 +270,3 @@ void mt7996_coredump_unregister(struct m
+ 	vfree(dev->coredump.crash_data);
+ 	dev->coredump.crash_data = NULL;
+ }
+-
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1836,7 +1836,7 @@ error:
+ 	return ret;
+ }
+ 
+-void mt7996_unregister_device(struct mt7996_dev *dev)
++void mt7996_cleanup_device(struct mt7996_dev *dev)
+ {
+ 	int i, err;
+ 
+@@ -1858,14 +1858,23 @@ void mt7996_unregister_device(struct mt7
+ 		if (dev->mt76.napi[i].dev)
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
+-	mt7996_mcu_exit(dev);
++	if (test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
++		mt7996_mcu_exit(dev);
+ 	mt7996_tx_token_put(dev);
+-	mt7996_dma_cleanup(dev);
++	if (test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
++		mt7996_dma_cleanup(dev);
++		clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++	}
+ 	if (mt7996_has_hwrro(dev) &&
+ 	    !mtk_wed_device_active(&dev->mt76.mmio.wed))
+ 		mt7996_rro_msdu_page_map_free(dev);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);
+ 
++}
++
++void mt7996_unregister_device(struct mt7996_dev *dev)
++{
++	mt7996_cleanup_device(dev);
+ 	mt76_free_device(&dev->mt76);
+ }
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -764,6 +764,7 @@ void mt7996_wfsys_reset(struct mt7996_de
+ irqreturn_t mt7996_irq_handler(int irq, void *dev_instance);
+ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link);
+ int mt7996_register_device(struct mt7996_dev *dev);
++void mt7996_cleanup_device(struct mt7996_dev *dev);
+ void mt7996_unregister_device(struct mt7996_dev *dev);
+ void mt7996_shutdown_device(struct mt7996_dev *dev);
+ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -108,7 +108,7 @@ static int mt7996_pci_probe(struct pci_d
+ 	struct pci_dev *hif2_dev;
+ 	struct mt7996_hif *hif2;
+ 	struct mt7996_dev *dev;
+-	int irq, hif2_irq, ret, npu_ret;
++	int irq, hif2_irq, ret;
+ 	struct mt76_dev *mdev;
+ 
+ 	ret = pcim_enable_device(pdev);
+@@ -205,10 +205,7 @@ static int mt7996_pci_probe(struct pci_d
+ 	return 0;
+ 
+ free_hif2_irq:
+-	npu_ret = mt7996_npu_hw_stop(dev);
+-	if (npu_ret)
+-		dev_warn(mdev->dev, "failed to stop NPU: %d\n", npu_ret);
+-	mt76_npu_rx_queues_deinit(mdev);
++	mt7996_cleanup_device(dev);
+ 	if (dev->hif2)
+ 		devm_free_irq(mdev->dev, hif2_irq, dev);
+ free_hif2_wed_irq_vector:

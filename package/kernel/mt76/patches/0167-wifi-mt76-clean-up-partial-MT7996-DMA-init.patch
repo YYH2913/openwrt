@@ -1,0 +1,138 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: clean up partial MT7996 DMA initialization
+
+Track the DMA initialization stage and tolerate a missing TX NAPI or partially allocated queue when probe fails. This lets the existing cleanup release rings, page pools and dummy NAPI devices without disabling or deleting an unregistered context.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/dma.c
++++ b/dma.c
+@@ -910,14 +910,18 @@ mt76_dma_alloc_queue(struct mt76_dev *de
+ 
+ 	q->desc = mt76_dma_alloc_coherent(dev, q->ndesc * size,
+ 					  &q->desc_dma, GFP_KERNEL);
+-	if (!q->desc)
++	if (!q->desc) {
++		q->ndesc = 0;
+ 		return -ENOMEM;
++	}
+ 
+ 	mt76_dma_queue_magic_cnt_init(dev, q);
+ 	size = q->ndesc * sizeof(*q->entry);
+ 	q->entry = devm_kzalloc(dev->dev, size, GFP_KERNEL);
+-	if (!q->entry)
++	if (!q->entry) {
++		q->ndesc = 0;
+ 		return -ENOMEM;
++	}
+ 
+ 	ret = mt76_create_page_pool(dev, q);
+ 	if (ret)
+@@ -1212,6 +1216,7 @@ mt76_dma_init(struct mt76_dev *dev,
+ 	dev->tx_napi_dev = alloc_netdev_dummy(sizeof(struct mt76_dev *));
+ 	if (!dev->tx_napi_dev) {
+ 		free_netdev(dev->napi_dev);
++		dev->napi_dev = NULL;
+ 		return -ENOMEM;
+ 	}
+ 	priv = netdev_priv(dev->tx_napi_dev);
+@@ -1257,8 +1262,11 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	int i;
+ 
+ 	mt76_worker_disable(&dev->tx_worker);
+-	napi_disable(&dev->tx_napi);
+-	netif_napi_del(&dev->tx_napi);
++	if (dev->tx_napi_registered) {
++		napi_disable(&dev->tx_napi);
++		netif_napi_del(&dev->tx_napi);
++		dev->tx_napi_registered = false;
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+ 		struct mt76_phy *phy = dev->phys[i];
+@@ -1300,7 +1308,13 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 
+ 	mt76_free_pending_txwi(dev);
+ 	mt76_free_pending_rxwi(dev);
+-	free_netdev(dev->napi_dev);
+-	free_netdev(dev->tx_napi_dev);
++	if (dev->napi_dev) {
++		free_netdev(dev->napi_dev);
++		dev->napi_dev = NULL;
++	}
++	if (dev->tx_napi_dev) {
++		free_netdev(dev->tx_napi_dev);
++		dev->tx_napi_dev = NULL;
++	}
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_cleanup);
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -685,6 +685,7 @@ mt76_alloc_device(struct device *pdev, u
+ 	dev->init_wiphy = NULL;
+ 	dev->drv = drv_ops;
+ 	dev->dma_dev = pdev;
++	dev->tx_napi_registered = true;
+ 
+ 	phy = &dev->phy;
+ 	phy->dev = dev;
+--- a/mt76.h
++++ b/mt76.h
+@@ -969,6 +969,7 @@ struct mt76_dev {
+ 	spinlock_t rx_lock;
+ 	struct napi_struct napi[__MT_RXQ_MAX];
+ 	unsigned long napi_registered;
++	bool tx_napi_registered;
+ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
+ 	struct tasklet_struct irq_tasklet;
+ 
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -669,6 +669,7 @@ int mt7996_dma_init(struct mt7996_dev *d
+ 	u32 hif1_ofs = 0;
+ 	int ret;
+ 
++	dev->mt76.tx_napi_registered = false;
+ 	mt7996_dma_config(dev);
+ 
+ 	mt76_dma_attach(&dev->mt76);
+@@ -950,6 +951,7 @@ int mt7996_dma_init(struct mt7996_dev *d
+ 
+ 	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+ 			  mt7996_poll_tx);
++	dev->mt76.tx_napi_registered = true;
+ 	napi_enable(&dev->mt76.tx_napi);
+ 
+ 	mt7996_dma_enable(dev, false);
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1309,6 +1309,7 @@ static int mt7996_init_hardware(struct m
+ 	if (ret)
+ 		return ret;
+ 
++	dev->dma_init_started = true;
+ 	ret = mt7996_dma_init(dev);
+ 	if (ret)
+ 		return ret;
+@@ -1858,8 +1859,10 @@ void mt7996_cleanup_device(struct mt7996
+ 	if (test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
+ 		mt7996_mcu_exit(dev);
+ 	mt7996_tx_token_put(dev);
+-	if (test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
++	if (dev->dma_init_started ||
++	    test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
+ 		mt7996_dma_cleanup(dev);
++		dev->dma_init_started = false;
+ 		clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+ 	}
+ 	if (mt7996_has_hwrro(dev) &&
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -495,6 +495,7 @@ struct mt7996_dev {
+ 		bool hw_init_done:1;
+ 		bool restart:1;
+ 	} recovery;
++	bool dma_init_started;
+ 
+ 	/* protects coredump data */
+ 	struct mutex dump_mutex;

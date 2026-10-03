@@ -1,0 +1,137 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: protect the HIF2 provider lifetime
+
+A device reference does not retain a supplier's devm HIF object or PCI
+BAR mappings when its driver is unbound. Return a referenced supplier
+device from list lookup, then validate it under its device lock, copy
+per-consumer HIF state and establish a managed driver-presence dependency.
+The core then quiesces a probing or active primary consumer before it
+releases the secondary supplier's private resources.
+
+Use trylock to avoid lock inversion with supplier-initiated unbinding.
+Keep absent HIF2 optional; only defer a recognized supplier that is not
+currently safe to use. Let the core remove the managed dependency after
+consumer probe failure or unbind, and release the snapshot and reference
+after consumer cleanup. Do not change HIF identification or runtime PM.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -29,8 +29,9 @@
+ 	{ },
+ };
+ 
+-static struct mt7996_hif *mt7996_pci_get_hif2(u32 idx)
++static struct device *mt7996_pci_get_hif2(u32 idx)
+ {
++	struct device *dev = NULL;
+ 	struct mt7996_hif *hif;
+ 	u32 val;
+ 
+@@ -42,15 +43,13 @@
+ 		if (val != idx)
+ 			continue;
+ 
+-		get_device(hif->dev);
+-		goto out;
++		dev = get_device(hif->dev);
++		break;
+ 	}
+-	hif = NULL;
+ 
+-out:
+ 	spin_unlock_bh(&hif_lock);
+ 
+-	return hif;
++	return dev;
+ }
+ 
+ static void mt7996_put_hif2(struct mt7996_hif *hif)
+@@ -59,11 +58,15 @@
+ 		return;
+ 
+ 	put_device(hif->dev);
++	kfree(hif);
+ }
+ 
+ static struct mt7996_hif *mt7996_pci_init_hif2(struct pci_dev *pdev)
+ {
++	struct mt7996_hif *hif, *copy;
+ 	struct pci_dev *tmp_pdev;
++	struct device *supplier;
++	int ret = -EPROBE_DEFER;
+ 	u32 idx;
+ 
+ 	spin_lock_bh(&hif_lock);
+@@ -82,7 +85,46 @@
+ 	writel(idx | MT_PCIE_RECOG_ID_SEM,
+ 	       pcim_iomap_table(pdev)[0] + MT_PCIE_RECOG_ID);
+ 
+-	return mt7996_pci_get_hif2(idx);
++	supplier = mt7996_pci_get_hif2(idx);
++	if (!supplier)
++		return NULL;
++
++	/* The consumer probe holds its own device lock. Avoid waiting on a
++	 * supplier that may already be waiting to unbind this consumer.
++	 */
++	if (!device_trylock(supplier))
++		goto error_put;
++	if (supplier->driver != &mt7996_hif_driver.driver ||
++	    READ_ONCE(supplier->links.status) != DL_DEV_DRIVER_BOUND)
++		goto error_unlock;
++
++	hif = dev_get_drvdata(supplier);
++	if (!hif)
++		goto error_unlock;
++
++	copy = kmemdup(hif, sizeof(*hif), GFP_KERNEL);
++	if (!copy) {
++		ret = -ENOMEM;
++		goto error_unlock;
++	}
++	INIT_LIST_HEAD(&copy->list);
++
++	if (!device_link_add(&pdev->dev, supplier,
++			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		ret = -ENOMEM;
++		kfree(copy);
++		goto error_unlock;
++	}
++	device_unlock(supplier);
++
++	return copy;
++
++error_unlock:
++	device_unlock(supplier);
++error_put:
++	put_device(supplier);
++
++	return ERR_PTR(ret);
+ }
+ 
+ static int mt7996_pci_hif2_probe(struct pci_dev *pdev)
+@@ -151,6 +193,10 @@
+ 	mdev->tx_napi_registered = false;
+ 	mt7996_wfsys_reset(dev);
+ 	hif2 = mt7996_pci_init_hif2(pdev);
++	if (IS_ERR(hif2)) {
++		ret = PTR_ERR(hif2);
++		goto free_device;
++	}
+ 	dev->hif2 = hif2;
+ 
+ 	mt76_npu_init(mdev, pci_resource_start(pdev, 0),
+@@ -286,9 +332,10 @@
+ 	if (dev->hif2)
+ 		hif2_dev = pci_dev_get(to_pci_dev(dev->hif2->dev));
+ 
+-	mt7996_put_hif2(dev->hif2);
+ 	mt7996_shutdown_device(dev);
+ 	pci_clear_master(pdev);
++	mt7996_put_hif2(dev->hif2);
++	dev->hif2 = NULL;
+ 
+ 	if (hif2_dev) {
+ 		pci_clear_master(hif2_dev);

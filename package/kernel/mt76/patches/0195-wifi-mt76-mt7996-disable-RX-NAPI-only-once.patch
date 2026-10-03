@@ -1,0 +1,29 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: disable RX NAPI only once
+
+The native unregister path now disables all added RX NAPIs before MCU
+exit and DMA cleanup. Keep that early disable owner and remove the local
+registration-aware disable loop from the later DMA cleanup stage.
+A second napi_disable() waits forever on the SCHED/NPSVC bits retained
+by the first call. Registration tracking and partial-queue cleanup stay
+unchanged, including the separate NPU queue teardown stage.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -1053,14 +1053,7 @@
+ 
+ void mt7996_dma_cleanup(struct mt7996_dev *dev)
+ {
+-	int i;
+-
+ 	mt7996_dma_disable(dev, true);
+ 
+-	/* Other mt76 drivers quiesce RX NAPI in their own remove paths. */
+-	for (i = 0; i < ARRAY_SIZE(dev->mt76.napi); i++)
+-		if (test_bit(i, &dev->mt76.napi_registered))
+-			napi_disable(&dev->mt76.napi[i]);
+-
+ 	mt76_dma_cleanup(&dev->mt76);
+ }

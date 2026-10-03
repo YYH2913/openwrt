@@ -1,0 +1,80 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: synchronize MT7996 HIF2 bookkeeping
+
+Serialize recognition-index allocation and HIF list removal with the existing lock, initialize list nodes before publication, and tolerate missing driver data during PCI remove or shutdown.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -64,8 +64,11 @@ static void mt7996_put_hif2(struct mt799
+ static struct mt7996_hif *mt7996_pci_init_hif2(struct pci_dev *pdev)
+ {
+ 	struct pci_dev *tmp_pdev;
++	u32 idx;
+ 
+-	hif_idx++;
++	spin_lock_bh(&hif_lock);
++	idx = ++hif_idx;
++	spin_unlock_bh(&hif_lock);
+ 
+ 	tmp_pdev = pci_get_device(PCI_VENDOR_ID_MEDIATEK, MT7996_DEVICE_ID_2, NULL);
+ 	if (!tmp_pdev)
+@@ -76,10 +79,10 @@ static struct mt7996_hif *mt7996_pci_ini
+ 		return NULL;
+ 	pci_dev_put(tmp_pdev);
+ 
+-	writel(hif_idx | MT_PCIE_RECOG_ID_SEM,
++	writel(idx | MT_PCIE_RECOG_ID_SEM,
+ 	       pcim_iomap_table(pdev)[0] + MT_PCIE_RECOG_ID);
+ 
+-	return mt7996_pci_get_hif2(hif_idx);
++	return mt7996_pci_get_hif2(idx);
+ }
+ 
+ static int mt7996_pci_hif2_probe(struct pci_dev *pdev)
+@@ -94,6 +97,7 @@ static int mt7996_pci_hif2_probe(struct
+ 	hif->regs = pcim_iomap_table(pdev)[0];
+ 	hif->irq = pdev->irq;
+ 	pcie_bandwidth_available(pdev, NULL, &hif->speed, &hif->width);
++	INIT_LIST_HEAD(&hif->list);
+ 	spin_lock_bh(&hif_lock);
+ 	list_add(&hif->list, &hif_list);
+ 	spin_unlock_bh(&hif_lock);
+@@ -234,7 +238,13 @@ static void mt7996_hif_remove(struct pci
+ {
+ 	struct mt7996_hif *hif = pci_get_drvdata(pdev);
+ 
+-	list_del(&hif->list);
++	if (!hif)
++		return;
++
++	spin_lock_bh(&hif_lock);
++	list_del_init(&hif->list);
++	spin_unlock_bh(&hif_lock);
++	pci_set_drvdata(pdev, NULL);
+ }
+ 
+ static void mt7996_hif_shutdown(struct pci_dev *pdev)
+@@ -248,6 +258,9 @@ static void mt7996_pci_remove(struct pci
+ 	struct mt7996_dev *dev;
+ 
+ 	mdev = pci_get_drvdata(pdev);
++	if (!mdev)
++		return;
++
+ 	dev = container_of(mdev, struct mt7996_dev, mt76);
+ 	mt7996_put_hif2(dev->hif2);
+ 	mt7996_unregister_device(dev);
+@@ -259,6 +272,11 @@ static void mt7996_pci_shutdown(struct p
+ 	struct mt7996_dev *dev;
+ 	struct pci_dev *hif2_dev = NULL;
+ 
++	if (!mdev) {
++		pci_clear_master(pdev);
++		return;
++	}
++
+ 	dev = container_of(mdev, struct mt7996_dev, mt76);
+ 	if (dev->hif2)
+ 		hif2_dev = pci_dev_get(to_pci_dev(dev->hif2->dev));

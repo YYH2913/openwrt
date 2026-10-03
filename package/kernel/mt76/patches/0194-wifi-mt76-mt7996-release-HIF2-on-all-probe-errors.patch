@@ -1,0 +1,32 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: release HIF2 on all probe errors
+
+Release the acquired HIF2 device reference from the common free-device
+exit. Early primary WED and IRQ errors bypass the old free-hif2 label,
+so releasing there leaked the reference on those failures. Preserve the
+existing IRQ, WED and device cleanup ordering and do not run hardware
+cleanup before its work items have been initialized.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+Index: mt76/mt7996/pci.c
+===================================================================
+--- mt76.orig/mt7996/pci.c	2026-10-09 19:18:01.999531796 -0700
++++ mt76/mt7996/pci.c	2026-10-09 19:44:33.430386778 -0700
+@@ -220,8 +220,6 @@
+ 			pci_free_irq_vectors(hif2_dev);
+ 	}
+ free_hif2:
+-	if (dev->hif2)
+-		put_device(dev->hif2->dev);
+ 	devm_free_irq(mdev->dev, irq, dev);
+ free_wed_or_irq_vector:
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
+@@ -229,6 +227,7 @@
+ 	else
+ 		pci_free_irq_vectors(pdev);
+ free_device:
++	mt7996_put_hif2(dev->hif2);
+ 	mt76_free_device(&dev->mt76);
+ 
+ 	return ret;

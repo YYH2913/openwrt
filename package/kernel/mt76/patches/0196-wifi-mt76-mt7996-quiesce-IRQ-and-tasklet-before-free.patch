@@ -1,0 +1,269 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: quiesce IRQ and tasklet before freeing state
+
+Remember the actual requested primary and HIF2 IRQs, including WED IRQs,
+and release them synchronously while dev_id still points to a live device.
+Stop RX/TX NAPI producers, drain the IRQ tasklet and deferred work before
+releasing RRO/DMA state. Disabling a queued tasklet is not a lifetime
+barrier, and devres runs too late for manually freed ieee80211 hardware.
+
+Keep firmware/interface teardown responses working until MCU exit. Prevent
+new recovery work during removal with a private guard, drain init work as
+well, and retire TX NAPI once before shared DMA cleanup. Make partial-probe
+unwind skip IRQs already released by device cleanup and retain the HIF2
+reference until consumer cleanup completes.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1841,6 +1841,8 @@
+ {
+ 	int i, err;
+ 
++	mt7996_stop_recovery(dev);
++	cancel_work_sync(&dev->init_work);
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->wed_rro.work);
+ 	cancel_work_sync(&dev->reset_work);
+@@ -1854,13 +1856,27 @@
+ 	mt7996_coredump_unregister(dev);
+ 	mt76_unregister_device(&dev->mt76);
+ 	mt76_npu_rx_queues_deinit(&dev->mt76);
+-	mt7996_wed_rro_free(dev);
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.napi); i++) {
+ 		if (dev->mt76.napi[i].dev)
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
+ 	if (test_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state))
+ 		mt7996_mcu_exit(dev);
++	if (dev->mt76.tx_napi_registered)
++		napi_disable(&dev->mt76.tx_napi);
++
++	mt7996_irq_cleanup(dev);
++	if (dev->mt76.tx_napi_registered) {
++		netif_napi_del(&dev->mt76.tx_napi);
++		dev->mt76.tx_napi_registered = false;
++	}
++
++	/* Flush anything queued before IRQ/NAPI producers were stopped. */
++	cancel_work_sync(&dev->dump_work);
++	cancel_work_sync(&dev->wed_rro.work);
++	cancel_work_sync(&dev->reset_work);
++	cancel_work_sync(&dev->rc_work);
++	mt7996_wed_rro_free(dev);
+ 	mt7996_tx_token_put(dev);
+ 	if (dev->dma_init_started ||
+ 	    test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state)) {
+@@ -1871,8 +1887,6 @@
+ 	if (mt7996_has_hwrro(dev) &&
+ 	    !mtk_wed_device_active(&dev->mt76.mmio.wed))
+ 		mt7996_rro_msdu_page_map_free(dev);
+-	tasklet_disable(&dev->mt76.irq_tasklet);
+-
+ }
+ 
+ void mt7996_unregister_device(struct mt7996_dev *dev)
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2398,6 +2398,8 @@
+ 	int i;
+ 
+ 	dev = container_of(work, struct mt7996_dev, reset_work);
++	if (READ_ONCE(dev->removing))
++		return;
+ 	hw = mt76_hw(dev);
+ 
+ 	/* chip full reset */
+@@ -2567,6 +2569,8 @@
+ 	u8 *buf;
+ 
+ 	dev = container_of(work, struct mt7996_dev, dump_work);
++	if (READ_ONCE(dev->removing))
++		return;
+ 
+ 	mutex_lock(&dev->dump_mutex);
+ 
+@@ -2623,13 +2627,34 @@
+ 	queue_work(dev->mt76.wq, &dev->reset_work);
+ }
+ 
++void mt7996_stop_recovery(struct mt7996_dev *dev)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->recovery_lock, flags);
++	WRITE_ONCE(dev->removing, true);
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
++}
++
+ void mt7996_reset(struct mt7996_dev *dev)
+ {
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->recovery_lock, flags);
++	if (READ_ONCE(dev->removing)) {
++		/* Let an already running recovery finish without starting another. */
++		if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_STOP_DMA) {
++			set_bit(MT76_MCU_RESET, &dev->mphy.state);
++			wake_up(&dev->mt76.mcu.wait);
++		}
++		wake_up(&dev->reset_wait);
++		goto unlock;
++	}
+ 	if (!dev->recovery.hw_init_done)
+-		return;
++		goto unlock;
+ 
+ 	if (dev->recovery.hw_full_reset)
+-		return;
++		goto unlock;
+ 
+ 	/* wm/wa exception: do full recovery */
+ 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_WDT_MASK) {
+@@ -2640,7 +2665,7 @@
+ 
+ 		mt7996_irq_disable(dev, MT_INT_MCU_CMD);
+ 		queue_work(dev->mt76.wq, &dev->dump_work);
+-		return;
++		goto unlock;
+ 	}
+ 
+ 	if (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_STOP_DMA) {
+@@ -2650,6 +2675,8 @@
+ 
+ 	queue_work(dev->mt76.wq, &dev->reset_work);
+ 	wake_up(&dev->reset_wait);
++unlock:
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ }
+ 
+ void mt7996_mac_update_stats(struct mt7996_phy *phy)
+--- a/mt7996/mmio.c
++++ b/mt7996/mmio.c
+@@ -458,6 +458,9 @@
+ 
+ 	ASSERT_RTNL();
+ 
++	if (READ_ONCE(dev->removing))
++		return -ESHUTDOWN;
++
+ 	if (test_and_set_bit(MT76_STATE_WED_RESET, &mphy->state))
+ 		return -EBUSY;
+ 
+@@ -650,6 +653,7 @@
+ 	dev = container_of(mdev, struct mt7996_dev, mt76);
+ 	mt76_mmio_init(&dev->mt76, mem_base);
+ 	spin_lock_init(&dev->reg_lock);
++	spin_lock_init(&dev->recovery_lock);
+ 
+ 	switch (device_id) {
+ 	case MT7996_DEVICE_ID:
+@@ -832,6 +836,20 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++void mt7996_irq_cleanup(struct mt7996_dev *dev)
++{
++	mt7996_irq_disable(dev, ~0);
++	if (dev->hif2_irq >= 0) {
++		devm_free_irq(dev->mt76.dev, dev->hif2_irq, dev);
++		dev->hif2_irq = -1;
++	}
++	if (dev->irq >= 0) {
++		devm_free_irq(dev->mt76.dev, dev->irq, dev);
++		dev->irq = -1;
++	}
++	tasklet_kill(&dev->mt76.irq_tasklet);
++}
++
+ struct mt7996_dev *mt7996_mmio_probe(struct device *pdev,
+ 				     void __iomem *mem_base, u32 device_id)
+ {
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -478,6 +478,9 @@
+ 	struct mac_address radio_addrs[MT7996_MAX_RADIOS];
+ 
+ 	struct mt7996_hif *hif2;
++	int irq, hif2_irq;
++	spinlock_t recovery_lock;
++	bool removing;
+ 	struct mt7996_reg_desc reg;
+ 	u8 q_id[MT7996_MAX_QUEUE];
+ 	u32 q_int_mask[MT7996_MAX_QUEUE];
+@@ -763,6 +766,8 @@
+ void mt7996_rro_hw_init(struct mt7996_dev *dev);
+ void mt7996_wfsys_reset(struct mt7996_dev *dev);
+ irqreturn_t mt7996_irq_handler(int irq, void *dev_instance);
++void mt7996_irq_cleanup(struct mt7996_dev *dev);
++void mt7996_stop_recovery(struct mt7996_dev *dev);
+ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link);
+ int mt7996_register_device(struct mt7996_dev *dev);
+ void mt7996_cleanup_device(struct mt7996_dev *dev);
+--- a/mt7996/pci.c
++++ b/mt7996/pci.c
+@@ -146,6 +146,9 @@
+ 		return PTR_ERR(dev);
+ 
+ 	mdev = &dev->mt76;
++	dev->irq = -1;
++	dev->hif2_irq = -1;
++	mdev->tx_napi_registered = false;
+ 	mt7996_wfsys_reset(dev);
+ 	hif2 = mt7996_pci_init_hif2(pdev);
+ 	dev->hif2 = hif2;
+@@ -169,6 +172,7 @@
+ 			       IRQF_SHARED, KBUILD_MODNAME, dev);
+ 	if (ret)
+ 		goto free_wed_or_irq_vector;
++	dev->irq = irq;
+ 
+ 	mt76_wr(dev, MT_INT_MASK_CSR, 0);
+ 	/* master switch of PCIe interrupt enable */
+@@ -196,6 +200,7 @@
+ 				       dev);
+ 		if (ret)
+ 			goto free_hif2_wed_irq_vector;
++		dev->hif2_irq = hif2_irq;
+ 
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0);
+ 		/* master switch of PCIe tnterrupt enable */
+@@ -210,9 +215,8 @@
+ 
+ free_hif2_irq:
+ 	mt7996_cleanup_device(dev);
+-	if (dev->hif2)
+-		devm_free_irq(mdev->dev, hif2_irq, dev);
+ free_hif2_wed_irq_vector:
++	mt7996_irq_cleanup(dev);
+ 	if (dev->hif2) {
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
+ 			mtk_wed_device_detach(&dev->mt76.mmio.wed_hif2);
+@@ -220,13 +224,14 @@
+ 			pci_free_irq_vectors(hif2_dev);
+ 	}
+ free_hif2:
+-	devm_free_irq(mdev->dev, irq, dev);
+ free_wed_or_irq_vector:
++	mt7996_irq_cleanup(dev);
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
+ 		mtk_wed_device_detach(&dev->mt76.mmio.wed);
+ 	else
+ 		pci_free_irq_vectors(pdev);
+ free_device:
++	mt7996_irq_cleanup(dev);
+ 	mt7996_put_hif2(dev->hif2);
+ 	mt76_free_device(&dev->mt76);
+ 
+@@ -261,8 +266,9 @@
+ 		return;
+ 
+ 	dev = container_of(mdev, struct mt7996_dev, mt76);
++	mt7996_cleanup_device(dev);
+ 	mt7996_put_hif2(dev->hif2);
+-	mt7996_unregister_device(dev);
++	mt76_free_device(mdev);
+ }
+ 
+ static void mt7996_pci_shutdown(struct pci_dev *pdev)
