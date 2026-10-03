@@ -1,0 +1,47 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: release PPE statistics mappings on deinit
+
+Use an explicit ioremap lifetime for the NPU PPE statistics region and release it whenever PPE deinitialization runs, including allocation-failure paths. This prevents repeated flow-offload setup retries from accumulating devm mappings.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -456,11 +456,11 @@ static int airoha_npu_ppe_init(struct ai
+ static int airoha_npu_ppe_deinit(struct airoha_npu *npu)
+ {
+ 	struct ppe_mbox_data *ppe_data;
+-	int err;
++	int err = -ENOMEM;
+ 
+ 	ppe_data = kzalloc(sizeof(*ppe_data), GFP_KERNEL);
+ 	if (!ppe_data)
+-		return -ENOMEM;
++		goto unmap_stats;
+ 
+ 	ppe_data->func_type = NPU_OP_SET;
+ 	ppe_data->func_id = PPE_FUNC_SET_WAIT_HWNAT_DEINIT;
+@@ -469,6 +469,12 @@ static int airoha_npu_ppe_deinit(struct
+ 				  sizeof(*ppe_data));
+ 	kfree(ppe_data);
+ 
++unmap_stats:
++	if (npu->stats) {
++		iounmap(npu->stats);
++		npu->stats = NULL;
++	}
++
+ 	return err;
+ }
+ 
+@@ -551,9 +557,7 @@ static int airoha_npu_ppe_stats_setup(st
+ 	if (err)
+ 		goto out;
+ 
+-	npu->stats = devm_ioremap(npu->dev,
+-				  ppe_data->stats_info.npu_stats_addr,
+-				  size);
++	npu->stats = ioremap(ppe_data->stats_info.npu_stats_addr, size);
+ 	if (!npu->stats)
+ 		err = -ENOMEM;
+ out:

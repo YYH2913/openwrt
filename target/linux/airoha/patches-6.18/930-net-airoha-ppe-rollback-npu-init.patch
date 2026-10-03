@@ -1,0 +1,34 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: roll back PPE state after failed NPU setup
+
+Call the matching NPU PPE deinitialization when post-init setup fails before the provider is published. This prevents a later flow-offload retry from issuing a second initialization against stale hardware state.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2167,6 +2167,7 @@ static int airoha_ppe_offload_setup(stru
+ 	struct airoha_npu *npu = airoha_ppe_npu_get(eth);
+ 	struct airoha_ppe *ppe = eth->ppe;
+ 	int err, ppe_num_stats_entries;
++	bool ppe_initialized = false;
+ 
+ 	if (IS_ERR(npu))
+ 		return PTR_ERR(npu);
+@@ -2174,6 +2175,7 @@ static int airoha_ppe_offload_setup(stru
+ 	err = npu->ops.ppe_init(npu);
+ 	if (err)
+ 		goto error_npu_put;
++	ppe_initialized = true;
+ 
+ 	/* Wait for NPU PPE configuration to complete */
+ 	err = airoha_ppe_wait_for_npu_init(eth);
+@@ -2201,6 +2203,8 @@ static int airoha_ppe_offload_setup(stru
+ 	return 0;
+ 
+ error_npu_put:
++	if (ppe_initialized)
++		npu->ops.ppe_deinit(npu);
+ 	airoha_npu_put(npu);
+ 
+ 	return err;
