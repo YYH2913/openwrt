@@ -397,8 +397,8 @@ function buildTachoInner(ppe, cs, mode) {
 	var unbLit = Math.min(TICKS, Math.round((unbTot / UNB_SCALE) * TICKS));
 
 	var modeText   = mode === 'ap' ? 'AP MODE' : 'ROUTER';
-	var statusText = cs.npuActive ? 'HW ACCELERATED' : (cs.hwEnabled ? 'NPU IDLE' : 'CPU PATH');
-	var statusCol  = cs.npuActive ? '#00c8ff' : (cs.hwEnabled ? '#888' : '#ff6b35');
+	var statusText = cs.npuStatus;
+	var statusCol  = cs.npuColor;
 	var bndColor   = bndTot > 0 ? '#00c8ff' : 'var(--soc-muted)';
 	var unbColor   = unbTot > 0 ? '#ff9800' : 'var(--soc-muted)';
 
@@ -672,8 +672,11 @@ function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
 	bypass = bypass || {}; hwBuf = hwBuf || {}; jitter = jitter || {};
 	wan = wan || {}; wifi = wifi || {}; bridge = bridge || {};
 
-	var npuActive = bypass.npu_active  === true;
-	var hwEnabled = bypass.hw_offload_enabled === true;
+	var pathKnown = !bypass.error && bypass.path !== 'unknown' &&
+		typeof bypass.npu_active === 'boolean' &&
+		typeof bypass.hw_offload_enabled === 'boolean';
+	var npuActive = pathKnown && bypass.npu_active === true;
+	var hwEnabled = pathKnown && bypass.hw_offload_enabled === true;
 	var cpuPct    = bypass.cpu_pct  || 0;
 	var wanMbps   = bypass.wan_mbps || 0;
 
@@ -713,6 +716,12 @@ function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
 	}
 	return {
 		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, wanMbps:wanMbps,
+		pathKnown: pathKnown,
+		npuStatus: !pathKnown ? 'UNKNOWN' : npuActive ? 'HW ACCELERATED' : hwEnabled ? 'NPU IDLE' : 'CPU PATH',
+		npuShort: !pathKnown ? 'UNKNOWN' : npuActive ? 'ACTIVE' : hwEnabled ? 'IDLE' : 'CPU PATH',
+		npuColor: !pathKnown ? '#888' : npuActive ? '#00c8ff' : hwEnabled ? '#888' : '#ff6b35',
+		npuOpacity: !pathKnown ? '0.2' : npuActive ? '1' : hwEnabled ? '0.45' : '0.2',
+		cpuOpacity: !pathKnown ? '0.2' : !hwEnabled ? '1' : npuActive ? '0.2' : '0.45',
 		hwBuf:hwBuf, mode:mode,
 		latMs:latMs, errCount:errCount, eastAlarm:eastAlarm,
 		wbDelta:wbDelta, worstSignal:worstSignal,
@@ -723,10 +732,10 @@ function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
 
 function buildCompassSVG(cs, mode, ppe) {
 	var cx=150, cy=150;
-	var npuOpacity  = cs.npuActive ? '1'    : cs.hwEnabled ? '0.45' : '0.2';
-	var cpuOpacity  = !cs.hwEnabled ? '1'   : cs.npuActive ? '0.2'  : '0.45';
+	var npuOpacity  = cs.npuOpacity;
+	var cpuOpacity  = cs.cpuOpacity;
 	var npuGlow     = cs.npuActive  ? ' filter="url(#f-cyan)"'   : '';
-	var cpuGlow     = !cs.hwEnabled ? ' filter="url(#f-orange)"' : '';
+	var cpuGlow     = cs.pathKnown && !cs.hwEnabled ? ' filter="url(#f-orange)"' : '';
 	var eastOpacity = cs.eastAlarm ? '1' : '0.45';
 	var eastGlow    = cs.eastAlarm ? ' filter="url(#f-red)"'  : '';
 	var southOpacity= cs.hwBuf.pulsing ? '1' : '0.45';
@@ -795,8 +804,8 @@ function buildCompassSVG(cs, mode, ppe) {
 function updateCompassSVG(cs, mode, ppe) {
 	function sa(id, attr, val) { var el=document.getElementById(id); if(el) el.setAttribute(attr, val); }
 
-	var npuOpacity  = cs.npuActive ? '1'    : cs.hwEnabled ? '0.45' : '0.2';
-	var cpuOpacity  = !cs.hwEnabled ? '1'   : cs.npuActive ? '0.2'  : '0.45';
+	var npuOpacity  = cs.npuOpacity;
+	var cpuOpacity  = cs.cpuOpacity;
 	var eastOpacity = cs.eastAlarm ? '1' : '0.45';
 	var southOpacity= cs.hwBuf.pulsing ? '1' : '0.45';
 	var tip = needleTip(cs.latMs);
@@ -817,7 +826,7 @@ function updateCompassSVG(cs, mode, ppe) {
 	var arcNpu = document.getElementById('cp-arc-npu');
 	if (arcNpu) { if(cs.npuActive) arcNpu.setAttribute('filter','url(#f-cyan)'); else arcNpu.removeAttribute('filter'); }
 	var arcCpu = document.getElementById('cp-arc-cpu');
-	if (arcCpu) { if(!cs.hwEnabled) arcCpu.setAttribute('filter','url(#f-orange)'); else arcCpu.removeAttribute('filter'); }
+	if (arcCpu) { if(cs.pathKnown && !cs.hwEnabled) arcCpu.setAttribute('filter','url(#f-orange)'); else arcCpu.removeAttribute('filter'); }
 	var arcEast = document.getElementById('cp-arc-east');
 	if (arcEast) { if(cs.eastAlarm) arcEast.setAttribute('filter','url(#f-red)'); else arcEast.removeAttribute('filter'); }
 
@@ -858,8 +867,8 @@ function buildCpuNpuTacho(cs, ppe, st) {
 	var governor = (st.cpu_governor && st.cpu_governor !== 'unknown') ? st.cpu_governor.toUpperCase() : '';
 
 	// Colours
-	var npuStatusCol = cs.npuActive ? '#00c8ff' : (cs.hwEnabled ? '#888' : '#ff6b35');
-	var npuStatus    = cs.npuActive ? 'HW ACCELERATED' : (cs.hwEnabled ? 'NPU IDLE' : 'CPU PATH');
+	var npuStatusCol = cs.npuColor;
+	var npuStatus    = cs.npuStatus;
 	var npuColor     = offloadPct > 60 ? '#00c8ff' : offloadPct > 30 ? '#f5a623' : '#888';
 
 	var TICKS = 90;
@@ -1249,8 +1258,8 @@ function renderCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
 	var rawBridgeDrops = bridge.tx_dropped || 0;
 	var bridgeDelta = (_prevBridgeDrops !== null && rawBridgeDrops >= _prevBridgeDrops) ? (rawBridgeDrops - _prevBridgeDrops) : 0;
 	_prevBridgeDrops = rawBridgeDrops;
-	var northVal   = cs.npuActive ? 'ACTIVE' : (cs.hwEnabled ? 'IDLE' : 'CPU PATH');
-	var northColor = cs.npuActive ? '#00c8ff' : (cs.hwEnabled ? '#888' : '#ff6b35');
+	var northVal   = cs.npuShort;
+	var northColor = cs.npuColor;
 	var northSub   = mode === 'ap'
 		? 'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta
 		: 'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps';
@@ -1320,8 +1329,8 @@ function updateCompassCards(cs, bypass, jitter, wan, wifi, bridge, mode) {
 	var bridgeDelta2 = (_prevBridgeDrops !== null && rawBridgeDrops2 >= _prevBridgeDrops) ? (rawBridgeDrops2 - _prevBridgeDrops) : 0;
 	_prevBridgeDrops = rawBridgeDrops2;
 
-	setCard(divs[0], cs.npuActive?'ACTIVE':(cs.hwEnabled?'IDLE':'CPU PATH'),
-		cs.npuActive?'#00c8ff':(cs.hwEnabled?'#888':'#ff6b35'),
+	setCard(divs[0], cs.npuShort,
+		cs.npuColor,
 		mode==='ap'
 			?'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta2
 			:'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps');

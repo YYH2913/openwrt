@@ -4,12 +4,148 @@
 
 . /lib/functions.sh
 
-get_status() {
+HARDWARE_BLOCKED_PREFIX="/var/run/luci-airoha-flowsense/probe"
+
+_is_en7581() {
+	case "$EN7581_SOC" in
+		1) return 0 ;;
+		0) return 1 ;;
+	esac
+
+	if [ -r /proc/device-tree/compatible ] &&
+		tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null |
+		grep -Eq '^airoha,(an|en)7581$'; then
+		EN7581_SOC=1
+		return 0
+	fi
+
+	EN7581_SOC=0
+	return 1
+}
+
+_get_npu_device() {
+	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
+
+	[ -d "$npu_driver_path" ] || return 0
+	ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1
+}
+
+# Execute a hardware/debugfs probe in a disposable worker and stop waiting
+# after a wall-clock deadline so a stalled register bus cannot consume rpcd.
+_run_with_deadline() {
+	local seconds="$1" tag="$2"
+	local base output done child_file
+	local worker timer child rc elapsed
+	shift 2
+
+	mkdir -p -m 700 "${HARDWARE_BLOCKED_PREFIX%/*}" || return 1
+	[ -e "$HARDWARE_BLOCKED_PREFIX.$tag.blocked" ] && return 125
+	base=$(mktemp -d /tmp/luci-airoha-flowsense.$tag.XXXXXX) || return 1
+	output="$base/out"
+	done="$base/done"
+	child_file="$base/child"
+
+	(
+		"$@" >"$output" 2>/dev/null &
+		child=$!
+		printf '%s\n' "$child" >"$child_file"
+		wait "$child"
+		printf '%s\n' "$?" >"$done"
+	) >/dev/null 2>&1 &
+	worker=$!
+
+	sleep "$seconds" >/dev/null 2>&1 &
+	timer=$!
+	wait -n 2>/dev/null
+	if kill -0 "$worker" 2>/dev/null && kill -0 "$timer" 2>/dev/null; then
+		elapsed=0
+		while [ "$elapsed" -lt "$seconds" ] && [ ! -e "$done" ]; do
+			sleep 1
+			elapsed=$((elapsed + 1))
+		done
+	fi
+
+	if [ -e "$done" ]; then
+		kill "$timer" 2>/dev/null
+		wait "$timer" 2>/dev/null
+		wait "$worker" 2>/dev/null
+		read -r rc <"$done" 2>/dev/null
+		[ -n "$rc" ] || rc=1
+		if [ "$rc" -eq 0 ] && [ -s "$output" ]; then
+			cat "$output"
+			rm -f "$output" "$done" "$child_file"
+			rmdir "$base" 2>/dev/null
+			return 0
+		fi
+		rm -f "$output" "$done" "$child_file"
+		rmdir "$base" 2>/dev/null
+		return 1
+	fi
+
+	if [ -s "$child_file" ]; then
+		read -r child <"$child_file" 2>/dev/null
+		case "$child" in
+			*[!0-9]*|'') ;;
+			*) kill -9 "$child" 2>/dev/null ;;
+		esac
+	fi
+	kill -9 "$worker" 2>/dev/null
+	wait "$worker" 2>/dev/null
+	kill "$timer" 2>/dev/null
+	wait "$timer" 2>/dev/null
+	rm -f "$output" "$done" "$child_file"
+	rmdir "$base" 2>/dev/null
+	printf '%s\n' "$tag timed out" >"$HARDWARE_BLOCKED_PREFIX.$tag.blocked"
+	logger -t luci.airoha_flowsense "hardware probe '$tag' timed out after $seconds s" 2>/dev/null
+	return 124
+}
+
+_ppe_bind_count() {
+	local file="$1"
+	[ -r "$file" ] || { echo 0; return; }
+	awk '
+		NF {
+			records++
+			if (records == 1 && NF == 1 && $1 ~ /^[0-9]+$/)
+				direct = $1
+			if (NF > 1 && $1 ~ /^[0-9a-fA-F]+:?$/)
+				entries++
+		}
+		END {
+			if (records == 1 && direct != "")
+				print direct
+			else
+				print entries + 0
+		}
+	' "$file" 2>/dev/null
+}
+
+_find_token_file() {
+	local candidate fallback=""
+	for candidate in /sys/kernel/debug/ieee80211/phy*/mt76/token_info; do
+		[ -r "$candidate" ] || continue
+		[ -n "$fallback" ] || fallback="$candidate"
+		if grep -q '^[[:space:]]*status:[[:space:]]*active' "$candidate" 2>/dev/null; then
+			echo "$candidate"
+			return
+		fi
+	done
+	echo "$fallback"
+}
+
+_get_status_raw() {
 	# === NPU Status ===
-	local npu_fw="/lib/firmware/airoha/en7581_MT7996_npu_rv32.bin"
+	local npu_fw="" npu_dt="/proc/device-tree/soc/npu@1e900000/firmware-name"
+	local fw_device="$(_get_npu_device)"
+	[ -z "$fw_device" ] || npu_dt="/sys/bus/platform/drivers/airoha-npu/$fw_device/of_node/firmware-name"
 	local npu_ver="Unknown"
 
-	if [ -f "$npu_fw" ]; then
+	if [ -r "$npu_dt" ]; then
+		local fw_rel=$(tr '\0' '\n' <"$npu_dt" 2>/dev/null | grep -m1 "rv32")
+		[ -n "$fw_rel" ] && npu_fw="/lib/firmware/$fw_rel"
+	fi
+
+	if [ -n "$npu_fw" ] && [ -f "$npu_fw" ]; then
 		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
 		[ -z "$npu_ver" ] && npu_ver="Unknown"
 	fi
@@ -19,7 +155,7 @@ get_status() {
 	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
 
 	if [ -d "$npu_driver_path" ]; then
-		npu_device=$(ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1)
+		npu_device=$(_get_npu_device)
 		if [ -n "$npu_device" ]; then
 			npu_loaded="true"
 		fi
@@ -30,9 +166,9 @@ get_status() {
 		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
 	fi
 
-	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
+	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null)
 
-	local offload_bound=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | grep -c "^[0-9a-fA-F]")
+	local offload_bound=$(_ppe_bind_count /sys/kernel/debug/ppe/bind)
 	local offload_total=$(cat /sys/kernel/debug/ppe/entries 2>/dev/null | grep -c "^[0-9a-fA-F]")
 
 	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
@@ -79,7 +215,7 @@ get_status() {
 
 	# Read actual PLL frequency from hardware (detects overclock)
 	local pll_freq=0
-	if command -v devmem > /dev/null 2>&1; then
+	if _is_en7581 && command -v devmem > /dev/null 2>&1; then
 		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
 		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
 		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
@@ -106,7 +242,17 @@ get_status() {
 		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_count:-0}" "${pll_freq:-0}"
 }
 
-get_ppe_entries() {
+get_status() {
+	if ! _run_with_deadline 3 status _get_status_raw; then
+		local npu_device="$(_get_npu_device)"
+		local npu_loaded="false"
+		[ -n "$npu_device" ] && npu_loaded="true"
+		printf '{"error":"hardware status unavailable","npu_version":"Unknown","npu_loaded":%s,"npu_device":"%s","npu_clock":0,"npu_cores":0,"offload_bound":0,"offload_total":0,"memory_regions":[],"cpu_cur_freq":0,"cpu_hw_freq":0,"cpu_governor":"unknown","cpu_avail_governors":"","cpu_min_freq":0,"cpu_max_freq":0,"cpu_avail_freqs":"","cpu_count":0,"pll_freq_mhz":0}\n' \
+			"$npu_loaded" "$npu_device"
+	fi
+}
+
+_get_ppe_entries_raw() {
 	local bind_file="/sys/kernel/debug/ppe/bind"
 	local entries_file="/sys/kernel/debug/ppe/entries"
 
@@ -277,14 +423,22 @@ get_ppe_entries() {
 	printf '{"bnd":%s,"unb":%s}' "$bnd_json" "$unb_json"
 }
 
-get_token_info() {
-	local token_file="/sys/kernel/debug/ieee80211/phy0/mt76/token_info"
+get_ppe_entries() {
+	if ! _run_with_deadline 3 ppe _get_ppe_entries_raw; then
+		echo '{"bnd":{"total":0,"ipv4":0,"ipv6":0,"entries":[]},"unb":{"total":0,"ipv4":0,"ipv6":0,"entries":[]}}'
+	fi
+}
+
+_get_token_info_raw() {
+	local token_file="$(_find_token_file)"
+	local phy
+	phy=$(printf '%s' "$token_file" | sed 's#/mt76/token_info$##; s#.*/##')
 
 	# Gather per-band WiFi station stats (count, retries, failures)
 	local sta_json="" band
 	for band in 0 1 2; do
 		local stats=$(
-			for iface in $(iw dev 2>/dev/null | awk '/Interface phy0\.'$band'-/{print $2}'); do
+				for iface in $(iw dev 2>/dev/null | awk -v prefix="$phy.$band-" '$1 == "Interface" && index($2, prefix) == 1 { print $2 }'); do
 				iw dev "$iface" station dump 2>/dev/null
 			done | awk '
 			BEGIN { n=0; tp=0; tr=0 }
@@ -339,10 +493,16 @@ get_token_info() {
 	' "$token_file" 2>/dev/null || printf '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[%s]}' "$sta_json"
 }
 
+get_token_info() {
+	if ! _run_with_deadline 3 token _get_token_info_raw; then
+		echo '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[]}'
+	fi
+}
 
 
 
-get_frame_engine() {
+
+_get_frame_engine_raw() {
 	if ! command -v devmem > /dev/null 2>&1; then
 		echo '{"error":"devmem not available"}'
 		return
@@ -404,8 +564,29 @@ get_frame_engine() {
 	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
 }
 
-get_tx_stats() {
-	local stats_file="/sys/kernel/debug/ieee80211/phy0/mt76/tx_stats"
+get_frame_engine() {
+	if ! _is_en7581; then
+		echo '{"error":"frame engine is not supported on this SoC"}'
+		return
+	fi
+
+	if [ ! -r /sys/kernel/debug/ppe/entries ]; then
+		echo '{"error":"frame engine not ready"}'
+		return
+	fi
+
+	if ! _run_with_deadline 3 frame _get_frame_engine_raw; then
+		echo '{"error":"frame engine unavailable"}'
+	fi
+}
+
+_get_tx_stats_raw() {
+	local token_file="$(_find_token_file)" stats_file=""
+	if [ -n "$token_file" ]; then
+		local phy
+		phy=$(printf '%s' "$token_file" | sed 's#/mt76/token_info$##; s#.*/##')
+		stats_file="/sys/kernel/debug/ieee80211/$phy/mt76/tx_stats"
+	fi
 
 	if [ ! -f "$stats_file" ]; then
 		echo '{"bands":[]}'
@@ -447,10 +628,20 @@ get_tx_stats() {
 	' "$stats_file" 2>/dev/null || echo '{"bands":[]}'
 }
 
+get_tx_stats() {
+	if ! _run_with_deadline 3 tx _get_tx_stats_raw; then
+		echo '{"bands":[],"error":"TX statistics unavailable"}'
+	fi
+}
+
 get_vlan_offload() {
-	local val
-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null)
-	printf '{"enabled":%d}' "${val:-0}"
+	local path="/proc/sys/net/bridge/bridge-nf-filter-vlan-tagged"
+	local filter
+	[ -r "$path" ] || { echo '{"available":false,"enabled":false}'; return; }
+	filter=$(cat "$path" 2>/dev/null)
+	[ -n "$filter" ] || filter=1
+	printf '{"available":true,"enabled":%s,"bridge_filter":%d}' \
+		"$([ "$filter" -eq 0 ] && echo true || echo false)" "$filter"
 }
 
 set_vlan_offload() {
@@ -465,13 +656,14 @@ set_vlan_offload() {
 		return
 	fi
 
-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
+	local filter=$((1 - enabled))
+	if ! echo "$filter" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
 		echo '{"error":"failed - bridge module may not be loaded"}'
 		return
 	fi
 
 	# Persist across reboots
-	echo "net.bridge.bridge-nf-filter-vlan-tagged=$enabled" > /etc/sysctl.d/14-vlan-offload.conf
+	echo "net.bridge.bridge-nf-filter-vlan-tagged=$filter" > /etc/sysctl.d/14-vlan-offload.conf
 	chmod 644 /etc/sysctl.d/14-vlan-offload.conf
 	printf '{"result":"ok","enabled":%d}' "$enabled"
 }
@@ -511,9 +703,13 @@ set_flow_offload() {
 }
 
 get_pppoe_offload() {
-	local val
-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
-	printf '{"enabled":%d}' "${val:-0}"
+	local path="/proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged"
+	local filter
+	[ -r "$path" ] || { echo '{"available":false,"enabled":false}'; return; }
+	filter=$(cat "$path" 2>/dev/null)
+	[ -n "$filter" ] || filter=1
+	printf '{"available":true,"enabled":%s,"bridge_filter":%d}' \
+		"$([ "$filter" -eq 0 ] && echo true || echo false)" "$filter"
 }
 
 set_pppoe_offload() {
@@ -527,13 +723,14 @@ set_pppoe_offload() {
 		return
 	fi
 
-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
+	local filter=$((1 - enabled))
+	if ! echo "$filter" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
 		echo '{"error":"failed - bridge module may not be loaded"}'
 		return
 	fi
 
 	# Persist across reboots
-	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$enabled" > /etc/sysctl.d/15-pppoe-offload.conf
+	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$filter" > /etc/sysctl.d/15-pppoe-offload.conf
 	chmod 644 /etc/sysctl.d/15-pppoe-offload.conf
 	printf '{"result":"ok","enabled":%d}' "$enabled"
 }
@@ -832,7 +1029,7 @@ get_bridge_stats() {
 		"${fwd_errors:-0}"
 }
 
-get_npu_bypass() {
+_get_npu_bypass_raw() {
 	# Determines if the NPU is actively offloading traffic.
 	# Primary indicator: offload_bound > 0 (live PPE entries in hardware).
 	# This works in both Router and AP mode — no WAN assumption needed.
@@ -845,12 +1042,7 @@ get_npu_bypass() {
 	local offload_bound=0
 	local ppe_bind="/sys/kernel/debug/ppe/bind"
 	if [ -r "$ppe_bind" ]; then
-		offload_bound=$(wc -l < "$ppe_bind" 2>/dev/null || echo 0)
-		# Subtract 1 if file has a header line (starts with non-numeric)
-		local first
-		first=$(head -1 "$ppe_bind" 2>/dev/null)
-		case "$first" in [0-9]*) ;; *) offload_bound=$(( offload_bound - 1 )) ;; esac
-		[ "$offload_bound" -lt 0 ] && offload_bound=0
+		offload_bound=$(_ppe_bind_count "$ppe_bind")
 	fi
 
 	# Calculate CPU usage % using /proc/stat delta
@@ -915,6 +1107,12 @@ get_npu_bypass() {
 	printf '{"hw_offload_enabled":%s,"cpu_pct":%d,"wan_mbps":%d,"offload_bound":%d,"npu_active":%s,"path":"%s"}' \
 		"$([ "$hw_offload" = "1" ] && echo true || echo false)" \
 		"${cpu_pct:-0}" "${wan_mbps:-0}" "${offload_bound:-0}" "$npu_active" "$path"
+}
+
+get_npu_bypass() {
+	if ! _run_with_deadline 3 bypass _get_npu_bypass_raw; then
+		echo '{"error":"hardware path unavailable","hw_offload_enabled":false,"cpu_pct":0,"wan_mbps":0,"offload_bound":0,"npu_active":false,"path":"unknown"}'
+	fi
 }
 
 get_conflict_alerts() {

@@ -9,6 +9,12 @@ RESULT_FILE="/tmp/npu-jitter.json"
 WINDOW=10
 INTERVAL=2  # seconds between pings
 
+# Keep the target in the data plane of awk and JSON.  UCI is writable input,
+# so reject characters that could be interpreted as shell/JSON syntax.
+case "$TARGET" in
+	''|-*|*[!A-Za-z0-9:._-]*) TARGET="1.1.1.1" ;;
+esac
+
 ping_values=""
 count=0
 
@@ -22,14 +28,14 @@ while true; do
 
 		# Trim to window size
 		if [ "$count" -gt "$WINDOW" ]; then
-			ping_values=$(echo "$ping_values" | awk '{
-				for (i = NF - '"$WINDOW"' + 1; i <= NF; i++) printf $i " "
-			}')
+				ping_values=$(printf '%s\n' "$ping_values" | awk -v window="$WINDOW" '{
+					for (i = NF - window + 1; i <= NF; i++) printf "%s ", $i
+				}')
 			count=$WINDOW
 		fi
 
 		# Calculate mean absolute deviation (jitter) and last ping
-		result=$(echo "$ping_values" | awk -v c="$count" '{
+			result=$(printf '%s\n' "$ping_values" | awk -v c="$count" -v target="$TARGET" '{
 			n = NF
 			sum = 0
 			for (i = 1; i <= n; i++) sum += $i
@@ -38,15 +44,15 @@ while true; do
 			for (i = 1; i <= n; i++) dev += ($i > avg ? $i - avg : avg - $i)
 			jitter = dev / n
 			last = $n
-			printf "{\"jitter\":%.2f,\"last_ping\":%.2f,\"samples\":%d,\"target\":\"%s\",\"reachable\":true,\"available\":true}", \
-				jitter, last, c, "'"$TARGET"'"
-		}')
+				printf "{\"jitter\":%.2f,\"last_ping\":%.2f,\"samples\":%d,\"target\":\"%s\",\"reachable\":true,\"available\":true}", \
+					jitter, last, c, target
+			}')
 
 		echo "$result" > "$RESULT_FILE"
 	else
 		# Unreachable — preserve sample count but mark unreachable
-		printf '{"jitter":0,"last_ping":0,"samples":%d,"target":"%s","reachable":false,"available":true}\n' \
-			"$count" "$TARGET" > "$RESULT_FILE"
+			printf '{"jitter":0,"last_ping":0,"samples":%d,"target":"%s","reachable":false,"available":true}\n' \
+				"$count" "$TARGET" > "$RESULT_FILE"
 	fi
 
 	sleep "$INTERVAL"

@@ -4,7 +4,7 @@
 
 . /lib/functions.sh
 
-HARDWARE_BLOCKED_PREFIX="/tmp/luci-airoha-npu"
+HARDWARE_BLOCKED_PREFIX="/var/run/luci-airoha-npu/probe"
 
 _is_en7581() {
 	case "$EN7581_SOC" in
@@ -36,16 +36,17 @@ _get_npu_device() {
 _run_with_deadline() {
 	local seconds="$1"
 	local tag="$2"
-	local base="/tmp/luci-airoha-npu.${tag}.$$"
-	local output="${base}.out"
-	local done="${base}.done"
-	local child_file="${base}.child"
+	local base output done child_file
 	local blocked_file="${HARDWARE_BLOCKED_PREFIX}.${tag}.blocked"
 	local worker timer child rc elapsed
 	shift 2
 
+	mkdir -p -m 700 "${HARDWARE_BLOCKED_PREFIX%/*}" || return 1
 	[ -e "$blocked_file" ] && return 125
-	rm -f "$output" "$done" "$child_file"
+	base=$(mktemp -d /tmp/luci-airoha-npu.$tag.XXXXXX) || return 1
+	output="$base/out"
+	done="$base/done"
+	child_file="$base/child"
 
 	(
 		HARDWARE_DEADLINE_ACTIVE=1
@@ -80,10 +81,12 @@ _run_with_deadline() {
 		if [ "${rc:-1}" -eq 0 ] && [ -s "$output" ]; then
 			cat "$output"
 			rm -f "$output" "$done" "$child_file"
+			rmdir "$base" 2>/dev/null
 			return 0
 		fi
 
 		rm -f "$output" "$done" "$child_file"
+		rmdir "$base" 2>/dev/null
 		return 1
 	fi
 
@@ -102,6 +105,7 @@ _run_with_deadline() {
 	kill "$timer" 2>/dev/null
 	wait "$timer" 2>/dev/null
 	rm -f "$output" "$done" "$child_file"
+	rmdir "$base" 2>/dev/null
 	printf '%s\n' "$tag timed out" >"$blocked_file"
 	logger -t luci.airoha_npu "hardware probe '$tag' timed out after ${seconds}s; disabling this probe until reboot" 2>/dev/null
 	return 124
