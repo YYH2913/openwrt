@@ -1,0 +1,23 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: validate airtime event array stride
+
+The upstream ALL_STA bounds check must recognize the downstream airtime
+array before the event reaches its existing handler. Use the actual airtime
+element size and retain the native station-count clamp for truncated events.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+Index: mt76/mt7996/mcu.c
+===================================================================
+--- mt76.orig/mt7996/mcu.c	2026-10-09 19:30:01.589667386 -0700
++++ mt76/mt7996/mcu.c	2026-10-09 19:30:19.181033280 -0700
+@@ -928,6 +928,9 @@
+ 	case UNI_ALL_STA_TXRX_MSDU_COUNT:
+ 		elem_size = sizeof(res->msdu_cnt[0]);
+ 		break;
++	case UNI_ALL_STA_TXRX_AIR_TIME:
++		elem_size = sizeof(res->airtime[0]);
++		break;
+ 	default:
+ 		return;
+ 	}
