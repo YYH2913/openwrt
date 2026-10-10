@@ -1,0 +1,90 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: quarantine uncertain SOE SA slots
+
+SOE completion descriptors carry only a slot index, not a generation.
+Keep a retired index reserved until its old RCU completion readers have
+left. A purged software context does not prove that its hardware packet
+has drained, and failed staging/clear commits also leave uncertain state.
+
+Remember when in-flight contexts were abandoned and quarantine slots
+with uncertain programming, clearing or draining until provider reset.
+Free their software state but do not let an old completion consume a new
+SA's context. Normally drained and cleared slots remain reusable after
+the grace period. The finite slot limit reports ENOSPC rather than
+silently mixing stale cryptographic contexts after a hardware failure.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -169,6 +169,7 @@
+ 	struct list_head rx_queue;
+ 	struct completion idle;
+ 	unsigned int inflight;
++	bool abandoned;
+ 	bool dead;
+ };
+ 
+@@ -635,6 +636,8 @@
+ 
+ 	err = airoha_soe_program_sa_locked(soe, i, &cfg);
+ 	if (err) {
++		/* A timed-out commit may still reach hardware; do not reuse its index. */
++		soe->sa_map |= BIT(i);
+ 		mutex_unlock(&soe->sa_lock);
+ 		kfree(new_sa);
+ 		return err;
+@@ -707,6 +710,8 @@
+ 
+ 	spin_lock_bh(&sa->lock);
+ 	sa->dead = true;
++	if (sa->inflight)
++		sa->abandoned = true;
+ 	airoha_soe_forget_rx_ctx_list(sa);
+ 	list_splice_init(&sa->tx_queue, &tx_queue);
+ 	list_splice_init(&sa->rx_queue, &rx_queue);
+@@ -723,13 +728,17 @@
+ 	LIST_HEAD(rx_queue);
+ 	LIST_HEAD(tx_queue);
+ 	struct airoha_soe *soe;
++	bool drained, release_slot = false;
++	int err;
+ 
+ 	if (!sa)
+ 		return;
+ 
+ 	soe = sa->soe;
+ 	airoha_soe_mark_sa_dead(sa);
+-	if (!wait_for_completion_timeout(&sa->idle, AIROHA_SOE_SA_FREE_TIMEOUT))
++	drained = wait_for_completion_timeout(&sa->idle,
++					      AIROHA_SOE_SA_FREE_TIMEOUT);
++	if (!drained)
+ 		dev_warn(soe->dev,
+ 			 "timed out waiting for SOE SA%u in-flight packets\n",
+ 			 sa->index);
+@@ -737,13 +746,23 @@
+ 	mutex_lock(&soe->sa_lock);
+ 	if (sa->index < AIROHA_SOE_NUM_SA &&
+ 	    rcu_access_pointer(soe->sa[sa->index]) == sa) {
+-		airoha_soe_clear_sa_locked(soe, sa->index);
++		err = airoha_soe_clear_sa_locked(soe, sa->index);
+ 		RCU_INIT_POINTER(soe->sa[sa->index], NULL);
+-		soe->sa_map &= ~BIT(sa->index);
++		release_slot = drained && !READ_ONCE(sa->abandoned) && !err;
++		if (!release_slot)
++			dev_warn(soe->dev, "quarantining SOE SA%u until reset\n",
++				 sa->index);
+ 	}
+ 	mutex_unlock(&soe->sa_lock);
+ 	synchronize_rcu();
+ 
++	/* Keep the index reserved until old completion readers have left. */
++	if (release_slot) {
++		mutex_lock(&soe->sa_lock);
++		soe->sa_map &= ~BIT(sa->index);
++		mutex_unlock(&soe->sa_lock);
++	}
++
+ 	spin_lock_bh(&sa->lock);
+ 	airoha_soe_forget_rx_ctx_list(sa);
+ 	list_splice_init(&sa->tx_queue, &tx_queue);

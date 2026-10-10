@@ -1,0 +1,31 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: clear SOE SAs with the valid bit unset
+
+Keep the valid bit in the constructed SA command, not in the generic
+staging writer. SA deletion passes a zero configuration through that
+writer; unconditionally adding VLD there leaves the cleared slot marked
+valid. New SA programming retains the same bits, keys and thresholds,
+while clearing now commits a zero, invalid command.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -315,7 +315,7 @@
+ {
+ 	void __iomem *base = soe->base;
+ 
+-	writel(cfg->cmd | AIROHA_SOE_SA_CMD_VLD, base + AIROHA_SOE_SA_CMD);
++	writel(cfg->cmd, base + AIROHA_SOE_SA_CMD);
+ 	writel(lower_32_bits(cfg->soft_byte_limit),
+ 	       base + AIROHA_SOE_BCNT_THSHD_32_SOFT);
+ 	writel(upper_32_bits(cfg->soft_byte_limit),
+@@ -562,7 +562,7 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	cfg->cmd = AIROHA_SOE_SA_CMD_SN_ERR_DROP |
++	cfg->cmd = AIROHA_SOE_SA_CMD_VLD | AIROHA_SOE_SA_CMD_SN_ERR_DROP |
+ 		   AIROHA_SOE_SA_CMD_PAD_ERR_DROP |
+ 		   AIROHA_SOE_SA_CMD_ICV_ERR_DROP;
+ 	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT) {

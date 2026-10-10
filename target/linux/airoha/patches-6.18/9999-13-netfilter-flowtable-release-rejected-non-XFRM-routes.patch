@@ -1,0 +1,22 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] netfilter: flowtable: release rejected non-XFRM TCP routes
+
+The post-route established-state check owns both destination references
+returned by nft_flow_route(). Rejecting a non-XFRM TCP flow there must
+release those references before clearing IPS_OFFLOAD, just like failure
+to allocate the flow object. The earlier routing-error label does not
+release them because failed routing unwinds its own references.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -160,7 +160,7 @@
+ 	if (tcp_not_established &&
+ 	    route.tuple[IP_CT_DIR_ORIGINAL].xmit_type != FLOW_OFFLOAD_XMIT_XFRM &&
+ 	    route.tuple[IP_CT_DIR_REPLY].xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
+-		goto err_flow_route;
++		goto err_flow_alloc;
+ 
+ 	flow = flow_offload_alloc(ct);
+ 	if (!flow)

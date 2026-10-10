@@ -1,0 +1,653 @@
+From 712ebae6642bfa7deb70afa6b769e96fa37aa2af Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:02:52 -0700
+Subject: [PATCH 2/2] net: airoha: validate SOE incarnations and delayed
+ observations
+
+Allocate non-reused software identities in the built-in skb core so
+identities survive provider reprobe and driver module reload. Associate
+each programmed SA with its identity and validate initial, cached and
+delayed PPE commits against the active incarnation under ppe_lock.
+
+Carry the SA and exact metadata observation in a refcounted skb
+extension. This prevents old completions and queued skbs from consuming
+metadata for a new SA or a new observation at the same hash, and
+preserves all nfmark bits. Allocation or identity exhaustion falls back
+to the normal path. Existing hardware drain/quarantine rules remain
+necessary; software identities cannot prove that a hardware bypass
+pipeline has drained.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h |  11 +-
+ drivers/net/ethernet/airoha/airoha_ppe.c | 169 +++++++++++++++++------
+ drivers/net/ethernet/airoha/airoha_soe.c |  22 ++-
+ drivers/net/ethernet/airoha/airoha_soe.h |   4 +-
+ include/linux/skbuff.h                   |  15 ++
+ net/core/skbuff.c                        |  23 +++
+ 6 files changed, 190 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 9db7041..947f2e3 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -498,8 +498,12 @@ struct airoha_foe_stats64 {
+ 	u64 packets;
+ };
+ 
++#define AIROHA_SOE_NUM_SA 32
++
+ /* All fields are protected by ppe_lock in airoha_ppe.c. */
+ struct airoha_ppe_soe_meta {
++	u64 cookie;
++	u64 observation;
+ 	unsigned long expires;
+ 	u32 key_hash;
+ 	u16 foe_hash;
+@@ -563,6 +567,7 @@ struct airoha_flow_table_entry {
+ 
+ 	struct rhash_head node;
+ 	unsigned long cookie;
++	u64 soe_cookie;
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -666,6 +671,7 @@ struct airoha_ppe {
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;
+ 	struct airoha_ppe_soe_meta *soe_meta;
++	u64 soe_sa_cookie[AIROHA_SOE_NUM_SA];
+ 
+ 	struct airoha_foe_stats *foe_stats;
+ 	dma_addr_t foe_stats_dma;
+@@ -777,11 +783,12 @@ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+ int airoha_qdma_xmit_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 			 u32 msg0, u32 msg1, u32 msg2);
+ void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+-			     u16 hash, u8 sa_index, u8 hop);
++			     u16 hash, u8 sa_index, u8 hop, u64 cookie);
+ bool airoha_ppe_soe_skb_marked(struct sk_buff *skb);
+ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			     struct net_device *netdev);
+-void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index);
++u64 airoha_ppe_soe_register_sa(struct airoha_ppe *ppe, u8 sa_index);
++void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index, u64 cookie);
+ 
+ extern struct mutex flow_offload_mutex;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index d52cd02..a182970 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -41,11 +41,9 @@ static DEFINE_SPINLOCK(ppe_lock);
+ #define AIROHA_PPE_SOE_CHANNEL 2
+ #define AIROHA_PPE_SOE_META_TIMEOUT_MS 1000
+ #define AIROHA_PPE_SOE_MAGIC_GDM4 0x729a
+-#define AIROHA_PPE_SOE_MARK_MAGIC 0x5e000000
+-#define AIROHA_PPE_SOE_MARK_MAGIC_MASK 0xff000000
+-#define AIROHA_PPE_SOE_MARK_HASH_MASK 0x00ffff00
+ 
+ struct airoha_ppe_soe_tuple_info {
++	u64 cookie;
+ 	unsigned int tunnel_mtu;
+ 	u8 sa_index;
+ 	u8 hop;
+@@ -592,6 +590,7 @@ static int airoha_ppe_foe_entry_set_ipv6_tuple(struct airoha_foe_entry *hwe,
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
+ static int airoha_ppe_soe_fill_inner_ipv4_data(struct sk_buff *skb,
+ 					       struct airoha_flow_data *data,
+ 					       int *type, int *l4proto)
+@@ -651,6 +650,8 @@ static int airoha_ppe_soe_fill_inner_ipv4_data(struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++#endif
++
+ static int airoha_ppe_foe_entry_set_soe_fields(struct airoha_foe_entry *hwe,
+ 					       u8 sa_index, u8 hop,
+ 					       unsigned int tunnel_mtu)
+@@ -701,7 +702,7 @@ airoha_ppe_soe_get_tuple_info(const struct flow_offload_tuple *tuple,
+ 		return -EOPNOTSUPP;
+ 
+ 	err = airoha_soe_xfrm_ppe_info(tuple->dst_cache, lower_dev,
+-				       &info->sa_index, &info->hop);
++				       &info->sa_index, &info->hop, &info->cookie);
+ 	if (err)
+ 		return err;
+ 
+@@ -714,7 +715,7 @@ airoha_ppe_soe_get_tuple_info(const struct flow_offload_tuple *tuple,
+ static int
+ airoha_ppe_foe_entry_set_soe_info(struct airoha_foe_entry *hwe,
+ 				  const struct flow_offload_tuple *tuple,
+-				  struct net_device *lower_dev)
++				  struct net_device *lower_dev, u64 *cookie)
+ {
+ 	struct airoha_ppe_soe_tuple_info info;
+ 	int err;
+@@ -728,6 +729,8 @@ airoha_ppe_foe_entry_set_soe_info(struct airoha_foe_entry *hwe,
+ 	if (err)
+ 		return err;
+ 
++	*cookie = info.cookie;
++
+ 	err = airoha_ppe_foe_entry_set_soe_fields(hwe, info.sa_index,
+ 						  info.hop, info.tunnel_mtu);
+ 	if (err)
+@@ -1298,22 +1301,52 @@ airoha_ppe_foe_prepare_bridge_subflow(struct airoha_ppe *ppe,
+ 	return err;
+ }
+ 
++static bool airoha_ppe_soe_sa_live(struct airoha_ppe *ppe, u8 sa_index,
++				   u64 cookie)
++{
++	lockdep_assert_held(&ppe_lock);
++
++	return cookie && sa_index < ARRAY_SIZE(ppe->soe_sa_cookie) &&
++	       ppe->soe_sa_cookie[sa_index] == cookie;
++}
++
++u64 airoha_ppe_soe_register_sa(struct airoha_ppe *ppe, u8 sa_index)
++{
++	u64 cookie = 0;
++
++	if (!ppe || sa_index >= ARRAY_SIZE(ppe->soe_sa_cookie))
++		return 0;
++
++	spin_lock_bh(&ppe_lock);
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++	cookie = skb_ext_airoha_soe_cookie_alloc();
++#endif
++	ppe->soe_sa_cookie[sa_index] = cookie;
++	spin_unlock_bh(&ppe_lock);
++
++	/* Exhaustion disables PPE binding, but keeps normal SOE operation. */
++	return cookie;
++}
++
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
+ static void airoha_ppe_soe_meta_store(struct airoha_ppe_soe_meta *meta,
+ 				      u32 key_hash, u16 foe_hash, u8 sa_index,
+-				      u8 hop)
++				      u8 hop, u64 cookie, u64 observation)
+ {
+ 	u8 seen = 1;
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 
+-	if (meta->valid &&
++	if (meta->valid && meta->cookie == cookie &&
+ 	    meta->key_hash == key_hash &&
+ 	    meta->foe_hash == foe_hash &&
+ 	    meta->sa_index == sa_index &&
+ 	    meta->hop == hop &&
+ 	    time_before_eq(jiffies, meta->expires))
+-		seen = min_t(u8, meta->seen + 1, U8_MAX);
++		seen = min_t(unsigned int, meta->seen + 1, U8_MAX);
+ 
++	meta->cookie = cookie;
++	meta->observation = observation;
+ 	meta->key_hash = key_hash;
+ 	meta->foe_hash = foe_hash;
+ 	meta->sa_index = sa_index;
+@@ -1324,43 +1357,55 @@ static void airoha_ppe_soe_meta_store(struct airoha_ppe_soe_meta *meta,
+ }
+ 
+ void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+-			     u16 hash, u8 sa_index, u8 hop)
++			     u16 hash, u8 sa_index, u8 hop, u64 cookie)
+ {
++	struct skb_ext_airoha_soe *ext;
+ 	struct airoha_ppe *ppe;
+ 	u32 ppe_hash_mask;
+ 
+ 	if (!dev || !skb)
+ 		return;
+ 
++	skb_ext_del(skb, SKB_EXT_AIROHA_SOE);
++
+ 	ppe = dev->priv;
+ 	if (!ppe || !ppe->soe_meta)
+ 		return;
+ 
+ 	ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+-	if (hash > ppe_hash_mask)
++	if (hash > ppe_hash_mask || !cookie)
+ 		return;
+ 
++	ext = skb_ext_add(skb, SKB_EXT_AIROHA_SOE);
++	if (!ext)
++		return;
++	ext->cookie = cookie;
++	ext->observation = skb_ext_airoha_soe_cookie_alloc();
++	if (!ext->observation) {
++		skb_ext_del(skb, SKB_EXT_AIROHA_SOE);
++		return;
++	}
++	ext->foe_hash = hash;
++
+ 	/* SOE decrypt completion is CPU-visible before normal routing has
+ 	 * selected the plaintext egress netdev. Keep the original encrypted FOE
+-	 * hash and SA hop briefly on the skb so airoha_dev_xmit() can finish
++	 * hash and SA incarnation on the skb so airoha_dev_xmit() can finish
+ 	 * the PPE entry once the final egress descriptor is known.
+ 	 */
+ 	spin_lock_bh(&ppe_lock);
+-	airoha_ppe_soe_meta_store(&ppe->soe_meta[hash], hash, hash, sa_index,
+-				  hop);
+-	ppe->foe_check_time[hash] = 0;
++	if (airoha_ppe_soe_sa_live(ppe, sa_index, cookie)) {
++		airoha_ppe_soe_meta_store(&ppe->soe_meta[hash], hash, hash,
++					  sa_index, hop, cookie, ext->observation);
++		ppe->foe_check_time[hash] = 0;
++	} else {
++		skb_ext_del(skb, SKB_EXT_AIROHA_SOE);
++	}
+ 	spin_unlock_bh(&ppe_lock);
+-
+-	skb->mark &= ~(AIROHA_PPE_SOE_MARK_MAGIC_MASK |
+-		       AIROHA_PPE_SOE_MARK_HASH_MASK);
+-	skb->mark |= AIROHA_PPE_SOE_MARK_MAGIC |
+-		     FIELD_PREP(AIROHA_PPE_SOE_MARK_HASH_MASK, hash);
+ }
+ 
+ bool airoha_ppe_soe_skb_marked(struct sk_buff *skb)
+ {
+-	return skb && ((skb->mark & AIROHA_PPE_SOE_MARK_MAGIC_MASK) ==
+-		       AIROHA_PPE_SOE_MARK_MAGIC);
++	return skb && skb_ext_find(skb, SKB_EXT_AIROHA_SOE);
+ }
+ 
+ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1369,7 +1414,9 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 	struct airoha_foe_entry entry, tmpl, *hwe;
+ 	struct airoha_flow_data data = {};
+ 	struct airoha_ppe_soe_meta *meta;
++	struct skb_ext_airoha_soe *ext;
+ 	u32 ppe_hash_mask, key_hash;
++	u64 cookie, observation;
+ 	bool soe_return_path;
+ 	struct airoha_ppe *ppe;
+ 	unsigned long expires;
+@@ -1381,27 +1428,31 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 	if (!dev || !skb || !netdev)
+ 		return;
+ 
+-	if ((skb->mark & AIROHA_PPE_SOE_MARK_MAGIC_MASK) !=
+-	    AIROHA_PPE_SOE_MARK_MAGIC)
++	ext = skb_ext_find(skb, SKB_EXT_AIROHA_SOE);
++	if (!ext)
+ 		return;
++	cookie = ext->cookie;
++	observation = ext->observation;
++	key_hash = ext->foe_hash;
+ 
+ 	ppe = dev->priv;
+ 	if (!ppe || !ppe->soe_meta)
+-		goto clear_mark;
++		goto clear_meta;
+ 
+ 	ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+-	key_hash = FIELD_GET(AIROHA_PPE_SOE_MARK_HASH_MASK, skb->mark);
+ 	if (key_hash > ppe_hash_mask)
+-		goto clear_mark;
++		goto clear_meta;
+ 
+ 	err = airoha_ppe_soe_fill_inner_ipv4_data(skb, &data, &type, &l4proto);
+ 	if (err)
+-		goto clear_mark;
++		goto clear_meta;
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 
+ 	meta = &ppe->soe_meta[key_hash];
+-	if (!meta->valid)
++	if (!meta->valid || meta->cookie != cookie ||
++	    meta->observation != observation ||
++	    !airoha_ppe_soe_sa_live(ppe, meta->sa_index, cookie))
+ 		goto unlock;
+ 
+ 	if (meta->key_hash != key_hash)
+@@ -1500,12 +1551,28 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+-clear_mark:
+-	skb->mark &= ~(AIROHA_PPE_SOE_MARK_MAGIC_MASK |
+-		       AIROHA_PPE_SOE_MARK_HASH_MASK);
++clear_meta:
++	skb_ext_del(skb, SKB_EXT_AIROHA_SOE);
++}
++
++#else
++void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			     u16 hash, u8 sa_index, u8 hop, u64 cookie)
++{
++}
++
++bool airoha_ppe_soe_skb_marked(struct sk_buff *skb)
++{
++	return false;
++}
++
++void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
++			     struct net_device *netdev)
++{
+ }
++#endif
+ 
+-void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
++void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index, u64 cookie)
+ {
+ 	u32 num_entries, hash;
+ 
+@@ -1515,6 +1582,10 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+ 	num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 
+ 	spin_lock_bh(&ppe_lock);
++	if (!airoha_ppe_soe_sa_live(ppe, sa_index, cookie))
++		goto unlock;
++	ppe->soe_sa_cookie[sa_index] = 0;
++
+ 	/* Remove CPU staging and cached flow templates under the same lock as
+ 	 * all commits. Invalidating only hardware leaves both able to rebind.
+ 	 */
+@@ -1523,18 +1594,11 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+ 		struct hlist_node *n;
+ 
+ 		if (ppe->soe_meta && ppe->soe_meta[hash].valid &&
+-		    ppe->soe_meta[hash].sa_index == sa_index)
++		    ppe->soe_meta[hash].cookie == cookie)
+ 			ppe->soe_meta[hash].valid = 0;
+ 
+ 		hlist_for_each_entry_safe(e, n, &ppe->foe_flow[hash], list) {
+-			u32 type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE,
+-					     e->data.ib1);
+-
+-			if (type != PPE_PKT_TYPE_IPV4_HNAPT &&
+-			    type != PPE_PKT_TYPE_IPV4_ROUTE)
+-				continue;
+-			if (!(e->data.ipv4.data & AIROHA_FOE_TUNNEL) ||
+-			    FIELD_GET(AIROHA_FOE_ACTDP, e->data.ipv4.data) != sa_index)
++			if (e->soe_cookie != cookie)
+ 				continue;
+ 
+ 			/* The flowtable still owns e; its destroy callback frees it. */
+@@ -1575,6 +1639,7 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+ 				       AIROHA_FOE_STATE_INVALID);
+ 		airoha_ppe_foe_commit_entry(ppe, hwe, hash, false);
+ 	}
++unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
+ 
+@@ -1621,6 +1686,12 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 		    !airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
++		if (e->soe_cookie &&
++		    !airoha_ppe_soe_sa_live(ppe,
++			FIELD_GET(AIROHA_FOE_ACTDP, e->data.ipv4.data),
++			e->soe_cookie))
++			continue;
++
+ 		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+ 		commit_done = true;
+ 		e->hash = hash;
+@@ -1684,8 +1755,15 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	if (soe_tunnel) {
+-		u32 commit_hash = airoha_ppe_foe_commit_hash(ppe, &e->data,
+-							     hash);
++		u32 commit_hash;
++
++		if (!airoha_ppe_soe_sa_live(ppe,
++					    FIELD_GET(AIROHA_FOE_ACTDP, e->data.ipv4.data),
++					    e->soe_cookie)) {
++			spin_unlock_bh(&ppe_lock);
++			return -ENOENT;
++		}
++		commit_hash = airoha_ppe_foe_commit_hash(ppe, &e->data, hash);
+ 
+ 		err = airoha_ppe_foe_commit_entry(ppe, &e->data, commit_hash,
+ 						  false);
+@@ -1806,6 +1884,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 	struct net_device *odev = NULL;
+ 	struct flow_action_entry *act;
+ 	struct airoha_foe_entry hwe;
++	u64 soe_cookie = 0;
+ 	u8 dsfield = 0, l4proto = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
+@@ -1980,7 +2059,8 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 			return err;
+ 	}
+ 
+-	err = airoha_ppe_foe_entry_set_soe_info(&hwe, tuple, odev);
++	err = airoha_ppe_foe_entry_set_soe_info(&hwe, tuple, odev,
++						&soe_cookie);
+ 	if (err)
+ 		return err;
+ 
+@@ -1989,6 +2069,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		return -ENOMEM;
+ 
+ 	e->cookie = f->cookie;
++	e->soe_cookie = soe_cookie;
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+ 
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index a8c707f..00669c8 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -43,7 +43,6 @@
+ #include "airoha_regs.h"
+ #include "airoha_soe.h"
+ 
+-#define AIROHA_SOE_NUM_SA 32
+ #define AIROHA_SOE_QDMA_HOP_DESC_LEN 32
+ #define AIROHA_SOE_KEY_WORDS 8
+ #define AIROHA_SOE_ADDR_WORDS 4
+@@ -152,6 +151,7 @@ struct airoha_soe_ctx {
+ 			u16 foe_hash;
+ 			u32 foe_reason;
+ 			u8 sa_index;
++			u64 ppe_cookie;
+ 			bool foe_valid;
+ 			u32 mark;
+ 		} rx;
+@@ -160,6 +160,7 @@ struct airoha_soe_ctx {
+ 
+ struct airoha_soe_sa {
+ 	struct airoha_soe *soe;
++	u64 ppe_cookie;
+ 	unsigned int index;
+ 	u32 cmd;
+ 	u32 spi;
+@@ -205,6 +206,7 @@ struct airoha_soe_rx_info {
+ 
+ struct airoha_soe {
+ 	struct device *dev;
++	struct airoha_eth *eth;
+ 	void __iomem *base;
+ 
+ 	/* Serialize SA table programming and software slot ownership. */
+@@ -652,6 +654,7 @@ static int airoha_soe_alloc_sa(struct airoha_soe *soe, struct xfrm_state *x,
+ 	INIT_LIST_HEAD(&new_sa->tx_queue);
+ 	INIT_LIST_HEAD(&new_sa->rx_queue);
+ 	init_completion(&new_sa->idle);
++	new_sa->ppe_cookie = airoha_ppe_soe_register_sa(soe->eth->ppe, i);
+ 	rcu_assign_pointer(soe->sa[i], new_sa);
+ 	soe->sa_map |= BIT(i);
+ 	mutex_unlock(&soe->sa_lock);
+@@ -1150,6 +1153,7 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 	ctx->rx.foe_hash = foe_hash;
+ 	ctx->rx.foe_reason = foe_reason;
+ 	ctx->rx.sa_index = state->sa->index;
++	ctx->rx.ppe_cookie = state->sa->ppe_cookie;
+ 	ctx->rx.foe_valid = foe_valid;
+ 	ctx->rx.mark = skb->mark;
+ 
+@@ -1285,7 +1289,8 @@ static bool airoha_soe_complete_in(struct sk_buff *skb,
+ 	if (ctx->rx.foe_valid)
+ 		airoha_ppe_soe_mark_skb(&ctx->rx.gdm_dev->eth->ppe->dev, skb,
+ 					ctx->rx.foe_hash, ctx->rx.sa_index,
+-					AIROHA_SOE_HOP_INFO_DECRYPT);
++					AIROHA_SOE_HOP_INFO_DECRYPT,
++					ctx->rx.ppe_cookie);
+ 
+ 	kfree(ctx);
+ 	netif_rx(skb);
+@@ -1358,7 +1363,7 @@ bool airoha_soe_has_pending_rx(struct airoha_soe *soe)
+ 
+ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+ 			     struct net_device *lower_dev, u8 *sa_index,
+-			     u8 *hop)
++			     u8 *hop, u64 *cookie)
+ {
+ 	struct airoha_soe_xfrm_state *state;
+ 	struct net_device *state_dev;
+@@ -1366,7 +1371,7 @@ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+ 	unsigned long handle;
+ 	int err = -ENODEV;
+ 
+-	if (!dst || !sa_index || !hop)
++	if (!dst || !sa_index || !hop || !cookie)
+ 		return -EINVAL;
+ 
+ 	x = dst_xfrm(dst);
+@@ -1419,7 +1424,10 @@ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+ 		goto out;
+ 	}
+ 
++	if (READ_ONCE(state->sa->dead) || !state->sa->ppe_cookie)
++		goto out;
+ 	*sa_index = state->sa->index;
++	*cookie = state->sa->ppe_cookie;
+ 	err = 0;
+ out:
+ 	rcu_read_unlock();
+@@ -1484,7 +1492,8 @@ static void airoha_soe_xfrm_state_delete(struct net_device *dev,
+ 
+ 	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
+ 	if (state && state->sa) {
+-		airoha_ppe_soe_flush_sa(state->dev->eth->ppe, state->sa->index);
++		airoha_ppe_soe_flush_sa(state->dev->eth->ppe, state->sa->index,
++					state->sa->ppe_cookie);
+ 		airoha_soe_abort_sa(state->sa);
+ 	}
+ }
+@@ -1500,7 +1509,7 @@ static void airoha_soe_xfrm_state_free(struct net_device *dev,
+ 
+ 	if (state->sa) {
+ 		airoha_ppe_soe_flush_sa(state->dev->eth->ppe,
+-					state->sa->index);
++					state->sa->index, state->sa->ppe_cookie);
+ 		airoha_soe_free_sa(state->sa);
+ 	}
+ 	if (state->counted)
+@@ -1912,6 +1921,7 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	}
+ 
+ 	soe->dev = dev;
++	soe->eth = eth;
+ 	soe->base = base;
+ 	mutex_init(&soe->sa_lock);
+ 	spin_lock_init(&soe->state_lock);
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 1a34717..d3ea5ae 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -51,7 +51,7 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev,
+ bool airoha_soe_has_pending_rx(struct airoha_soe *soe);
+ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+ 			     struct net_device *lower_dev, u8 *sa_index,
+-			     u8 *hop);
++			     u8 *hop, u64 *cookie);
+ int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
+ 		    struct sk_buff *skb, struct xfrm_state *x);
+ #else
+@@ -112,7 +112,7 @@ static inline bool airoha_soe_has_pending_rx(struct airoha_soe *soe)
+ 
+ static inline int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+ 					   struct net_device *lower_dev,
+-					   u8 *sa_index, u8 *hop)
++					   u8 *sa_index, u8 *hop, u64 *cookie)
+ {
+ 	return -EOPNOTSUPP;
+ }
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index a14d7c9..535150c 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4916,6 +4916,18 @@ static inline void skb_set_nfct(struct sk_buff *skb, unsigned long nfct)
+ }
+ 
+ #ifdef CONFIG_SKB_EXTENSIONS
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++/* Immutable delayed PPE binding identity; contains no owned pointers. */
++struct skb_ext_airoha_soe {
++	u64 cookie;
++	u64 observation;
++	u16 foe_hash;
++};
++
++/* Non-reused identities survive driver unbind and module reload. */
++u64 skb_ext_airoha_soe_cookie_alloc(void);
++#endif
++
+ enum skb_ext_id {
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	SKB_EXT_BRIDGE_NF,
+@@ -4934,6 +4946,9 @@ enum skb_ext_id {
+ #endif
+ #if IS_ENABLED(CONFIG_INET_PSP)
+ 	SKB_EXT_PSP,
++#endif
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++	SKB_EXT_AIROHA_SOE,
+ #endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 7cd4f55..e174850 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -5101,7 +5101,30 @@ EXPORT_SYMBOL_GPL(skb_segment);
+ #define SKB_EXT_ALIGN_VALUE	8
+ #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++/* Kept in the networking core so driver reload cannot reuse an identity. */
++static DEFINE_SPINLOCK(skb_ext_airoha_soe_cookie_lock);
++static u64 skb_ext_airoha_soe_cookie;
++
++u64 skb_ext_airoha_soe_cookie_alloc(void)
++{
++	unsigned long flags;
++	u64 cookie = 0;
++
++	spin_lock_irqsave(&skb_ext_airoha_soe_cookie_lock, flags);
++	if (skb_ext_airoha_soe_cookie != U64_MAX)
++		cookie = ++skb_ext_airoha_soe_cookie;
++	spin_unlock_irqrestore(&skb_ext_airoha_soe_cookie_lock, flags);
++
++	return cookie;
++}
++EXPORT_SYMBOL_GPL(skb_ext_airoha_soe_cookie_alloc);
++#endif
++
+ static const u8 skb_ext_type_len[] = {
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++	[SKB_EXT_AIROHA_SOE] = SKB_EXT_CHUNKSIZEOF(struct skb_ext_airoha_soe),
++#endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+ #endif
+-- 
+2.43.0
+

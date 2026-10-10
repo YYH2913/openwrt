@@ -1,0 +1,149 @@
+From 8caff2ac4a1015919777819cddc9bf9550357fea Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:27:33 -0700
+Subject: [PATCH] net: airoha: npu: quarantine unfinished mailbox requests
+
+A polling timeout leaves the blocking NPU callback free to keep using the
+coherent mailbox buffer and to post DONE later. Reusing the buffer and
+control registers for a new request can corrupt the old request or accept
+its late response as completion of the new request.
+
+Keep a timed-out request pending under the mailbox lock. Reject further
+submissions with -EBUSY without changing its buffer or control registers
+until the original DONE is observed. The SDK blocking-mailbox contract
+states that DONE follows callback completion, so a late DONE can release
+the buffer even when the callback returned an error.
+
+Refuse core 0 recovery while that request is unfinished: the SDK reboot
+preserves firmware state and provides no request cancellation fence.
+Checking mailbox readiness when waiting for recovery also prevents an
+unrelated core's successful restart from hiding the unfinished request.
+Do not replace the recorded status of an actual restart when refusing to
+start one.
+
+Normal completed requests and recovery with no pending request keep their
+existing behavior. A permanently stalled callback leaves mailbox service
+unavailable; this change does not invent a hardware stop or DMA-drain
+sequence. Extracted-source ASan/UBSan fixtures fail four ownership cases
+before the fix and pass all eight cases after it. The private arm64 object
+build also passes with the target GCC and -Werror.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_npu.c  | 51 ++++++++++++++++++++++-
+ include/linux/soc/airoha/airoha_offload.h |  2 +
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index aa16ecd..3d7b12e 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -165,6 +165,29 @@ struct wlan_mbox_data {
+ 	DECLARE_FLEX_ARRAY(u8, d);
+ };
+ 
++/* Caller holds core 0's mailbox lock. */
++static int airoha_npu_check_mbox(struct airoha_npu *npu)
++{
++	struct airoha_npu_core *core = &npu->cores[0];
++	u32 val;
++	int ret;
++
++	if (!core->mbox_pending)
++		return 0;
++
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3), &val);
++	if (ret)
++		return ret;
++	if (!(val & MBOX_MSG_DONE))
++		return -EBUSY;
++
++	/* The original blocking callback has finished using its buffer. */
++	dma_rmb();
++	core->mbox_pending = false;
++
++	return 0;
++}
++
+ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 				 const void *data, int len, void *reply,
+ 				 u16 reply_len)
+@@ -196,6 +219,9 @@ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 		ret = -EAGAIN;
+ 		goto unlock;
+ 	}
++	ret = airoha_npu_check_mbox(npu);
++	if (ret)
++		goto unlock;
+ 
+ 	memcpy(core->buf, data, len);
+ 	dma_wmb();
+@@ -211,7 +237,10 @@ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+ 					      val, (val & MBOX_MSG_DONE),
+ 					      100, 100 * MSEC_PER_SEC);
+-	if (!ret) {
++	if (ret) {
++		/* Timeout does not cancel NPU access or its eventual DONE. */
++		core->mbox_pending = true;
++	} else {
+ 		dma_rmb();
+ 		if (FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
+ 			ret = -EINVAL;
+@@ -348,6 +377,15 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+ 		spin_unlock_bh(&npu->cores[i].lock);
+ 	}
+ 
++	/* Rebooting core 0 is not a cancellation fence for its mailbox. */
++	if (!core) {
++		spin_lock_bh(&npu->cores[0].lock);
++		err = airoha_npu_check_mbox(npu);
++		spin_unlock_bh(&npu->cores[0].lock);
++		if (err)
++			goto abort;
++	}
++
+ 	err = regmap_read(npu->regmap, REG_CR_BOOT_CONFIG, &val);
+ 	if (err)
+ 		goto out;
+@@ -368,6 +406,7 @@ static int airoha_npu_restart_core(struct airoha_npu *npu, int core)
+ 
+ out:
+ 	npu->recovery_err = err;
++abort:
+ 	atomic_set(&npu->recovering, 0);
+ unlock:
+ 	mutex_unlock(&npu->recovery_lock);
+@@ -386,7 +425,15 @@ int airoha_npu_wait_recovery(struct airoha_npu *npu)
+ 	int err;
+ 
+ 	mutex_lock(&npu->recovery_lock);
+-	err = npu->stopping ? -ESHUTDOWN : npu->recovery_err;
++	if (npu->stopping) {
++		err = -ESHUTDOWN;
++	} else {
++		spin_lock_bh(&npu->cores[0].lock);
++		err = airoha_npu_check_mbox(npu);
++		spin_unlock_bh(&npu->cores[0].lock);
++		if (!err)
++			err = npu->recovery_err;
++	}
+ 	mutex_unlock(&npu->recovery_lock);
+ 
+ 	return err;
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 3d0a387..56e7301 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -188,6 +188,8 @@ struct airoha_npu {
+ 		/* Coherent bounce buffer for mailbox cmd/rsp */
+ 		void *buf;
+ 		dma_addr_t addr;
++		/* A timed-out request owns buf until its DONE is observed. */
++		bool mbox_pending;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];
+-- 
+2.43.0
+

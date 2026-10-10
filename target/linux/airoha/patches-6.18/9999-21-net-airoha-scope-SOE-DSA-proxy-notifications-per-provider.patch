@@ -1,0 +1,252 @@
+From 62bc38dee234fb7a2d6653be764b6ebe4fff28b4 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:34:07 -0700
+Subject: [PATCH] net: airoha: scope SOE DSA proxy notifications per provider
+
+Keep DSA proxy ownership with each SOE provider and process register,
+unregister, feature and conduit-change events in every network namespace.
+Flush user policies and conduit states before removing a proxy, and make
+repeated notifier events harmless.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.c | 146 +++++++++++++++++------
+ 1 file changed, 112 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 00669c8..1b9a3d4 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -204,6 +204,12 @@ struct airoha_soe_rx_info {
+ 	__be32 spi;
+ };
+ 
++struct airoha_soe_dsa_proxy {
++	struct list_head list;
++	struct net_device *dev;
++	struct net_device *conduit;
++};
++
+ struct airoha_soe {
+ 	struct device *dev;
+ 	struct airoha_eth *eth;
+@@ -219,6 +225,10 @@ struct airoha_soe {
+ 	refcount_t refcnt;
+ 	struct completion released;
+ 	bool dead;
++
++	/* Netdevice notifications and proxy ownership are serialized by RTNL. */
++	struct notifier_block netdev_notifier;
++	struct list_head dsa_proxies;
+ };
+ 
+ static const struct xfrmdev_ops airoha_soe_xfrmdev_ops;
+@@ -1751,16 +1761,43 @@ static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops = {
+ 	.flags = XFRMDEV_OPS_F_LOWER_HANDLE,
+ };
+ 
+-static void airoha_soe_dsa_proxy_enable(struct net_device *dev)
++static struct airoha_soe_dsa_proxy *
++airoha_soe_dsa_proxy_find(struct airoha_soe *soe, struct net_device *dev)
+ {
+-	struct net_device *conduit;
++	struct airoha_soe_dsa_proxy *proxy;
+ 
+-	conduit = airoha_soe_dsa_conduit_get(dev);
+-	if (!conduit)
++	list_for_each_entry(proxy, &soe->dsa_proxies, list)
++		if (proxy->dev == dev)
++			return proxy;
++
++	return NULL;
++}
++
++static void airoha_soe_dsa_proxy_enable(struct airoha_soe *soe,
++					struct net_device *dev,
++					struct net_device *conduit)
++{
++	struct airoha_soe_dsa_proxy *proxy;
++	struct airoha_gdm_dev *gdm_dev;
++
++	if (READ_ONCE(soe->dead) || !dsa_user_dev_check(dev) ||
++	    conduit->xfrmdev_ops != &airoha_soe_xfrmdev_ops)
+ 		return;
+ 
+-	if (dev->xfrmdev_ops && dev->xfrmdev_ops != &airoha_soe_dsa_xfrmdev_ops)
+-		goto out;
++	gdm_dev = netdev_priv(conduit);
++	if (gdm_dev->eth != soe->eth ||
++	    airoha_soe_dsa_proxy_find(soe, dev) || dev->xfrmdev_ops)
++		return;
++
++	proxy = kzalloc(sizeof(*proxy), GFP_KERNEL);
++	if (!proxy)
++		return;
++
++	dev_hold(dev);
++	dev_hold(conduit);
++	proxy->dev = dev;
++	proxy->conduit = conduit;
++	list_add_tail(&proxy->list, &soe->dsa_proxies);
+ 
+ 	/* Mirror ESP capability onto DSA users while programming SAs on the conduit. */
+ 	dev->xfrmdev_ops = &airoha_soe_dsa_xfrmdev_ops;
+@@ -1771,51 +1808,96 @@ static void airoha_soe_dsa_proxy_enable(struct net_device *dev)
+ 	conduit->wanted_features |= NETIF_F_HW_ESP;
+ 	netdev_update_features(conduit);
+ 	netdev_update_features(dev);
+-out:
+-	dev_put(conduit);
+ }
+ 
+-static void airoha_soe_dsa_proxy_clear(struct net_device *dev)
++static void airoha_soe_dsa_proxy_flush(struct airoha_soe_dsa_proxy *proxy)
+ {
+-	if (dev->xfrmdev_ops != &airoha_soe_dsa_xfrmdev_ops)
+-		return;
++	/* A feature change only validates the XFRM API; it does not flush SAs.
++	 * XFRM stores the DSA user's device in xso.dev/xdo.dev. The private
++	 * state object still records the conduit for SOE programming, but that
++	 * must not make withdrawal flush unrelated conduit-owned states.
++	 */
++	xfrm_dev_state_flush(dev_net(proxy->dev), proxy->dev, true);
++	xfrm_dev_policy_flush(dev_net(proxy->dev), proxy->dev, true);
++}
++
++static void airoha_soe_dsa_proxy_clear(struct airoha_soe_dsa_proxy *proxy)
++{
++	struct net_device *dev = proxy->dev;
++
++	list_del(&proxy->list);
++	airoha_soe_dsa_proxy_flush(proxy);
+ 
+ 	dev->wanted_features &= ~NETIF_F_HW_ESP;
+ 	dev->hw_features &= ~NETIF_F_HW_ESP;
+ 	dev->hw_enc_features &= ~NETIF_F_HW_ESP;
+ 	netdev_update_features(dev);
+ 	dev->xfrmdev_ops = NULL;
++	dev_put(proxy->conduit);
++	dev_put(dev);
++	kfree(proxy);
+ }
+ 
+-static void airoha_soe_dsa_proxy_scan(bool enable)
++static void airoha_soe_dsa_proxy_register(struct airoha_soe *soe,
++					  struct net_device *dev)
+ {
+-	struct net_device *dev;
++	struct net_device *conduit;
+ 
+-	for_each_netdev(&init_net, dev) {
+-		if (enable)
+-			airoha_soe_dsa_proxy_enable(dev);
+-		else
+-			airoha_soe_dsa_proxy_clear(dev);
+-	}
++	conduit = airoha_soe_dsa_conduit_get(dev);
++	if (!conduit)
++		return;
++
++	airoha_soe_dsa_proxy_enable(soe, dev, conduit);
++	dev_put(conduit);
+ }
+ 
+ static int airoha_soe_netdev_event(struct notifier_block *nb,
+ 				   unsigned long event, void *ptr)
+ {
++	struct airoha_soe *soe = container_of(nb, struct airoha_soe,
++					    netdev_notifier);
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++	struct airoha_soe_dsa_proxy *proxy, *tmp;
++
+ 	switch (event) {
+ 	case NETDEV_REGISTER:
+-	case NETDEV_CHANGENAME:
+-		airoha_soe_dsa_proxy_scan(true);
++		airoha_soe_dsa_proxy_register(soe, dev);
++		break;
++	case NETDEV_UNREGISTER:
++		list_for_each_entry_safe(proxy, tmp, &soe->dsa_proxies, list) {
++			if (proxy->dev != dev && proxy->conduit != dev)
++				continue;
++			if (dev->moving_ns)
++				airoha_soe_dsa_proxy_flush(proxy);
++			else
++				airoha_soe_dsa_proxy_clear(proxy);
++		}
++		break;
++	case NETDEV_FEAT_CHANGE:
++		proxy = airoha_soe_dsa_proxy_find(soe, dev);
++		if (proxy && !(dev->features & NETIF_F_HW_ESP))
++			airoha_soe_dsa_proxy_flush(proxy);
++		break;
++	case NETDEV_CHANGEUPPER: {
++		struct netdev_notifier_changeupper_info *info = ptr;
++
++		/* DSA updates cpu_dp after linking the new conduit, so use the
++		 * notification's lower device rather than the old cpu_dp here.
++		 */
++		proxy = airoha_soe_dsa_proxy_find(soe, info->upper_dev);
++		if (!info->linking) {
++			if (proxy && proxy->conduit == dev)
++				airoha_soe_dsa_proxy_clear(proxy);
++		} else {
++			airoha_soe_dsa_proxy_enable(soe, info->upper_dev, dev);
++		}
+ 		break;
+ 	}
++	}
+ 
+ 	return NOTIFY_DONE;
+ }
+ 
+-static struct notifier_block airoha_soe_netdev_notifier = {
+-	.notifier_call = airoha_soe_netdev_event,
+-};
+-
+ void airoha_soe_build_netdev(struct net_device *netdev,
+ 			     airoha_soe_xmit_skb_t xmit_skb)
+ {
+@@ -1927,6 +2009,8 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	spin_lock_init(&soe->state_lock);
+ 	refcount_set(&soe->refcnt, 1);
+ 	init_completion(&soe->released);
++	INIT_LIST_HEAD(&soe->dsa_proxies);
++	soe->netdev_notifier.notifier_call = airoha_soe_netdev_event;
+ 
+ 	/* Enable the packet engines; reset leaves SOE present but idle. */
+ 	writel(AIROHA_SOE_INT_ALL, base + AIROHA_SOE_INT_STS);
+@@ -1935,16 +2019,12 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	writel(AIROHA_SOE_GLB_CFG_ENC_EN | AIROHA_SOE_GLB_CFG_DEC_EN,
+ 	       base + AIROHA_SOE_GLB_CFG);
+ 
+-	err = register_netdevice_notifier(&airoha_soe_netdev_notifier);
++	err = register_netdevice_notifier(&soe->netdev_notifier);
+ 	if (err)
+ 		goto disable_soe;
+ 
+ 	eth->soe = soe;
+ 
+-	rtnl_lock();
+-	airoha_soe_dsa_proxy_scan(true);
+-	rtnl_unlock();
+-
+ 	of_node_put(np);
+ 
+ 	return 0;
+@@ -1973,10 +2053,8 @@ void airoha_soe_deinit(struct airoha_eth *eth)
+ 	soe->dead = true;
+ 	spin_unlock_irqrestore(&soe->state_lock, flags);
+ 
+-	rtnl_lock();
+-	airoha_soe_dsa_proxy_scan(false);
+-	rtnl_unlock();
+-	unregister_netdevice_notifier(&airoha_soe_netdev_notifier);
++	/* Unregister replays removal events in every network namespace. */
++	unregister_netdevice_notifier(&soe->netdev_notifier);
+ 
+ 	airoha_soe_put_ref(soe);
+ 	wait_for_completion(&soe->released);
+-- 
+2.43.0
+

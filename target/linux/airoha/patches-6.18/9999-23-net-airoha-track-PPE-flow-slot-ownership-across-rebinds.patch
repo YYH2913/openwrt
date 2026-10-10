@@ -1,0 +1,281 @@
+From ecf62bb4426d7f27923f72e80503416b5df6d1c6 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:37:13 -0700
+Subject: [PATCH] net: airoha: track PPE flow slot ownership across rebinds
+
+A PPE hash slot can be reused after a flow ages out or after a cached
+SOE flow is rebound. The old flow's destroy callback then invalidates
+the new flow's slot, and an L2 subflow can retain a 0xffff sentinel
+while the parent walks it. Direct SOE commits also displaced software
+metadata without informing the flow owner.
+
+Keep one owner pointer per slot under ppe_lock. Commit publication
+transfers ownership only after the DMA commit succeeds, retires a
+flow's old slot before migration, and leaves the previous owner intact
+when a replacement commit fails. All L2/L3 destroy, cache rebind,
+flush, and hardware mismatch paths clear ownership before an object is
+freed. Allocate the owner table with the PPE lifetime.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h |  2 +
+ drivers/net/ethernet/airoha/airoha_ppe.c | 93 ++++++++++++++++++------
+ 2 files changed, 74 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 947f2e3..cdac052 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -669,6 +669,8 @@ struct airoha_ppe {
+ 	struct rhashtable l2_flows;
+ 
+ 	struct hlist_head *foe_flow;
++	/* Software slot ownership, protected by ppe_lock. */
++	struct airoha_flow_table_entry **foe_owner;
+ 	u16 *foe_check_time;
+ 	struct airoha_ppe_soe_meta *soe_meta;
+ 	u64 soe_sa_cookie[AIROHA_SOE_NUM_SA];
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 1c3b979..6c13609 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -965,9 +965,21 @@ static bool airoha_ppe_foe_compare_entry(struct airoha_flow_table_entry *e,
+ 	return !memcmp(&e->data.d, &hwe->d, len - sizeof(hwe->ib1));
+ }
+ 
++static void
++airoha_ppe_foe_flow_unbind(struct airoha_ppe *ppe,
++			   struct airoha_flow_table_entry *e)
++{
++	lockdep_assert_held(&ppe_lock);
++
++	if (e->hash != 0xffff && ppe->foe_owner[e->hash] == e)
++		ppe->foe_owner[e->hash] = NULL;
++	e->hash = 0xffff;
++}
++
+ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ 				       struct airoha_foe_entry *e,
+-				       u32 hash, bool rx_wlan)
++				       u32 hash, bool rx_wlan,
++				       struct airoha_flow_table_entry *owner)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
+@@ -976,6 +988,24 @@ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ 	struct airoha_npu *npu;
+ 	int err = 0;
+ 
++	lockdep_assert_held(&ppe_lock);
++
++	/* Retire a flow's former slot before publishing its replacement. This
++	 * makes a failed source retirement leave the old owner intact and a
++	 * failed destination commit leave no live software owner behind.
++	 */
++	if (owner && owner->hash != 0xffff && owner->hash != hash &&
++	    ppe->foe_owner[owner->hash] == owner) {
++		struct airoha_foe_entry old = owner->data;
++		u32 old_hash = owner->hash;
++
++		old.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++		old.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
++				       AIROHA_FOE_STATE_INVALID);
++		if (airoha_ppe_foe_commit_entry(ppe, &old, old_hash, false, NULL))
++			return -EIO;
++	}
++
+ 	memcpy(&hwe->d, &e->d, sizeof(*hwe) - sizeof(hwe->ib1));
+ 	wmb();
+ 
+@@ -1005,7 +1035,17 @@ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ unlock:
+ 	rcu_read_unlock();
+ 
+-	return err;
++	if (err)
++		return err;
++
++	if (ppe->foe_owner[hash])
++		airoha_ppe_foe_flow_unbind(ppe, ppe->foe_owner[hash]);
++	if (owner) {
++		owner->hash = hash;
++		ppe->foe_owner[hash] = owner;
++	}
++
++	return 0;
+ }
+ 
+ static bool airoha_ppe_foe_commit_slot_free(struct airoha_ppe *ppe,
+@@ -1106,13 +1146,14 @@ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
+ 	lockdep_assert_held(&ppe_lock);
+ 
+ 	hlist_del_init(&e->list);
+-	if (e->hash != 0xffff) {
++	if (e->hash != 0xffff && ppe->foe_owner[e->hash] == e) {
+ 		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+ 					  AIROHA_FOE_STATE_INVALID);
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, e->hash, false);
+-		e->hash = 0xffff;
++		airoha_ppe_foe_commit_entry(ppe, &e->data, e->hash, false,
++					    NULL);
+ 	}
++	airoha_ppe_foe_flow_unbind(ppe, e);
+ 	if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+ 		hlist_del_init(&e->l2_subflow_node);
+ 		kfree(e);
+@@ -1149,7 +1190,8 @@ static void airoha_ppe_foe_flow_remove_entry(struct airoha_ppe *ppe,
+ static int
+ airoha_ppe_foe_commit_subflow(struct airoha_ppe *ppe,
+ 			      const struct airoha_foe_entry *bridge,
+-			      u32 hash, bool rx_wlan)
++			      u32 hash, bool rx_wlan,
++			      struct airoha_flow_table_entry *owner)
+ {
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+@@ -1182,7 +1224,7 @@ airoha_ppe_foe_commit_subflow(struct airoha_ppe *ppe,
+ 	}
+ 
+ 	hwe.bridge.data = bridge->bridge.data;
+-	return airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	return airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan, owner);
+ }
+ 
+ static int
+@@ -1197,7 +1239,8 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 	if (!f)
+ 		return -ENOMEM;
+ 
+-	err = airoha_ppe_foe_commit_subflow(ppe, &e->data, hash, rx_wlan);
++	f->hash = 0xffff;
++	err = airoha_ppe_foe_commit_subflow(ppe, &e->data, hash, rx_wlan, f);
+ 	if (err) {
+ 		kfree(f);
+ 		return err;
+@@ -1205,7 +1248,6 @@ airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+ 
+ 	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+ 	f->type = FLOW_TYPE_L2_SUBFLOW;
+-	f->hash = hash;
+ 
+ 	return 0;
+ }
+@@ -1547,7 +1589,7 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 	err = airoha_ppe_foe_entry_set_soe_fields(&entry, sa_index, hop,
+ 						  AIROHA_PPE_SOE_DEFAULT_TUNNEL_MTU);
+ 	if (!err)
+-		airoha_ppe_foe_commit_entry(ppe, &entry, hash, false);
++		airoha_ppe_foe_commit_entry(ppe, &entry, hash, false, NULL);
+ 
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1603,7 +1645,7 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index, u64 cookie)
+ 
+ 			/* The flowtable still owns e; its destroy callback frees it. */
+ 			hlist_del_init(&e->list);
+-			e->hash = 0xffff;
++			airoha_ppe_foe_flow_unbind(ppe, e);
+ 		}
+ 	}
+ 
+@@ -1637,7 +1679,7 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index, u64 cookie)
+ 		hwe->ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+ 		hwe->ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+ 				       AIROHA_FOE_STATE_INVALID);
+-		airoha_ppe_foe_commit_entry(ppe, hwe, hash, false);
++		airoha_ppe_foe_commit_entry(ppe, hwe, hash, false, NULL);
+ 	}
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1676,7 +1718,7 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 		if (e->type == FLOW_TYPE_L2_SUBFLOW) {
+ 			state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1);
+ 			if (state != AIROHA_FOE_STATE_BIND) {
+-				e->hash = 0xffff;
++				airoha_ppe_foe_flow_unbind(ppe, e);
+ 				airoha_ppe_foe_remove_flow(ppe, e);
+ 			}
+ 			continue;
+@@ -1692,9 +1734,8 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 			e->soe_cookie))
+ 			continue;
+ 
+-		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+-		commit_done = true;
+-		e->hash = hash;
++		if (!airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan, e))
++			commit_done = true;
+ 	}
+ 
+ 	if (commit_done)
+@@ -1708,7 +1749,8 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 	if (e)
+ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
+ 	else if (bridge_ready)
+-		airoha_ppe_foe_commit_subflow(ppe, &bridge_hwe, hash, rx_wlan);
++		airoha_ppe_foe_commit_subflow(ppe, &bridge_hwe, hash, rx_wlan,
++					      NULL);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
+@@ -1770,13 +1812,12 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+ 		}
+ 
+ 		err = airoha_ppe_foe_commit_entry(ppe, &e->data, commit_hash,
+-						  false);
++						  false, e);
+ 		if (err) {
+ 			spin_unlock_bh(&ppe_lock);
+ 			return err;
+ 		}
+ 
+-		e->hash = commit_hash;
+ 	}
+ 	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1818,6 +1859,11 @@ airoha_ppe_foe_flow_l2_entry_update(struct airoha_ppe *ppe,
+ 		u32 ib1, state;
+ 		int idle;
+ 
++		if (iter->hash == 0xffff) {
++			airoha_ppe_foe_remove_flow(ppe, iter);
++			continue;
++		}
++
+ 		hwe = airoha_ppe_foe_get_entry_locked(ppe, iter->hash);
+ 		if (!hwe)
+ 			continue;
+@@ -1825,7 +1871,7 @@ airoha_ppe_foe_flow_l2_entry_update(struct airoha_ppe *ppe,
+ 		ib1 = READ_ONCE(hwe->ib1);
+ 		state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+ 		if (state != AIROHA_FOE_STATE_BIND) {
+-			iter->hash = 0xffff;
++			airoha_ppe_foe_flow_unbind(ppe, iter);
+ 			airoha_ppe_foe_remove_flow(ppe, iter);
+ 			continue;
+ 		}
+@@ -1861,7 +1907,7 @@ static void airoha_ppe_foe_flow_entry_update(struct airoha_ppe *ppe,
+ 
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+ 	if (!airoha_ppe_foe_compare_entry(e, &hwe)) {
+-		e->hash = 0xffff;
++		airoha_ppe_foe_flow_unbind(ppe, e);
+ 		goto unlock;
+ 	}
+ 
+@@ -2484,6 +2530,11 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	if (!ppe->foe_flow)
+ 		return -ENOMEM;
+ 
++	ppe->foe_owner = devm_kcalloc(eth->dev, ppe_num_entries,
++				      sizeof(*ppe->foe_owner), GFP_KERNEL);
++	if (!ppe->foe_owner)
++		return -ENOMEM;
++
+ 	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+ 	if (ppe_num_stats_entries > 0) {
+ 		foe_size = ppe_num_stats_entries * sizeof(*ppe->foe_stats);
+-- 
+2.43.0
+

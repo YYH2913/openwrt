@@ -1,0 +1,26 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: validate the complete SOE IPv4 header
+
+IPv4 options extend the header beyond the base 20 bytes. Validate IHL
+and pull the full header before returning the skb to IP output, whose
+checksum helper reads iph->ihl words. Use that same length for the
+transport offset. Reject undersized IHL and truncated options without
+changing valid IPv4 or fixed IPv6 header handling.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -790,7 +790,11 @@
+ 
+ 	switch (skb->data[0] & 0xf0) {
+ 	case 0x40:
+-		hdr_len = sizeof(struct iphdr);
++		if (!pskb_may_pull(skb, sizeof(struct iphdr)))
++			return -EINVAL;
++		hdr_len = (skb->data[0] & 0x0f) * 4;
++		if (hdr_len < sizeof(struct iphdr))
++			return -EINVAL;
+ 		skb->protocol = htons(ETH_P_IP);
+ 		break;
+ 	case 0x60:

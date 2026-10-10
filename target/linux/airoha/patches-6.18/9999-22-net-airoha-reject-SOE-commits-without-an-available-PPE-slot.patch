@@ -1,0 +1,45 @@
+From 2afac5fbf1643afd4d0bf111daaecf6c5ebd975e Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:28:02 -0700
+Subject: [PATCH] net: airoha: reject SOE commits without an available PPE slot
+
+The SOE force-commit probe returns the base hash even when every
+examined slot belongs to an unrelated live flow. The caller then
+overwrites that entry and reports a successful offload.
+
+Return the existing unbound sentinel after exhausting the probe and
+reject the flow with ENOSPC before publishing any hardware or cache
+state. Unreadable SRAM slots also remain unavailable.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index a182970..1c3b979 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1097,7 +1097,7 @@ static u32 airoha_ppe_foe_commit_hash(struct airoha_ppe *ppe,
+ 		}
+ 	}
+ 
+-	return hash;
++	return 0xffff;
+ }
+ 
+ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
+@@ -1764,6 +1764,10 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+ 			return -ENOENT;
+ 		}
+ 		commit_hash = airoha_ppe_foe_commit_hash(ppe, &e->data, hash);
++		if (commit_hash == 0xffff) {
++			spin_unlock_bh(&ppe_lock);
++			return -ENOSPC;
++		}
+ 
+ 		err = airoha_ppe_foe_commit_entry(ppe, &e->data, commit_hash,
+ 						  false);
+-- 
+2.43.0
+

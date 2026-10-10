@@ -1,0 +1,235 @@
+From 9e1eed21a672dc184c21e0c1d53257101debe13a Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 19:59:28 -0700
+Subject: [PATCH] bonding: defer replicated XFRM deletes out of atomic context
+
+XFRM invokes xdo_dev_state_delete while holding the state's spin_lock_bh.
+Taking ipsec_lock there can sleep and reverses the migration lock order.
+
+Publish a delete request through the RCU upper-private object and reject
+new lower handle/offload lookups immediately. A bond-level worker scans
+only states owned by the mutex-protected list and serializes lower delete
+callbacks with slave add/remove and free. Free also performs any pending
+delete, so a forced XFRM flush need not wait for the worker or retain a
+state reference as a substitute for private-handle lifetime.
+
+Gate work submission against uninit before canceling outside the mutex.
+Retire pending offload adds at uninit, and retain ipsec_lock until the
+private destructor: XFRM can finish freeing an already-retired pending
+state after ndo_uninit while still owning its netdev reference.
+
+Preserve the original imported patches and active-backup atomic lower
+delete path. Source-extracted ASan/UBSan pthread fixtures reproduce the
+old atomic mutex and post-uninit mutex use and cover eleven corrected
+lifecycle/scheduling cases. The configured AArch64 bond_main.o compile
+passes. Hardware and live kernel RCU stress are outside this validation.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/bonding/bond_main.c | 94 +++++++++++++++++++++++++++------
+ include/net/bonding.h           |  5 ++
+ 2 files changed, 82 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index b811930..fca72f0 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -564,6 +564,24 @@ static void bond_ipsec_lag_call_state(struct xfrm_state *xs,
+ 	}
+ }
+ 
++static void bond_ipsec_delete_work(struct work_struct *work)
++{
++	struct bonding *bond = container_of(work, struct bonding,
++					    ipsec_delete_work);
++	struct bond_ipsec *ipsec;
++
++	/* The list owns each xs until free_sa removes it under this mutex.
++	 * Do not retain a state or an instance after dropping the mutex:
++	 * forced XFRM flush may free private handles with state refs held.
++	 */
++	mutex_lock(&bond->ipsec_lock);
++	list_for_each_entry(ipsec, &bond->ipsec_list, list) {
++		if (ipsec->replicated && READ_ONCE(ipsec->delete_requested))
++			bond_ipsec_lag_call_state(ipsec->xs, ipsec, true, false);
++	}
++	mutex_unlock(&bond->ipsec_lock);
++}
++
+ static int bond_ipsec_lag_add_inst(struct xfrm_state *xs,
+ 				   struct bond_ipsec_inst *inst,
+ 				   struct netlink_ext_ack *extack)
+@@ -636,6 +654,7 @@ static int bond_ipsec_lag_add_sa(struct net_device *bond_dev,
+ 
+ 	ipsec->xs = xs;
+ 	ipsec->replicated = true;
++	ipsec->delete_requested = false;
+ 	INIT_LIST_HEAD(&ipsec->list);
+ 	INIT_LIST_HEAD(&ipsec->inst_list);
+ 
+@@ -855,7 +874,8 @@ static int bond_ipsec_lag_add_slave(struct bonding *bond,
+ 			continue;
+ 		have_states = true;
+ 
+-		if (ipsec->xs->km.state == XFRM_STATE_DEAD)
++		if (READ_ONCE(ipsec->delete_requested) ||
++		    READ_ONCE(ipsec->xs->km.state) == XFRM_STATE_DEAD)
+ 			continue;
+ 
+ 		if (!slave_ok) {
+@@ -1061,14 +1081,25 @@ static void bond_ipsec_del_sa(struct net_device *bond_dev,
+ 
+ 	bond = netdev_priv(bond_dev);
+ 
+-	mutex_lock(&bond->ipsec_lock);
+-	ipsec = bond_ipsec_find(bond, xs);
+-	if (ipsec && ipsec->replicated) {
+-		bond_ipsec_lag_call_state(xs, ipsec, true, false);
+-		mutex_unlock(&bond->ipsec_lock);
++	/* XFRM calls delete with xs->lock held and BHs disabled. Only hide
++	 * replicated handles here; serialize lower callbacks with add/free
++	 * and slave changes in process context instead of taking ipsec_lock.
++	 */
++	rcu_read_lock();
++	ipsec = rcu_dereference(xs->xso.upper_priv);
++	if (ipsec && ipsec->replicated && ipsec->xs == xs) {
++		WRITE_ONCE(ipsec->delete_requested, true);
++		spin_lock_bh(&bond->ipsec_work_lock);
++		if (!bond->ipsec_work_stopping)
++			schedule_work(&bond->ipsec_delete_work);
++		spin_unlock_bh(&bond->ipsec_work_lock);
++		rcu_read_unlock();
+ 		return;
+ 	}
+-	mutex_unlock(&bond->ipsec_lock);
++	rcu_read_unlock();
++
++	if (BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP)
++		return;
+ 
+ 	if (!xs->xso.real_dev)
+ 		return;
+@@ -1148,7 +1179,8 @@ static void bond_ipsec_free_sa(struct net_device *bond_dev,
+ 	ipsec = bond_ipsec_find(bond, xs);
+ 	if (ipsec && ipsec->replicated) {
+ 		list_del(&ipsec->list);
+-		bond_ipsec_lag_call_state(xs, ipsec, false, true);
++		/* The delete worker may not have run yet. */
++		bond_ipsec_lag_call_state(xs, ipsec, true, true);
+ 		RCU_INIT_POINTER(xs->xso.upper_priv, NULL);
+ 		bond_ipsec_lag_free_instances(ipsec);
+ 		call_rcu(&ipsec->rcu, bond_ipsec_rcu_free);
+@@ -1190,10 +1222,21 @@ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+ 		return false;
+ 
+ 	bond = netdev_priv(bond_dev);
+-	if (bond_mode_can_use_lag_xfrm(bond))
+-		return (xs->xso.type == XFRM_DEV_OFFLOAD_CRYPTO ||
+-			xs->xso.type == XFRM_DEV_OFFLOAD_PACKET) &&
+-		       rcu_access_pointer(xs->xso.upper_priv);
++	if (bond_mode_can_use_lag_xfrm(bond)) {
++		struct bond_ipsec *ipsec;
++		bool ok;
++
++		if (xs->xso.type != XFRM_DEV_OFFLOAD_CRYPTO &&
++		    xs->xso.type != XFRM_DEV_OFFLOAD_PACKET)
++			return false;
++
++		rcu_read_lock();
++		ipsec = rcu_dereference(xs->xso.upper_priv);
++		ok = ipsec && ipsec->replicated && ipsec->xs == xs &&
++		     !READ_ONCE(ipsec->delete_requested);
++		rcu_read_unlock();
++		return ok;
++	}
+ 
+ 	rcu_read_lock();
+ 	real_dev = bond_ipsec_dev(xs);
+@@ -1283,7 +1326,8 @@ static unsigned long bond_ipsec_lower_handle(struct net_device *bond_dev,
+ 
+ 	rcu_read_lock();
+ 	ipsec = rcu_dereference(xs->xso.upper_priv);
+-	if (!ipsec || !ipsec->replicated || ipsec->xs != xs)
++	if (!ipsec || !ipsec->replicated || ipsec->xs != xs ||
++	    READ_ONCE(ipsec->delete_requested))
+ 		goto out;
+ 
+ 	list_for_each_entry_rcu(inst, &ipsec->inst_list, list) {
+@@ -7030,6 +7074,13 @@ static void bond_destructor(struct net_device *bond_dev)
+ {
+ 	struct bonding *bond = netdev_priv(bond_dev);
+ 
++#ifdef CONFIG_XFRM_OFFLOAD
++	/* A pending offload add can reach state_free after ndo_uninit.
++	 * Its XFRM netdev reference keeps the private state alive until here.
++	 */
++	mutex_destroy(&bond->ipsec_lock);
++#endif /* CONFIG_XFRM_OFFLOAD */
++
+ 	if (bond->wq)
+ 		destroy_workqueue(bond->wq);
+ 
+@@ -7068,6 +7119,9 @@ void bond_setup(struct net_device *bond_dev)
+ 	INIT_LIST_HEAD(&bond->ipsec_list);
+ 	mutex_init(&bond->ipsec_lock);
+ 	bond->ipsec_lag_blocked = false;
++	INIT_WORK(&bond->ipsec_delete_work, bond_ipsec_delete_work);
++	spin_lock_init(&bond->ipsec_work_lock);
++	bond->ipsec_work_stopping = false;
+ #endif /* CONFIG_XFRM_OFFLOAD */
+ 
+ 	/* don't acquire bond device's netif_tx_lock when transmitting */
+@@ -7110,6 +7164,16 @@ static void bond_uninit(struct net_device *bond_dev)
+ 	struct list_head *iter;
+ 	struct slave *slave;
+ 
++#ifdef CONFIG_XFRM_OFFLOAD
++	/* Also retire SAs still between offload add and XFRM insertion. */
++	bond_ipsec_lag_begin_flush(bond);
++	spin_lock_bh(&bond->ipsec_work_lock);
++	bond->ipsec_work_stopping = true;
++	spin_unlock_bh(&bond->ipsec_work_lock);
++	/* Never wait for the worker while holding ipsec_lock or xs->lock. */
++	cancel_work_sync(&bond->ipsec_delete_work);
++#endif /* CONFIG_XFRM_OFFLOAD */
++
+ 	bond_netpoll_cleanup(bond_dev);
+ 
+ 	/* Release the bonded slaves */
+@@ -7117,10 +7181,6 @@ static void bond_uninit(struct net_device *bond_dev)
+ 		__bond_release_one(bond_dev, slave->dev, true, true);
+ 	netdev_info(bond_dev, "Released all slaves\n");
+ 
+-#ifdef CONFIG_XFRM_OFFLOAD
+-	mutex_destroy(&bond->ipsec_lock);
+-#endif /* CONFIG_XFRM_OFFLOAD */
+-
+ 	bond_set_slave_arr(bond, NULL, NULL);
+ 
+ 	list_del_rcu(&bond->bond_list);
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 25caf61..5d5b028 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -214,6 +214,7 @@ struct bond_ipsec {
+ 	struct list_head inst_list;
+ 	struct rcu_head rcu;
+ 	bool replicated;
++	bool delete_requested;
+ };
+ 
+ /* Per-lower-device instance of a replicated LAG XFRM state. */
+@@ -280,6 +281,10 @@ struct bonding {
+ 	/* protecting ipsec_list and ipsec_lag_blocked */
+ 	struct mutex ipsec_lock;
+ 	bool ipsec_lag_blocked;
++	struct work_struct ipsec_delete_work;
++	/* Serialize work submission with teardown, never lower callbacks. */
++	spinlock_t ipsec_work_lock;
++	bool ipsec_work_stopping;
+ #endif /* CONFIG_XFRM_OFFLOAD */
+ 	struct bpf_prog *xdp_prog;
+ };
+-- 
+2.43.0
+

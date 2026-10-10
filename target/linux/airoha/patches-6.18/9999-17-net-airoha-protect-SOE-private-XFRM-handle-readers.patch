@@ -1,0 +1,229 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: protect SOE private XFRM handle readers
+
+An xfrm_state reference does not retain the driver's offload_handle:
+xfrm_dev_state_flush() invokes the driver's free callback even with
+outstanding references from input lookups or cached destinations.
+
+Hold RCU from lower-handle resolution through all state/SA dereferences
+and packet submission, including GSO. The existing SA retirement grace
+period then protects live-SA readers. Release-publish initialized
+handles.
+
+RCU-retire the private object as well, since acquire templates have no
+SA and never pass through the SA grace period. Test a template's NULL SA
+before accessing its provider/GDM. This keeps the template free path
+nonblocking: native xfrm_state_find() can free a failed acquire inside
+its RCU section. The provider reference can still be dropped
+synchronously after live-SA readers have drained; template readers only
+inspect the RCU-retired object.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -174,6 +174,7 @@
+ };
+ 
+ struct airoha_soe_xfrm_state {
++	struct rcu_head rcu;
+ 	struct airoha_gdm_dev *dev;
+ 	struct airoha_soe *soe;
+ 	struct airoha_soe_sa *sa;
+@@ -1109,6 +1110,7 @@
+ 	if (!x)
+ 		return false;
+ 
++	rcu_read_lock();
+ 	if (x->xso.dir != XFRM_DEV_OFFLOAD_IN)
+ 		goto put_state;
+ 	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET)
+@@ -1131,8 +1133,8 @@
+ 	 * GDM device for submission, but require the resolved SA to belong to
+ 	 * the same Ethernet/SOE instance.
+ 	 */
+-	if (!state || !state->dev || state->dev->eth != dev->eth ||
+-	    !state->sa)
++	if (!state || !state->sa || !state->dev ||
++	    state->dev->eth != dev->eth)
+ 		goto put_state;
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+@@ -1157,12 +1159,15 @@
+ 		goto drop_state;
+ 	}
+ 
++	rcu_read_unlock();
+ 	return true;
+ 
+ drop_state:
++	rcu_read_unlock();
+ 	kfree_skb(skb);
+ 	return true;
+ put_state:
++	rcu_read_unlock();
+ 	xfrm_state_put(x);
+ 	return false;
+ }
+@@ -1359,6 +1364,7 @@
+ 	struct net_device *state_dev;
+ 	struct xfrm_state *x;
+ 	unsigned long handle;
++	int err = -ENODEV;
+ 
+ 	if (!dst || !sa_index || !hop)
+ 		return -EINVAL;
+@@ -1367,20 +1373,21 @@
+ 	if (!x || x->xso.type != XFRM_DEV_OFFLOAD_PACKET)
+ 		return -EOPNOTSUPP;
+ 
++	rcu_read_lock();
+ 	if (!lower_dev)
+-		lower_dev = x->xso.dev;
++		lower_dev = READ_ONCE(x->xso.dev);
+ 
+ 	handle = xfrm_dev_state_lower_handle(x, lower_dev);
+ 	state = (struct airoha_soe_xfrm_state *)handle;
+ 	if (!state || !state->sa)
+-		return -ENODEV;
++		goto out;
+ 
+ 	if (!state->dev || !state->dev->eth)
+-		return -ENODEV;
++		goto out;
+ 
+ 	state_dev = netdev_from_priv(state->dev);
+ 	if (!(state_dev->features & NETIF_F_HW_ESP))
+-		return -ENODEV;
++		goto out;
+ 
+ 	if (state_dev != lower_dev) {
+ 		struct airoha_gdm_dev *lower_gdm;
+@@ -1393,11 +1400,11 @@
+ 		if (!lower_dev || !netif_is_lag_port(lower_dev) ||
+ 		    lower_dev->netdev_ops != state_dev->netdev_ops ||
+ 		    !(lower_dev->features & NETIF_F_HW_ESP))
+-			return -ENODEV;
++			goto out;
+ 
+ 		lower_gdm = netdev_priv(lower_dev);
+ 		if (!airoha_is_valid_gdm_dev(state->dev->eth, lower_gdm))
+-			return -ENODEV;
++			goto out;
+ 	}
+ 
+ 	switch (x->xso.dir) {
+@@ -1408,12 +1415,16 @@
+ 		*hop = AIROHA_SOE_HOP_INFO_DECRYPT;
+ 		break;
+ 	default:
+-		return -EOPNOTSUPP;
++		err = -EOPNOTSUPP;
++		goto out;
+ 	}
+ 
+ 	*sa_index = state->sa->index;
++	err = 0;
++out:
++	rcu_read_unlock();
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static int airoha_soe_xfrm_state_add(struct net_device *dev,
+@@ -1456,7 +1467,8 @@
+ 	atomic_inc(&gdm_dev->soe_xfrm_state_count);
+ 	state->counted = true;
+ out:
+-	x->xso.offload_handle = (unsigned long)state;
++	/* Publish initialization to acquire handle lookups in the datapath. */
++	smp_store_release(&x->xso.offload_handle, (unsigned long)state);
+ 	return 0;
+ 
+ err_free:
+@@ -1494,25 +1506,38 @@
+ 	if (state->counted)
+ 		atomic_dec(&state->dev->soe_xfrm_state_count);
+ 	airoha_soe_put_ref(state->soe);
+-	kfree(state);
++	/* Live SA readers have left at free_sa's grace period. Acquire templates
++	 * have no SA and can be freed in atomic context, but their private object
++	 * can still be observed by a reader testing state->sa under RCU.
++	 */
++	kfree_rcu(state, rcu);
+ }
+ 
+ static bool airoha_soe_xfrm_offload_ok(struct sk_buff *skb,
+ 				       struct xfrm_state *x)
+ {
+ 	struct airoha_soe_xfrm_state *state;
+-	struct net_device *dev = x->xso.dev;
++	struct net_device *dev;
++	unsigned long handle;
++	bool ok = false;
+ 
++	rcu_read_lock();
++	dev = READ_ONCE(x->xso.dev);
+ 	if (!dev || !(dev->features & NETIF_F_HW_ESP))
+-		return false;
++		goto out;
+ 
+ 	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
+ 	    x->xso.dir != XFRM_DEV_OFFLOAD_OUT)
+-		return false;
++		goto out;
+ 
+-	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	/* Pair with state_add's release publication. */
++	handle = smp_load_acquire(&x->xso.offload_handle);
++	state = (struct airoha_soe_xfrm_state *)handle;
++	ok = state && state->sa;
++out:
++	rcu_read_unlock();
+ 
+-	return state && state->sa;
++	return ok;
+ }
+ 
+ static int airoha_soe_xfrm_packet_xmit_gso(struct sk_buff *skb,
+@@ -1549,11 +1574,13 @@
+ 				       struct xfrm_state *x)
+ {
+ 	struct airoha_soe_xfrm_state *state;
+-	struct net_device *lower_dev = x->xso.dev;
++	struct net_device *lower_dev;
+ 	struct net_device *state_dev;
+ 	unsigned long handle;
+ 	int err = -EHOSTUNREACH;
+ 
++	rcu_read_lock();
++	lower_dev = READ_ONCE(x->xso.dev);
+ 	if (!lower_dev || lower_dev->xfrmdev_ops != &airoha_soe_xfrmdev_ops)
+ 		lower_dev = skb->dev;
+ 
+@@ -1567,16 +1594,21 @@
+ 	    !(state_dev->features & NETIF_F_HW_ESP))
+ 		goto drop;
+ 
+-	if (skb_is_gso(skb))
+-		return airoha_soe_xfrm_packet_xmit_gso(skb, x, state);
++	if (skb_is_gso(skb)) {
++		err = airoha_soe_xfrm_packet_xmit_gso(skb, x, state);
++		goto out;
++	}
+ 
+ 	err = airoha_soe_xmit(state->sa, state->dev, skb, x);
+ 	if (err)
+ 		goto drop;
+ 
+-	return 0;
++out:
++	rcu_read_unlock();
++	return err;
+ 
+ drop:
++	rcu_read_unlock();
+ 	XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
+ 	kfree_skb(skb);
+ 	return err;

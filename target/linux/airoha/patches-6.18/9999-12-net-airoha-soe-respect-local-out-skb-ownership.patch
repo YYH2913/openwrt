@@ -1,0 +1,36 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: respect local_out skb ownership on SOE completion
+
+After local_out() is called, an skb is retained by the caller only when
+the callback returns 1. Netfilter DROP consumes it and QUEUE/STOLEN may
+retain it asynchronously; L3-master output handlers can also consume it.
+Do not free it a second time when the callback returns another value.
+Release the SOE context independently and continue dst_output only for 1,
+matching the native IP/XFRM output contract.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -1177,18 +1177,13 @@
+ 	net = dev_net(dst->dev);
+ 	nf_reset_ct(skb);
+ 	err = skb_dst(skb)->ops->local_out(net, NULL, skb);
+-	if (unlikely(err != 1))
+-		goto drop_skb;
+ 	kfree(ctx);
+-	dst_output(net, NULL, skb);
++	/* A non-1 return means local_out already consumed or queued the skb. */
++	if (likely(err == 1))
++		dst_output(net, NULL, skb);
+ 
+ 	return true;
+ 
+-drop_skb:
+-	kfree(ctx);
+-	kfree_skb(skb);
+-	return true;
+-
+ drop:
+ 	dst_release(dst);
+ 	kfree(ctx);

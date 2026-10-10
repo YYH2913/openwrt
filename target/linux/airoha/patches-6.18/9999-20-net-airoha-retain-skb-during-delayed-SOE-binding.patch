@@ -1,0 +1,50 @@
+From 962c174dcb3715edeed8b12f1969e29f45df7a4e Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 20:03:42 -0700
+Subject: [PATCH] net: airoha: retain skb while finishing delayed SOE binding
+
+airoha_dev_xmit() publishes the skb to QDMA and drops the queue lock before
+finishing delayed SOE flow binding. TX NAPI cleanup can acquire that lock
+and release the queue's skb reference before the binding helper reads its
+header and metadata, causing a use-after-free.
+
+Take a local skb reference after all fallible mapping steps and before the
+QDMA CPU index is published. Release it after the delayed helper completes.
+This keeps PPE work outside the queue lock and leaves all early error and
+busy paths unchanged.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index dbbb3ac..eba6498 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3247,6 +3247,10 @@ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+ 		q->txq_stopped = true;
+ 	}
+ 
++	/* Completion can release the queue's skb as soon as q->lock drops. */
++	if (soe_decrypt_skb)
++		skb_get(skb);
++
+ 	if (netif_xmit_stopped(txq) || !netdev_xmit_more() ||
+ 	    soe_decrypt_skb)
+ 		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid),
+@@ -3261,8 +3265,10 @@ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+ 	 * the newly bound decrypt entry cannot race the CPU-transmitted packet.
+ 	 */
+ #if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
+-	if (soe_decrypt_skb)
++	if (soe_decrypt_skb) {
+ 		airoha_ppe_soe_xmit_skb(&dev->eth->ppe->dev, skb, netdev);
++		consume_skb(skb);
++	}
+ #endif
+ 
+ 	rcu_read_unlock();
+-- 
+2.43.0
+

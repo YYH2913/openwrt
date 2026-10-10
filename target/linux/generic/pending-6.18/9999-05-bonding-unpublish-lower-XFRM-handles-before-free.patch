@@ -1,0 +1,135 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] bonding: unpublish lower XFRM handles before freeing them
+
+A lower driver's RCU grace period is ineffective if bonding still publishes
+inst->lower_handle until the driver's free callback returns. The temporary
+xso.real_dev/offload_handle pair can also bypass the upper resolver and
+expose a handle that was deliberately hidden during slave removal.
+
+Delegate upper-owned lookups to their resolver before considering the
+transient callback fields. Unpublish each instance before invoking lower
+free, and pair release publication of initialized handles with acquire
+lookups. Keep the callback's private handle available to the lower driver.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -526,6 +526,15 @@
+ 	if (!ops)
+ 		return;
+ 
++	/* Stop all datapath publications before the lower driver waits for
++	 * readers and frees its private handle. Its callback still uses the
++	 * temporary xso.offload_handle below, not the upper's resolver.
++	 */
++	if (free_state) {
++		WRITE_ONCE(inst->added, false);
++		xchg(&inst->lower_handle, 0);
++	}
++
+ 	WRITE_ONCE(xs->xso.real_dev, inst->real_dev);
+ 	WRITE_ONCE(xs->xso.offload_handle, lower_handle);
+ 	if (delete_state) {
+@@ -538,8 +547,6 @@
+ 	}
+ 	if (free_state && ops->xdo_dev_state_free)
+ 		ops->xdo_dev_state_free(inst->real_dev, xs);
+-	if (free_state)
+-		WRITE_ONCE(inst->lower_handle, 0);
+ 
+ 	WRITE_ONCE(xs->xso.real_dev, bond_real_dev);
+ 	WRITE_ONCE(xs->xso.offload_handle, bond_handle);
+@@ -588,7 +595,8 @@
+ 		goto out;
+ 	}
+ 
+-	WRITE_ONCE(inst->lower_handle, lower_handle);
++	/* Publish the lower driver's initialized private object to readers. */
++	smp_store_release(&inst->lower_handle, lower_handle);
+ 	inst->deleted = false;
+ 	WRITE_ONCE(inst->added, true);
+ 
+@@ -1265,7 +1273,10 @@
+ 	if (BOND_MODE(bond) == BOND_MODE_ACTIVEBACKUP) {
+ 		struct net_device *real_dev = READ_ONCE(xs->xso.real_dev);
+ 
+-		return real_dev == lower_dev ? READ_ONCE(xs->xso.offload_handle) : 0;
++		if (real_dev != lower_dev)
++			return 0;
++		/* Pair with the lower driver's initialized handle publication. */
++		return smp_load_acquire(&xs->xso.offload_handle);
+ 	}
+ 	if (!bond_mode_can_use_lag_xfrm(bond))
+ 		return 0;
+@@ -1277,7 +1288,8 @@
+ 
+ 	list_for_each_entry_rcu(inst, &ipsec->inst_list, list) {
+ 		if (READ_ONCE(inst->added) && inst->real_dev == lower_dev) {
+-			handle = READ_ONCE(inst->lower_handle);
++			/* Pair with lag_add_inst's release publication. */
++			handle = smp_load_acquire(&inst->lower_handle);
+ 			break;
+ 		}
+ 	}
+@@ -1290,7 +1302,8 @@
+ 		 */
+ 		list_for_each_entry_rcu(inst, &ipsec->inst_list, list) {
+ 			if (READ_ONCE(inst->added)) {
+-				handle = READ_ONCE(inst->lower_handle);
++				/* Pair with lag_add_inst's release publication. */
++				handle = smp_load_acquire(&inst->lower_handle);
+ 				break;
+ 			}
+ 		}
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -1714,13 +1714,12 @@
+ #ifdef CONFIG_XFRM_OFFLOAD
+ /*
+  * Return the hardware offload handle lower_dev should use for x. States
+- * installed directly on lower_dev use a nonzero xso.offload_handle. During
+- * upper-device callbacks, xso.real_dev may identify the lower device whose
+- * callback is running; use xso.offload_handle directly in that case. Other
+- * states owned by an upper device are resolved through the owner's
+- * xdo_dev_state_lower_handle(). Bonding uses that callback for replicated XFRM
+- * states because it installs the state on each slave and keeps the per-slave
+- * hardware handles internally.
++ * installed directly on lower_dev use a nonzero xso.offload_handle. Always
++ * use an upper owner's xdo_dev_state_lower_handle(): its temporary
++ * real_dev/offload_handle pair during callbacks is not a datapath publication.
++ * Bonding keeps the per-slave hardware handles internally. Callers must hold
++ * RCU while dereferencing the returned private handle; lower drivers must
++ * defer freeing it until readers that saw the old publication have left.
+  */
+ static inline unsigned long
+ xfrm_dev_state_lower_handle(struct xfrm_state *x, struct net_device *lower_dev)
+@@ -1728,21 +1727,23 @@
+ 	struct xfrm_dev_offload *xdo = &x->xso;
+ 	struct net_device *real_dev = READ_ONCE(xdo->real_dev);
+ 	struct net_device *dev = READ_ONCE(xdo->dev);
+-	unsigned long offload_handle = READ_ONCE(xdo->offload_handle);
++	unsigned long offload_handle;
+ 
+ 	if (!dev || !lower_dev)
+ 		return 0;
+ 
++	if (dev->xfrmdev_ops && dev->xfrmdev_ops->xdo_dev_state_lower_handle)
++		return dev->xfrmdev_ops->xdo_dev_state_lower_handle(dev, x,
++								    lower_dev);
++
++	/* Pair with the lower driver's initialized handle publication. */
++	offload_handle = smp_load_acquire(&xdo->offload_handle);
+ 	if (dev == lower_dev && offload_handle)
+ 		return offload_handle;
+ 
+ 	if (real_dev == lower_dev && offload_handle)
+ 		return offload_handle;
+ 
+-	if (dev->xfrmdev_ops && dev->xfrmdev_ops->xdo_dev_state_lower_handle)
+-		return dev->xfrmdev_ops->xdo_dev_state_lower_handle(dev, x,
+-								    lower_dev);
+-
+ 	return 0;
+ }
+ 
