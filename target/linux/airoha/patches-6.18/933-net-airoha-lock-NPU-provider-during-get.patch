@@ -1,0 +1,65 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: lock the NPU provider while acquiring it
+
+The platform device and module references do not retain the NPU's devm
+private data during driver unbind. Validate the bound NPU driver and its
+published data under the supplier device lock, and establish the managed
+consumer dependency before dropping that lock. Reject in-progress probe
+or detach instead of returning a stale provider.
+
+Use trylock because the consumer can already hold its own device lock
+while the supplier waits to unbind it. Keep the existing unavailable
+errors and balance module/platform references on every failure path.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -697,6 +697,8 @@
+ 	regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
++static struct platform_driver airoha_npu_driver;
++
+ struct airoha_npu *airoha_npu_get(struct device *dev)
+ {
+ 	struct platform_device *pdev;
+@@ -722,10 +724,20 @@
+ 		goto error_pdev_put;
+ 	}
+ 
++	if (!device_trylock(&pdev->dev)) {
++		npu = ERR_PTR(-ENODEV);
++		goto error_module_put;
++	}
++	if (pdev->dev.driver != &airoha_npu_driver.driver ||
++	    READ_ONCE(pdev->dev.links.status) != DL_DEV_DRIVER_BOUND) {
++		npu = ERR_PTR(-ENODEV);
++		goto error_unlock;
++	}
++
+ 	npu = platform_get_drvdata(pdev);
+ 	if (!npu) {
+ 		npu = ERR_PTR(-ENODEV);
+-		goto error_module_put;
++		goto error_unlock;
+ 	}
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+@@ -733,11 +745,15 @@
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
+ 		npu = ERR_PTR(-EINVAL);
+-		goto error_module_put;
++		goto error_unlock;
+ 	}
+ 
++	device_unlock(&pdev->dev);
++
+ 	return npu;
+ 
++error_unlock:
++	device_unlock(&pdev->dev);
+ error_module_put:
+ 	module_put(THIS_MODULE);
+ error_pdev_put:

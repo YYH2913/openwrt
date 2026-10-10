@@ -1,0 +1,49 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: lock the PPE provider while acquiring it
+
+Ethernet drvdata is published before probe has initialized every PPE
+resource. Merely finding eth does not prove eth->ppe is ready, nor does
+a platform device reference protect its devm state during driver unbind.
+
+Trylock the supplier, require the bound Ethernet driver and initialized
+PPE, and add the managed consumer dependency before releasing the lock.
+Keep the existing unavailable response and module/device reference
+balance, without blocking against supplier-initiated consumer unbind.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1554,19 +1554,29 @@
+ 		goto error_pdev_put;
+ 	}
+ 
+-	eth = platform_get_drvdata(pdev);
+-	if (!eth)
++	if (!device_trylock(&pdev->dev))
+ 		goto error_module_put;
++	if (READ_ONCE(pdev->dev.links.status) != DL_DEV_DRIVER_BOUND ||
++	    strcmp(dev_driver_string(&pdev->dev), KBUILD_MODNAME))
++		goto error_unlock;
++
++	eth = platform_get_drvdata(pdev);
++	if (!eth || !eth->ppe)
++		goto error_unlock;
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+ 		dev_err(&pdev->dev,
+ 			"failed to create device link to consumer %s\n",
+ 			dev_name(dev));
+-		goto error_module_put;
++		goto error_unlock;
+ 	}
+ 
++	device_unlock(&pdev->dev);
++
+ 	return &eth->ppe->dev;
+ 
++error_unlock:
++	device_unlock(&pdev->dev);
+ error_module_put:
+ 	module_put(THIS_MODULE);
+ error_pdev_put:
