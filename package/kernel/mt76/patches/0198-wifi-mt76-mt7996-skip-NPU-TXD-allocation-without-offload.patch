@@ -1,0 +1,37 @@
+From 86f84c85510ee802ac365bfeb1036b66aa321a93 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 10 Oct 2026 19:56:04 -0700
+Subject: [PATCH] wifi: mt76: mt7996: skip NPU TXD allocation without offload
+
+CONFIG_MT76_NPU can be enabled even when mt76_npu_init() fails to find
+an Airoha provider and the PCI driver continues without offload. Moving
+the TXD buffer allocations out of __mt7996_npu_hw_init() put them before
+its NULL-provider check. The fallback path now reserves six unused
+coherent buffers and can fail ordinary Wi-Fi probe with -ENOMEM.
+
+Check whether offload is active before allocating the NPU-only buffers,
+matching the existing NPU RX queue initialization guard.
+
+Fixes: e826923c533a ("wifi: mt76: mt7996: Store DMA mapped buffer addresses in mt7996_npu_hw_init()")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ mt7996/npu.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/mt7996/npu.c b/mt7996/npu.c
+index 23142e1..f24d295 100644
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -609,6 +609,9 @@ int mt7996_npu_hw_init(struct mt7996_dev *dev)
+ {
+ 	int i, err;
+ 
++	if (!mt76_npu_device_active(&dev->mt76))
++		return 0;
++
+ 	BUILD_BUG_ON(ARRAY_SIZE(dev->npu_txd_addr) % 3);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dev->npu_txd_addr); i += 3) {
+-- 
+2.43.0
+
