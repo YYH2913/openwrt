@@ -1,0 +1,39 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Thu, 10 Sep 2026 15:45:00 +0800
+Subject: [PATCH] net: phy: realtek: keep board flow_s recovery exclusive
+
+The upstream RTL8261N/BE link-change callback now schedules an asynchronous
+SerDes reset workaround. Boards opting into realtek,patch-rtk-serdes already
+use the post-AN flow_s recovery state machine in read_status(). Running both
+paths can interleave transactions through the same indirect SerDes window
+and reset the block while the board recovery sequence is settling.
+
+Do not schedule the generic reset worker on these opt-in boards. The
+property is set once in probe before any link-change callback can run, so
+the worker is never queued on this path. Keep its initialization and devm
+cancellation intact, and preserve upstream behavior for all other boards.
+Do not change the board's register values, pulse delay or carrier retries.
+
+The generic reset workaround originates from Daniel Golle's
+7e7c098948cf877d8ebb7e7c17bfdc82a9764f3c, which credits Bo-Cun Chen's
+MediaTek SDK workaround. This patch only selects between that unchanged
+upstream implementation and the existing downstream board recovery path.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -2577,6 +2577,13 @@
+ {
+ 	struct rtl826x_priv *priv = phydev->priv;
+ 
++	/* Opt-in boards recover through flow_s in read_status(). Do not race
++	 * that sequence with a reset through the same indirect SerDes window.
++	 * The property is fixed in probe, before this work can ever be queued.
++	 */
++	if (priv->patch_rtk_serdes)
++		return;
++
+ 	if (phydev->state != PHY_RUNNING) {
+ 		if (!priv->sds_work_disabled) {
+ 			disable_delayed_work(&priv->sds_work);

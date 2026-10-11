@@ -1,0 +1,39 @@
+From 2d3e4ed2ab802ba4ef5ce1689e179b399b2fc498 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 08:39:27 -0700
+Subject: [PATCH] net: airoha synchronize PHY-up after paired replay
+
+After a successful AN restart, synchronize phylink when the PHY already
+reports link up but the state machine did not deliver an up callback. The
+callback runs under the PHY mutex before replay_end, matching
+the error-path down notification and avoiding a carrier-down result after
+successful replay. A duplicate up callback only updates phylink state and
+queues resolve while replay remains disabled.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index e29b72d..9e586c6 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4327,10 +4327,12 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 		phy->eee_active = false;
+ 		phy->enable_tx_lpi = false;
+ 		phy->phy_link_change(phy, false);
++	} else if (phy->link) {
++		phy->phy_link_change(phy, true);
+ 	}
+ 	mutex_unlock(&phy->lock);
+ 
+-	/* Synchronize PHY-down before balancing replay on PHY errors. */
++	/* Synchronize PHY state before balancing replay on PHY errors or recovery. */
+ 	phylink_replay_link_end(dev->phylink);
+ 	WRITE_ONCE(dev->usxgmii_recovery_running, false);
+ 	if (ret)
+-- 
+2.43.0
+

@@ -1,0 +1,51 @@
+From 32bb2d61f2f186b1a92ff3676619b9c30656cb4e Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 07:20:23 -0700
+Subject: [PATCH] net: airoha limit paired USXGMII replay to Ethernet port zero
+
+Restrict both rate-change scheduling and deferred replay to GDM4
+nbq0. Revalidate the current PHY interface under RTNL before replay
+so a queued transition cannot reset another mode. Log completion of
+the paired operation for hardware validation.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 457e6b3..b2e2a46 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4289,7 +4289,7 @@ static bool
+ airoha_usxgmii_recovery_eligible(struct airoha_gdm_dev *dev,
+ 				 phy_interface_t interface, int speed)
+ {
+-	return dev->port->id == AIROHA_GDM4_IDX &&
++	return dev->port->id == AIROHA_GDM4_IDX && dev->nbq == 0 &&
+ 	       airoha_is_lan_gdm_dev(dev) && airoha_is_7581(dev->eth) &&
+ 	       interface == PHY_INTERFACE_MODE_USXGMII && speed != SPEED_UNKNOWN;
+ }
+@@ -4308,7 +4308,8 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	rtnl_lock();
+ 	if (!netif_running(netdev) || !dev->phylink ||
+ 	    !netdev->phydev || !airoha_is_7581(dev->eth) ||
+-	    dev->port->id != AIROHA_GDM4_IDX ||
++	    dev->port->id != AIROHA_GDM4_IDX || dev->nbq != 0 ||
++	    READ_ONCE(netdev->phydev->interface) != PHY_INTERFACE_MODE_USXGMII ||
+ 	    !airoha_is_lan_gdm_dev(dev))
+ 		goto out_unlock;
+ 
+@@ -4327,6 +4328,8 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	WRITE_ONCE(dev->usxgmii_recovery_running, false);
+ 	if (ret)
+ 		netdev_err(netdev, "USXGMII paired PHY replay failed: %d\n", ret);
++	else
++		netdev_info(netdev, "USXGMII paired PHY/PCS replay completed\n");
+ 
+ out_unlock:
+ 	rtnl_unlock();
+-- 
+2.43.0
+

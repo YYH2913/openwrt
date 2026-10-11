@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 09:20:00 -0700
+Subject: [PATCH] net: airoha restart PHY state machine after paired replay
+
+The paired USXGMII replay reinitializes the PHY while phylink remains
+running.  A successful PHY reset can leave phylib in NOLINK with the
+carrier already invalidated; the normal state-machine transition back to
+PHY_UP is then skipped, leaving the carrier down until an interface
+down/up.  Restart the PHY state machine after replay has been balanced,
+using the same public stop/start contract as a normal interface restart.
+
+This runs under RTNL and outside the PHY mutex.  It does not close the
+netdev or re-enter phylink while replay is disabled.
+
+Assisted-by: Codex:GPT-6-Astra
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 9e586c6..9f1f3c0 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4336,5 +4336,10 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	/* Synchronize PHY state before balancing replay on PHY errors or recovery. */
+ 	phylink_replay_link_end(dev->phylink);
++	if (!ret) {
++		/* Restart polling as a normal PHY stop/start cycle would. */
++		phy_stop(phy);
++		phy_start(phy);
++	}
+ 	WRITE_ONCE(dev->usxgmii_recovery_running, false);
+ 	if (ret)
+ 		netdev_err(netdev, "USXGMII paired PHY replay failed: %d\n", ret);
+-- 
+2.43.0

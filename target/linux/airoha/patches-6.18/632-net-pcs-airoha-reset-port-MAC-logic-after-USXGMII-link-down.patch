@@ -1,0 +1,79 @@
+From 5fab4637c3e30b85576e4609e0e153e79ad20d50 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 04:30:55 -0700
+Subject: [PATCH] net: pcs: airoha: reset AN7581 port MAC logic after USXGMII
+ link down
+
+On XR1710G, renegotiating the LAN copper link from 2.5G to 1G can leave
+return traffic unusable even though PHY speed, PCS negotiation and rate
+adaptation registers have converged. Restoring 2.5G does not recover
+traffic, while a complete interface stop/open does.
+
+The normal PCS link-down path only stops the MAC interfaces. Unlike
+pre_config, it does not reset port MAC logic. Follow the AN7581 SDK's
+port MAC reset operation after an initialized Ethernet USXGMII link
+goes down: allow the interfaces to stop, toggle the local logic reset,
+and retain configuration and stop state until the following link-up.
+
+Keep PHY negotiation, PLLs, PMA resets, other PCS controllers and MAC
+counters unchanged. Restrict the reset to a previously active AN7581
+Ethernet USXGMII port.
+
+Three LAN 2.5G-to-1G-and-back transitions preserve DHCP, ping and
+bidirectional file hashes without restarting the interface. The baseline
+failed the same controlled transition. WAN remains operational.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 25 ++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 683be03..9a34319 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1047,8 +1047,14 @@ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	struct airoha_pcs_maps *maps;
++	bool reset_mac;
++	u32 cfg;
+ 
+ 	maps = &priv->maps[port->index];
++	reset_mac = port->initialized &&
++		    port->interface == PHY_INTERFACE_MODE_USXGMII &&
++		    READ_ONCE(port->usxgmii_speed) != SPEED_UNKNOWN &&
++		    device_is_compatible(priv->dev, "airoha,an7581-pcs-eth");
+ 	WRITE_ONCE(port->usxgmii_speed, SPEED_UNKNOWN);
+ 
+ 	/* MPI MBI disable */
+@@ -1057,6 +1063,25 @@ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+ 			AIROHA_PCS_XFI_RXMBI_STOP |
+ 			AIROHA_PCS_XFI_TXMPI_STOP |
+ 			AIROHA_PCS_XFI_TXMBI_STOP);
++
++	if (!reset_mac)
++		return;
++
++	if (regmap_read(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG, &cfg))
++		return;
++
++	/* Flush the port MAC logic after stopping its interfaces, as in the
++	 * AN7581 SDK link-down hook. Leave PHY/PCS negotiation and PLLs alone.
++	 */
++	usleep_range(1000, 2000);
++	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
++			  AIROHA_PCS_XFI_MAC_LOGIC_RST);
++	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
++			AIROHA_PCS_XFI_MAC_LOGIC_RST);
++	usleep_range(1000, 2000);
++
++	/* Keep configuration and stop state until the next link-up. */
++	regmap_write(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG, cfg);
+ }
+ 
+ static void airoha_pcs_pre_config(struct phylink_pcs *pcs,
+-- 
+2.43.0
+

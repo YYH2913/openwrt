@@ -1,0 +1,221 @@
+From 7c6321af524e0f89d3b20b154aac94740672cef3 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 05:20:05 -0700
+Subject: [PATCH] net: pcs: airoha: enable USXGMII data after MAC fragment
+ setup
+
+phylink calls pcs_link_up() before mac_link_up(). Airoha currently opens
+its XFI MPI/MBI interfaces in the PCS callback, before the MAC callback
+updates the GDM4 fragment sizes for the resolved rate. A relink can
+therefore expose the new PCS rate while FE still has the old fragments.
+
+Add an optional PCS completion callback after MAC link-up and before LPI
+activation and carrier publication. Existing PCS drivers without the
+callback keep their behavior. For initialized AN7581 Ethernet USXGMII,
+keep the interfaces stopped through rate setup and the existing deferred
+MAC reset, then enable them from completion after the FE callback. Cancel
+prepared state at link-down and pre-config, and commit applied speed only
+after completion. Other ports, modes and invalid-speed fallback retain
+their existing enable path.
+
+This closes a source-observed programming window. It is a private hardware
+validation candidate, not proof that the window caused the observed
+one-way fault. PHY, reset phase, fragment values and shared DMA are not
+changed.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 43 ++++++++++++++++++++++
+ drivers/net/pcs/airoha/pcs-airoha.h        |  1 +
+ drivers/net/phy/phylink.c                  | 13 +++++++
+ include/linux/phylink.h                    | 22 +++++++++++
+ 4 files changed, 79 insertions(+)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index a520dc8..9f92d31 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -987,11 +987,22 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 	const struct airoha_pcs_match_data *data;
+ 	struct airoha_pcs_maps *maps;
+ 	int ret = 0;
++	bool defer_mac;
+ 	u32 cfg;
+ 
+ 	maps = &priv->maps[port->index];
+ 	data = priv->data;
+ 
++	port->mac_link_up_pending = false;
++	defer_mac = port->initialized && interface == PHY_INTERFACE_MODE_USXGMII &&
++		    device_is_compatible(priv->dev, "airoha,an7581-pcs-eth");
++	if (defer_mac)
++		regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				AIROHA_PCS_XFI_RXMPI_STOP |
++				AIROHA_PCS_XFI_RXMBI_STOP |
++				AIROHA_PCS_XFI_TXMPI_STOP |
++				AIROHA_PCS_XFI_TXMBI_STOP);
++
+ 	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED &&
+ 	    interface == PHY_INTERFACE_MODE_SGMII) {
+ 		regmap_update_bits(maps->hsgmii_rate_adp,
+@@ -1054,6 +1065,11 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 		}
+ 	}
+ 
++	if (!ret && defer_mac) {
++		port->mac_link_up_pending = true;
++		return;
++	}
++
+ 	/* BPI BMI enable */
+ 	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 			  AIROHA_PCS_XFI_RXMPI_STOP |
+@@ -1065,6 +1081,30 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 		WRITE_ONCE(port->usxgmii_speed, speed);
+ }
+ 
++static void airoha_pcs_link_up_complete(struct phylink_pcs *pcs,
++					unsigned int neg_mode,
++					phy_interface_t interface,
++					int speed, int duplex)
++{
++	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
++	struct airoha_pcs_maps *maps = &port->priv->maps[port->index];
++
++	if (!port->mac_link_up_pending || !port->initialized ||
++	    interface != PHY_INTERFACE_MODE_USXGMII ||
++	    port->interface != interface ||
++	    !device_is_compatible(port->priv->dev, "airoha,an7581-pcs-eth"))
++		return;
++
++	/* The MAC has now programmed the matching FE fragment sizes. */
++	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			  AIROHA_PCS_XFI_RXMPI_STOP |
++			  AIROHA_PCS_XFI_RXMBI_STOP |
++			  AIROHA_PCS_XFI_TXMPI_STOP |
++			  AIROHA_PCS_XFI_TXMBI_STOP);
++	port->mac_link_up_pending = false;
++	WRITE_ONCE(port->usxgmii_speed, speed);
++}
++
+ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+ {
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+@@ -1073,6 +1113,7 @@ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+ 	bool reset_mac;
+ 
+ 	maps = &priv->maps[port->index];
++	port->mac_link_up_pending = false;
+ 	reset_mac = port->initialized &&
+ 		    port->interface == PHY_INTERFACE_MODE_USXGMII &&
+ 		    READ_ONCE(port->usxgmii_speed) != SPEED_UNKNOWN &&
+@@ -1100,6 +1141,7 @@ static void airoha_pcs_pre_config(struct phylink_pcs *pcs,
+ 	maps = &priv->maps[port->index];
+ 	port->initialized = false;
+ 	port->mac_reset_pending = false;
++	port->mac_link_up_pending = false;
+ 	WRITE_ONCE(port->usxgmii_speed, SPEED_UNKNOWN);
+ 
+ 	/* Select HSGMII or USXGMII in SCU regs */
+@@ -1170,6 +1212,7 @@ static const struct phylink_pcs_ops airoha_pcs_ops = {
+ 	.pcs_config = airoha_pcs_config,
+ 	.pcs_an_restart = airoha_pcs_an_restart,
+ 	.pcs_link_up = airoha_pcs_link_up,
++	.pcs_link_up_complete = airoha_pcs_link_up_complete,
+ 	.pcs_link_down = airoha_pcs_link_down,
+ };
+ 
+diff --git a/drivers/net/pcs/airoha/pcs-airoha.h b/drivers/net/pcs/airoha/pcs-airoha.h
+index eabeb00..1584729 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1676,6 +1676,7 @@ struct airoha_pcs_port {
+ 	bool initialized;
+ 	int usxgmii_speed;
+ 	bool mac_reset_pending;
++	bool mac_link_up_pending;
+ 
+ 	struct phylink_pcs pcs;
+ };
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index 57c402b..ec5efd4 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -993,6 +993,16 @@ static void phylink_pcs_link_down(struct phylink_pcs *pcs)
+ 		pcs->ops->pcs_link_down(pcs);
+ }
+ 
++static void phylink_pcs_link_up_complete(struct phylink_pcs *pcs,
++					 unsigned int neg_mode,
++					 phy_interface_t interface,
++					 int speed, int duplex)
++{
++	if (pcs && pcs->ops->pcs_link_up_complete)
++		pcs->ops->pcs_link_up_complete(pcs, neg_mode, interface, speed,
++					      duplex);
++}
++
+ static void phylink_pcs_disable_eee(struct phylink_pcs *pcs)
+ {
+ 	if (pcs && pcs->ops->pcs_disable_eee)
+@@ -1673,6 +1683,9 @@ static void phylink_link_up(struct phylink *pl,
+ 				 pl->cur_interface, speed, duplex,
+ 				 !!(link_state.pause & MLO_PAUSE_TX), rx_pause);
+ 
++	phylink_pcs_link_up_complete(pl->pcs, pl->pcs_neg_mode,
++				     pl->cur_interface, speed, duplex);
++
+ 	if (pl->mac_supports_eee && pl->phy_enable_tx_lpi)
+ 		phylink_activate_lpi(pl);
+ 
+diff --git a/include/linux/phylink.h b/include/linux/phylink.h
+index 258d68e..7c9ddac 100644
+--- a/include/linux/phylink.h
++++ b/include/linux/phylink.h
+@@ -499,6 +499,8 @@ struct phylink_pcs {
+  * @pcs_an_restart: restart 802.3z BaseX autonegotiation.
+  * @pcs_link_up: program the PCS for the resolved link configuration
+  *               (where necessary).
++ * @pcs_link_up_complete: optionally enable the PCS data path after the MAC
++ *                       has applied the resolved link configuration.
+  * @pcs_link_down: tear down link between MAC and PCS.
+  * @pcs_disable_eee: optional notification to PCS that EEE has been disabled
+  *		     at the MAC.
+@@ -527,6 +529,10 @@ struct phylink_pcs_ops {
+ 	void (*pcs_an_restart)(struct phylink_pcs *pcs);
+ 	void (*pcs_link_up)(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			    phy_interface_t interface, int speed, int duplex);
++	void (*pcs_link_up_complete)(struct phylink_pcs *pcs,
++				     unsigned int neg_mode,
++				     phy_interface_t interface,
++				     int speed, int duplex);
+ 	void (*pcs_link_down)(struct phylink_pcs *pcs);
+ 	void (*pcs_disable_eee)(struct phylink_pcs *pcs);
+ 	void (*pcs_enable_eee)(struct phylink_pcs *pcs);
+@@ -663,6 +669,22 @@ void pcs_an_restart(struct phylink_pcs *pcs);
+ void pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 		 phy_interface_t interface, int speed, int duplex);
+ 
++/**
++ * pcs_link_up_complete() - enable the data path after MAC configuration
++ * @pcs: a pointer to a &struct phylink_pcs.
++ * @neg_mode: link negotiation mode
++ * @interface: link interface mode
++ * @speed: resolved link speed
++ * @duplex: resolved link duplex
++ *
++ * Optional callback made after mac_link_up(), before LPI activation and
++ * carrier publication. A PCS may keep its data interfaces stopped in
++ * pcs_link_up() until the MAC has applied the resolved link parameters.
++ * Callbacks without this method retain their existing link-up behavior.
++ */
++void pcs_link_up_complete(struct phylink_pcs *pcs, unsigned int neg_mode,
++			  phy_interface_t interface, int speed, int duplex);
++
+ /**
+  * pcs_link_down() - tear down link between MAC and PCS
+  * @pcs: a pointer to a &struct phylink_pcs.
+-- 
+2.43.0
+

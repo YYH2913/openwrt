@@ -1,0 +1,54 @@
+From e5fbdda00fa786678ac8b4fa373ff3539583f827 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 07:39:31 -0700
+Subject: [PATCH] net: airoha fail closed on paired USXGMII replay error
+
+Consume the deferred replay token while RTNL is held and invalidate any
+pending token from ndo_stop so a stop/reopen cycle cannot replay stale
+state. When PHY initialization or AN restart fails, release the PHY lock
+before closing the netdev so phylink drops carrier and forwarding state,
+then always balance the replay contract.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index b2e2a46..8b19ce3 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2640,6 +2640,7 @@ static int airoha_dev_stop(struct net_device *netdev)
+ 	struct airoha_qdma *qdma;
+ 
+ 	WRITE_ONCE(dev->usxgmii_last_speed, SPEED_UNKNOWN);
++	atomic_set(&dev->usxgmii_recovery_queued, 0);
+ 
+ 	netif_tx_disable(netdev);
+ 	airoha_set_vip_for_gdm_port(dev, false);
+@@ -4302,10 +4303,10 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	struct phy_device *phy;
+ 	int ret = 0;
+ 
++	rtnl_lock();
+ 	if (atomic_xchg(&dev->usxgmii_recovery_queued, 0) == 0)
+-		return;
++		goto out_unlock;
+ 
+-	rtnl_lock();
+ 	if (!netif_running(netdev) || !dev->phylink ||
+ 	    !netdev->phydev || !airoha_is_7581(dev->eth) ||
+ 	    dev->port->id != AIROHA_GDM4_IDX || dev->nbq != 0 ||
+@@ -4322,6 +4323,8 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	if (!ret)
+ 		ret = _phy_start_aneg(phy);
+ 	mutex_unlock(&phy->lock);
++	if (ret)
++		dev_close(netdev);
+ 
+ 	/* Always balance begin, including PHY reset or AN failures. */
+ 	phylink_replay_link_end(dev->phylink);
+-- 
+2.43.0
+

@@ -1,0 +1,55 @@
+From 02ab8a58732788e6d159b0f66f1403e9e2b0e1d4 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 02:26:34 -0700
+Subject: [PATCH 1/2] net: pcs: airoha: gate in-band USXGMII on completed AN
+
+Do not resolve an old received partner word while the PCS reports its
+in-band negotiation as incomplete. Only gate the enabled in-band mode;
+fixed-mode status handling remains unchanged.
+
+Private candidate: bit24 is named AN_COMPLETE in the existing driver
+and read by the SDK AN status helper, but strict gating still needs
+AN7581 boot/relink validation. This is not a demonstrated fix for the
+Oct11 one-way fault.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 1510557..78d7462 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -399,6 +399,7 @@ static void airoha_pcs_get_state_hsgmii(struct airoha_pcs_priv *priv, int index,
+ }
+ 
+ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index,
++					 unsigned int neg_mode,
+ 					 struct phylink_link_state *state)
+ {
+ 	const struct airoha_pcs_match_data *data = priv->data;
+@@ -424,6 +425,10 @@ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index
+ 
+ 	state->link = !!(lpa & MDIO_USXGMII_LINK);
+ 	state->an_complete = !!(an_done & AIROHA_PCS_USXGMII_PCS_AN_COMPLETE);
++	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED && !state->an_complete) {
++		state->link = false;
++		return;
++	}
+ 
+ 	phylink_decode_usxgmii_word(state, lpa);
+ }
+@@ -480,7 +485,7 @@ static void airoha_pcs_get_state(struct phylink_pcs *pcs,
+ 		airoha_pcs_get_state_hsgmii(priv, port->index, state);
+ 		break;
+ 	case PHY_INTERFACE_MODE_USXGMII:
+-		airoha_pcs_get_state_usxgmii(priv, port->index, state);
++		airoha_pcs_get_state_usxgmii(priv, port->index, neg_mode, state);
+ 		break;
+ 	case PHY_INTERFACE_MODE_10GBASER:
+ 		airoha_pcs_get_state_10gbaser(priv, port->index, state);
+-- 
+2.43.0
+

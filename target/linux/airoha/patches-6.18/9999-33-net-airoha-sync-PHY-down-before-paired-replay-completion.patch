@@ -1,0 +1,43 @@
+From 2bf41db8d5af0fca6c5277b94c7ae6f3e32401c4 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 08:12:12 -0700
+Subject: [PATCH] net: airoha sync PHY down before paired replay completion
+
+Avoid re-entering netdev close from the deferred worker when a PHY init or
+AN restart fails. While holding the PHY mutex, clear the cached link and
+EEE state and invoke the phylink link-change callback. Release the
+PHY mutex before balancing the replay contract so stale phylink link state
+is invalidated without the dev_close recursion that panicked on hardware.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 8b19ce3..e29b72d 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4322,11 +4322,15 @@ static void airoha_usxgmii_recovery_work(struct work_struct *work)
+ 	ret = phy_init_hw(phy);
+ 	if (!ret)
+ 		ret = _phy_start_aneg(phy);
++	if (ret) {
++		phy->link = false;
++		phy->eee_active = false;
++		phy->enable_tx_lpi = false;
++		phy->phy_link_change(phy, false);
++	}
+ 	mutex_unlock(&phy->lock);
+-	if (ret)
+-		dev_close(netdev);
+ 
+-	/* Always balance begin, including PHY reset or AN failures. */
++	/* Synchronize PHY-down before balancing replay on PHY errors. */
+ 	phylink_replay_link_end(dev->phylink);
+ 	WRITE_ONCE(dev->usxgmii_recovery_running, false);
+ 	if (ret)
+-- 
+2.43.0
+

@@ -1,0 +1,129 @@
+From 8ee9236dd11590ebdeb24f8c37cd4f57b25ef967 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 02:28:41 -0700
+Subject: [PATCH 2/2] net: pcs: airoha: relink completed live USXGMII speed
+ changes
+
+The phylink resolver does not call pcs_link_up again when the received
+USXGMII speed changes while the link bit stays asserted. The Airoha PCS
+and GDM fragment programming retain the previous resolved speed.
+
+Keep a per-port applied speed and report link down until pcs_link_down
+has invalidated that speed. The next resolve programs the new speed
+through the existing link_up callback. Diagnostic state reads cannot
+consume the required edge. Initialize and invalidate the cache at
+probe, pre_config and link_down; fixed modes are unchanged.
+
+Private candidate only: actual-source tests reproduce the missed edge,
+but historical corrected-rate experiments did not recover the Oct11
+one-way datapath stall. This is not a proven root-cause fix and has not
+been deployed.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 24 ++++++++++++++++++----
+ drivers/net/pcs/airoha/pcs-airoha.h        |  1 +
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 78d7462..683be03 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -398,18 +398,20 @@ static void airoha_pcs_get_state_hsgmii(struct airoha_pcs_priv *priv, int index,
+ 	state->duplex = DUPLEX_FULL;
+ }
+ 
+-static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index,
++static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_port *port,
+ 					 unsigned int neg_mode,
+ 					 struct phylink_link_state *state)
+ {
++	struct airoha_pcs_priv *priv = port->priv;
+ 	const struct airoha_pcs_match_data *data = priv->data;
+-	struct airoha_pcs_maps *maps = &priv->maps[index];
++	struct airoha_pcs_maps *maps = &priv->maps[port->index];
++	int applied_speed = READ_ONCE(port->usxgmii_speed);
+ 	u32 an_done, lpa;
+ 
+ 	/* Trigger HW workaround if needed. If an error is reported,
+ 	 * consider link down and test again later.
+ 	 */
+-	if (data->rxlock_workaround && data->rxlock_workaround(priv, index)) {
++	if (data->rxlock_workaround && data->rxlock_workaround(priv, port->index)) {
+ 		state->link = false;
+ 		return;
+ 	}
+@@ -431,6 +433,14 @@ static void airoha_pcs_get_state_usxgmii(struct airoha_pcs_priv *priv, int index
+ 	}
+ 
+ 	phylink_decode_usxgmii_word(state, lpa);
++
++	/* phylink reprograms the resolved speed only across a link edge.
++	 * Keep reporting down until pcs_link_down clears the applied speed;
++	 * a diagnostic get_state must not consume this edge before resolve.
++	 */
++	if (neg_mode == PHYLINK_PCS_NEG_INBAND_ENABLED && state->link &&
++	    applied_speed != SPEED_UNKNOWN && applied_speed != state->speed)
++		state->link = false;
+ }
+ 
+ static void airoha_pcs_get_state_10gbaser(struct airoha_pcs_priv *priv, int index,
+@@ -485,7 +495,7 @@ static void airoha_pcs_get_state(struct phylink_pcs *pcs,
+ 		airoha_pcs_get_state_hsgmii(priv, port->index, state);
+ 		break;
+ 	case PHY_INTERFACE_MODE_USXGMII:
+-		airoha_pcs_get_state_usxgmii(priv, port->index, neg_mode, state);
++		airoha_pcs_get_state_usxgmii(port, neg_mode, state);
+ 		break;
+ 	case PHY_INTERFACE_MODE_10GBASER:
+ 		airoha_pcs_get_state_10gbaser(priv, port->index, state);
+@@ -1027,6 +1037,9 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			  AIROHA_PCS_XFI_RXMBI_STOP |
+ 			  AIROHA_PCS_XFI_TXMPI_STOP |
+ 			  AIROHA_PCS_XFI_TXMBI_STOP);
++
++	if (interface == PHY_INTERFACE_MODE_USXGMII && !ret)
++		WRITE_ONCE(port->usxgmii_speed, speed);
+ }
+ 
+ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+@@ -1036,6 +1049,7 @@ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+ 	struct airoha_pcs_maps *maps;
+ 
+ 	maps = &priv->maps[port->index];
++	WRITE_ONCE(port->usxgmii_speed, SPEED_UNKNOWN);
+ 
+ 	/* MPI MBI disable */
+ 	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+@@ -1054,6 +1068,7 @@ static void airoha_pcs_pre_config(struct phylink_pcs *pcs,
+ 
+ 	maps = &priv->maps[port->index];
+ 	port->initialized = false;
++	WRITE_ONCE(port->usxgmii_speed, SPEED_UNKNOWN);
+ 
+ 	/* Select HSGMII or USXGMII in SCU regs */
+ 	airoha_pcs_setup_scu(priv, port->index, interface);
+@@ -1478,6 +1493,7 @@ static int airoha_pcs_probe(struct platform_device *pdev)
+ 
+ 		port->priv = priv;
+ 		port->index = index;
++		WRITE_ONCE(port->usxgmii_speed, SPEED_UNKNOWN);
+ 		port->pcs.poll = true;
+ 		port->pcs.ops = &airoha_pcs_ops;
+ 
+diff --git a/drivers/net/pcs/airoha/pcs-airoha.h b/drivers/net/pcs/airoha/pcs-airoha.h
+index b9a64ef..0be3c4b 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1674,6 +1674,7 @@ struct airoha_pcs_port {
+ 	int index;
+ 	phy_interface_t interface;
+ 	bool initialized;
++	int usxgmii_speed;
+ 
+ 	struct phylink_pcs pcs;
+ };
+-- 
+2.43.0
+

@@ -1,0 +1,51 @@
+From 9ea18b2c35d3471d6a968713db46cda5286df0de Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 02:17:20 -0700
+Subject: [PATCH] net: phy: realtek: report actual RTL826x autonegotiated speed
+
+rtl826x_read_status() derives speed and duplex only from the highest
+common advertisement. Those abilities do not reflect a PHY downshift,
+so the reported link can remain 10G or 2.5G after the physical link has
+settled at a lower speed. phy_check_downshift() requires the PHY driver
+to supply the actual speed and cannot detect the difference otherwise.
+
+Read the vendor physical-status register after a successful autoneg
+link-up and reuse the existing Realtek decoder, as done by the RTL822x
+Clause 45 status path. The RTL8261 SDK independently reads the same
+MMD31.0xa434 speed and duplex encoding. Propagate MDIO errors and leave
+forced PMA configuration and the board flow_s recovery path unchanged.
+
+This corrects status reporting; it does not establish the cause of the
+observed XR1710G one-way failure. In-band USXGMII MAC speed still comes
+from the PCS partner word when no separate rate-matching mode is used.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-5.6-sol
+---
+ drivers/net/phy/realtek/realtek_main.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+index 8a7b9dc..bfd795d 100644
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -3619,6 +3619,16 @@ static int rtl826x_read_status(struct phy_device *phydev)
+ 			return ret;
+ 	}
+ 
++	if (phydev->link && phydev->autoneg == AUTONEG_ENABLE) {
++		/* Advertisement resolution does not reflect a downshifted link. */
++		status = phy_read_mmd(phydev, MDIO_MMD_VEND2,
++				      RTL822X_VND2_C22_REG(RTL_PHYSR));
++		if (status < 0)
++			return status;
++
++		rtlgen_decode_physr(phydev, status);
++	}
++
+ 	ret = genphy_c45_read_mdix(phydev);
+ 	if (ret)
+ 		return ret;
+-- 
+2.43.0
+

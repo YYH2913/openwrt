@@ -1,0 +1,172 @@
+From 7a3712bb1ee6a88b2e1dd22530a7a2d3201731dc Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sun, 11 Oct 2026 06:43:02 -0700
+Subject: [PATCH] net: airoha replay PHY and PCS after USXGMII speed change
+
+Queue one deferred recovery for an AN7581 GDM4 LAN USXGMII rate
+transition. Use the public phylink replay contract so MAC and PCS
+state is rebuilt after the PHY vendor initialization and AN restart.
+Keep the work lifetime tied to the GDM device and balance replay on
+all PHY error paths.
+
+Assisted-by: Codex:GPT-5.6-sol
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 68 ++++++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_eth.h |  5 ++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index eba6498..457e6b3 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -8,6 +8,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/moduleparam.h>
+ #include <linux/platform_device.h>
++#include <linux/rtnetlink.h>
+ #include <linux/tcp.h>
+ #include <linux/pcs/pcs.h>
+ #include <linux/u64_stats_sync.h>
+@@ -2578,6 +2579,8 @@ static int airoha_dev_open(struct net_device *netdev)
+ 	struct airoha_qdma *qdma;
+ 	int qdma_id, err;
+ 
++	WRITE_ONCE(dev->usxgmii_last_speed, SPEED_UNKNOWN);
++
+ 	/* HW LRO is configured on the QDMA and it is shared between
+ 	 * all the devices using it. Refuse to open a second device on
+ 	 * the same QDMA if LRO is enabled on any device sharing it.
+@@ -2636,6 +2639,8 @@ static int airoha_dev_stop(struct net_device *netdev)
+ 	struct airoha_gdm_port *port = dev->port;
+ 	struct airoha_qdma *qdma;
+ 
++	WRITE_ONCE(dev->usxgmii_last_speed, SPEED_UNKNOWN);
++
+ 	netif_tx_disable(netdev);
+ 	airoha_set_vip_for_gdm_port(dev, false);
+ 
+@@ -4280,6 +4285,53 @@ static void airoha_mac_config(struct phylink_config *config, unsigned int mode,
+ {
+ }
+ 
++static bool
++airoha_usxgmii_recovery_eligible(struct airoha_gdm_dev *dev,
++				 phy_interface_t interface, int speed)
++{
++	return dev->port->id == AIROHA_GDM4_IDX &&
++	       airoha_is_lan_gdm_dev(dev) && airoha_is_7581(dev->eth) &&
++	       interface == PHY_INTERFACE_MODE_USXGMII && speed != SPEED_UNKNOWN;
++}
++
++static void airoha_usxgmii_recovery_work(struct work_struct *work)
++{
++	struct airoha_gdm_dev *dev = container_of(work, struct airoha_gdm_dev,
++						  usxgmii_recovery_work);
++	struct net_device *netdev = netdev_from_priv(dev);
++	struct phy_device *phy;
++	int ret = 0;
++
++	if (atomic_xchg(&dev->usxgmii_recovery_queued, 0) == 0)
++		return;
++
++	rtnl_lock();
++	if (!netif_running(netdev) || !dev->phylink ||
++	    !netdev->phydev || !airoha_is_7581(dev->eth) ||
++	    dev->port->id != AIROHA_GDM4_IDX ||
++	    !airoha_is_lan_gdm_dev(dev))
++		goto out_unlock;
++
++	WRITE_ONCE(dev->usxgmii_recovery_running, true);
++	phylink_replay_link_begin(dev->phylink);
++
++	phy = netdev->phydev;
++	mutex_lock(&phy->lock);
++	ret = phy_init_hw(phy);
++	if (!ret)
++		ret = _phy_start_aneg(phy);
++	mutex_unlock(&phy->lock);
++
++	/* Always balance begin, including PHY reset or AN failures. */
++	phylink_replay_link_end(dev->phylink);
++	WRITE_ONCE(dev->usxgmii_recovery_running, false);
++	if (ret)
++		netdev_err(netdev, "USXGMII paired PHY replay failed: %d\n", ret);
++
++out_unlock:
++	rtnl_unlock();
++}
++
+ static void airoha_mac_link_up(struct phylink_config *config, struct phy_device *phy,
+ 			       unsigned int mode, phy_interface_t interface,
+ 			       int speed, int duplex, bool tx_pause, bool rx_pause)
+@@ -4290,6 +4342,16 @@ static void airoha_mac_link_up(struct phylink_config *config, struct phy_device
+ 	struct airoha_eth *eth = dev->eth;
+ 	u32 frag_size_tx, frag_size_rx;
+ 	u32 mask, val;
++	int previous_speed;
++
++	if (airoha_usxgmii_recovery_eligible(dev, interface, speed)) {
++		previous_speed = READ_ONCE(dev->usxgmii_last_speed);
++		WRITE_ONCE(dev->usxgmii_last_speed, speed);
++		if (previous_speed != SPEED_UNKNOWN && previous_speed != speed &&
++		    !READ_ONCE(dev->usxgmii_recovery_running) &&
++		    atomic_cmpxchg(&dev->usxgmii_recovery_queued, 0, 1) == 0)
++			schedule_work(&dev->usxgmii_recovery_work);
++	}
+ 
+ 	/* TX/RX frag is configured only for GDM4 */
+ 	if (port->id != AIROHA_GDM4_IDX)
+@@ -4481,6 +4543,10 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
+ 	device_set_node(&netdev->dev, of_fwnode_handle(of_node_get(np)));
+ 	dev = netdev_priv(netdev);
+ 	u64_stats_init(&dev->stats.syncp);
++	INIT_WORK(&dev->usxgmii_recovery_work, airoha_usxgmii_recovery_work);
++	atomic_set(&dev->usxgmii_recovery_queued, 0);
++	dev->usxgmii_recovery_running = false;
++	dev->usxgmii_last_speed = SPEED_UNKNOWN;
+ 	dev->port = port;
+ 	dev->eth = eth;
+ 	dev->nbq = nbq;
+@@ -4723,6 +4789,7 @@ error_napi_stop:
+ 			netdev = netdev_from_priv(dev);
+ 			if (netdev->reg_state == NETREG_REGISTERED)
+ 				unregister_netdev(netdev);
++			cancel_work_sync(&dev->usxgmii_recovery_work);
+ 			airoha_soe_teardown_netdev(netdev);
+ 			if (dev->phylink)
+ 				phylink_destroy(dev->phylink);
+@@ -4765,6 +4832,7 @@ static void airoha_remove(struct platform_device *pdev)
+ 
+ 			netdev = netdev_from_priv(dev);
+ 			unregister_netdev(netdev);
++			cancel_work_sync(&dev->usxgmii_recovery_work);
+ 			airoha_soe_teardown_netdev(netdev);
+ 			phylink_destroy(dev->phylink);
+ 			of_node_put(netdev->dev.of_node);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index cdac052..6595261 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -14,6 +14,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/reset.h>
+ #include <linux/soc/airoha/airoha_offload.h>
++#include <linux/workqueue.h>
+ #include <net/dsa.h>
+ 
+ struct airoha_soe;
+@@ -640,6 +641,10 @@ struct airoha_gdm_dev {
+ 			    u32 msg0, u32 msg1, u32 msg2);
+ 
+ 	struct airoha_hw_stats stats;
++	struct work_struct usxgmii_recovery_work;
++	atomic_t usxgmii_recovery_queued;
++	bool usxgmii_recovery_running;
++	int usxgmii_last_speed;
+ 
+ 	struct phylink *phylink;
+ 	struct phylink_config phylink_config;
+-- 
+2.43.0
+
