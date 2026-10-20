@@ -1,0 +1,59 @@
+From a13a2be996e36244044ae082d2e6dd381b1f198a Mon Sep 17 00:00:00 2001
+From: Jiale Yao <yaojiale02@163.com>
+Date: Tue, 20 Oct 2026 10:49:27 +0800
+Subject: [PATCH] wifi: mt76: mt7996: validate MCU response lengths
+
+The MCU receive and response paths access descriptor fields without
+checking that they are present. The response parser can also read a UNI
+event payload beyond a truncated skb.
+
+Require enough descriptor data at the receive entry point, account for
+the shorter patch response, and validate UNI event payloads before
+accessing them.
+
+Fixes: 98686cd21624 ("wifi: mt76: mt7996: add driver for MediaTek Wi-Fi 7 (802.11be) devices")
+Signed-off-by: Jiale Yao <yaojiale02@163.com>
+Link: https://patch.msgid.link/20261020024933.3205681-2-yaojiale02@163.com
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ mt7996/mcu.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index a9c7361c8..3ec414533 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -238,6 +238,11 @@ mt7996_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 
+ 		return -ETIMEDOUT;
+ 	}
++	if (cmd == MCU_CMD(PATCH_SEM_CONTROL) &&
++	    skb->len < offsetofend(struct mt7996_mcu_rxd, ext_eid))
++		return -EINVAL;
++	if (cmd != MCU_CMD(PATCH_SEM_CONTROL) && skb->len < sizeof(*rxd))
++		return -EINVAL;
+ 
+ 	rxd = (struct mt7996_mcu_rxd *)skb->data;
+ 	if (seq != rxd->seq)
+@@ -248,6 +253,9 @@ mt7996_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 		ret = *skb->data;
+ 	} else if ((rxd->option & MCU_UNI_CMD_EVENT) &&
+ 		    rxd->eid == MCU_UNI_EVENT_RESULT) {
++		if (skb->len < sizeof(*rxd) + sizeof(*event))
++			return -EINVAL;
++
+ 		skb_pull(skb, sizeof(*rxd));
+ 		event = (struct mt7996_mcu_uni_event *)skb->data;
+ 		ret = le32_to_cpu(event->status);
+@@ -987,6 +995,11 @@ void mt7996_mcu_rx_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt7996_mcu_rxd *rxd = (struct mt7996_mcu_rxd *)skb->data;
+ 
++	if (skb->len < offsetofend(struct mt7996_mcu_rxd, ext_eid)) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	if (rxd->option & MCU_UNI_CMD_UNSOLICITED_EVENT) {
+ 		mt7996_mcu_uni_rx_unsolicited_event(dev, skb);
+ 		return;
