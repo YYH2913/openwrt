@@ -109,10 +109,10 @@ TARGET_DEVICES += gemtek_w1700k-ubi
 define Device/gemtek_xr1710g-ubi
   DEVICE_VENDOR := Gemtek
   DEVICE_MODEL := XR1710G
-  DEVICE_VARIANT := UBI
+  DEVICE_VARIANT := (UBI)
   DEVICE_ALT0_VENDOR := Brightspeed
   DEVICE_ALT0_MODEL := XR1710G
-  DEVICE_ALT0_VARIANT := UBI
+  DEVICE_ALT0_VARIANT := (UBI)
   DEVICE_DTS := an7581-xr1710g-ubi
   SUPPORTED_DEVICES += econet,xr1710g-ubi
   DEVICE_COMPAT_VERSION := 2.0
@@ -154,6 +154,8 @@ define Device/gemtek_xr1710g-ubi
   KERNEL_INITRAMFS_SUFFIX := -recovery.itb
   IMAGES := sysupgrade.itb
   IMAGE/sysupgrade.itb := append-kernel | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | append-metadata
+  ARTIFACTS := chainload-uboot.itb
+  ARTIFACT/chainload-uboot.itb := an7581-chainloader gemtek_xr1710g
   SOC := an7581
 endef
 TARGET_DEVICES += gemtek_xr1710g-ubi
