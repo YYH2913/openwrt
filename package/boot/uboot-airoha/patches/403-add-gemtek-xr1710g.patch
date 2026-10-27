@@ -37,16 +37,18 @@ On top of that:
   none of them holds an environment.
 - The installer entries of the W1700K are dropped: the device is
   installed by booting the recovery image and running sysupgrade.
+- CONFIG_CMD_ASKENV is enabled, as on the Nokia boards: the TFTP and
+  recovery menu entries wait for Enter with askenv when they fail.
 
 Based on the XR1710G chainloader by Kenneth Kasilag.
 
 Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
 ---
- configs/an7581_xr1710g_defconfig                     | 106 ++++++++++++++++++++++++++++++++++++++++
+ configs/an7581_xr1710g_defconfig                     | 107 ++++++++++++++++++++++++++++++++++++++++
  defenvs/an7581_xr1710g_env                           |  31 +++++++++++++++++++++++++++++++
  dts/upstream/src/arm64/airoha/an7581-xr1710g-ubi.dts | 131 ++++++++++++++++++++++++++++++++++++++++
  arch/arm/dts/an7581-xr1710g-ubi-u-boot.dtsi          |   7 +++++++
- 4 files changed, 275 insertions(+)
+ 4 files changed, 276 insertions(+)
  create mode 100644 configs/an7581_xr1710g_defconfig
  create mode 100644 defenvs/an7581_xr1710g_env
  create mode 100644 dts/upstream/src/arm64/airoha/an7581-xr1710g-ubi.dts
@@ -54,7 +56,7 @@ Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
 
 --- /dev/null
 +++ b/configs/an7581_xr1710g_defconfig
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,107 @@
 +CONFIG_ARM=y
 +CONFIG_ARCH_AIROHA=y
 +CONFIG_AUTOBOOT_KEYED=y
@@ -81,6 +83,7 @@ Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
 +CONFIG_HUSH_PARSER=y
 +CONFIG_SYS_PROMPT="U-Boot> "
 +CONFIG_SYS_MAXARGS=8
++CONFIG_CMD_ASKENV=y
 +CONFIG_CMD_BOOTZ=y
 +CONFIG_CMD_BOOTMENU=y
 +# CONFIG_CMD_ELF is not set
@@ -182,7 +185,7 @@ Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
 +bootmenu_confirm_return=askenv - Press ENTER to return to menu ; bootmenu 60
 +bootmenu_default=0
 +bootmenu_delay=3
-+bootmenu_title=      34m( ( ( mOpenWrt34m ) ) )
++bootmenu_title=      [0;34m( ( ( [1;39mOpenWrt[0;34m ) ) )
 +bootmenu_0=Run default boot command.=run bootcmd
 +bootmenu_1=Boot system via TFTP.=run boot_tftp ; run bootmenu_confirm_return
 +bootmenu_2=Boot recovery system from flash.=run boot_recovery ; run bootmenu_confirm_return
