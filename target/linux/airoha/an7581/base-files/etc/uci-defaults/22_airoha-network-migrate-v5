@@ -6,31 +6,53 @@
 [ "$(board_name)" = "gemtek,xr1710g-ubi" ] || exit 0
 
 migrated=0
+legacy_names=0
+migration_failed=0
+
+xr1710g_uci() {
+	uci "$@" || {
+		migration_failed=1
+		return 1
+	}
+}
+
+detect_xr1710g_legacy_names() {
+	local config="$1"
+	local option values value
+
+	for option in name device ports ifname; do
+		config_get values "$config" "$option"
+		for value in $values; do
+			case "$value" in
+			eth0|eth0.1|eth0.2|eth0.8|\
+			eth1|eth1.*|eth1:*|eth2|eth2.*|eth2:*|\
+			ae_wan|ae_wan.*|ae_wan:*|lan1|lan1.*|lan1:*)
+				legacy_names=1
+				;;
+			esac
+		done
+	done
+}
 
 normalize_xr1710g_netdev() {
-	case "$1" in
-	ae_wan|wan|eth0)
-		printf 'eth1'
-		;;
-	ae_wan.*|wan.*)
-		printf 'eth1.%s' "${1#*.}"
-		;;
-	ae_wan:*|wan:*)
-		printf 'eth1:%s' "${1#*:}"
-		;;
-	lan1)
-		printf 'eth2'
-		;;
-	lan1.*)
-		printf 'eth2.%s' "${1#*.}"
-		;;
-	lan1:*)
-		printf 'eth2:%s' "${1#*:}"
-		;;
-	*)
-		printf '%s' "$1"
-		;;
+	local value="$1"
+	local base="${value%%[.:]*}"
+	local suffix="${value#"$base"}"
+
+	[ "$legacy_names" -eq 1 ] || {
+		printf '%s' "$value"
+		return
+	}
+
+	# Transform the old physical layout once, not successive substitutions:
+	# eth2 (10G) -> lan2; old lan2/lan3 (1G) -> lan3/lan4.
+	case "$base" in
+	ae_wan|eth0|eth1) base=wan ;;
+	eth2|lan1) base=lan2 ;;
+	lan2) base=lan3 ;;
+	lan3) base=lan4 ;;
 	esac
+	printf '%s%s' "$base" "$suffix"
 }
 
 migrate_xr1710g_list() {
@@ -49,9 +71,9 @@ migrate_xr1710g_list() {
 
 	[ "$changed" -eq 1 ] || return 0
 
-	uci -q delete "network.$config.$option"
+	xr1710g_uci -q delete "network.$config.$option"
 	for value in $new_values; do
-		uci add_list "network.$config.$option=$value"
+		xr1710g_uci add_list "network.$config.$option=$value"
 	done
 	migrated=1
 }
@@ -72,7 +94,7 @@ migrate_xr1710g_words() {
 
 	[ "$changed" -eq 1 ] || return 0
 
-	uci set "network.$config.$option=$new_values"
+	xr1710g_uci set "network.$config.$option=$new_values"
 	migrated=1
 }
 
@@ -90,9 +112,9 @@ migrate_xr1710g_device() {
 		*" eth0.8 "*|*" eth0.1 "*|*" eth0.2 "*)
 			uci -q delete "network.$config.ifname"
 			uci -q delete "network.$config.ports"
-			uci add_list "network.$config.ports=eth2"
-			uci add_list "network.$config.ports=lan2"
-			uci add_list "network.$config.ports=lan3"
+			xr1710g_uci add_list "network.$config.ports=lan2"
+			xr1710g_uci add_list "network.$config.ports=lan3"
+			xr1710g_uci add_list "network.$config.ports=lan4"
 			migrated=1
 			return 0
 			;;
@@ -101,7 +123,7 @@ migrate_xr1710g_device() {
 
 	normalized="$(normalize_xr1710g_netdev "$name")"
 	if [ -n "$name" ] && [ "$normalized" != "$name" ]; then
-		uci set "network.$config.name=$normalized"
+		xr1710g_uci set "network.$config.name=$normalized"
 		migrated=1
 	fi
 
@@ -117,7 +139,7 @@ migrate_xr1710g_interface() {
 	normalized="$(normalize_xr1710g_netdev "$device")"
 
 	if [ -n "$device" ] && [ "$normalized" != "$device" ]; then
-		uci set "network.$config.device=$normalized"
+		xr1710g_uci set "network.$config.device=$normalized"
 		migrated=1
 	fi
 
@@ -137,7 +159,7 @@ set_xr1710g_wan_clientid_default() {
 	case "$sendclientid" in
 	''|none)
 		# "none" suppresses option 61; "hardware" keeps the MAC-based ID.
-		uci set network.wan.sendclientid='hardware'
+		xr1710g_uci set network.wan.sendclientid='hardware'
 		;;
 	*)
 		return 0
@@ -147,12 +169,27 @@ set_xr1710g_wan_clientid_default() {
 }
 
 config_load network
+config_get port_names globals xr1710g_port_names
+[ "$port_names" = "pr26296" ] && exit 0
+
+config_foreach detect_xr1710g_legacy_names device
+config_foreach detect_xr1710g_legacy_names interface
+config_foreach detect_xr1710g_legacy_names bridge-vlan
 config_foreach migrate_xr1710g_device device
 config_foreach migrate_xr1710g_interface interface
+config_foreach migrate_xr1710g_list bridge-vlan ports
 set_xr1710g_wan_clientid_default
 
-[ "$migrated" -eq 1 ] || exit 0
+# A saved PR-style configuration must not have its lan2/lan3 shifted again.
+uci -q get network.globals >/dev/null || xr1710g_uci set network.globals=globals
+xr1710g_uci set network.globals.xr1710g_port_names='pr26296'
 
-uci commit network
+[ "$migration_failed" -eq 0 ] || {
+	uci -q revert network
+	logger -t xr1710g-network 'Port name migration failed; configuration unchanged'
+	exit 1
+}
+
+uci commit network || exit 1
 
 exit 0

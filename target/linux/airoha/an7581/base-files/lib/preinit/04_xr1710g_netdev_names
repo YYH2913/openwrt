@@ -1,0 +1,22 @@
+xr1710g_netdev_names() {
+	local dir node netdev name
+
+	[ "$(board_name)" = "gemtek,xr1710g-ubi" ] || return 0
+
+	# Match GDM hardware nodes, not probe-order-dependent ethN names.
+	# The DSA ports already use their PR26296 labels (lan3 and lan4).
+	for dir in /sys/class/net/*; do
+		node="$(readlink -f "$dir/of_node")" || continue
+		case "$node" in
+		*/ethernet@1fb50000/ethernet@2) name=wan ;;
+		*/ethernet@1fb50000/ethernet@4) name=lan2 ;;
+		*) continue ;;
+		esac
+
+		netdev="${dir##*/}"
+		[ "$netdev" = "$name" ] && continue
+		ip link set "$netdev" name "$name" || return 1
+	done
+}
+
+boot_hook_add preinit_main xr1710g_netdev_names
