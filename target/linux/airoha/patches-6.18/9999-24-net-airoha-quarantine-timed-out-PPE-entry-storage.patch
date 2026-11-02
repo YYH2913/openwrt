@@ -1,0 +1,107 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: quarantine timed-out PPE entry storage
+
+A timed-out pointer-bearing NPU commit can still consume its coherent
+FOE entry and publish the hardware slot later. The existing software
+owner remains the old flow until success, so destroying it can make the
+uncertain slot appear reusable. This also lets a later commit overwrite
+the DMA source while the original callback may still read it.
+
+Quarantine that index for the PPE object's lifetime on -ETIMEDOUT, and
+validate indices before forming table pointers. Reject quarantined slots
+in the common getter as well as commit: SRAM reads copy hardware into
+the coherent source, and callers such as SA flush modify the returned
+entry before attempting commit. The shared getter guard also excludes
+these slots from force-commit probes, cached binding and debug snapshots.
+
+Other errors retain their existing behavior. This extends the previously
+reviewed private quarantine candidate to cover SRAM snapshot writes.
+Provider teardown and bulk-reset retry still need an independent hardware
+stop/drain and transitive DMA lifetime contract.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -671,6 +671,8 @@
+ 	struct hlist_head *foe_flow;
+ 	/* Software slot ownership, protected by ppe_lock. */
+ 	struct airoha_flow_table_entry **foe_owner;
++	/* Timed-out NPU commits retain their coherent entry storage. */
++	unsigned long *foe_quarantine;
+ 	u16 *foe_check_time;
+ 	struct airoha_ppe_soe_meta *soe_meta;
+ 	u64 soe_sa_cookie[AIROHA_SOE_NUM_SA];
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -4,6 +4,7 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#include <linux/bitmap.h>
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/kstrtox.h>
+@@ -910,6 +911,13 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 
++	/* SRAM reads overwrite this coherent snapshot, so readers must also
++	 * leave storage referenced by an unfinished NPU callback untouched.
++	 */
++	if (hash >= airoha_ppe_get_total_num_entries(ppe) ||
++	    test_bit(hash, ppe->foe_quarantine))
++		return NULL;
++
+ 	if (hash < sram_num_entries) {
+ 		u32 *hwe = ppe->foe + hash * sizeof(struct airoha_foe_entry);
+ 		struct airoha_eth *eth = ppe->eth;
+@@ -982,7 +990,7 @@
+ 				       struct airoha_flow_table_entry *owner)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+-	struct airoha_foe_entry *hwe = ppe->foe + hash * sizeof(*hwe);
++	struct airoha_foe_entry *hwe;
+ 	u32 ts = airoha_ppe_get_timestamp(ppe);
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu *npu;
+@@ -990,6 +998,12 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++	if (test_bit(hash, ppe->foe_quarantine))
++		return -EBUSY;
++	hwe = ppe->foe + hash * sizeof(*hwe);
++
+ 	/* Retire a flow's former slot before publishing its replacement. This
+ 	 * makes a failed source retirement leave the old owner intact and a
+ 	 * failed destination commit leave no live software owner behind.
+@@ -1035,8 +1049,14 @@
+ unlock:
+ 	rcu_read_unlock();
+ 
+-	if (err)
++	if (err) {
++		/* Timeout does not cancel the pointer-bearing callback. Keep both
++		 * the DMA source and its uncertain hardware slot out of reuse.
++		 */
++		if (err == -ETIMEDOUT)
++			set_bit(hash, ppe->foe_quarantine);
+ 		return err;
++	}
+ 
+ 	if (ppe->foe_owner[hash])
+ 		airoha_ppe_foe_flow_unbind(ppe, ppe->foe_owner[hash]);
+@@ -2535,6 +2555,11 @@
+ 	if (!ppe->foe_owner)
+ 		return -ENOMEM;
+ 
++	ppe->foe_quarantine = devm_bitmap_zalloc(eth->dev, ppe_num_entries,
++						 GFP_KERNEL);
++	if (!ppe->foe_quarantine)
++		return -ENOMEM;
++
+ 	ppe_num_stats_entries = airoha_ppe_get_total_num_stats_entries(ppe);
+ 	if (ppe_num_stats_entries > 0) {
+ 		foe_size = ppe_num_stats_entries * sizeof(*ppe->foe_stats);

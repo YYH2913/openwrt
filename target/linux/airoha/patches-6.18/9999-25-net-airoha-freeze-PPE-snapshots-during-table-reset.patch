@@ -1,0 +1,92 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: freeze PPE snapshots during table reset
+
+The bulk SRAM reset passes the entire coherent FOE table to the NPU.
+The public debugfs snapshot and CPU binding paths can still copy SRAM
+entries into that table during the blocking call or after a timeout.
+Per-entry quarantine does not cover this transaction.
+
+Block common entry getters and commits before preparing the reset data.
+Keep the table frozen on any reset error, and explicitly wait for the
+previous mailbox/recovery completion before retrying the destructive
+initialization. Restore table access only after a successful blocking
+reset. Existing flow_offload_mutex serialization and delayed publication
+of eth->npu keep this setup path separate from accepted entry commits.
+
+This protects CPU reuse of reset storage. It does not stop hardware DMA
+or extend allocation lifetime during provider teardown.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -673,6 +673,8 @@
+ 	struct airoha_flow_table_entry **foe_owner;
+ 	/* Timed-out NPU commits retain their coherent entry storage. */
+ 	unsigned long *foe_quarantine;
++	/* Protected by ppe_lock; bulk reset still owns the coherent table. */
++	bool foe_flush_pending;
+ 	u16 *foe_check_time;
+ 	struct airoha_ppe_soe_meta *soe_meta;
+ 	u64 soe_sa_cookie[AIROHA_SOE_NUM_SA];
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -914,7 +914,8 @@
+ 	/* SRAM reads overwrite this coherent snapshot, so readers must also
+ 	 * leave storage referenced by an unfinished NPU callback untouched.
+ 	 */
+-	if (hash >= airoha_ppe_get_total_num_entries(ppe) ||
++	if (ppe->foe_flush_pending ||
++	    hash >= airoha_ppe_get_total_num_entries(ppe) ||
+ 	    test_bit(hash, ppe->foe_quarantine))
+ 		return NULL;
+ 
+@@ -1000,7 +1001,7 @@
+ 
+ 	if (hash >= airoha_ppe_get_total_num_entries(ppe))
+ 		return -EINVAL;
+-	if (test_bit(hash, ppe->foe_quarantine))
++	if (ppe->foe_flush_pending || test_bit(hash, ppe->foe_quarantine))
+ 		return -EBUSY;
+ 	hwe = ppe->foe + hash * sizeof(*hwe);
+ 
+@@ -2263,6 +2264,22 @@
+ 	u32 ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	struct airoha_foe_entry *hwe = ppe->foe;
++	int err;
++
++	/* Setup is serialized and the NPU is not published to PPE consumers.
++	 * On retry, establish that the previous callback released the table
++	 * before zeroing it again. A timeout alone never establishes that.
++	 */
++	lockdep_assert_held(&flow_offload_mutex);
++	if (ppe->foe_flush_pending) {
++		err = airoha_npu_wait_recovery(npu);
++		if (err)
++			return err;
++	}
++
++	spin_lock_bh(&ppe_lock);
++	ppe->foe_flush_pending = true;
++	spin_unlock_bh(&ppe_lock);
+ 
+ 	memset(hwe, 0, ppe_num_entries * sizeof(*hwe));
+ 	if (ppe->foe_stats) {
+@@ -2274,8 +2291,15 @@
+ 	}
+ 	dma_wmb();
+ 
+-	return npu->ops.ppe_flush_sram_entries(npu, ppe->foe_dma,
+-					       sram_num_entries);
++	err = npu->ops.ppe_flush_sram_entries(npu, ppe->foe_dma,
++					    sram_num_entries);
++	if (!err) {
++		spin_lock_bh(&ppe_lock);
++		ppe->foe_flush_pending = false;
++		spin_unlock_bh(&ppe_lock);
++	}
++
++	return err;
+ }
+ 
+ static int airoha_ppe_set_bind_rate(const char *val,
