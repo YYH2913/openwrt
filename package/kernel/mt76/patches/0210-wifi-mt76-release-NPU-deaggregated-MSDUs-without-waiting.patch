@@ -1,0 +1,152 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: release NPU deaggregated MSDUs without waiting
+
+NPU forwarding can consume some MSDUs of an A-MSDU without delivering them
+to the host. The ordinary host collection path waits for its last subframe,
+so a CPU-bound first subframe can remain buffered until unrelated traffic
+arrives. Tracing shows 32 ms p95 here, versus 0.2 ms for standalone
+frames. Sparse traffic can leave the final packet waiting much longer.
+
+Queue complete header-translated NPU MSDUs immediately. Preserve the
+whole-aggregate injection check and original first/last metadata.
+Track the open
+sequence alongside each CCMP replay counter so non-first subframes can
+share their MPDU PN without allowing an older PN, a new first subframe or
+a different/closed sequence. Reset this state with the key. Other receive
+paths and NPU/PPE acceleration are retained.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -934,6 +934,21 @@ static void mt76_rx_release_burst(struct
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+ 
++	/* NPU siblings can go straight to the PPE, so their last subframe
++	 * need not reach the host. Each translated skb is already one MSDU.
++	 */
++	if (mt76_queue_is_npu_rx(&phy->dev->q_rx[q]) &&
++	    (status->flag & RX_FLAG_8023)) {
++		if (phy->rx_amsdu[q].head)
++			mt76_rx_release_amsdu(phy, q);
++
++		status->npu_deagg = 1;
++		if (status->amsdu && !status->first_amsdu)
++			status->flag |= RX_FLAG_ALLOW_SAME_PN;
++		__skb_queue_tail(&phy->dev->rx_skb[q], skb);
++		return;
++	}
++
+ 	if (phy->rx_amsdu[q].head &&
+ 	    (!status->amsdu || status->first_amsdu ||
+ 	     status->seqno != phy->rx_amsdu[q].seqno))
+@@ -1316,6 +1331,49 @@ mt76_rx_convert(struct mt76_dev *dev, st
+ 	*hw = mt76_phy_hw(dev, mstat.phy_idx);
+ }
+ 
++/* Called under rx_lock, before delivery or replay-counter updates. */
++static bool
++mt76_npu_check_amsdu(struct mt76_dev *dev, struct sk_buff *skb)
++{
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	u8 tid = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
++	struct mt76_wcid *wcid;
++	bool invalid;
++
++	if (!status->npu_deagg)
++		return true;
++
++	invalid = skb->len < ETH_HLEN;
++	if (!status->amsdu)
++		return !invalid;
++
++	if (!invalid)
++		invalid = ether_addr_equal(skb->data, rfc1042_header);
++	wcid = __mt76_wcid_ptr(dev, status->wcid_idx);
++	if (!wcid)
++		return !invalid;
++
++	wcid = mt76_wcid_primary(wcid);
++	if (invalid) {
++		/* Preserve rejection of the entire aggregate if its first
++		 * CPU-visible subframe has the unauthenticated A-MSDU layout.
++		 */
++		wcid->rx_npu_bad_seq[tid] = status->seqno;
++		memcpy(wcid->rx_npu_bad_pn[tid], status->iv, sizeof(status->iv));
++		return false;
++	}
++
++	if (wcid->rx_npu_bad_seq[tid] == status->seqno &&
++	    !memcmp(wcid->rx_npu_bad_pn[tid], status->iv, sizeof(status->iv)))
++		return false;
++
++	/* NPU reordering delivers each TID in order. Do not retain a rejected
++	 * sequence across a later MPDU, including sequence-number wrap.
++	 */
++	wcid->rx_npu_bad_seq[tid] = U16_MAX;
++	return true;
++}
++
+ static void
+ mt76_check_ccmp_pn(struct mt76_dev *dev, struct sk_buff *skb)
+ {
+@@ -1368,12 +1426,17 @@ skip_hdr_check:
+ 	BUILD_BUG_ON(sizeof(status->iv) != sizeof(wcid->rx_key_pn[0]));
+ 	ret = memcmp(status->iv, pn_wcid->rx_key_pn[security_idx],
+ 		     sizeof(status->iv));
+-	if (ret <= 0) {
++	if (ret < 0 ||
++	    (!ret && (!(status->flag & RX_FLAG_ALLOW_SAME_PN) ||
++		      !status->amsdu || status->first_amsdu ||
++		      status->seqno != pn_wcid->rx_key_seq[security_idx]))) {
+ 		status->flag |= RX_FLAG_ONLY_MONITOR;
+ 		return;
+ 	}
+ 
+ 	memcpy(pn_wcid->rx_key_pn[security_idx], status->iv, sizeof(status->iv));
++	pn_wcid->rx_key_seq[security_idx] =
++		status->amsdu && !status->last_amsdu ? status->seqno : U16_MAX;
+ 
+ 	if (status->flag & RX_FLAG_IV_STRIPPED)
+ 		status->flag |= RX_FLAG_PN_VALIDATED;
+@@ -1559,6 +1622,11 @@ void mt76_rx_complete(struct mt76_dev *d
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
+ 
++		if (!mt76_npu_check_amsdu(dev, skb)) {
++			dev_kfree_skb(skb);
++			continue;
++		}
++
+ 		mt76_check_ccmp_pn(dev, skb);
+ 		skb_shinfo(skb)->frag_list = NULL;
+ 		mt76_rx_convert(dev, skb, &hw, &sta);
+--- a/mt76.h
++++ b/mt76.h
+@@ -414,6 +414,9 @@ struct mt76_wcid {
+ 
+ 	u8 rx_check_pn;
+ 	u8 rx_key_pn[IEEE80211_NUM_TIDS + 1][6];
++	u16 rx_key_seq[IEEE80211_NUM_TIDS + 1];
++	u16 rx_npu_bad_seq[IEEE80211_NUM_TIDS];
++	u8 rx_npu_bad_pn[IEEE80211_NUM_TIDS][6];
+ 	u16 cipher;
+ 
+ 	u32 tx_info;
+@@ -756,6 +759,7 @@ struct mt76_rx_status {
+ 
+ 	u8 phy_idx:2;
+ 	u8 aggr:1;
++	u8 npu_deagg:1;
+ 	u8 qos_ctl;
+ 	u16 seqno;
+ 
+@@ -1597,6 +1601,8 @@ mt76_wcid_key_link_setup(struct mt76_wci
+ 			 struct ieee80211_key_conf *key)
+ {
+ 	wcid->rx_check_pn = key && key->cipher == WLAN_CIPHER_SUITE_CCMP;
++	memset(wcid->rx_key_seq, 0xff, sizeof(wcid->rx_key_seq));
++	memset(wcid->rx_npu_bad_seq, 0xff, sizeof(wcid->rx_npu_bad_seq));
+ }
+ 
+ void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
