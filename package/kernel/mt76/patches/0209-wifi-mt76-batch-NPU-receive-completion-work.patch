@@ -1,0 +1,31 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: batch NPU receive completion work
+
+The NPU RX loop calls mt76_rx_poll_complete after every skb, including
+control notifications which queue no data frames. That repeatedly acquires
+the device-wide rx_lock and dispatches short lists to mac80211.
+
+Complete the bounded poll batch once, as the regular DMA RX path already
+does. Preserve delivery order and finish upper-layer work before refilling
+the ring and completing NAPI. Zero-budget polls and provider RCU lifetime
+remain unchanged. NPU/PPE acceleration and hardware queue sizes are
+retained.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+
+--- a/npu.c
++++ b/npu.c
+@@ -251,10 +251,12 @@
+ 		}
+ 
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+-		mt76_rx_poll_complete(dev, qid, napi);
+ 		done++;
+ 	}
+ 
++	if (done)
++		mt76_rx_poll_complete(dev, qid, napi);
++
+ 	mt76_npu_fill_rx_queue(dev, q);
+ out:
+ 	if (done < budget && napi_complete(napi))
