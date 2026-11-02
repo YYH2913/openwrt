@@ -1,0 +1,28 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] xfrm: release policy device reference after ops withdrawal
+
+A policy may remain referenced after xfrm_dev_policy_flush() unlinks it.
+If a device withdraws its XFRM operations before the final policy put,
+xfrm_dev_policy_free() skips both the optional driver callback and the
+netdev_put(). The latter leaks the policy's device reference and can keep
+device unregistration waiting indefinitely.
+
+Keep the driver callback conditional on available operations, but always
+clear the policy's device pointer and release its reference on destruction.
+This keeps the final-reference lifetime and callback-before-put ordering.
+
+Fixes: 919e43fad516 ("xfrm: add an interface to offload policy")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -2195,8 +2195,8 @@
+ 	struct xfrm_dev_offload *xdo = &x->xdo;
+ 	struct net_device *dev = xdo->dev;
+ 
+-	if (dev && dev->xfrmdev_ops) {
+-		if (dev->xfrmdev_ops->xdo_dev_policy_free)
++	if (dev) {
++		if (dev->xfrmdev_ops && dev->xfrmdev_ops->xdo_dev_policy_free)
+ 			dev->xfrmdev_ops->xdo_dev_policy_free(x);
+ 		xdo->dev = NULL;
+ 		netdev_put(dev, &xdo->dev_tracker);
