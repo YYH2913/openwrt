@@ -1,0 +1,56 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: charge NPU RX drops to the poll budget
+
+NPU dequeue returns NULL both when no complete packet is available and
+when it consumed malformed descriptors or failed to build an skb. In the
+latter case, completing NAPI immediately leaves already completed packets
+behind the drop waiting for another interrupt.
+
+Check queue progress around dequeue. Charge a consumed drop as one packet
+of NAPI work and continue polling within the budget. A NULL result with
+no progress still stops the poll, including partial hardware completions.
+Keep the existing zero-budget page-pool guard.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/npu.c
++++ b/npu.c
+@@ -220,6 +220,7 @@
+ {
+ 	struct mt76_dev *dev = mt76_priv(napi->dev);
+ 	enum mt76_rxq_id qid = napi - dev->napi;
++	struct mt76_queue *q = &dev->q_rx[qid];
+ 	struct airoha_npu *npu;
+ 	int done = 0;
+ 
+@@ -234,18 +235,27 @@
+ 
+ 	while (done < budget) {
+ 		struct sk_buff *skb;
++		int queued = q->queued;
+ 		u32 info = 0;
+ 
+-		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
+-		if (!skb)
+-			break;
++		skb = mt76_npu_dequeue(dev, q, &info);
++		if (!skb) {
++			if (q->queued == queued)
++				break;
++
++			/* A dropped packet consumed descriptors. Keep polling the
++			 * completed packets behind it, but account for the work.
++			 */
++			done++;
++			continue;
++		}
+ 
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done++;
+ 	}
+ 
+-	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
++	mt76_npu_fill_rx_queue(dev, q);
+ out:
+ 	if (done < budget && napi_complete(napi))
+ 		dev->drv->rx_poll_complete(dev, qid);

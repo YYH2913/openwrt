@@ -1,0 +1,41 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: order NPU TX descriptor publication
+
+The NPU host-adapter worker polls descriptor DONE independently of the
+host producer index. It can copy the TXWI and consume the payload address
+as soon as that bit becomes visible. The write barrier in the later queue
+kick only orders descriptors against the producer-index notification.
+
+Order the TXWI copy and payload address before publishing DONE with a
+DMA write barrier and a single control-word store. Keep the existing
+queue-kick barrier for the separate index notification. Descriptor bits,
+queue bookkeeping and DMA mappings remain the same.
+
+Fixes: 141a81557070 ("wifi: mt76: Introduce the NPU generic layer")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/npu.c
++++ b/npu.c
+@@ -313,14 +313,20 @@
+ {
+ 	u16 txwi_len = min_t(u16, phy->dev->drv->txwi_size, NPU_TXWI_LEN);
+ 	struct airoha_npu_tx_dma_desc *desc = (void *)q->desc;
++	u32 ctrl;
+ 	int ret;
+ 
++	ctrl = FIELD_PREP(NPU_TX_DMA_DESC_VEND_LEN_MASK, txwi_len) |
++	       FIELD_PREP(NPU_TX_DMA_DESC_LEN_MASK, skb->len) |
++	       NPU_TX_DMA_DESC_DONE_MASK;
++
+ 	/* TODO: Take into account unlinear skbs */
+ 	memcpy(desc[q->head].txwi, txwi_ptr, txwi_len);
+ 	desc[q->head].addr = buf->addr;
+-	desc[q->head].ctrl = FIELD_PREP(NPU_TX_DMA_DESC_VEND_LEN_MASK, txwi_len) |
+-			     FIELD_PREP(NPU_TX_DMA_DESC_LEN_MASK, skb->len) |
+-			     NPU_TX_DMA_DESC_DONE_MASK;
++
++	/* The NPU polls DONE independently of the producer index. */
++	dma_wmb();
++	WRITE_ONCE(desc[q->head].ctrl, ctrl);
+ 
+ 	ret = q->head;
+ 	q->entry[q->head].skip_buf0 = true;

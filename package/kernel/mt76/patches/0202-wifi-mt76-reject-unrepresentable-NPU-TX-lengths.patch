@@ -1,0 +1,29 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: reject unrepresentable NPU TX lengths
+
+The NPU TX descriptor has a 13-bit packet length. FIELD_PREP silently
+truncates a larger variable length, so an oversized monitor-injected MPDU
+can be published with a different length from the skb/DMA mapping. Monitor
+interfaces deliberately have no maximum MTU in mac80211.
+
+Validate the final skb length after optional header padding, before DMA
+mapping or tx_prepare_skb takes TX token ownership. Reuse the existing
+TXWI/error cleanup and report EMSGSIZE. Leave the ordinary DMA path's
+length handling unchanged.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/dma.c
++++ b/dma.c
+@@ -708,6 +708,12 @@
+ 	if (dev->drv->drv_flags & MT_DRV_TX_ALIGNED4_SKBS)
+ 		mt76_insert_hdr_pad(skb);
+ 
++	if (mt76_npu_device_active(dev) &&
++	    skb->len > FIELD_MAX(NPU_TX_DMA_DESC_LEN_MASK)) {
++		ret = -EMSGSIZE;
++		goto free;
++	}
++
+ 	len = skb_headlen(skb);
+ 	addr = dma_map_single(dev->dma_dev, skb->data, len, DMA_TO_DEVICE);
+ 	if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
