@@ -1,0 +1,69 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: finish partial TX free batches
+
+A truncated TX completion batch can be discovered after valid tokens have
+already been released. Returning at that point skips the local skb free
+list, the TX unblock flag and the TX worker. This can leak completed skbs
+and leave transmissions stopped despite newly available tokens.
+
+Finish the valid prefix through the normal completion epilogue instead.
+Check the complete fixed header and every whole info word, including the
+version 7 pair extension, before reading them. Pull a fragmented TXFREE
+skb into linear storage before giving the full length to the parser.
+
+The incomplete-batch warning was observed on an XR1710G NPU receive queue.
+NPU/PPE forwarding, hardware queues and airtime limits are unchanged.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1263,11 +1263,16 @@
+ 	struct mt76_wcid *wcid = NULL;
+ 	LIST_HEAD(free_list);
+ 	struct sk_buff *skb, *tmp;
+-	void *end = data + len;
++	void *end;
+ 	bool wake = false;
+ 	u16 total, count = 0;
+ 	u8 ver;
+ 
++	if (len < 2 * (int)sizeof(*tx_free))
++		return;
++
++	end = data + len;
++
+ 	/* clean DMA queues and unmap buffers first */
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_BE], false);
+@@ -1289,8 +1294,8 @@
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)cur_info >= end))
+-			return;
++		if (WARN_ON_ONCE(end - (void *)cur_info < sizeof(*cur_info)))
++			break;
+ 		/* 1'b1: new wcid pair.
+ 		 * 1'b0: msdu_id with the same 'wcid pair' as above.
+ 		 */
+@@ -1312,7 +1317,8 @@
+ 				goto next;
+ next:
+ 			/* ver 7 has a new DW with pair = 1, skip it */
+-			if (ver == 7 && ((void *)(cur_info + 1) < end) &&
++			if (ver == 7 &&
++			    end - (void *)(cur_info + 1) >= sizeof(*cur_info) &&
+ 			    (le32_to_cpu(*(cur_info + 1)) & MT_TXFREE_INFO_PAIR))
+ 				cur_info++;
+ 			continue;
+@@ -1602,7 +1608,8 @@
+ 			break;
+ 		}
+ 
+-		mt7996_mac_tx_free(dev, skb->data, skb->len);
++		if (pskb_may_pull(skb, skb->len))
++			mt7996_mac_tx_free(dev, skb->data, skb->len);
+ 		napi_consume_skb(skb, 1);
+ 		break;
+ 	case PKT_TYPE_RX_EVENT:
