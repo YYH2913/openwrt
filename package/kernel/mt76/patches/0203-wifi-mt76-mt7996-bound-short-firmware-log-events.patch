@@ -1,0 +1,37 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: bound short firmware log events
+
+The unified firmware log minimum includes the MCU header, event prefix
+and TLV header, but omits four format bytes skipped before the log data.
+A truncated event can advance data past the skb and produce a negative
+clamped length for the text/relay log paths.
+
+Include the fixed format bytes in the minimum. Also check that at least
+four log bytes are available before reading the binary magic, so empty or
+short legacy and unified text messages do not read beyond the payload.
+Keep clamping oversized advertised lengths to the actual skb data.
+
+Fixes: 56c8b4a4b407 ("wifi: mt76: mt7996: validate firmware event lengths before parsing")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -1143,7 +1143,7 @@
+ 
+ bool mt7996_debugfs_rx_log(struct mt7996_dev *dev, const void *data, int len)
+ {
+-	if (get_unaligned_le32(data) != FW_BIN_LOG_MAGIC)
++	if (len < 4 || get_unaligned_le32(data) != FW_BIN_LOG_MAGIC)
+ 		return false;
+ 
+ 	if (dev->relay_fwlog)
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -830,7 +830,7 @@
+ 		goto out;
+ 	}
+ 
+-	if (skb->len < sizeof(*rxd) + 4 + sizeof(*tlv))
++	if (skb->len < sizeof(*rxd) + 4 + sizeof(*tlv) + 4)
+ 		return;
+ 
+ 	tlv = (struct tlv *)((char *)&rxd[1] + 4);

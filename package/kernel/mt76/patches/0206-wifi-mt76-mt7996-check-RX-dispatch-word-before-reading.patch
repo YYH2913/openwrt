@@ -1,0 +1,50 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: check RX dispatch word before reading
+
+Both the raw RX precheck and the skb receive callback classify packets by
+reading RXD0 before ensuring that a full word is present. Descriptor length
+checks in individual firmware-event handlers happen too late for this read.
+
+Reject raw buffers shorter than RXD0 and pull the dispatch word into the
+skb linear head before accessing it. Reload skb data pointers after the
+pull, which may reallocate the head, and free rejected skbs exactly once.
+Leave subtype parsing and existing dispatch/ownership rules unchanged.
+
+Fixes: 98686cd21624 ("wifi: mt76: mt7996: add driver for MediaTek Wi-Fi 7 (802.11be) devices")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1521,9 +1521,13 @@
+ {
+ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
+ 	__le32 *rxd = (__le32 *)data;
+-	__le32 *end = (__le32 *)&rxd[len / 4];
++	__le32 *end;
+ 	enum rx_pkt_type type;
+ 
++	if (len < 4)
++		return false;
++
++	end = rxd + len / 4;
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+ 	if (type != PKT_TYPE_NORMAL) {
+ 		u32 sw_type = le32_get_bits(rxd[0], MT_RXD0_SW_PKT_TYPE_MASK);
+@@ -1553,10 +1557,16 @@
+ 			 struct sk_buff *skb, u32 *info)
+ {
+ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
+-	__le32 *rxd = (__le32 *)skb->data;
+-	__le32 *end = (__le32 *)&skb->data[skb->len];
++	__le32 *rxd, *end;
+ 	enum rx_pkt_type type;
+ 
++	if (!pskb_may_pull(skb, sizeof(*rxd))) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
++	rxd = (__le32 *)skb->data;
++	end = (__le32 *)&skb->data[skb->len];
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+ 	if (type != PKT_TYPE_NORMAL) {
+ 		u32 sw_type = le32_get_bits(rxd[0], MT_RXD0_SW_PKT_TYPE_MASK);
