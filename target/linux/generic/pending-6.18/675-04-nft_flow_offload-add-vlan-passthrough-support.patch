@@ -23,24 +23,24 @@ Assisted-by: Codex:GPT-5.6-sol
 ---
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
-@@ -151,6 +151,30 @@ struct nft_forward_info {
+@@ -151,6 +151,31 @@
  	enum flow_offload_xmit_type xmit_type;
  };
  
-+static void nft_fill_vlan_passthrough_info(const struct nft_pktinfo *pkt,
-+					   struct nft_forward_info *info)
++static int nft_fill_vlan_passthrough_info(const struct nft_pktinfo *pkt,
++					struct nft_forward_info *info)
 +{
 +	struct net_bridge_port *port;
++	int ret = 0;
 +
 +	if (!skb_vlan_tag_present(pkt->skb))
-+		return;
++		return 0;
 +
 +	rcu_read_lock();
 +	port = br_port_get_rcu(pkt->skb->dev);
-+	/* The bridge handles the VLAN tag when VLAN filtering is enabled. */
 +	if (port && !br_opt_get(port->br, BROPT_VLAN_ENABLED)) {
 +		if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX) {
-+			info->indev = NULL;
++			ret = -ENOENT;
 +			goto out;
 +		}
 +		info->encap[info->num_encaps].id = skb_vlan_tag_get_id(pkt->skb);
@@ -49,20 +49,17 @@ Assisted-by: Codex:GPT-5.6-sol
 +	}
 +out:
 +	rcu_read_unlock();
++	return ret;
 +}
 +
- static void nft_dev_path_info(const struct net_device_path_stack *stack,
- 			      struct nft_forward_info *info,
- 			      unsigned char *ha, struct nf_flowtable *flowtable)
-@@ -286,8 +310,10 @@ static int nft_dev_forward_path(const st
- 		nft_br_vlan_dev_fill_forward_path(pkt, &ctx);
+ static int nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			     struct nft_forward_info *info,
+ 			     unsigned char *ha, struct nf_flowtable *flowtable)
+@@ -291,6 +316,7 @@
  	}
  
--	if (nft_dev_fill_forward_path(&ctx, route, dst, ct, dir, ha, &stack) >= 0)
-+	if (nft_dev_fill_forward_path(&ctx, route, dst, ct, dir, ha, &stack) >= 0) {
-+		nft_fill_vlan_passthrough_info(pkt, &info);
- 		nft_dev_path_info(&stack, &info, ha, &ft->data);
-+	}
- 
- 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+ 	if (nft_dev_fill_forward_path(&ctx, route, dst, ct, dir, ha, &stack) < 0 ||
++	    nft_fill_vlan_passthrough_info(pkt, &info) < 0 ||
+ 	    nft_dev_path_info(&stack, &info, ha, &ft->data) < 0)
  		return -ENOENT;
+ 

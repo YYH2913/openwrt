@@ -14,10 +14,11 @@ behaviour.
 
 Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
-@@ -226,6 +226,7 @@ struct net_device_core_stats {
+@@ -232,6 +232,7 @@
  
  struct neighbour;
  struct neigh_parms;
@@ -25,7 +26,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  struct sk_buff;
  
  struct netdev_hw_addr {
-@@ -922,6 +923,7 @@ struct net_device_path_stack {
+@@ -924,6 +925,7 @@
  
  struct net_device_path_ctx {
  	const struct net_device *dev;
@@ -33,42 +34,35 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	u8			daddr[ETH_ALEN];
  
  	int			num_vlans;
-@@ -3359,6 +3361,9 @@ int dev_get_iflink(const struct net_devi
+@@ -3365,6 +3367,9 @@
  int dev_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb);
  int __dev_fill_forward_path(struct net_device_path_ctx *ctx, const u8 *daddr,
  			    struct net_device_path_stack *stack);
 +int dev_fill_forward_path_flow(const struct net_device *dev, const u8 *daddr,
 +			       const struct flow_keys *flow,
 +			       struct net_device_path_stack *stack);
- int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+ int dev_fill_forward_path(struct net_device_path_ctx *ctx,
  			  struct net_device_path_stack *stack);
  struct net_device *dev_get_by_name(struct net *net, const char *name);
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
-@@ -782,15 +782,24 @@ int __dev_fill_forward_path(struct net_d
+@@ -795,6 +795,19 @@
  }
  EXPORT_SYMBOL_GPL(__dev_fill_forward_path);
  
--int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
--			  struct net_device_path_stack *stack)
 +int dev_fill_forward_path_flow(const struct net_device *dev, const u8 *daddr,
 +			       const struct flow_keys *flow,
 +			       struct net_device_path_stack *stack)
- {
- 	struct net_device_path_ctx ctx = {
- 		.dev	= dev,
-+		.flow	= flow,
- 	};
- 
- 	return __dev_fill_forward_path(&ctx, daddr, stack);
- }
++{
++	struct net_device_path_ctx ctx = {
++		.dev = dev,
++		.flow = flow,
++	};
++
++	return __dev_fill_forward_path(&ctx, daddr, stack);
++}
 +EXPORT_SYMBOL_GPL(dev_fill_forward_path_flow);
 +
-+int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
-+			  struct net_device_path_stack *stack)
-+{
-+	return dev_fill_forward_path_flow(dev, daddr, NULL, stack);
-+}
- EXPORT_SYMBOL_GPL(dev_fill_forward_path);
- 
  /* must be called under rcu_read_lock(), as we dont take a reference */
+ static struct napi_struct *napi_by_id(unsigned int napi_id)
+ {

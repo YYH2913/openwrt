@@ -9,6 +9,7 @@ and the QDMA TX helper used by the SOE provider.
 
 Assisted-by: Codex:gpt-5.5
 Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
@@ -93,7 +94,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  
  u32 airoha_rr(void __iomem *base, u32 offset)
  {
-@@ -74,6 +137,100 @@ static void airoha_qdma_irq_disable(stru
+@@ -74,6 +137,100 @@
  	airoha_qdma_set_irqmask(irq_bank, index, mask, 0);
  }
  
@@ -194,7 +195,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  static int airoha_set_macaddr(struct airoha_gdm_dev *dev, const u8 *addr)
  {
  	u8 ref_addr[ETH_ALEN] __aligned(2);
-@@ -607,6 +764,11 @@ static int airoha_fe_init(struct airoha_
+@@ -622,6 +779,11 @@
  	airoha_fe_wr(eth, REG_FE_CDM1_OQ_MAP2, BIT(4));
  	airoha_fe_wr(eth, REG_FE_CDM1_OQ_MAP3, BIT(28));
  
@@ -206,7 +207,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	airoha_fe_vip_setup(eth);
  	airoha_fe_pse_ports_init(eth);
  
-@@ -693,20 +855,29 @@ static int airoha_qdma_fill_rx_queue(str
+@@ -708,20 +870,29 @@
  		int offset;
  		u32 val;
  
@@ -245,8 +246,8 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  		WRITE_ONCE(desc->tcp_ts_reply, 0);
  		val = FIELD_PREP(QDMA_DESC_LEN_MASK, e->dma_len);
  		WRITE_ONCE(desc->ctrl, cpu_to_le32(val));
-@@ -908,81 +1079,216 @@ static struct sk_buff *airoha_qdma_build
- 	return skb;
+@@ -899,97 +1070,240 @@
+ 	return 0;
  }
  
 +#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
@@ -261,6 +262,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
  {
 -	enum dma_data_direction dir = page_pool_get_dma_dir(q->page_pool);
+-	int qid = q - &q->qdma->q_rx[0], done = 0;
 -	struct airoha_eth *eth = q->qdma->eth;
 +	enum dma_data_direction dir;
 +	struct airoha_qdma *qdma = q->qdma;
@@ -268,9 +270,8 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +	int qid = q - &qdma->q_rx[0];
 +	int desc_budget = q->ndesc;
 +	int desc_done = 0;
- 	int done = 0;
- 
--	while (done < budget) {
++	int done = 0;
++
 +	dir = q->rx_coherent ? DMA_FROM_DEVICE :
 +			       page_pool_get_dma_dir(q->page_pool);
 +
@@ -278,7 +279,8 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +	if (airoha_soe_rx_poll_desc_budget > 0)
 +		desc_budget = min(airoha_soe_rx_poll_desc_budget, q->ndesc);
 +#endif
-+
+ 
+-	while (done < budget) {
 +	while (q->queued > 0 && done < budget && desc_done < desc_budget) {
  		struct airoha_queue_entry *e = &q->entry[q->tail];
  		struct airoha_qdma_desc *desc = &q->desc[q->tail];
@@ -341,8 +343,15 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 -		dev = airoha_qdma_get_gdm_dev(eth, desc);
 -		if (IS_ERR(dev))
 -			goto free_frag;
+-
 +		msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
-+		msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
+ 		msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
+-		netdev = netdev_from_priv(dev);
+-
+-		if (!q->skb) { /* first buffer */
+-			q->skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM,
+-						q->buf_size);
+-			if (!q->skb)
 +		msg2 = le32_to_cpu(READ_ONCE(desc->msg2));
 +#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
 +		soe_pkt = partial_soe || airoha_qdma_rx_is_soe(msg0);
@@ -350,15 +359,24 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +		if (!soe_pkt) {
 +			dev = airoha_qdma_get_gdm_dev(eth, desc);
 +			if (IS_ERR(dev))
-+				goto free_frag;
-+
+ 				goto free_frag;
+ 
+-			skb_reserve(q->skb, AIROHA_RX_HEADROOM);
+-			__skb_put(q->skb, len);
+-			skb_mark_for_recycle(q->skb);
+-			q->skb->dev = netdev;
+-			q->skb->ip_summed = CHECKSUM_UNNECESSARY;
+-			skb_record_rx_queue(q->skb, qid);
 +			netdev = netdev_from_priv(dev);
 +			rx_dev = netdev;
 +		}
  
--		netdev = netdev_from_priv(dev);
- 		if (!q->skb) { /* first buffer */
--			q->skb = airoha_qdma_build_rx_skb(q, desc, e, netdev);
+-			if (airoha_qdma_lro_rx_skb(q, desc, msg1, len)) {
+-				dev_core_stats_rx_dropped_inc(netdev);
+-				dev_kfree_skb(q->skb);
+-				q->skb = NULL;
+-				continue;
++		if (!q->skb) { /* first buffer */
 +			if (soe_pkt) {
 +				if (q->rx_coherent) {
 +					q->skb = napi_alloc_skb(&q->napi, len);
@@ -383,19 +401,46 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +					q->soe_rx_msg2 = msg2;
 +				}
 +			} else {
-+				q->skb = airoha_qdma_build_rx_skb(q, desc, e,
-+								  netdev);
-+			}
- 			if (!q->skb)
- 				goto free_frag;
--		} else { /* scattered frame */
--			struct skb_shared_info *shinfo = skb_shinfo(q->skb);
--			int nr_frags = shinfo->nr_frags;
++				if (q->rx_coherent) {
++					q->skb = napi_alloc_skb(&q->napi, len);
++					if (q->skb)
++						skb_put_data(q->skb, e->buf, len);
++				} else {
++					q->skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM,
++								q->buf_size);
++					if (q->skb) {
++						skb_reserve(q->skb, AIROHA_RX_HEADROOM);
++						__skb_put(q->skb, len);
++						skb_mark_for_recycle(q->skb);
++					}
++				}
++				if (!q->skb)
++					goto free_frag;
++
++				q->skb->dev = netdev;
++				q->skb->ip_summed = CHECKSUM_UNNECESSARY;
++				skb_record_rx_queue(q->skb, qid);
++				if (airoha_qdma_lro_rx_skb(q, desc, msg1, len)) {
++					dev_core_stats_rx_dropped_inc(netdev);
++					dev_kfree_skb(q->skb);
++					q->skb = NULL;
++					q->rx_frame_descs = 0;
++					done++;
++					continue;
++				}
++				q->skb->protocol = eth_type_trans(q->skb, netdev);
+ 			}
++			if (!q->skb)
++				goto free_frag;
  
--			if (nr_frags >= ARRAY_SIZE(shinfo->frags))
+-			q->skb->protocol = eth_type_trans(q->skb, netdev);
 +			q->rx_drop_chain = false;
 +			q->rx_frame_descs = 1;
-+		} else { /* scattered frame */
+ 		} else { /* scattered frame */
+-			struct skb_shared_info *shinfo = skb_shinfo(q->skb);
+-			int nr_frags = shinfo->nr_frags;
+-
+-			if (nr_frags >= ARRAY_SIZE(shinfo->frags))
 +#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
 +			if (soe_pkt && airoha_soe_rx_max_frame_descs > 0 &&
 +			    q->rx_frame_descs >=
@@ -486,11 +531,8 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +			}
  		}
  
--		msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
  		hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
- 		if (hash != AIROHA_RXD4_FOE_ENTRY)
- 			skb_set_hash(q->skb, jhash_1word(hash, 0),
-@@ -994,18 +1300,46 @@ static int airoha_qdma_rx_process(struct
+@@ -1003,18 +1317,46 @@
  					     false);
  
  		done++;
@@ -538,7 +580,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	return done;
  }
  
-@@ -1021,17 +1355,9 @@ static int airoha_qdma_rx_napi_poll(stru
+@@ -1030,17 +1372,9 @@
  
  	if (done < budget && napi_complete(napi)) {
  		struct airoha_qdma *qdma = q->qdma;
@@ -558,7 +600,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	}
  
  	return done;
-@@ -1053,11 +1379,24 @@ static int airoha_qdma_init_rx_queue(str
+@@ -1062,11 +1396,24 @@
  	dma_addr_t dma_addr;
  	bool lro_q;
  
@@ -585,7 +627,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	if (!q->entry)
  		return -ENOMEM;
  
-@@ -1065,25 +1404,49 @@ static int airoha_qdma_init_rx_queue(str
+@@ -1074,25 +1421,49 @@
  				      &dma_addr, GFP_KERNEL);
  	if (!q->desc)
  		return -ENOMEM;
@@ -643,7 +685,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  			FIELD_PREP(RX_RING_SIZE_MASK, ndesc));
  
  	thr = clamp(ndesc >> 3, 1, 32);
-@@ -1091,6 +1454,12 @@ static int airoha_qdma_init_rx_queue(str
+@@ -1100,6 +1471,12 @@
  			FIELD_PREP(RX_RING_THR_MASK, thr));
  	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
  			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->head));
@@ -656,7 +698,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	if (lro_q)
  		airoha_qdma_clear(qdma, REG_RX_SCATTER_CFG(qid),
  				  RX_RING_SG_EN_MASK);
-@@ -1112,11 +1481,14 @@ static void airoha_qdma_cleanup_rx_queue
+@@ -1121,11 +1498,14 @@
  	while (q->queued) {
  		struct airoha_queue_entry *e = &q->entry[q->tail];
  		struct airoha_qdma_desc *desc = &q->desc[q->tail];
@@ -675,15 +717,15 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  		/* Reset DMA descriptor */
  		WRITE_ONCE(desc->tcp_ts_reply, 0);
  		WRITE_ONCE(desc->ctrl, 0);
-@@ -1317,8 +1689,24 @@ unlock:
+@@ -1332,9 +1712,25 @@
  			airoha_qdma_rmw(qdma, REG_IRQ_CLEAR_LEN(id),
  					IRQ_CLEAR_LEN_MASK, 0x80);
  		airoha_qdma_rmw(qdma, REG_IRQ_CLEAR_LEN(id),
 -				IRQ_CLEAR_LEN_MASK, (done & 0x7f));
 +				IRQ_CLEAR_LEN_MASK,
 +				(done & 0x7f));
-+	}
-+
+ 	}
+ 
 +#if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
 +	if (done && airoha_soe_has_pending_rx(eth->soe)) {
 +		int i;
@@ -696,12 +738,13 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
 +			if (rxq->ndesc)
 +				napi_schedule(&rxq->napi);
 +		}
- 	}
++	}
 +#endif
- 
++
  	if (done < budget && napi_complete(napi))
  		airoha_qdma_irq_enable(&qdma->irq_banks[0], QDMA_INT_REG_IDX0,
-@@ -1637,16 +2025,11 @@ static int airoha_qdma_hw_init(struct ai
+ 				       TX_DONE_INT_MASK(id));
+@@ -1652,16 +2048,11 @@
  	for (i = 0; i < ARRAY_SIZE(qdma->irq_banks); i++) {
  		/* clear pending irqs */
  		airoha_qdma_wr(qdma, REG_INT_STATUS(i), 0xffffffff);
@@ -722,19 +765,19 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	/* setup tx irqs */
  	airoha_qdma_irq_enable(&qdma->irq_banks[0], QDMA_INT_REG_IDX0,
  			       TX_COHERENT_LOW_INT_MASK | INT_TX_MASK);
-@@ -2558,6 +2941,11 @@ static int airoha_dev_set_features(struc
+@@ -2629,6 +3020,11 @@
+ 				   netdev_features_t features)
+ {
  	struct airoha_gdm_dev *dev = netdev_priv(netdev);
- 	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
- 	int qdma_id = qdma - &dev->eth->qdma[0];
 +	int err;
 +
 +	err = airoha_soe_set_features(netdev, features);
 +	if (err)
 +		return err;
  
- 	if (!(diff & NETIF_F_GRO_HW))
- 		return 0;
-@@ -2570,6 +2958,123 @@ static int airoha_dev_set_features(struc
+ 	if (features & NETIF_F_LRO)
+ 		airoha_dev_lro_enable(dev);
+@@ -2638,6 +3034,123 @@
  	return 0;
  }
  
@@ -858,7 +901,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
  				   struct net_device *netdev)
  {
-@@ -2579,6 +3084,7 @@ static netdev_tx_t airoha_dev_xmit(struc
+@@ -2647,6 +3160,7 @@
  	struct airoha_qdma *qdma;
  	struct netdev_queue *txq;
  	struct airoha_queue *q;
@@ -866,7 +909,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	LIST_HEAD(tx_list);
  	dma_addr_t addr;
  	int i = 0, qid;
-@@ -2619,6 +3125,11 @@ static netdev_tx_t airoha_dev_xmit(struc
+@@ -2687,6 +3201,11 @@
  	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
  	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
  
@@ -878,7 +921,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	q = &qdma->q_tx[qid];
  	if (WARN_ON_ONCE(!q->ndesc))
  		goto error;
-@@ -2697,12 +3208,24 @@ static netdev_tx_t airoha_dev_xmit(struc
+@@ -2765,12 +3284,24 @@
  		q->txq_stopped = true;
  	}
  
@@ -904,7 +947,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	rcu_read_unlock();
  
  	return NETDEV_TX_OK;
-@@ -3920,6 +4443,7 @@ static int airoha_alloc_gdm_device(struc
+@@ -4012,6 +4543,7 @@
  	dev->eth = eth;
  	dev->nbq = nbq;
  	port->devs[index] = dev;
@@ -912,7 +955,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  
  	return airoha_setup_phylink(netdev);
  }
-@@ -4099,6 +4623,10 @@ static int airoha_probe(struct platform_
+@@ -4191,6 +4723,10 @@
  	strscpy(eth->napi_dev->name, "qdma_eth", sizeof(eth->napi_dev->name));
  	platform_set_drvdata(pdev, eth);
  
@@ -923,7 +966,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	err = airoha_hw_init(pdev, eth);
  	if (err)
  		goto error_netdev_free;
-@@ -4153,6 +4681,7 @@ error_napi_stop:
+@@ -4245,6 +4781,7 @@
  			netdev = netdev_from_priv(dev);
  			if (netdev->reg_state == NETREG_REGISTERED)
  				unregister_netdev(netdev);
@@ -931,7 +974,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  			if (dev->phylink)
  				phylink_destroy(dev->phylink);
  			of_node_put(netdev->dev.of_node);
-@@ -4161,6 +4690,7 @@ error_napi_stop:
+@@ -4253,6 +4790,7 @@
  	}
  	airoha_hw_cleanup(eth);
  error_netdev_free:
@@ -939,7 +982,7 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  	free_netdev(eth->napi_dev);
  	platform_set_drvdata(pdev, NULL);
  
-@@ -4193,12 +4723,14 @@ static void airoha_remove(struct platfor
+@@ -4285,12 +4823,14 @@
  
  			netdev = netdev_from_priv(dev);
  			unregister_netdev(netdev);

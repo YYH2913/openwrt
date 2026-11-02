@@ -43,7 +43,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 ---
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -833,65 +833,178 @@ static void airoha_ppe_foe_flow_remove_e
+@@ -845,65 +845,181 @@
  }
  
  static int
@@ -168,6 +168,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +{
 +	struct net_device_path_stack stack;
 +	struct ethhdr *eh = eth_hdr(skb);
++	struct net_device_path_ctx ctx = {};
 +	struct airoha_flow_data data = {};
 +	struct net_device *master, *egress;
 +	int err;
@@ -190,8 +191,10 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
 +	if (!master)
 +		return false;
 +
++	ctx.dev = master;
++	ether_addr_copy(ctx.daddr, eh->h_dest);
 +	rcu_read_lock();
-+	err = dev_fill_forward_path(master, eh->h_dest, &stack);
++	err = dev_fill_forward_path(&ctx, &stack);
 +	if (err || stack.num_paths < 2 ||
 +	    stack.path[0].type != DEV_PATH_BRIDGE) {
 +		rcu_read_unlock();
@@ -241,7 +244,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  	spin_lock_bh(&ppe_lock);
  
  	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
-@@ -913,7 +1026,8 @@ static void airoha_ppe_foe_insert_entry(
+@@ -925,7 +1041,8 @@
  			continue;
  		}
  
@@ -251,7 +254,7 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  			continue;
  
  		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
-@@ -923,12 +1037,16 @@ static void airoha_ppe_foe_insert_entry(
+@@ -935,12 +1052,16 @@
  
  	if (commit_done)
  		goto unlock;

@@ -27,11 +27,9 @@ Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
  net/core/skbuff.c                        |  23 +++
  6 files changed, 190 insertions(+), 54 deletions(-)
 
-diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index 9db7041..947f2e3 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
-@@ -498,8 +498,12 @@ struct airoha_foe_stats64 {
+@@ -500,8 +500,12 @@
  	u64 packets;
  };
  
@@ -44,7 +42,7 @@ index 9db7041..947f2e3 100644
  	unsigned long expires;
  	u32 key_hash;
  	u16 foe_hash;
-@@ -563,6 +567,7 @@ struct airoha_flow_table_entry {
+@@ -565,6 +569,7 @@
  
  	struct rhash_head node;
  	unsigned long cookie;
@@ -52,7 +50,7 @@ index 9db7041..947f2e3 100644
  
  	/* Must be last --ends in a flexible-array member. */
  	struct airoha_foe_entry data;
-@@ -666,6 +671,7 @@ struct airoha_ppe {
+@@ -674,6 +679,7 @@
  	struct hlist_head *foe_flow;
  	u16 *foe_check_time;
  	struct airoha_ppe_soe_meta *soe_meta;
@@ -60,7 +58,7 @@ index 9db7041..947f2e3 100644
  
  	struct airoha_foe_stats *foe_stats;
  	dma_addr_t foe_stats_dma;
-@@ -777,11 +783,12 @@ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+@@ -785,11 +791,12 @@
  int airoha_qdma_xmit_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
  			 u32 msg0, u32 msg1, u32 msg2);
  void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
@@ -75,11 +73,9 @@ index 9db7041..947f2e3 100644
  
  extern struct mutex flow_offload_mutex;
  
-diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
-index d52cd02..a182970 100644
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -41,11 +41,9 @@ static DEFINE_SPINLOCK(ppe_lock);
+@@ -41,11 +41,9 @@
  #define AIROHA_PPE_SOE_CHANNEL 2
  #define AIROHA_PPE_SOE_META_TIMEOUT_MS 1000
  #define AIROHA_PPE_SOE_MAGIC_GDM4 0x729a
@@ -92,7 +88,7 @@ index d52cd02..a182970 100644
  	unsigned int tunnel_mtu;
  	u8 sa_index;
  	u8 hop;
-@@ -592,6 +590,7 @@ static int airoha_ppe_foe_entry_set_ipv6_tuple(struct airoha_foe_entry *hwe,
+@@ -604,6 +602,7 @@
  	return 0;
  }
  
@@ -100,7 +96,7 @@ index d52cd02..a182970 100644
  static int airoha_ppe_soe_fill_inner_ipv4_data(struct sk_buff *skb,
  					       struct airoha_flow_data *data,
  					       int *type, int *l4proto)
-@@ -651,6 +650,8 @@ static int airoha_ppe_soe_fill_inner_ipv4_data(struct sk_buff *skb,
+@@ -663,6 +662,8 @@
  	return 0;
  }
  
@@ -109,7 +105,7 @@ index d52cd02..a182970 100644
  static int airoha_ppe_foe_entry_set_soe_fields(struct airoha_foe_entry *hwe,
  					       u8 sa_index, u8 hop,
  					       unsigned int tunnel_mtu)
-@@ -701,7 +702,7 @@ airoha_ppe_soe_get_tuple_info(const struct flow_offload_tuple *tuple,
+@@ -713,7 +714,7 @@
  		return -EOPNOTSUPP;
  
  	err = airoha_soe_xfrm_ppe_info(tuple->dst_cache, lower_dev,
@@ -118,7 +114,7 @@ index d52cd02..a182970 100644
  	if (err)
  		return err;
  
-@@ -714,7 +715,7 @@ airoha_ppe_soe_get_tuple_info(const struct flow_offload_tuple *tuple,
+@@ -726,7 +727,7 @@
  static int
  airoha_ppe_foe_entry_set_soe_info(struct airoha_foe_entry *hwe,
  				  const struct flow_offload_tuple *tuple,
@@ -127,7 +123,7 @@ index d52cd02..a182970 100644
  {
  	struct airoha_ppe_soe_tuple_info info;
  	int err;
-@@ -728,6 +729,8 @@ airoha_ppe_foe_entry_set_soe_info(struct airoha_foe_entry *hwe,
+@@ -740,6 +741,8 @@
  	if (err)
  		return err;
  
@@ -136,7 +132,7 @@ index d52cd02..a182970 100644
  	err = airoha_ppe_foe_entry_set_soe_fields(hwe, info.sa_index,
  						  info.hop, info.tunnel_mtu);
  	if (err)
-@@ -1298,22 +1301,52 @@ airoha_ppe_foe_prepare_bridge_subflow(struct airoha_ppe *ppe,
+@@ -1310,22 +1313,52 @@
  	return err;
  }
  
@@ -192,7 +188,7 @@ index d52cd02..a182970 100644
  	meta->key_hash = key_hash;
  	meta->foe_hash = foe_hash;
  	meta->sa_index = sa_index;
-@@ -1324,43 +1357,55 @@ static void airoha_ppe_soe_meta_store(struct airoha_ppe_soe_meta *meta,
+@@ -1336,43 +1369,55 @@
  }
  
  void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
@@ -261,7 +257,7 @@ index d52cd02..a182970 100644
  }
  
  void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
-@@ -1369,7 +1414,9 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1381,7 +1426,9 @@
  	struct airoha_foe_entry entry, tmpl, *hwe;
  	struct airoha_flow_data data = {};
  	struct airoha_ppe_soe_meta *meta;
@@ -271,7 +267,7 @@ index d52cd02..a182970 100644
  	bool soe_return_path;
  	struct airoha_ppe *ppe;
  	unsigned long expires;
-@@ -1381,27 +1428,31 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1393,27 +1440,31 @@
  	if (!dev || !skb || !netdev)
  		return;
  
@@ -310,7 +306,7 @@ index d52cd02..a182970 100644
  		goto unlock;
  
  	if (meta->key_hash != key_hash)
-@@ -1500,12 +1551,28 @@ void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+@@ -1512,12 +1563,28 @@
  
  unlock:
  	spin_unlock_bh(&ppe_lock);
@@ -319,8 +315,9 @@ index d52cd02..a182970 100644
 -		       AIROHA_PPE_SOE_MARK_HASH_MASK);
 +clear_meta:
 +	skb_ext_del(skb, SKB_EXT_AIROHA_SOE);
-+}
-+
+ }
+ 
+-void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
 +#else
 +void airoha_ppe_soe_mark_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
 +			     u16 hash, u8 sa_index, u8 hop, u64 cookie)
@@ -335,15 +332,14 @@ index d52cd02..a182970 100644
 +void airoha_ppe_soe_xmit_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
 +			     struct net_device *netdev)
 +{
- }
++}
 +#endif
- 
--void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
++
 +void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index, u64 cookie)
  {
  	u32 num_entries, hash;
  
-@@ -1515,6 +1582,10 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+@@ -1527,6 +1594,10 @@
  	num_entries = airoha_ppe_get_total_num_entries(ppe);
  
  	spin_lock_bh(&ppe_lock);
@@ -354,7 +350,7 @@ index d52cd02..a182970 100644
  	/* Remove CPU staging and cached flow templates under the same lock as
  	 * all commits. Invalidating only hardware leaves both able to rebind.
  	 */
-@@ -1523,18 +1594,11 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+@@ -1535,18 +1606,11 @@
  		struct hlist_node *n;
  
  		if (ppe->soe_meta && ppe->soe_meta[hash].valid &&
@@ -375,7 +371,7 @@ index d52cd02..a182970 100644
  				continue;
  
  			/* The flowtable still owns e; its destroy callback frees it. */
-@@ -1575,6 +1639,7 @@ void airoha_ppe_soe_flush_sa(struct airoha_ppe *ppe, u8 sa_index)
+@@ -1587,6 +1651,7 @@
  				       AIROHA_FOE_STATE_INVALID);
  		airoha_ppe_foe_commit_entry(ppe, hwe, hash, false);
  	}
@@ -383,7 +379,7 @@ index d52cd02..a182970 100644
  	spin_unlock_bh(&ppe_lock);
  }
  
-@@ -1621,6 +1686,12 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+@@ -1633,6 +1698,12 @@
  		    !airoha_ppe_foe_compare_entry(e, hwe))
  			continue;
  
@@ -396,7 +392,7 @@ index d52cd02..a182970 100644
  		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
  		commit_done = true;
  		e->hash = hash;
-@@ -1684,8 +1755,15 @@ static int airoha_ppe_foe_flow_commit_entry(struct airoha_ppe *ppe,
+@@ -1696,8 +1767,15 @@
  
  	spin_lock_bh(&ppe_lock);
  	if (soe_tunnel) {
@@ -414,15 +410,15 @@ index d52cd02..a182970 100644
  
  		err = airoha_ppe_foe_commit_entry(ppe, &e->data, commit_hash,
  						  false);
-@@ -1806,6 +1884,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
- 	struct net_device *odev = NULL;
+@@ -1819,6 +1897,7 @@
  	struct flow_action_entry *act;
+ 	u8 dsfield = 0, l4proto = 0;
  	struct airoha_foe_entry hwe;
 +	u64 soe_cookie = 0;
- 	u8 dsfield = 0, l4proto = 0;
  	int err, i, offload_type;
  	u16 addr_type = 0;
-@@ -1980,7 +2059,8 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 
+@@ -1993,7 +2072,8 @@
  			return err;
  	}
  
@@ -432,7 +428,7 @@ index d52cd02..a182970 100644
  	if (err)
  		return err;
  
-@@ -1989,6 +2069,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+@@ -2002,6 +2082,7 @@
  		return -ENOMEM;
  
  	e->cookie = f->cookie;
@@ -440,8 +436,6 @@ index d52cd02..a182970 100644
  	memcpy(&e->data, &hwe, sizeof(e->data));
  
  	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
-diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
-index a8c707f..00669c8 100644
 --- a/drivers/net/ethernet/airoha/airoha_soe.c
 +++ b/drivers/net/ethernet/airoha/airoha_soe.c
 @@ -43,7 +43,6 @@
@@ -452,7 +446,7 @@ index a8c707f..00669c8 100644
  #define AIROHA_SOE_QDMA_HOP_DESC_LEN 32
  #define AIROHA_SOE_KEY_WORDS 8
  #define AIROHA_SOE_ADDR_WORDS 4
-@@ -152,6 +151,7 @@ struct airoha_soe_ctx {
+@@ -152,6 +151,7 @@
  			u16 foe_hash;
  			u32 foe_reason;
  			u8 sa_index;
@@ -460,7 +454,7 @@ index a8c707f..00669c8 100644
  			bool foe_valid;
  			u32 mark;
  		} rx;
-@@ -160,6 +160,7 @@ struct airoha_soe_ctx {
+@@ -160,6 +160,7 @@
  
  struct airoha_soe_sa {
  	struct airoha_soe *soe;
@@ -468,7 +462,7 @@ index a8c707f..00669c8 100644
  	unsigned int index;
  	u32 cmd;
  	u32 spi;
-@@ -205,6 +206,7 @@ struct airoha_soe_rx_info {
+@@ -205,6 +206,7 @@
  
  struct airoha_soe {
  	struct device *dev;
@@ -476,7 +470,7 @@ index a8c707f..00669c8 100644
  	void __iomem *base;
  
  	/* Serialize SA table programming and software slot ownership. */
-@@ -652,6 +654,7 @@ static int airoha_soe_alloc_sa(struct airoha_soe *soe, struct xfrm_state *x,
+@@ -652,6 +654,7 @@
  	INIT_LIST_HEAD(&new_sa->tx_queue);
  	INIT_LIST_HEAD(&new_sa->rx_queue);
  	init_completion(&new_sa->idle);
@@ -484,7 +478,7 @@ index a8c707f..00669c8 100644
  	rcu_assign_pointer(soe->sa[i], new_sa);
  	soe->sa_map |= BIT(i);
  	mutex_unlock(&soe->sa_lock);
-@@ -1150,6 +1153,7 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -1150,6 +1153,7 @@
  	ctx->rx.foe_hash = foe_hash;
  	ctx->rx.foe_reason = foe_reason;
  	ctx->rx.sa_index = state->sa->index;
@@ -492,7 +486,7 @@ index a8c707f..00669c8 100644
  	ctx->rx.foe_valid = foe_valid;
  	ctx->rx.mark = skb->mark;
  
-@@ -1285,7 +1289,8 @@ static bool airoha_soe_complete_in(struct sk_buff *skb,
+@@ -1285,7 +1289,8 @@
  	if (ctx->rx.foe_valid)
  		airoha_ppe_soe_mark_skb(&ctx->rx.gdm_dev->eth->ppe->dev, skb,
  					ctx->rx.foe_hash, ctx->rx.sa_index,
@@ -502,7 +496,7 @@ index a8c707f..00669c8 100644
  
  	kfree(ctx);
  	netif_rx(skb);
-@@ -1358,7 +1363,7 @@ bool airoha_soe_has_pending_rx(struct airoha_soe *soe)
+@@ -1358,7 +1363,7 @@
  
  int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
  			     struct net_device *lower_dev, u8 *sa_index,
@@ -511,7 +505,7 @@ index a8c707f..00669c8 100644
  {
  	struct airoha_soe_xfrm_state *state;
  	struct net_device *state_dev;
-@@ -1366,7 +1371,7 @@ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+@@ -1366,7 +1371,7 @@
  	unsigned long handle;
  	int err = -ENODEV;
  
@@ -520,7 +514,7 @@ index a8c707f..00669c8 100644
  		return -EINVAL;
  
  	x = dst_xfrm(dst);
-@@ -1419,7 +1424,10 @@ int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
+@@ -1419,7 +1424,10 @@
  		goto out;
  	}
  
@@ -531,7 +525,7 @@ index a8c707f..00669c8 100644
  	err = 0;
  out:
  	rcu_read_unlock();
-@@ -1484,7 +1492,8 @@ static void airoha_soe_xfrm_state_delete(struct net_device *dev,
+@@ -1484,7 +1492,8 @@
  
  	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
  	if (state && state->sa) {
@@ -541,7 +535,7 @@ index a8c707f..00669c8 100644
  		airoha_soe_abort_sa(state->sa);
  	}
  }
-@@ -1500,7 +1509,7 @@ static void airoha_soe_xfrm_state_free(struct net_device *dev,
+@@ -1500,7 +1509,7 @@
  
  	if (state->sa) {
  		airoha_ppe_soe_flush_sa(state->dev->eth->ppe,
@@ -550,7 +544,7 @@ index a8c707f..00669c8 100644
  		airoha_soe_free_sa(state->sa);
  	}
  	if (state->counted)
-@@ -1912,6 +1921,7 @@ int airoha_soe_init(struct airoha_eth *eth)
+@@ -1912,6 +1921,7 @@
  	}
  
  	soe->dev = dev;
@@ -558,11 +552,9 @@ index a8c707f..00669c8 100644
  	soe->base = base;
  	mutex_init(&soe->sa_lock);
  	spin_lock_init(&soe->state_lock);
-diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
-index 1a34717..d3ea5ae 100644
 --- a/drivers/net/ethernet/airoha/airoha_soe.h
 +++ b/drivers/net/ethernet/airoha/airoha_soe.h
-@@ -51,7 +51,7 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev,
+@@ -51,7 +51,7 @@
  bool airoha_soe_has_pending_rx(struct airoha_soe *soe);
  int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
  			     struct net_device *lower_dev, u8 *sa_index,
@@ -571,7 +563,7 @@ index 1a34717..d3ea5ae 100644
  int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
  		    struct sk_buff *skb, struct xfrm_state *x);
  #else
-@@ -112,7 +112,7 @@ static inline bool airoha_soe_has_pending_rx(struct airoha_soe *soe)
+@@ -112,7 +112,7 @@
  
  static inline int airoha_soe_xfrm_ppe_info(const struct dst_entry *dst,
  					   struct net_device *lower_dev,
@@ -580,11 +572,9 @@ index 1a34717..d3ea5ae 100644
  {
  	return -EOPNOTSUPP;
  }
-diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index a14d7c9..535150c 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -4916,6 +4916,18 @@ static inline void skb_set_nfct(struct sk_buff *skb, unsigned long nfct)
+@@ -4918,6 +4918,18 @@
  }
  
  #ifdef CONFIG_SKB_EXTENSIONS
@@ -603,21 +593,19 @@ index a14d7c9..535150c 100644
  enum skb_ext_id {
  #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
  	SKB_EXT_BRIDGE_NF,
-@@ -4934,6 +4946,9 @@ enum skb_ext_id {
- #endif
+@@ -4937,6 +4949,9 @@
  #if IS_ENABLED(CONFIG_INET_PSP)
  	SKB_EXT_PSP,
-+#endif
+ #endif
 +#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
 +	SKB_EXT_AIROHA_SOE,
- #endif
++#endif
  	SKB_EXT_NUM, /* must be last */
  };
-diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 7cd4f55..e174850 100644
+ 
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -5101,7 +5101,30 @@ EXPORT_SYMBOL_GPL(skb_segment);
+@@ -5105,7 +5105,30 @@
  #define SKB_EXT_ALIGN_VALUE	8
  #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
  
@@ -648,6 +636,3 @@ index 7cd4f55..e174850 100644
  #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
  	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
  #endif
--- 
-2.43.0
-
