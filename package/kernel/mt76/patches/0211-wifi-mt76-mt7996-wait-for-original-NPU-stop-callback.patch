@@ -1,0 +1,221 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: consume the original NPU stop response
+
+Use the owned sleepable mailbox API for pause, drain and detach under a
+shared two-second deadline. Continue only after the original command's
+successful DONE and response; never replay a timed-out stop handshake or
+reboot core 0 over an unknown callback.
+
+Keep receive interrupts and NAPI available until stop completes. End full
+reset immediately on a stop failure, leaving reset state and queues
+stopped; retain retry behavior for other initialization failures. Clear
+the full-reset in-progress latch when the failed attempt ends so a later
+explicit recovery is not silently ignored.
+
+Requires the matching Airoha provider wait API and kernel. Hardware
+acceleration, queue capacity and rate policy are unchanged.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2188,22 +2188,13 @@ void mt7996_tx_token_put(struct mt7996_d
+ }
+ 
+ static int
+-mt7996_mac_restart(struct mt7996_dev *dev)
++mt7996_mac_restart(struct mt7996_dev *dev, bool *stop_failed)
+ {
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	struct mt7996_phy *phy;
+ 	int i, ret;
+ 
+-	if (dev->hif2) {
+-		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
+-		mt76_wr(dev, MT_INT1_SOURCE_CSR, ~0);
+-	}
+-
+-	if (dev_is_pci(mdev->dev)) {
+-		mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0x0);
+-		if (dev->hif2)
+-			mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0x0);
+-	}
++	*stop_failed = false;
+ 
+ 	set_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	mt7996_for_each_phy(dev, phy)
+@@ -2216,8 +2207,25 @@ mt7996_mac_restart(struct mt7996_dev *de
+ 
+ 	/* disable all tx/rx napi */
+ 	mt76_worker_disable(&dev->mt76.tx_worker);
+-	/* NPU must drain while its RX NAPI is still running. */
++	/* Keep NAPI and both interrupt paths available for NPU drain. */
+ 	ret = __mt7996_npu_hw_stop(dev);
++	if (ret) {
++		*stop_failed = true;
++		mt76_worker_enable(&dev->mt76.tx_worker);
++		return ret;
++	}
++
++	if (dev->hif2) {
++		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
++		mt76_wr(dev, MT_INT1_SOURCE_CSR, ~0);
++	}
++
++	if (dev_is_pci(mdev->dev)) {
++		mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0x0);
++		if (dev->hif2)
++			mt76_wr(dev, MT_PCIE1_MAC_INT_ENABLE, 0x0);
++	}
++
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
+ 		    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
+@@ -2228,16 +2236,12 @@ mt7996_mac_restart(struct mt7996_dev *de
+ 	}
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+-	if (ret)
+-		goto enable_rx;
+-
+ 	/* token reinit */
+ 	mt7996_tx_token_put(dev);
+ 	idr_init(&dev->mt76.token);
+ 
+ 	mt7996_dma_reset(dev, true);
+ 
+-enable_rx:
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
+ 		    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
+@@ -2247,9 +2251,6 @@ enable_rx:
+ 			napi_enable(&dev->mt76.napi[i]);
+ 		}
+ 	}
+-	if (ret)
+-		goto out;
+-
+ 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 
+@@ -2398,6 +2399,7 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	struct mt7996_phy *phy;
+ 	LIST_HEAD(list);
+ 	int i, ret = -ETIMEDOUT;
++	bool stop_failed;
+ 
+ 	dev->recovery.hw_full_reset = true;
+ 
+@@ -2414,13 +2416,17 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
+-		ret = mt7996_mac_restart(dev);
+-		if (!ret)
++		ret = mt7996_mac_restart(dev, &stop_failed);
++		if (!ret || stop_failed)
+ 			break;
+ 	}
+ 
+ 	if (ret) {
+ 		dev_err(dev->mt76.dev, "chip full reset failed: %d\n", ret);
++		mt7996_irq_disable(dev, ~0);
++		mt76_npu_disable_irqs(&dev->mt76);
++		/* This attempt ended; reset state and stopped queues remain. */
++		dev->recovery.hw_full_reset = false;
+ 		mutex_unlock(&dev->mt76.mutex);
+ 		return ret;
+ 	}
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -4,6 +4,7 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ #include <linux/kernel.h>
++#include <linux/jiffies.h>
+ #include <linux/soc/airoha/airoha_offload.h>
+ 
+ #include "mt7996.h"
+@@ -646,19 +647,23 @@ int mt7996_npu_hw_init(struct mt7996_dev
+ static int mt7996_npu_hw_stop_once(struct mt7996_dev *dev,
+ 				   struct airoha_npu *npu)
+ {
++	unsigned long deadline = jiffies + 2 * HZ;
++	struct airoha_npu_mailbox_result result;
+ 	int i, err;
+-	u32 info;
++	u32 info, value = 0;
+ 
+-	err = mt76_npu_send_msg(npu, 4, WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+-				0, GFP_KERNEL);
++	err = airoha_npu_wlan_send_msg_wait(npu, 4,
++					    WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++					    &value, sizeof(value), deadline, &result);
+ 	if (err) {
+ 		dev_warn(dev->mt76.dev, "NPU pause request failed: %d\n", err);
+ 		return err;
+ 	}
+ 
+ 	for (i = 0; i < 10; i++) {
+-		err = mt76_npu_get_msg(npu, 3, WLAN_FUNC_GET_WAIT_NPU_INFO,
+-				       &info, GFP_KERNEL);
++		err = airoha_npu_wlan_get_msg_wait(npu, 3,
++						   WLAN_FUNC_GET_WAIT_NPU_INFO, &info, sizeof(info),
++						   deadline, &result);
+ 		if (err) {
+ 			dev_warn(dev->mt76.dev,
+ 				 "NPU drain status request failed: %d\n", err);
+@@ -675,19 +680,18 @@ static int mt7996_npu_hw_stop_once(struc
+ 		return -ETIMEDOUT;
+ 	}
+ 
+-	err = mt76_npu_send_msg(npu, 6,
+-				WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+-				0, GFP_KERNEL);
++	err = airoha_npu_wlan_send_msg_wait(npu, 6,
++					    WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++					    &value, sizeof(value), deadline, &result);
+ 	if (err)
+ 		dev_warn(dev->mt76.dev, "NPU detach request failed: %d\n", err);
+ 
+ 	return err;
+ }
+ 
+-static int mt7996_npu_hw_stop_locked(struct mt7996_dev *dev, bool recover)
++static int mt7996_npu_hw_stop_locked(struct mt7996_dev *dev)
+ {
+ 	struct airoha_npu *npu;
+-	int err = 0;
+ 
+ 	lockdep_assert_held(&dev->mt76.mutex);
+ 
+@@ -695,18 +699,13 @@ static int mt7996_npu_hw_stop_locked(str
+ 	if (!npu)
+ 		return 0;
+ 
+-	err = mt7996_npu_hw_stop_once(dev, npu);
+-	if (recover && (err == -ETIMEDOUT || err == -EAGAIN)) {
+-		err = mt7996_npu_prepare_retry(dev, npu, err, "NPU stop");
+-		if (!err)
+-			err = mt7996_npu_hw_stop_once(dev, npu);
+-	}
+-	return err;
++	/* Do not replay a stop phase whose callback completion is unknown. */
++	return mt7996_npu_hw_stop_once(dev, npu);
+ }
+ 
+ int __mt7996_npu_hw_stop(struct mt7996_dev *dev)
+ {
+-	return mt7996_npu_hw_stop_locked(dev, true);
++	return mt7996_npu_hw_stop_locked(dev);
+ }
+ 
+ int mt7996_npu_hw_stop(struct mt7996_dev *dev)
+@@ -725,7 +724,7 @@ int mt7996_npu_hw_stop_teardown(struct m
+ 	int err;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+-	err = mt7996_npu_hw_stop_locked(dev, false);
++	err = mt7996_npu_hw_stop_locked(dev);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return err;
