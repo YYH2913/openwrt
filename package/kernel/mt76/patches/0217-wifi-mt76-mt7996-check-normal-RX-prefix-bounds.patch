@@ -1,0 +1,147 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: check normal RX prefix bounds
+
+The normal RX dispatcher only guarantees four linear bytes, while the
+parser reads the fixed RXD and optional groups directly and later pulls
+the declared metadata gap. Short or split headers can therefore be read
+past valid linear data or pulled past the skb's linear head.
+
+Copy the fixed RXD first, validate its existing conditional group layout,
+and determine the translated Ethernet or raw MAC prefix with bounded
+peeks. Pull that complete prefix once before deriving any parser pointer.
+Include the existing VLAN translation-error field and raw A-MSDU pad in
+the required prefix. Leave packet transformations and security decisions
+unchanged for complete packets.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
+ #include <linux/timekeeping.h>
+ #include "coredump.h"
+ #include "mt7996.h"
+@@ -306,6 +307,81 @@ mt7996_wed_check_ppe(struct mt7996_dev *
+ 				 msta_link->wcid.idx);
+ }
+ 
++/* Make the declared RXD groups and the consumed MAC prefix linear before
++ * the normal parser obtains pointers into them.
++ */
++static bool mt7996_mac_rx_preflight(struct sk_buff *skb)
++{
++	__le32 fixed[8], value;
++	u32 rxd0, rxd1, rxd2, mesh_mask = MT_RXD0_MESH | MT_RXD0_MHCP;
++	unsigned int len = sizeof(fixed), gap, need;
++	__le16 fc = 0;
++	bool hdr_trans;
++
++	if (skb_copy_bits(skb, 0, fixed, sizeof(fixed)))
++		return false;
++
++	rxd0 = le32_to_cpu(fixed[0]);
++	rxd1 = le32_to_cpu(fixed[1]);
++	rxd2 = le32_to_cpu(fixed[2]);
++	if (rxd1 & MT_RXD1_NORMAL_GROUP_4)
++		len += 16;
++	if (rxd1 & MT_RXD1_NORMAL_GROUP_1)
++		len += 16;
++	if (rxd1 & MT_RXD1_NORMAL_GROUP_2)
++		len += 16;
++	if (rxd1 & MT_RXD1_NORMAL_GROUP_3) {
++		len += 16;
++		if (rxd1 & MT_RXD1_NORMAL_GROUP_5)
++			len += 96;
++	}
++	if (len > skb->len)
++		return false;
++
++	gap = len + 2 * FIELD_GET(MT_RXD2_NORMAL_HDR_OFFSET, rxd2);
++	if (gap > skb->len)
++		return false;
++
++	if (rxd1 & MT_RXD1_NORMAL_GROUP_4) {
++		if (skb_copy_bits(skb, sizeof(fixed), &value, sizeof(value)))
++			return false;
++		fc = cpu_to_le16(le32_get_bits(value, MT_RXD8_FRAME_CONTROL));
++	}
++
++	hdr_trans = rxd2 & MT_RXD2_NORMAL_HDR_TRANS;
++	if (hdr_trans) {
++		__be16 proto;
++
++		need = ETH_HLEN;
++		if (need > skb->len - gap)
++			return false;
++		if (!ieee80211_has_morefrags(fc) &&
++		    (rxd2 & MT_RXD2_NORMAL_HDR_TRANS_ERROR)) {
++			if (skb_copy_bits(skb, gap + 2 * ETH_ALEN,
++					  &proto, sizeof(proto)))
++				return false;
++			if (proto == cpu_to_be16(ETH_P_8021Q))
++				need += VLAN_HLEN + 2;
++		}
++	} else {
++		__le16 raw_fc;
++
++		if (sizeof(raw_fc) > skb->len - gap ||
++		    skb_copy_bits(skb, gap, &raw_fc, sizeof(raw_fc)))
++			return false;
++		need = ieee80211_hdrlen(raw_fc);
++		if (le32_get_bits(fixed[4], MT_RXD4_NORMAL_PAYLOAD_FORMAT) &&
++		    !(ieee80211_has_a4(fc) && (rxd0 & mesh_mask) == mesh_mask) &&
++		    skb->len - gap >= 10)
++			need += 2;
++	}
++
++	if (need > skb->len - gap)
++		return false;
++
++	return pskb_may_pull(skb, gap + need);
++}
++
+ static int
+ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
+ 		   struct sk_buff *skb, u32 *info)
+@@ -314,17 +390,13 @@ mt7996_mac_fill_rx(struct mt7996_dev *de
+ 	struct mt76_phy *mphy = &dev->mt76.phy;
+ 	struct mt7996_phy *phy = &dev->phy;
+ 	struct ieee80211_supported_band *sband;
+-	__le32 *rxd = (__le32 *)skb->data;
++	__le32 *rxd;
+ 	__le32 *rxv = NULL;
+-	u32 rxd0 = le32_to_cpu(rxd[0]);
+-	u32 rxd1 = le32_to_cpu(rxd[1]);
+-	u32 rxd2 = le32_to_cpu(rxd[2]);
+-	u32 rxd3 = le32_to_cpu(rxd[3]);
+-	u32 rxd4 = le32_to_cpu(rxd[4]);
++	u32 rxd0, rxd1, rxd2, rxd3, rxd4;
+ 	u32 csum_mask = MT_RXD3_NORMAL_IP_SUM | MT_RXD3_NORMAL_UDP_TCP_SUM;
+ 	u32 csum_status = *(u32 *)skb->cb;
+ 	u32 mesh_mask = MT_RXD0_MESH | MT_RXD0_MHCP;
+-	bool is_mesh = (rxd0 & mesh_mask) == mesh_mask;
++	bool is_mesh;
+ 	bool unicast, insert_ccmp_hdr = false;
+ 	u8 remove_pad, amsdu_info, band_idx;
+ 	u8 mode = 0, qos_ctl = 0;
+@@ -336,6 +408,17 @@ mt7996_mac_fill_rx(struct mt7996_dev *de
+ 	u8 hw_aggr = false;
+ 	struct mt7996_sta *msta = NULL;
+ 
++	if (!mt7996_mac_rx_preflight(skb))
++		return -EINVAL;
++
++	rxd = (__le32 *)skb->data;
++	rxd0 = le32_to_cpu(rxd[0]);
++	rxd1 = le32_to_cpu(rxd[1]);
++	rxd2 = le32_to_cpu(rxd[2]);
++	rxd3 = le32_to_cpu(rxd[3]);
++	rxd4 = le32_to_cpu(rxd[4]);
++	is_mesh = (rxd0 & mesh_mask) == mesh_mask;
++
+ 	hw_aggr = status->aggr;
+ 	memset(status, 0, sizeof(*status));
+ 
