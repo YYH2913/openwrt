@@ -1,0 +1,515 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: complete NPU BA retirement before reuse
+
+The RRO session worker acknowledges a BA deletion to WM even when the
+NPU signature-clear request fails. WM may then reuse a session whose
+old signature entries remain visible. An uncertain WM acknowledgment
+also cannot safely be retried against a possibly reused session id.
+
+Wait in process context for the owned NPU request and require its
+successful completion before sending the WM deletion. Retain failed
+and unprocessed notifications behind a persistent gate, then request a
+full recovery asynchronously. Keep both requests and their receipts
+separate from atomic mailbox users.
+
+After NPU drain, endpoint DMA quiescence and Wi-Fi firmware reload,
+invalidate the signatures of every normal and special RRO session with
+the existing per-session callback. Preserve the address, head, count,
+bitmap and base registrations instead of repeating cold initialization.
+Share one absolute 30-second deadline across all 1025 original requests.
+Keep NPU workers and RRO NAPI stopped until every clear succeeds, before
+RRO configuration and NPU resume. Record the completed count, elapsed
+time and failing SID without retrying an uncertain request. Stop without
+NPU resume on failure; reconcile the notification ledger only after the
+complete restart succeeds. Free host-only event records after producer
+shutdown; their addresses are never submitted to either firmware.
+
+Consume full-reset requests under the recovery lock before each
+attempt, preserving a new request that arrives while recovery runs.
+Keep failed attempts pending without introducing an unbounded retry.
+
+Fixes: d7a79fcece87 ("wifi: mt76: mt7996: Integrate NPU in RRO session management")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- mt76-npu-ba-retire-if3-v4.orig/mt76.h
++++ mt76-npu-ba-retire-if3-v4/mt76.h
+@@ -1724,6 +1724,10 @@ int mt76_npu_net_setup_tc(struct ieee802
+ int mt76_npu_send_txrx_addr(struct mt76_dev *dev, int ifindex,
+ 			    u32 direction, u32 i_count_addr,
+ 			    u32 o_status_addr, u32 o_count_addr);
++int mt76_npu_send_txrx_addr_wait(struct mt76_dev *dev, int ifindex,
++				 u32 direction, u32 i_count_addr,
++				 u32 o_status_addr, u32 o_count_addr,
++				 unsigned long deadline);
+ #else
+ static inline void mt76_npu_check_ppe(struct mt76_dev *dev,
+ 				      struct sk_buff *skb, u32 info)
+@@ -1798,6 +1802,15 @@ static inline int mt76_npu_send_txrx_add
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int
++mt76_npu_send_txrx_addr_wait(struct mt76_dev *dev, int ifindex,
++			     u32 direction, u32 i_count_addr,
++			     u32 o_status_addr, u32 o_count_addr,
++			     unsigned long deadline)
++{
++	return -EOPNOTSUPP;
++}
+ #endif /* CONFIG_MT76_NPU */
+ 
+ static inline bool mt76_npu_device_active(struct mt76_dev *dev)
+--- mt76-npu-ba-retire-if3-v4.orig/mt7996/init.c
++++ mt76-npu-ba-retire-if3-v4/mt7996/init.c
+@@ -7,6 +7,8 @@
+ #include <linux/of.h>
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
++#include <linux/jiffies.h>
++#include <linux/sizes.h>
+ #include <linux/thermal.h>
+ #include "mt7996.h"
+ #include "mac.h"
+@@ -1153,6 +1155,22 @@ static int mt7996_wed_rro_init(struct mt
+ 	return mt7996_dma_rro_init(dev);
+ }
+ 
++void mt7996_wed_rro_free_sessions(struct mt7996_dev *dev)
++{
++	struct mt7996_wed_rro_session_id *e, *tmp;
++	LIST_HEAD(list);
++
++	lockdep_assert_held(&dev->mt76.mutex);
++	spin_lock_bh(&dev->wed_rro.lock);
++	list_splice_init(&dev->wed_rro.poll_list, &list);
++	spin_unlock_bh(&dev->wed_rro.lock);
++
++	list_for_each_entry_safe(e, tmp, &list, list) {
++		list_del(&e->list);
++		kfree(e);
++	}
++}
++
+ static void mt7996_wed_rro_free(struct mt7996_dev *dev)
+ {
+ 	int i;
+@@ -1160,6 +1178,11 @@ static void mt7996_wed_rro_free(struct m
+ 	if (!mt7996_has_hwrro(dev))
+ 		return;
+ 
++	/* IRQ/NAPI producers and the session worker have already stopped. */
++	mutex_lock(&dev->mt76.mutex);
++	mt7996_wed_rro_free_sessions(dev);
++	mutex_unlock(&dev->mt76.mutex);
++
+ 	for (i = 0; i < ARRAY_SIZE(dev->wed_rro.ba_bitmap); i++) {
+ 		if (!dev->wed_rro.ba_bitmap[i].ptr)
+ 			continue;
+@@ -1213,21 +1236,106 @@ static void mt7996_wed_rro_free(struct m
+ 			   dev->wed_rro.session.phy_addr);
+ }
+ 
++int mt7996_npu_reset_rro_sessions(struct mt7996_dev *dev)
++{
++	const size_t group_size = MT7996_RRO_WINDOW_MAX_SIZE *
++				  sizeof(struct mt7996_wed_rro_addr);
++	const size_t session_size = MT7996_RRO_WINDOW_MAX_LEN *
++				    sizeof(struct mt7996_wed_rro_addr);
++	unsigned long start, deadline;
++	const unsigned int count = MT7996_RRO_MAX_SESSION + 1;
++	unsigned int sid;
++	int i, err;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++	if (!is_mt7996(&dev->mt76) || !mt76_npu_device_active(&dev->mt76))
++		return 0;
++
++	BUILD_BUG_ON(MT7996_RRO_ADDR_ELEM_LEN != 128);
++	BUILD_BUG_ON(MT7996_RRO_MAX_SESSION != 1024);
++	BUILD_BUG_ON(MT7996_RRO_WINDOW_MAX_LEN != 1024);
++	BUILD_BUG_ON(MT7996_RRO_WINDOW_MAX_SIZE *
++		     sizeof(struct mt7996_wed_rro_addr) != SZ_64K);
++	BUILD_BUG_ON(MT7996_RRO_WINDOW_MAX_LEN *
++		     sizeof(struct mt7996_wed_rro_addr) != SZ_8K);
++
++	/* Validate the backing storage for the retained cold-init registrations. */
++	for (i = 0; i < ARRAY_SIZE(dev->wed_rro.addr_elem); i++) {
++		if (!dev->wed_rro.addr_elem[i].ptr ||
++		    dev->wed_rro.addr_elem[i].phy_addr > U32_MAX - group_size + 1)
++			return -EINVAL;
++	}
++	if (!dev->wed_rro.session.ptr ||
++	    dev->wed_rro.session.phy_addr > U32_MAX - session_size + 1)
++		return -EINVAL;
++
++	start = jiffies;
++	deadline = start + 30 * HZ;
++	dev_info(dev->mt76.dev,
++		 "NPU BA signature sweep start: SIDs 0-%u, budget_ms=%u\n",
++		 (unsigned int)MT7996_RRO_MAX_SESSION,
++		 jiffies_to_msecs(deadline - start));
++
++	/* The interface3 callback invalidates one complete session's signatures
++	 * without zeroing its head, count, or address fields.
++	 */
++	for (sid = 0; sid < count; sid++) {
++		err = mt76_npu_send_txrx_addr_wait(&dev->mt76, 3, sid,
++						   0, 0, 0, deadline);
++		if (err) {
++			dev_err(dev->mt76.dev,
++				"NPU BA signature sweep failed: completed=%u sid=%u elapsed_ms=%u error=%d\n",
++				sid, sid, jiffies_to_msecs(jiffies - start), err);
++			return err;
++		}
++	}
++
++	dev_info(dev->mt76.dev,
++		 "NPU BA signature sweep complete: commands=%u elapsed_ms=%u\n",
++		 count, jiffies_to_msecs(jiffies - start));
++
++	return 0;
++}
++
++static void mt7996_wed_rro_request_reset(struct mt7996_dev *dev)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->recovery_lock, flags);
++	if (!READ_ONCE(dev->removing) && dev->recovery.hw_init_done) {
++		dev->recovery.restart = true;
++		set_bit(MT76_MCU_RESET, &dev->mphy.state);
++		wake_up(&dev->mt76.mcu.wait);
++		queue_work(dev->mt76.wq, &dev->reset_work);
++		wake_up(&dev->reset_wait);
++	}
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
++}
++
+ static void mt7996_wed_rro_work(struct work_struct *work)
+ {
+ 	u32 val = FIELD_PREP(WED_RRO_ADDR_SIGNATURE_MASK, 0xff);
++	struct mt7996_wed_rro_session_id *e;
+ 	struct mt7996_dev *dev;
++	bool npu_retire;
+ 	LIST_HEAD(list);
++	int err = 0;
+ 
+ 	dev = (struct mt7996_dev *)container_of(work, struct mt7996_dev,
+ 						wed_rro.work);
+ 
++	mutex_lock(&dev->mt76.mutex);
++	npu_retire = is_mt7996(&dev->mt76) && mt76_npu_device_active(&dev->mt76);
++	if (dev->wed_rro.reset_pending ||
++	    (npu_retire && (READ_ONCE(dev->removing) ||
++			    test_bit(MT76_MCU_RESET, &dev->mphy.state))))
++		goto unlock;
++
+ 	spin_lock_bh(&dev->wed_rro.lock);
+ 	list_splice_init(&dev->wed_rro.poll_list, &list);
+ 	spin_unlock_bh(&dev->wed_rro.lock);
+ 
+ 	while (!list_empty(&list)) {
+-		struct mt7996_wed_rro_session_id *e;
+ 		int i;
+ 
+ 		e = list_first_entry(&list, struct mt7996_wed_rro_session_id,
+@@ -1235,9 +1343,17 @@ static void mt7996_wed_rro_work(struct w
+ 		list_del_init(&e->list);
+ 
+ 		if (mt76_npu_device_active(&dev->mt76)) {
+-			if (is_mt7996(&dev->mt76))
+-				mt76_npu_send_txrx_addr(&dev->mt76, 3, e->id,
+-							0, 0, 0);
++			if (npu_retire) {
++				if (e->id > MT7996_RRO_MAX_SESSION) {
++					err = -EINVAL;
++					goto recover;
++				}
++				err = mt76_npu_send_txrx_addr_wait(&dev->mt76, 3,
++								   e->id, 0, 0, 0,
++								   jiffies + 2 * HZ);
++				if (err)
++					goto recover;
++			}
+ 			goto reset_session;
+ 		}
+ 
+@@ -1262,10 +1378,33 @@ reset:
+ 			elem->data |= cpu_to_le32(val);
+ 		}
+ reset_session:
+-		mt7996_mcu_wed_rro_reset_sessions(dev, e->id);
++		if (npu_retire && (READ_ONCE(dev->removing) ||
++				   test_bit(MT76_MCU_RESET, &dev->mphy.state))) {
++			err = -ESHUTDOWN;
++			goto recover;
++		}
++		err = mt7996_mcu_wed_rro_reset_sessions(dev, e->id);
++		if (err && npu_retire)
++			goto recover;
+ out:
+ 		kfree(e);
+ 	}
++unlock:
++	mutex_unlock(&dev->mt76.mutex);
++	return;
++
++recover:
++	dev_warn(dev->mt76.dev, "RRO session %u retirement failed: %d\n", e->id, err);
++	/* A WM delete may already have completed; never replay this ledger. */
++	dev->wed_rro.reset_pending = true;
++	list_add(&e->list, &list);
++	spin_lock_bh(&dev->wed_rro.lock);
++	list_splice_init(&list, &dev->wed_rro.poll_list);
++	spin_unlock_bh(&dev->wed_rro.lock);
++	mutex_unlock(&dev->mt76.mutex);
++
++	/* Full reset cancels this worker before acquiring the device mutex. */
++	mt7996_wed_rro_request_reset(dev);
+ }
+ 
+ static int mt7996_variant_type_init(struct mt7996_dev *dev)
+@@ -1827,6 +1966,7 @@ int mt7996_register_device(struct mt7996
+ {
+ 	struct ieee80211_hw *hw = mt76_hw(dev);
+ 	struct mt7996_phy *phy;
++	unsigned long flags;
+ 	int ret;
+ 
+ 	dev->phy.dev = dev;
+@@ -1872,7 +2012,9 @@ int mt7996_register_device(struct mt7996
+ 
+ 	ieee80211_queue_work(mt76_hw(dev), &dev->init_work);
+ 
++	spin_lock_irqsave(&dev->recovery_lock, flags);
+ 	dev->recovery.hw_init_done = true;
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 
+ 	ret = mt7996_init_debugfs(dev);
+ 	if (ret)
+@@ -1951,6 +2093,8 @@ void mt7996_unregister_device(struct mt7
+ 
+ void mt7996_shutdown_device(struct mt7996_dev *dev)
+ {
++	unsigned long flags;
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed_hif2);
+ 
+@@ -1962,7 +2106,9 @@ void mt7996_shutdown_device(struct mt799
+ 	mt7996_dma_disable(dev, true);
+ 
+ 	if (is_mt7990(&dev->mt76)) {
++		spin_lock_irqsave(&dev->recovery_lock, flags);
+ 		dev->recovery.hw_full_reset = true;
++		spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 		mt7996_wfsys_reset(dev);
+ 	}
+ }
+--- mt76-npu-ba-retire-if3-v4.orig/mt7996/mac.c
++++ mt76-npu-ba-retire-if3-v4/mt7996/mac.c
+@@ -2288,6 +2288,11 @@ mt7996_mac_restart(struct mt7996_dev *de
+ 		set_bit(MT76_RESET, &phy->mt76->state);
+ 	wake_up(&dev->mt76.mcu.wait);
+ 
++	if (dev->wed_rro.reset_pending && !npu_rro_reset) {
++		*stop_failed = true;
++		return -EINVAL;
++	}
++
+ 	/* lock/unlock all queues to ensure that no tx is pending */
+ 	mt7996_for_each_phy(dev, phy)
+ 		mt76_txq_schedule_all(phy->mt76);
+@@ -2373,8 +2378,16 @@ enable_napi:
+ 	if (ret)
+ 		goto out;
+ 
+-	/* Match cold initialization: rebuild NPU RRO before MAC routing. */
++	/* Match cold initialization: rebuild signatures after firmware reload,
++	 * before RRO configuration and NPU resume.
++	 */
+ 	if (npu_rro_reset) {
++		ret = mt7996_npu_reset_rro_sessions(dev);
++		if (ret) {
++			*stop_failed = true;
++			goto out;
++		}
++
+ 		mt7996_rro_hw_init(dev);
+ 		ret = __mt7996_npu_hw_init(dev, true);
+ 		if (ret)
+@@ -2520,11 +2533,13 @@ mt7996_mac_full_reset(struct mt7996_dev
+ {
+ 	struct ieee80211_hw *hw = mt76_hw(dev);
+ 	struct mt7996_phy *phy;
+-	LIST_HEAD(list);
++	unsigned long flags;
+ 	int i, ret = -ETIMEDOUT;
+ 	bool stop_failed;
+ 
++	spin_lock_irqsave(&dev->recovery_lock, flags);
+ 	dev->recovery.hw_full_reset = true;
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 	mt7996_led_block(dev, false);
+ 
+ 	set_bit(MT76_RESTART, &dev->mphy.state);
+@@ -2550,7 +2565,9 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 		mt7996_irq_disable(dev, ~0);
+ 		mt76_npu_disable_irqs(&dev->mt76);
+ 		/* This attempt ended; reset state and stopped queues remain. */
++		spin_lock_irqsave(&dev->recovery_lock, flags);
+ 		dev->recovery.hw_full_reset = false;
++		spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 		mutex_unlock(&dev->mt76.mutex);
+ 		return ret;
+ 	}
+@@ -2571,22 +2588,14 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	INIT_LIST_HEAD(&dev->sta_rc_list);
+ 	INIT_LIST_HEAD(&dev->twt_list);
+ 
+-	spin_lock_bh(&dev->wed_rro.lock);
+-	list_splice_init(&dev->wed_rro.poll_list, &list);
+-	spin_unlock_bh(&dev->wed_rro.lock);
+-
+-	while (!list_empty(&list)) {
+-		struct mt7996_wed_rro_session_id *e;
+-
+-		e = list_first_entry(&list, struct mt7996_wed_rro_session_id,
+-				     list);
+-		list_del_init(&e->list);
+-		kfree(e);
+-	}
++	mt7996_wed_rro_free_sessions(dev);
++	dev->wed_rro.reset_pending = false;
+ 
+ 	i = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+ 	dev->mt76.global_wcid.idx = i;
++	spin_lock_irqsave(&dev->recovery_lock, flags);
+ 	dev->recovery.hw_full_reset = false;
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -2603,15 +2612,25 @@ void mt7996_mac_reset_work(struct work_s
+ 	struct ieee80211_hw *hw;
+ 	struct mt7996_dev *dev;
+ 	struct mt7996_phy *phy;
++	unsigned long flags;
++	bool restart;
+ 	int i, ret;
+ 
+ 	dev = container_of(work, struct mt7996_dev, reset_work);
+-	if (READ_ONCE(dev->removing))
++	spin_lock_irqsave(&dev->recovery_lock, flags);
++	if (READ_ONCE(dev->removing)) {
++		spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 		return;
++	}
++	/* Consume this request now, so a later request survives this attempt. */
++	restart = dev->recovery.restart;
++	if (restart)
++		dev->recovery.restart = false;
++	spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 	hw = mt76_hw(dev);
+ 
+ 	/* chip full reset */
+-	if (dev->recovery.restart) {
++	if (restart) {
+ 		/* disable WA/WM WDT */
+ 		mt76_clear(dev, MT_WFDMA0_MCU_HOST_INT_ENA,
+ 			   MT_MCU_CMD_WDT_MASK);
+@@ -2621,11 +2640,15 @@ void mt7996_mac_reset_work(struct work_s
+ 		else
+ 			dev->recovery.wm_reset_count++;
+ 
+-		if (mt7996_mac_full_reset(dev))
++		if (mt7996_mac_full_reset(dev)) {
++			spin_lock_irqsave(&dev->recovery_lock, flags);
++			if (!READ_ONCE(dev->removing))
++				dev->recovery.restart = true;
++			spin_unlock_irqrestore(&dev->recovery_lock, flags);
+ 			return;
++		}
+ 
+ 		dev->recovery.state = MT_MCU_CMD_NORMAL_STATE;
+-		dev->recovery.restart = false;
+ 
+ 		/* enable mcu irq */
+ 		mt7996_irq_enable(dev, MT_INT_MCU_CMD);
+--- mt76-npu-ba-retire-if3-v4.orig/mt7996/mt7996.h
++++ mt76-npu-ba-retire-if3-v4/mt7996/mt7996.h
+@@ -574,6 +574,8 @@ struct mt7996_dev {
+ 		struct work_struct work;
+ 		struct list_head poll_list;
+ 		spinlock_t lock;
++		/* Held until a complete full reset reconciles the session ledger. */
++		bool reset_pending;
+ 
+ 		struct list_head page_cache;
+ 		struct list_head page_map[MT7996_RRO_MSDU_PG_HASH_SIZE];
+@@ -931,6 +933,8 @@ void mt7996_mcu_exit(struct mt7996_dev *
+ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag);
+ int mt7996_mcu_get_per_sta_info(struct mt7996_phy *phy, u16 tag);
+ int mt7996_mcu_wed_rro_reset_sessions(struct mt7996_dev *dev, u16 id);
++int mt7996_npu_reset_rro_sessions(struct mt7996_dev *dev);
++void mt7996_wed_rro_free_sessions(struct mt7996_dev *dev);
+ int mt7996_mcu_set_sniffer_mode(struct mt7996_phy *phy, bool enabled);
+ int mt7996_mcu_set_dup_wtbl(struct mt7996_dev *dev);
+ int mt7996_mcu_mld_reconf_stop_link(struct mt7996_dev *dev,
+--- mt76-npu-ba-retire-if3-v4.orig/npu.c
++++ mt76-npu-ba-retire-if3-v4/npu.c
+@@ -15,6 +15,8 @@
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+ #define MT76_NPU_TX_RESERVED_DESC	5
++#define MT76_NPU_MBOX_SUCCESS	1
++#define MT76_NPU_WLAN_MSG_HEAD_LEN	8
+ 
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+@@ -602,6 +604,45 @@ int mt76_npu_send_txrx_addr(struct mt76_
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_send_txrx_addr);
+ 
++int mt76_npu_send_txrx_addr_wait(struct mt76_dev *dev, int ifindex,
++				 u32 direction, u32 i_count_addr,
++				 u32 o_status_addr, u32 o_count_addr,
++				 unsigned long deadline)
++{
++	struct {
++		__le32 dir;
++		__le32 in_count_addr;
++		__le32 out_status_addr;
++		__le32 out_count_addr;
++	} info = {
++		.dir = cpu_to_le32(direction),
++		.in_count_addr = cpu_to_le32(i_count_addr),
++		.out_status_addr = cpu_to_le32(o_status_addr),
++		.out_count_addr = cpu_to_le32(o_count_addr),
++	};
++	struct airoha_npu_mailbox_result result;
++	struct airoha_npu *npu;
++	int err;
++
++	lockdep_assert_held(&dev->mutex);
++	npu = rcu_dereference_protected(dev->mmio.npu,
++					lockdep_is_held(&dev->mutex));
++	if (!npu)
++		return -ENODEV;
++
++	err = airoha_npu_wlan_send_msg_wait(npu, ifindex,
++					    WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++					    &info, sizeof(info), deadline, &result);
++	if (!err && (!result.submitted || !result.completed ||
++		     result.status != MT76_NPU_MBOX_SUCCESS ||
++		     result.request_len != sizeof(info) + MT76_NPU_WLAN_MSG_HEAD_LEN ||
++		     result.reply_len))
++		return -EIO;
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(mt76_npu_send_txrx_addr_wait);
++
+ void mt76_npu_disable_irqs(struct mt76_dev *dev)
+ {
+ 	struct airoha_npu *npu;
