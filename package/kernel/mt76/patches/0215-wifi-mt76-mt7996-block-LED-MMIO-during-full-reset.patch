@@ -1,0 +1,162 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: block LED MMIO during full reset
+
+The LED callbacks remain active while full recovery resets WFSYS and
+reloads firmware. A callback can access TMAC and CONN_INFRA registers
+while the reset worker expects the device to be quiescent.
+
+Serialize each complete LED programming sequence with a private lock.
+Before full reset, take the same lock to finish any entered callback and
+block subsequent hardware accesses. Cache the desired per-band blink
+configuration while blocked and restore it only after recovery succeeds.
+
+Retain the block after recovery failure. Mark teardown permanently under
+the same lock before unregistering LEDs so a concurrent recovery cannot
+re-enable their hardware accesses. Keep normal LED programming and the
+existing software timers and triggers unchanged.
+
+Fixes: b7a6c0effff3 ("wifi: mt76: mt7996: enable full system reset support")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -287,15 +287,13 @@ static int mt7996_thermal_init(struct mt
+ 	return 0;
+ }
+ 
+-static void mt7996_led_set_config(struct led_classdev *led_cdev,
+-				  u8 delay_on, u8 delay_off)
++static void __mt7996_led_set_config(struct mt76_phy *mphy,
++				    u8 delay_on, u8 delay_off)
+ {
+-	struct mt7996_dev *dev;
+-	struct mt76_phy *mphy;
++	struct mt7996_dev *dev = container_of(mphy->dev, struct mt7996_dev, mt76);
+ 	u32 val;
+ 
+-	mphy = container_of(led_cdev, struct mt76_phy, leds.cdev);
+-	dev = container_of(mphy->dev, struct mt7996_dev, mt76);
++	lockdep_assert_held(&dev->led_lock);
+ 
+ 	/* select TX blink mode, 2: only data frames */
+ 	mt76_rmw_field(dev, MT_TMAC_TCR0(mphy->band_idx), MT_TMAC_TCR0_TX_BLINK, 2);
+@@ -325,6 +323,57 @@ static void mt7996_led_set_config(struct
+ 	mt76_clear(dev, MT_LED_CTRL(mphy->band_idx), MT_LED_CTRL_KICK);
+ }
+ 
++static void mt7996_led_set_config(struct led_classdev *led_cdev,
++				  u8 delay_on, u8 delay_off)
++{
++	struct mt7996_dev *dev;
++	struct mt76_phy *mphy;
++	u8 band;
++
++	mphy = container_of(led_cdev, struct mt76_phy, leds.cdev);
++	dev = container_of(mphy->dev, struct mt7996_dev, mt76);
++	band = mphy->band_idx;
++
++	spin_lock_bh(&dev->led_lock);
++	dev->led_config[band].delay_on = delay_on;
++	dev->led_config[band].delay_off = delay_off;
++	dev->led_config[band].valid = true;
++	if (!dev->led_blocked)
++		__mt7996_led_set_config(mphy, delay_on, delay_off);
++	spin_unlock_bh(&dev->led_lock);
++}
++
++void mt7996_led_block(struct mt7996_dev *dev, bool teardown)
++{
++	/* Acquiring this lock also waits for an in-flight LED callback. */
++	spin_lock_bh(&dev->led_lock);
++	dev->led_blocked = true;
++	dev->led_stopped |= teardown;
++	spin_unlock_bh(&dev->led_lock);
++}
++
++void mt7996_led_resume(struct mt7996_dev *dev)
++{
++	int i;
++
++	spin_lock_bh(&dev->led_lock);
++	if (dev->led_stopped)
++		goto unlock;
++
++	dev->led_blocked = false;
++	for (i = 0; i < ARRAY_SIZE(dev->led_config); i++) {
++		struct mt76_phy *mphy = dev->mt76.phys[i];
++
++		if (!mphy || !dev->led_config[i].valid)
++			continue;
++
++		__mt7996_led_set_config(mphy, dev->led_config[i].delay_on,
++					dev->led_config[i].delay_off);
++	}
++unlock:
++	spin_unlock_bh(&dev->led_lock);
++}
++
+ static int mt7996_led_set_blink(struct led_classdev *led_cdev,
+ 				unsigned long *delay_on,
+ 				unsigned long *delay_off)
+@@ -1846,6 +1895,7 @@ void mt7996_cleanup_device(struct mt7996
+ 	int i, err;
+ 
+ 	mt7996_stop_recovery(dev);
++	mt7996_led_block(dev, true);
+ 	cancel_work_sync(&dev->init_work);
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->wed_rro.work);
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2412,6 +2412,7 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	bool stop_failed;
+ 
+ 	dev->recovery.hw_full_reset = true;
++	mt7996_led_block(dev, false);
+ 
+ 	set_bit(MT76_RESTART, &dev->mphy.state);
+ 	set_bit(MT76_MCU_RESET, &dev->mphy.state);
+@@ -2476,6 +2477,7 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
++	mt7996_led_resume(dev);
+ 	ieee80211_wake_queues(mt76_hw(dev));
+ 
+ 	ieee80211_restart_hw(mt76_hw(dev));
+--- a/mt7996/mmio.c
++++ b/mt7996/mmio.c
+@@ -655,6 +655,7 @@ static int mt7996_mmio_init(struct mt76_
+ 	mt76_mmio_init(&dev->mt76, mem_base);
+ 	spin_lock_init(&dev->reg_lock);
+ 	spin_lock_init(&dev->recovery_lock);
++	spin_lock_init(&dev->led_lock);
+ 
+ 	switch (device_id) {
+ 	case MT7996_DEVICE_ID:
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -485,6 +485,15 @@ struct mt7996_dev {
+ 	struct mt7996_hif *hif2;
+ 	int irq, hif2_irq;
+ 	spinlock_t recovery_lock;
++	/* Serializes LED MMIO and its reset/teardown gate. */
++	spinlock_t led_lock;
++	bool led_blocked;
++	bool led_stopped;
++	struct {
++		u8 delay_on;
++		u8 delay_off;
++		bool valid;
++	} led_config[__MT_MAX_BAND];
+ 	bool removing;
+ 	struct mt7996_reg_desc reg;
+ 	u8 q_id[MT7996_MAX_QUEUE];
+@@ -802,6 +811,8 @@ int mt7996_init_tx_queues(struct mt7996_
+ void mt7996_init_txpower(struct mt7996_phy *phy);
+ int mt7996_txbf_init(struct mt7996_dev *dev);
+ void mt7996_reset(struct mt7996_dev *dev);
++void mt7996_led_block(struct mt7996_dev *dev, bool teardown);
++void mt7996_led_resume(struct mt7996_dev *dev);
+ int mt7996_run(struct mt7996_phy *phy);
+ int mt7996_mcu_init(struct mt7996_dev *dev);
+ int mt7996_mcu_init_firmware(struct mt7996_dev *dev);
