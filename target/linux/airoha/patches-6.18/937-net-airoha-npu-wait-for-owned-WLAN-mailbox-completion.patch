@@ -1,0 +1,387 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] net: airoha: npu: wait for the owned WLAN mailbox response
+
+Some WLAN stop callbacks finish after the atomic transport's 100ms
+polling deadline. Replaying the handshake after a generic availability
+check loses the original callback status and can repeat detach forever.
+
+Add separate process-context WLAN wait APIs. Reserve the coherent bounce
+while sleeping and serialize against recovery and software resource
+release. Preserve the original status and reply in provider-private
+storage before any later request can reuse the mailbox.
+
+An atomic caller may help capture that completed response, then submit
+its own request. It shares only the original request's remaining 100ms
+atomic budget; later callers never restart that budget. The sleeping
+owner consumes the stable cached receipt without reading a later
+request's registers or clearing its pending state. Keep quarantine on
+timeout or an uncertain kick.
+
+Use a provider-private wrapper for reservation state. Existing public
+NPU and ops layouts and ordinary atomic PPE polling remain unchanged.
+This supplies no cancellation or physical DMA-stop fence for a callback
+that does not complete.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -9,6 +9,8 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/firmware.h>
++#include <linux/jiffies.h>
++#include <linux/ktime.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_net.h>
+ #include <linux/of_platform.h>
+@@ -165,6 +167,69 @@ struct wlan_mbox_data {
+ 	DECLARE_FLEX_ARRAY(u8, d);
+ };
+ 
++struct airoha_npu_priv {
++	struct airoha_npu npu;
++	/* Protected by core 0's lock; recovery_lock pins the sleeping owner. */
++	bool mbox_reserved;
++	bool mbox_active;
++	bool mbox_completed;
++	u64 mbox_generation;
++	ktime_t mbox_atomic_deadline;
++	u32 mbox_status;
++	u32 mbox_len;
++	u8 mbox_reply[NPU_MBOX_SIZE];
++};
++
++static struct airoha_npu_priv *airoha_npu_priv(struct airoha_npu *npu)
++{
++	return container_of(npu, struct airoha_npu_priv, npu);
++}
++
++/* Caller holds core 0's lock; recovery_lock pins the original owner. */
++static int airoha_npu_capture_reserved_mbox(struct airoha_npu *npu)
++{
++	struct airoha_npu_core *core = &npu->cores[0];
++	struct airoha_npu_priv *priv = airoha_npu_priv(npu);
++	u32 val;
++	int ret;
++
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(3), &val);
++	if (ret)
++		return ret;
++	if (!(val & MBOX_MSG_DONE))
++		return -EAGAIN;
++
++	dma_rmb();
++	memcpy(priv->mbox_reply, core->buf, priv->mbox_len);
++	priv->mbox_status = FIELD_GET(MBOX_MSG_STATUS, val);
++	priv->mbox_completed = true;
++	priv->mbox_reserved = false;
++	core->mbox_pending = false;
++
++	return 0;
++}
++
++static int airoha_npu_help_reserved_mbox(struct airoha_npu *npu)
++{
++	struct airoha_npu_priv *priv = airoha_npu_priv(npu);
++	int ret;
++	s64 ns;
++
++	if (!priv->mbox_active)
++		return -EBUSY;
++
++	for (;;) {
++		ret = airoha_npu_capture_reserved_mbox(npu);
++		if (ret != -EAGAIN)
++			return ret;
++		ns = ktime_to_ns(ktime_sub(priv->mbox_atomic_deadline, ktime_get()));
++		if (ns <= 0)
++			return -EBUSY;
++		/* Share the original request's atomic budget, never restart it. */
++		udelay(min_t(s64, DIV_ROUND_UP(ns, NSEC_PER_USEC), 100));
++	}
++}
++
+ /* Caller holds core 0's mailbox lock. */
+ static int airoha_npu_check_mbox(struct airoha_npu *npu)
+ {
+@@ -172,6 +237,10 @@ static int airoha_npu_check_mbox(struct
+ 	u32 val;
+ 	int ret;
+ 
++	/* Preserve the owner's receipt before allowing atomic buffer reuse. */
++	if (airoha_npu_priv(npu)->mbox_reserved)
++		return airoha_npu_help_reserved_mbox(npu);
++
+ 	if (!core->mbox_pending)
+ 		return 0;
+ 
+@@ -254,6 +323,125 @@ unlock:
+ 	return ret;
+ }
+ 
++static int __airoha_npu_send_msg_wait(struct airoha_npu *npu, int func_id,
++				      const void *data, int len, void *reply,
++				      u16 reply_len, unsigned long deadline,
++				      struct airoha_npu_mailbox_result *result)
++{
++	struct airoha_npu_core *core = &npu->cores[0];
++	struct airoha_npu_priv *priv = airoha_npu_priv(npu);
++	u32 val;
++	int ret;
++
++	might_sleep();
++	memset(result, 0, sizeof(*result));
++	result->status = U32_MAX;
++	result->request_len = len;
++	if ((size_t)len > NPU_MBOX_SIZE || (reply && reply_len > len))
++		return -EMSGSIZE;
++
++	/* Bound admission too; no mutex wait may extend the caller's deadline. */
++	while (!mutex_trylock(&npu->recovery_lock)) {
++		if (READ_ONCE(npu->stopping))
++			return -ESHUTDOWN;
++		if (time_after_eq(jiffies, deadline))
++			return -ETIMEDOUT;
++		usleep_range(10000, 20000);
++	}
++
++	for (;;) {
++		spin_lock_bh(&core->lock);
++		if (READ_ONCE(npu->stopping))
++			ret = -ESHUTDOWN;
++		else if (atomic_read(&npu->recovering))
++			ret = -EAGAIN;
++		else
++			ret = airoha_npu_check_mbox(npu);
++		if (ret != -EBUSY && ret != -EAGAIN)
++			break;
++		spin_unlock_bh(&core->lock);
++		if (time_after_eq(jiffies, deadline)) {
++			ret = -ETIMEDOUT;
++			goto unlock_recovery;
++		}
++		usleep_range(10000, 20000);
++	}
++	if (ret)
++		goto unlock_core;
++	if (time_after_eq(jiffies, deadline)) {
++		ret = -ETIMEDOUT;
++		goto unlock_core;
++	}
++
++	priv->mbox_reserved = true;
++	priv->mbox_active = true;
++	priv->mbox_completed = false;
++	priv->mbox_len = len;
++	result->generation = ++priv->mbox_generation;
++	memcpy(core->buf, data, len);
++	dma_wmb();
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0), core->addr);
++	if (ret)
++		goto release_reservation;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1), len);
++	if (ret)
++		goto release_reservation;
++	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3), val);
++	if (ret)
++		goto release_reservation;
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2), &val);
++	if (ret)
++		goto release_reservation;
++	/* A failed doorbell write may still have reached the engine. */
++	result->submitted = true;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2), val + 1);
++	if (ret) {
++		core->mbox_pending = true;
++		goto release_reservation;
++	}
++	priv->mbox_atomic_deadline = ktime_add_us(ktime_get(), 100 * MSEC_PER_SEC);
++	spin_unlock_bh(&core->lock);
++
++	for (;;) {
++		spin_lock_bh(&core->lock);
++		/* An atomic caller may have cached our response and reused HW. */
++		ret = priv->mbox_completed ? 0 : airoha_npu_capture_reserved_mbox(npu);
++		if (priv->mbox_completed) {
++			result->completed = true;
++			result->status = priv->mbox_status;
++			if (result->status != NPU_MBOX_SUCCESS) {
++				ret = -EINVAL;
++			} else if (reply) {
++				memcpy(reply, priv->mbox_reply + len - reply_len,
++				       reply_len);
++				result->reply_len = reply_len;
++			}
++			/* Shared pending may now belong to the later atomic caller. */
++			goto release_owner;
++		}
++		if (ret != -EAGAIN || time_after_eq(jiffies, deadline)) {
++			/* Timeout does not cancel this original request or its DMA. */
++			core->mbox_pending = true;
++			if (ret == -EAGAIN)
++				ret = -ETIMEDOUT;
++			break;
++		}
++		spin_unlock_bh(&core->lock);
++		usleep_range(10000, 20000);
++	}
++release_reservation:
++	priv->mbox_reserved = false;
++release_owner:
++	priv->mbox_active = false;
++unlock_core:
++	spin_unlock_bh(&core->lock);
++unlock_recovery:
++	mutex_unlock(&npu->recovery_lock);
++
++	return ret;
++}
++
+ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 			       void *data, int len)
+ {
+@@ -665,6 +853,65 @@ static int airoha_npu_wlan_msg_get(struc
+ 	return err;
+ }
+ 
++static int airoha_npu_wlan_msg_wait(struct airoha_npu *npu, int ifindex,
++				    u32 func_type, u32 command, const void *data,
++				    void *reply, int data_len,
++				    unsigned long deadline,
++				    struct airoha_npu_mailbox_result *result)
++{
++	struct wlan_mbox_data *wlan_data;
++	int err, len;
++
++	might_sleep();
++	if (!result)
++		return -EINVAL;
++	memset(result, 0, sizeof(*result));
++	result->status = U32_MAX;
++	if (ifindex < 0 || ifindex > 15 || data_len < 0 ||
++	    (data_len && !data && !reply))
++		return -EINVAL;
++	if (data_len > NPU_MBOX_SIZE - sizeof(*wlan_data))
++		return -EMSGSIZE;
++
++	len = sizeof(*wlan_data) + data_len;
++	wlan_data = kzalloc(len, GFP_KERNEL);
++	if (!wlan_data)
++		return -ENOMEM;
++	wlan_data->ifindex = ifindex;
++	wlan_data->func_type = func_type;
++	wlan_data->func_id = command;
++	if (data_len && data)
++		memcpy(wlan_data->d, data, data_len);
++
++	err = __airoha_npu_send_msg_wait(npu, NPU_FUNC_WIFI, wlan_data, len,
++					 reply, reply ? data_len : 0, deadline,
++					 result);
++	kfree(wlan_data);
++
++	return err;
++}
++
++int airoha_npu_wlan_send_msg_wait(struct airoha_npu *npu, int ifindex,
++				  enum airoha_npu_wlan_set_cmd cmd,
++				  const void *data, int data_len,
++				  unsigned long deadline,
++				  struct airoha_npu_mailbox_result *result)
++{
++	return airoha_npu_wlan_msg_wait(npu, ifindex, NPU_OP_SET, cmd, data,
++					NULL, data_len, deadline, result);
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_send_msg_wait);
++
++int airoha_npu_wlan_get_msg_wait(struct airoha_npu *npu, int ifindex,
++				 enum airoha_npu_wlan_get_cmd cmd, void *reply,
++				 int reply_len, unsigned long deadline,
++				 struct airoha_npu_mailbox_result *result)
++{
++	return airoha_npu_wlan_msg_wait(npu, ifindex, NPU_OP_GET, cmd, NULL,
++					reply, reply_len, deadline, result);
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_get_msg_wait);
++
+ static int
+ airoha_npu_wlan_set_reserved_memory(struct airoha_npu *npu,
+ 				    int ifindex, const char *name,
+@@ -890,6 +1137,7 @@ static void airoha_npu_stop_recovery(voi
+ static int airoha_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct airoha_npu_priv *priv;
+ 	struct airoha_npu *npu;
+ 	struct resource res;
+ 	void __iomem *base;
+@@ -900,9 +1148,10 @@ static int airoha_npu_probe(struct platf
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);
+ 
+-	npu = devm_kzalloc(dev, sizeof(*npu), GFP_KERNEL);
+-	if (!npu)
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
+ 		return -ENOMEM;
++	npu = &priv->npu;
+ 
+ 	npu->dev = dev;
+ 	mutex_init(&npu->recovery_lock);
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -225,11 +225,29 @@ struct airoha_npu {
+ #endif
+ };
+ 
++struct airoha_npu_mailbox_result {
++	u64 generation;
++	u32 request_len;
++	u32 reply_len;
++	u32 status;
++	bool submitted;
++	bool completed;
++};
++
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ struct airoha_npu *airoha_npu_get(struct device *dev);
+ void airoha_npu_put(struct airoha_npu *npu);
+ int airoha_npu_recover(struct airoha_npu *npu);
+ int airoha_npu_wait_recovery(struct airoha_npu *npu);
++int airoha_npu_wlan_send_msg_wait(struct airoha_npu *npu, int ifindex,
++				  enum airoha_npu_wlan_set_cmd cmd,
++				  const void *data, int data_len,
++				  unsigned long deadline,
++				  struct airoha_npu_mailbox_result *result);
++int airoha_npu_wlan_get_msg_wait(struct airoha_npu *npu, int ifindex,
++				 enum airoha_npu_wlan_get_cmd cmd, void *reply,
++				 int reply_len, unsigned long deadline,
++				 struct airoha_npu_mailbox_result *result);
+ 
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
+@@ -296,6 +314,24 @@ static inline int airoha_npu_wait_recove
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int
++airoha_npu_wlan_send_msg_wait(struct airoha_npu *npu, int ifindex,
++			      enum airoha_npu_wlan_set_cmd cmd, const void *data,
++			      int data_len, unsigned long deadline,
++			      struct airoha_npu_mailbox_result *result)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int
++airoha_npu_wlan_get_msg_wait(struct airoha_npu *npu, int ifindex,
++			     enum airoha_npu_wlan_get_cmd cmd, void *reply,
++			     int reply_len, unsigned long deadline,
++			     struct airoha_npu_mailbox_result *result)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
