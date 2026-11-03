@@ -90,7 +90,7 @@
 &en7581_pinctrl {
 	gpio-ranges = <&en7581_pinctrl 0 13 47>;
 
-	pcie0_rst_pins {
+	pcie0-rst-pins {
 		mux {
 			function = "pcie_reset";
 			groups = "pcie_reset0", "pcie_reset1";
@@ -101,7 +101,7 @@
 		};
 	};
 
-	pcie2_rst_pins {
+	pcie2-rst-pins {
 		mux {
 			function = "pcie_reset";
 			groups = "pcie_reset2";
