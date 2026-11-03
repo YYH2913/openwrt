@@ -1,0 +1,130 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 03 Nov 2026 17:08:34 +0000
+Subject: [PATCH] wifi: mt76: publish NPU RX buffers before releasing DONE
+
+The NPU tests DONE two slots ahead of its producer and does not use the
+host free index as an admission fence. A dropped packet currently returns
+its pages and clears DONE before replacement addresses reach the ring.
+Three consumed slots can let the producer wrap to an already released
+page. Clearing descriptors before writing replacement addresses also
+allows ownership publication to overtake those addresses.
+
+Keep completed descriptors owned by the host after page drop or transfer
+to an skb. Refill metadata and the DMA address without touching control,
+then use dma_wmb before the final DONE clear. Each subsequent slot barrier
+also orders the previous ownership release before the next lookahead slot.
+Preserve the existing free-index update, capacity and poll budgeting.
+
+Initialize new NPU RX descriptors to host-owned before exposing their ring
+base. During the existing quiesced cleanup path, mark all slots owned
+before returning pages; only refilled slots are released afterward. This
+is not a DMA cancellation fence and retains the existing successful stop
+and drain prerequisite for reset or teardown. Clear host buffer references
+after drop or skb transfer so cleanup cannot return transferred pages.
+
+The source-backed producer model reproduces the old three-slot drop and
+weak-publication gaps; the candidate preserves ownership across wrap,
+fragmented packets, skb allocation failure and partial refill failure.
+These checks establish a lifetime fix, not the cause of a measured delay.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- mt76-npu-rx-ownership-fix.orig/dma.c
++++ mt76-npu-rx-ownership-fix/dma.c
+@@ -938,6 +938,15 @@ mt76_dma_alloc_queue(struct mt76_dev *de
+ 		q->ndesc = 0;
+ 		return -ENOMEM;
+ 	}
++	if (mt76_queue_is_npu_rx(q)) {
++		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++		int i;
++
++		/* Unfilled slots must block the NPU's lookahead admission. */
++		for (i = 0; i < q->ndesc; i++)
++			WRITE_ONCE(desc[i].ctrl, NPU_RX_DMA_DESC_DONE_MASK);
++		dma_wmb();
++	}
+ 
+ 	mt76_dma_queue_magic_cnt_init(dev, q);
+ 	size = q->ndesc * sizeof(*q->entry);
+--- mt76-npu-rx-ownership-fix.orig/npu.c
++++ mt76-npu-rx-ownership-fix/npu.c
+@@ -20,10 +20,10 @@
+ 
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int nframes = 0;
+ 
+ 	while (q->queued < q->ndesc) {
+-		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 		struct mt76_queue_entry *e = &q->entry[q->head];
+ 		struct page *page;
+ 		int offset;
+@@ -36,8 +36,14 @@ int mt76_npu_fill_rx_queue(struct mt76_d
+ 		page = virt_to_head_page(e->buf);
+ 		e->dma_addr[0] = page_pool_get_dma_addr(page) + offset;
+ 
+-		memset(&desc[q->head], 0, sizeof(*desc));
+-		desc[q->head].addr = e->dma_addr[0];
++		WRITE_ONCE(desc[q->head].info, 0);
++		WRITE_ONCE(desc[q->head].data, 0);
++		WRITE_ONCE(desc[q->head].addr, e->dma_addr[0]);
++		WRITE_ONCE(desc[q->head].rsv, 0);
++
++		/* Order replacements and earlier releases before this lookahead slot. */
++		dma_wmb();
++		WRITE_ONCE(desc[q->head].ctrl, 0);
+ 
+ 		q->head = (q->head + 1) % q->ndesc;
+ 		q->queued++;
+@@ -54,7 +60,14 @@ int mt76_npu_fill_rx_queue(struct mt76_d
+ 
+ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++	int i;
++
+ 	spin_lock_bh(&q->lock);
++	/* Existing stop/drain must have quiesced DMA before freeing pages. */
++	for (i = 0; i < q->ndesc; i++)
++		WRITE_ONCE(desc[i].ctrl, NPU_RX_DMA_DESC_DONE_MASK);
++	dma_wmb();
+ 	while (q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+ 
+@@ -62,6 +75,7 @@ void mt76_npu_queue_cleanup(struct mt76_
+ 					e->dma_len[0],
+ 					page_pool_get_dma_dir(q->page_pool));
+ 		mt76_put_page_pool_buf(e->buf, false);
++		e->buf = NULL;
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 	}
+@@ -71,8 +85,6 @@ void mt76_npu_queue_cleanup(struct mt76_
+ static void mt76_npu_drop_rx(struct mt76_dev *dev, struct mt76_queue *q,
+ 			     int nframes)
+ {
+-	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+-
+ 	while (nframes-- > 0 && q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+ 
+@@ -80,8 +92,8 @@ static void mt76_npu_drop_rx(struct mt76
+ 					e->dma_len[0],
+ 					page_pool_get_dma_dir(q->page_pool));
+ 		mt76_put_page_pool_buf(e->buf, false);
+-		WRITE_ONCE(desc[q->tail].ctrl, 0);
+-		WRITE_ONCE(desc[q->tail].info, 0);
++		e->buf = NULL;
++		/* Keep DONE set until refill has installed a replacement page. */
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 	}
+@@ -183,6 +195,7 @@ static struct sk_buff *mt76_npu_dequeue(
+ 		}
+ 
+ 		*info = READ_ONCE(desc[index].info);
++		e->buf = NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;
