@@ -1,0 +1,140 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: quiesce DMA before full reset cleanup
+
+The full reset path releases TX tokens before disabling WFDMA. Stopping
+host workers and NAPI does not stop the device from accessing those DMA
+buffers. The later reset only delays for a fixed interval after clearing
+the enable bits, without checking that DMA has actually stopped.
+
+After NPU stop and NAPI shutdown, disable TX/RX DMA on both HIFs and wait
+for their enable and busy bits to clear under one shared deadline. Only
+then release tokens and reset the queues and WFSYS. Treat inaccessible
+registers or a failed stop as a stop failure, retaining buffers and
+ending this recovery attempt without replaying the physical reset.
+
+The MT7996 host DMA busy fields are documented by the MediaTek debug
+register definitions for the main and secondary HIF GLO_CFG registers.
+This change does not alter the WFSYS reset sequence or IRQ lifecycle.
+
+Fixes: b7a6c0effff3 ("wifi: mt76: mt7996: enable full system reset support")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -3,6 +3,8 @@
+  * Copyright (C) 2022 MediaTek Inc.
+  */
+ 
++#include <linux/ktime.h>
++
+ #include "mt7996.h"
+ #include "../dma.h"
+ #include "mac.h"
+@@ -959,6 +961,54 @@ int mt7996_dma_init(struct mt7996_dev *d
+ 	return 0;
+ }
+ 
++int mt7996_dma_quiesce(struct mt7996_dev *dev)
++{
++	ktime_t deadline = ktime_add_ms(ktime_get(), 1000);
++	u32 hif1_ofs = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
++	u32 mask = MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++		   MT_WFDMA0_GLO_CFG_RX_DMA_EN |
++		   MT_WFDMA0_GLO_CFG_TX_DMA_BUSY |
++		   MT_WFDMA0_GLO_CFG_RX_DMA_BUSY;
++	u32 cfg, cfg1 = 0;
++	int ret;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++
++	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
++		   MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++		   MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (dev->hif2)
++		mt76_clear(dev, MT_WFDMA0_GLO_CFG + hif1_ofs,
++			   MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++			   MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++
++	for (;;) {
++		cfg = mt76_rr(dev, MT_WFDMA0_GLO_CFG);
++		if (cfg == ~0U) {
++			ret = -EIO;
++			break;
++		}
++		if (dev->hif2)
++			cfg1 = mt76_rr(dev, MT_WFDMA0_GLO_CFG + hif1_ofs);
++
++		if (cfg1 == ~0U) {
++			ret = -EIO;
++			break;
++		}
++		if (!((cfg | cfg1) & mask))
++			return 0;
++		if (ktime_compare(ktime_get(), deadline) >= 0) {
++			ret = -ETIMEDOUT;
++			break;
++		}
++		usleep_range(1000, 2000);
++	}
++
++	dev_err(dev->mt76.dev, "DMA did not stop: %d, cfg %#x, cfg1 %#x\n",
++		ret, cfg, cfg1);
++	return ret;
++}
++
+ void mt7996_dma_reset(struct mt7996_dev *dev, bool force)
+ {
+ 	struct mt76_phy *phy2 = dev->mt76.phys[MT_BAND1];
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2236,12 +2236,19 @@ mt7996_mac_restart(struct mt7996_dev *de
+ 	}
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
++	ret = mt7996_dma_quiesce(dev);
++	if (ret) {
++		*stop_failed = true;
++		goto enable_napi;
++	}
++
+ 	/* token reinit */
+ 	mt7996_tx_token_put(dev);
+ 	idr_init(&dev->mt76.token);
+ 
+ 	mt7996_dma_reset(dev, true);
+ 
++enable_napi:
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
+ 		    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
+@@ -2251,6 +2258,9 @@ mt7996_mac_restart(struct mt7996_dev *de
+ 			napi_enable(&dev->mt76.napi[i]);
+ 		}
+ 	}
++	if (ret)
++		goto out;
++
+ 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -791,6 +791,7 @@ int mt7996_eeprom_get_target_power(struc
+ s8 mt7996_eeprom_get_power_delta(struct mt7996_dev *dev, int band);
+ bool mt7996_eeprom_has_background_radar(struct mt7996_dev *dev);
+ int mt7996_dma_init(struct mt7996_dev *dev);
++int mt7996_dma_quiesce(struct mt7996_dev *dev);
+ void mt7996_dma_reset(struct mt7996_dev *dev, bool force);
+ void mt7996_dma_prefetch(struct mt7996_dev *dev);
+ void mt7996_dma_disable(struct mt7996_dev *dev, bool reset);
+--- a/mt7996/regs.h
++++ b/mt7996/regs.h
+@@ -474,7 +474,9 @@ enum offs_rev {
+ 
+ #define MT_WFDMA0_GLO_CFG			MT_WFDMA0(0x208)
+ #define MT_WFDMA0_GLO_CFG_TX_DMA_EN		BIT(0)
++#define MT_WFDMA0_GLO_CFG_TX_DMA_BUSY		BIT(1)
+ #define MT_WFDMA0_GLO_CFG_RX_DMA_EN		BIT(2)
++#define MT_WFDMA0_GLO_CFG_RX_DMA_BUSY		BIT(3)
+ #define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2	BIT(21)
+ #define MT_WFDMA0_GLO_CFG_EXT_EN		BIT(26)
+ #define MT_WFDMA0_GLO_CFG_OMIT_RX_INFO		BIT(27)
