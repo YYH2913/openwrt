@@ -1,0 +1,366 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: rebuild NPU RRO rings after firmware
+
+NPU initialization replaces the endpoint RRO descriptor bases with its
+own rings while the queue objects retain separate host DMA allocations.
+A full reset currently writes those host addresses back before firmware
+reload, then configures MAC RRO routing before rebinding the NPU rings.
+
+Defer the complete NPU RRO reset until firmware is ready. Reuse the RRO
+hardware configuration and existing NPU binding/refill/resume sequence
+before MAC routing, with explicit NPU descriptor addresses and unchanged
+ring sizes. Preserve host cleanup, RX token release and quiescence, keep
+RRO shadow NAPI stopped during reconstruction, and balance it on failure.
+Return full initialization errors through a fresh stop/drain/quiesce
+attempt instead of replaying ring writes after an uncertain resume.
+
+Keep cold, L1, WED and other-chip sequences unchanged. This repairs source
+ownership and ordering; it does not establish a new hardware DMA fence
+or prove that PCIe Completion Timeouts are resolved.
+
+Fixes: 01575edfc36d ("wifi: mt76: mt7996: Add NPU support for MT7990 chipset")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/dma.c
++++ b/dma.c
+@@ -199,7 +199,8 @@ mt76_dma_read_dma_idx(struct mt76_queue
+ }
+ 
+ static void
+-mt76_dma_sync_idx(struct mt76_dev *dev, struct mt76_queue *q)
++__mt76_dma_sync_idx(struct mt76_dev *dev, struct mt76_queue *q,
++		    dma_addr_t desc_dma)
+ {
+ 	if ((q->flags & MT_QFLAG_WED_RRO_EN) &&
+ 	    (!is_mt7992(dev) || !mt76_npu_device_active(dev)))
+@@ -209,17 +210,26 @@ mt76_dma_sync_idx(struct mt76_dev *dev,
+ 
+ 	if (mt76_queue_is_npu_tx(q)) {
+ 		writel(q->ndesc, &q->regs->ring_size);
+-		writel(q->desc_dma, &q->regs->desc_base);
++		writel(desc_dma, &q->regs->desc_base);
+ 	}
+ 
+-	Q_WRITE(q, desc_base, q->desc_dma);
++	Q_WRITE(q, desc_base, desc_dma);
+ 
+ 	q->head = mt76_dma_read_dma_idx(q, 0);
+ 	q->tail = q->head;
+ }
+ 
+-void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+-			  bool reset_idx)
++static void
++mt76_dma_sync_idx(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	__mt76_dma_sync_idx(dev, q, q->desc_dma);
++}
++
++/* An offload engine can own the hardware ring while q->desc_dma still
++ * describes the host allocation used for queue bookkeeping and teardown.
++ */
++void mt76_dma_queue_reset_addr(struct mt76_dev *dev, struct mt76_queue *q,
++			       bool reset_idx, dma_addr_t desc_dma)
+ {
+ 	if (!q || !q->ndesc)
+ 		return;
+@@ -241,7 +251,15 @@ void mt76_dma_queue_reset(struct mt76_de
+ 			Q_WRITE(q, cpu_idx, 0);
+ 		Q_WRITE(q, dma_idx, 0);
+ 	}
+-	mt76_dma_sync_idx(dev, q);
++	__mt76_dma_sync_idx(dev, q, desc_dma);
++}
++EXPORT_SYMBOL_GPL(mt76_dma_queue_reset_addr);
++
++void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
++			  bool reset_idx)
++{
++	if (q)
++		mt76_dma_queue_reset_addr(dev, q, reset_idx, q->desc_dma);
+ }
+ 
+ static int
+--- a/dma.h
++++ b/dma.h
+@@ -174,6 +174,8 @@ int mt76_dma_rx_fill(struct mt76_dev *de
+ 		     bool allow_direct);
+ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+ 			  bool reset_idx);
++void mt76_dma_queue_reset_addr(struct mt76_dev *dev, struct mt76_queue *q,
++			       bool reset_idx, dma_addr_t desc_dma);
+ 
+ static inline void
+ mt76_dma_reset_tx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -1076,6 +1076,16 @@ void mt7996_dma_reset(struct mt7996_dev
+ 	mt76_for_each_q_rx(&dev->mt76, i) {
+ 		struct mt76_queue *q = &dev->mt76.q_rx[i];
+ 
++		/* Rebuild NPU-owned RRO rings after firmware is ready, using
++		 * the NPU descriptor bases rather than the host allocations.
++		 */
++		if (force && is_mt7996(&dev->mt76) &&
++		    mt76_npu_device_active(&dev->mt76) &&
++		    !mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++		    mt7996_has_hwrro(dev) &&
++		    mt76_queue_is_wed_rro(q))
++			continue;
++
+ 		if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+ 			if (mt76_queue_is_wed_rro(q) ||
+ 			    mt76_queue_is_wed_tx_free(q)) {
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2274,6 +2274,10 @@ static int
+ mt7996_mac_restart(struct mt7996_dev *dev, bool *stop_failed)
+ {
+ 	struct mt76_dev *mdev = &dev->mt76;
++	DECLARE_BITMAP(rro_napi, __MT_RXQ_MAX) = {};
++	bool npu_rro_reset = is_mt7996(mdev) && mt76_npu_device_active(mdev) &&
++			     !mtk_wed_device_active(&mdev->mmio.wed) &&
++			     mt7996_has_hwrro(dev);
+ 	struct mt7996_phy *phy;
+ 	int i, ret;
+ 
+@@ -2338,6 +2342,11 @@ enable_napi:
+ 			continue;
+ 
+ 		if (mdev->q_rx[i].ndesc) {
++			if (!ret && npu_rro_reset &&
++			    mt76_queue_is_wed_rro(&mdev->q_rx[i])) {
++				__set_bit(i, rro_napi);
++				continue;
++			}
+ 			napi_enable(&dev->mt76.napi[i]);
+ 		}
+ 	}
+@@ -2364,6 +2373,14 @@ enable_napi:
+ 	if (ret)
+ 		goto out;
+ 
++	/* Match cold initialization: rebuild NPU RRO before MAC routing. */
++	if (npu_rro_reset) {
++		mt7996_rro_hw_init(dev);
++		ret = __mt7996_npu_hw_init(dev, true);
++		if (ret)
++			goto out;
++	}
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
+ 	    mt7996_has_hwrro(dev)) {
+ 		u32 wed_irq_mask = dev->mt76.mmio.irqmask |
+@@ -2402,9 +2419,11 @@ enable_napi:
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = __mt7996_npu_hw_init(dev);
+-	if (ret)
+-		goto out;
++	if (!npu_rro_reset) {
++		ret = __mt7996_npu_hw_init(dev, false);
++		if (ret)
++			goto out;
++	}
+ 
+ 	mt7996_for_each_phy(dev, phy) {
+ 		if (!test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
+@@ -2422,6 +2441,12 @@ out:
+ 		mt76_npu_disable_irqs(mdev);
+ 	}
+ 
++	/* Restore each delayed NAPI once, including failed attempts, so the
++	 * next stop or teardown starts from the same enabled state.
++	 */
++	for_each_set_bit(i, rro_napi, __MT_RXQ_MAX)
++		napi_enable(&dev->mt76.napi[i]);
++
+ 	if (ret) {
+ 		set_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	} else {
+@@ -2435,6 +2460,11 @@ out:
+ 			    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
+ 				continue;
+ 
++			if (npu_rro_reset &&
++			    (mt76_queue_is_wed_rro(&mdev->q_rx[i]) ||
++			     mt76_queue_is_npu_txfree(&mdev->q_rx[i])))
++				continue;
++
+ 			local_bh_disable();
+ 			napi_schedule(&dev->mt76.napi[i]);
+ 			local_bh_enable();
+@@ -2699,7 +2729,7 @@ void mt7996_mac_reset_work(struct work_s
+ 				     MT_INT_TX_RX_DONE_EXT);
+ 	}
+ 
+-	ret = __mt7996_npu_hw_init(dev);
++	ret = __mt7996_npu_hw_init(dev, false);
+ 
+ out:
+ 	if (!ret) {
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -1088,7 +1088,7 @@ int mt7996_dma_rro_init(struct mt7996_de
+ void mt7996_dma_rro_start(struct mt7996_dev *dev);
+ 
+ #ifdef CONFIG_MT7996_NPU
+-int __mt7996_npu_hw_init(struct mt7996_dev *dev);
++int __mt7996_npu_hw_init(struct mt7996_dev *dev, bool reset_rro);
+ int __mt7996_npu_hw_stop(struct mt7996_dev *dev);
+ int mt7996_npu_hw_init(struct mt7996_dev *dev);
+ int mt7996_npu_hw_stop(struct mt7996_dev *dev);
+@@ -1100,7 +1100,7 @@ static inline int __mt7996_npu_hw_stop(s
+ 	return 0;
+ }
+ 
+-static inline int __mt7996_npu_hw_init(struct mt7996_dev *dev)
++static inline int __mt7996_npu_hw_init(struct mt7996_dev *dev, bool reset_rro)
+ {
+ 	return 0;
+ }
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -8,6 +8,7 @@
+ #include <linux/soc/airoha/airoha_offload.h>
+ 
+ #include "mt7996.h"
++#include "../dma.h"
+ 
+ static int mt7992_npu_txrx_offload_init(struct mt7996_dev *dev,
+ 					struct airoha_npu *npu)
+@@ -275,7 +276,20 @@ static int mt7992_npu_rxd_init(struct mt
+ 	return 0;
+ }
+ 
+-static int mt7996_npu_rxd_init(struct mt7996_dev *dev, struct airoha_npu *npu)
++static void mt7996_npu_bind_rx_queue(struct mt7996_dev *dev,
++				     enum mt76_rxq_id qid, u32 desc_dma,
++				     bool reset_rro)
++{
++	struct mt76_queue *q = &dev->mt76.q_rx[qid];
++
++	if (reset_rro)
++		mt76_dma_queue_reset_addr(&dev->mt76, q, true, desc_dma);
++	else
++		writel(desc_dma, &q->regs->desc_base);
++}
++
++static int mt7996_npu_rxd_init(struct mt7996_dev *dev, struct airoha_npu *npu,
++			       bool reset_rro)
+ {
+ 	u32 val;
+ 	int err;
+@@ -287,7 +301,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan rx ring0 addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_RRO_BAND0].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_RRO_BAND0, val, reset_rro);
+ 
+ 	err = mt76_npu_get_msg(npu, 2, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+ 			       &val, GFP_KERNEL);
+@@ -296,7 +310,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan rx ring2 addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_RRO_BAND2].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_RRO_BAND2, val, reset_rro);
+ 
+ 	/* msdu pg ring */
+ 	err = mt76_npu_get_msg(npu, 10, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+@@ -306,7 +320,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan msdu pg ring addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_MSDU_PAGE_BAND0].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_MSDU_PAGE_BAND0, val, reset_rro);
+ 
+ 	err = mt76_npu_get_msg(npu, 11, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+ 			       &val, GFP_KERNEL);
+@@ -315,7 +329,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan msdu pg ring addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_MSDU_PAGE_BAND1].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_MSDU_PAGE_BAND1, val, reset_rro);
+ 
+ 	err = mt76_npu_get_msg(npu, 12, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+ 			       &val, GFP_KERNEL);
+@@ -324,7 +338,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan msdu pg ring addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_MSDU_PAGE_BAND2].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_MSDU_PAGE_BAND2, val, reset_rro);
+ 
+ 	/* ind_cmd ring */
+ 	err = mt76_npu_get_msg(npu, 8, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
+@@ -334,7 +348,7 @@ static int mt7996_npu_rxd_init(struct mt
+ 			 "failed retrieving NPU wlan ind_cmd ring addr\n");
+ 		return err;
+ 	}
+-	writel(val, &dev->mt76.q_rx[MT_RXQ_RRO_IND].regs->desc_base);
++	mt7996_npu_bind_rx_queue(dev, MT_RXQ_RRO_IND, val, reset_rro);
+ 
+ 	return 0;
+ }
+@@ -515,7 +529,7 @@ int mt7996_npu_rx_queues_init(struct mt7
+ }
+ 
+ static int mt7996_npu_hw_init_once(struct mt7996_dev *dev,
+-				   struct airoha_npu *npu)
++				   struct airoha_npu *npu, bool reset_rro)
+ {
+ 	int i, err;
+ 
+@@ -524,7 +538,7 @@ static int mt7996_npu_hw_init_once(struc
+ 		return err;
+ 
+ 	if (is_mt7996(&dev->mt76))
+-		err = mt7996_npu_rxd_init(dev, npu);
++		err = mt7996_npu_rxd_init(dev, npu, reset_rro);
+ 	else
+ 		err = mt7992_npu_rxd_init(dev, npu);
+ 
+@@ -580,7 +594,7 @@ static int mt7996_npu_prepare_retry(stru
+ 	return err;
+ }
+ 
+-int __mt7996_npu_hw_init(struct mt7996_dev *dev)
++int __mt7996_npu_hw_init(struct mt7996_dev *dev, bool reset_rro)
+ {
+ 	struct airoha_npu *npu;
+ 	int err;
+@@ -589,7 +603,12 @@ int __mt7996_npu_hw_init(struct mt7996_d
+ 	if (!npu)
+ 		return 0;
+ 
+-	err = mt7996_npu_hw_init_once(dev, npu);
++	err = mt7996_npu_hw_init_once(dev, npu, reset_rro);
++	/* A failed resume may already have started a worker. A full ring
++	 * rebuild must return through a fresh stop/drain/quiesce boundary.
++	 */
++	if (reset_rro)
++		return err;
+ 	if (err != -ETIMEDOUT && err != -EAGAIN)
+ 		return err;
+ 
+@@ -598,7 +617,7 @@ int __mt7996_npu_hw_init(struct mt7996_d
+ 	if (err)
+ 		return err;
+ 
+-	err = mt7996_npu_hw_init_once(dev, npu);
++	err = mt7996_npu_hw_init_once(dev, npu, false);
+ 	if (err)
+ 		dev_err(dev->mt76.dev,
+ 			"NPU hardware initialization retry failed: %d\n", err);
+@@ -638,7 +657,7 @@ int mt7996_npu_hw_init(struct mt7996_dev
+ 	}
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+-	err = __mt7996_npu_hw_init(dev);
++	err = __mt7996_npu_hw_init(dev, false);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return err;
