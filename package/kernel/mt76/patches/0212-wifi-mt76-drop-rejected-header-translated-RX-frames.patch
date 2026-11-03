@@ -1,0 +1,57 @@
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Tue, 03 Nov 2026 04:55:05 +0000
+Subject: [PATCH] wifi: mt76: drop rejected header-translated RX frames
+
+mac80211 skips monitor processing for frames marked RX_FLAG_8023, so
+RX_FLAG_ONLY_MONITOR does not prevent delivery on that path. Drop
+translated frames already rejected by the device, and those rejected
+by the CCMP PN check, before converting their RX status.
+
+Keep normal 802.11 frames available to monitor interfaces. Preserve
+the existing NPU A-MSDU guard and same-PN subframe handling, and reject
+already invalid translated frames before touching aggregate state.
+The existing drop path retains ownership of any attached frag_list.
+
+Fixes: f2edd340ddb4 ("mt76: allow receiving frames with invalid CCMP PN via monitor interfaces")
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1442,6 +1442,24 @@
+ 		status->flag |= RX_FLAG_PN_VALIDATED;
+ }
+ 
++static bool
++mt76_rx_check(struct mt76_dev *dev, struct sk_buff *skb)
++{
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	u32 drop_flags = RX_FLAG_8023 | RX_FLAG_ONLY_MONITOR;
++
++	/* Translated frames bypass mac80211's monitor rejection path. */
++	if ((status->flag & drop_flags) == drop_flags)
++		return false;
++
++	if (!mt76_npu_check_amsdu(dev, skb))
++		return false;
++
++	mt76_check_ccmp_pn(dev, skb);
++
++	return (status->flag & drop_flags) != drop_flags;
++}
++
+ static void
+ mt76_airtime_report(struct mt76_dev *dev, struct mt76_rx_status *status,
+ 		    int len)
+@@ -1622,12 +1640,11 @@
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
+ 
+-		if (!mt76_npu_check_amsdu(dev, skb)) {
++		if (!mt76_rx_check(dev, skb)) {
+ 			dev_kfree_skb(skb);
+ 			continue;
+ 		}
+ 
+-		mt76_check_ccmp_pn(dev, skb);
+ 		skb_shinfo(skb)->frag_list = NULL;
+ 		mt76_rx_convert(dev, skb, &hw, &sta);
+ 		ieee80211_rx_list(hw, sta, skb, &list);
