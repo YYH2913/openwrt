@@ -113,7 +113,7 @@ define Device/gemtek_xr1710g-ubi
   DEVICE_ALT0_VENDOR := Brightspeed
   DEVICE_ALT0_MODEL := XR1710G
   DEVICE_ALT0_VARIANT := (UBI)
-  DEVICE_DTS := an7581-xr1710g-ubi
+  DEVICE_DTS := an7581-gemtek_xr1710g-ubi
   SUPPORTED_DEVICES += econet,xr1710g-ubi
   DEVICE_COMPAT_VERSION := 2.0
   DEVICE_COMPAT_MESSAGE := The XR1710G BMT/BBT boundary has changed. Install \

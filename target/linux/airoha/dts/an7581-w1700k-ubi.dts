@@ -2,7 +2,7 @@
 
 /dts-v1/;
 
-#include "an7581-gemtek_w1700k-common.dtsi"
+#include "an7581-gemtek-common.dtsi"
 
 / {
 	model = "Gemtek W1700K (OpenWrt U-Boot layout)";
