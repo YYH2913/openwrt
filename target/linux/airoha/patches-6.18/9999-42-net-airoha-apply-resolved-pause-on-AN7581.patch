@@ -1,0 +1,131 @@
+From 906247fb7ad7a8dabd0f0bb9795ed10f1b1e1058 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 7 Nov 2026 00:57:58 -0800
+Subject: [RFC PATCH] net: airoha: apply resolved pause settings on AN7581
+
+The PCS uses permit_pause_to_mac to enable both flow-control directions,
+while the MAC ignores the final TX/RX pause values. This can leave the
+hardware configuration different from the negotiated or manually
+selected pause settings. The Ethernet ethtool operations also lack pause
+configuration callbacks.
+
+Apply the final TX/RX enables independently to the existing XFI
+flow-control bits from PCS completion, after MAC fragment setup and
+before releasing the data path. Cover both AN7581 ETH and PON USXGMII
+providers, disable pause in half duplex and preserve unrelated register
+fields.
+
+Wire the phylink pause helpers into ethtool. Accept changes only for
+direct AN7581 GDM2/GDM4 NBQ0 ports with a USXGMII PHY, leaving fixed,
+shared and unsupported paths rejected. Configuration queries report
+intent and PHY negotiation, not a hardware readback or pause-frame
+counters.
+
+This depends on the preceding PCS completion API extension and the
+downstream post-MAC completion hook. Keep it with the RFC until that
+interface is agreed with the phylink and PCS maintainers.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-6.1-sol
+---
+ drivers/net/ethernet/airoha/airoha_eth.c   | 28 ++++++++++++++++++++++
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 28 +++++++++++++++++++---
+ 2 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 80bd7a02b3a2e712cc17a622e72c68dfc44041cb..f7c44bd8de06dde0a6bc428f5927318b456d2067 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -4363,11 +4363,39 @@ static const struct net_device_ops airoha_netdev_ops = {
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
+ };
+ 
++static void airoha_ethtool_get_pauseparam(struct net_device *netdev,
++					  struct ethtool_pauseparam *pause)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	phylink_ethtool_get_pauseparam(dev->phylink, pause);
++}
++
++static int airoha_ethtool_set_pauseparam(struct net_device *netdev,
++					 struct ethtool_pauseparam *pause)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct phy_device *phydev = netdev->phydev;
++
++	/* Only these direct AN7581 USXGMII ports apply resolved pause in PCS.
++	 * Do not claim control of the internal switch link or another SoC.
++	 */
++	if (!airoha_is_7581(dev->eth) ||
++	    (dev->port->id != AIROHA_GDM2_IDX &&
++	     dev->port->id != AIROHA_GDM4_IDX) || dev->nbq || !phydev ||
++	    phydev->interface != PHY_INTERFACE_MODE_USXGMII)
++		return -EOPNOTSUPP;
++
++	return phylink_ethtool_set_pauseparam(dev->phylink, pause);
++}
++
+ static const struct ethtool_ops airoha_ethtool_ops = {
+ 	.get_drvinfo		= airoha_ethtool_get_drvinfo,
+ 	.get_sset_count		= airoha_ethtool_get_sset_count,
+ 	.get_strings		= airoha_ethtool_get_strings,
+ 	.get_ethtool_stats	= airoha_ethtool_get_stats,
++	.get_pauseparam		= airoha_ethtool_get_pauseparam,
++	.set_pauseparam		= airoha_ethtool_set_pauseparam,
+ 	.get_eth_mac_stats      = airoha_ethtool_get_mac_stats,
+ 	.get_rmon_stats		= airoha_ethtool_get_rmon_stats,
+ 	.get_link_ksettings	= airoha_ethtool_get_link_ksettings,
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 4ef5461d683b95c4c13438325b761e6180e15975..d4e848254aa84f6e29f8b647f7b1d5a9b6c0bc11 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -995,7 +995,8 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 
+ 	port->mac_link_up_pending = false;
+ 	defer_mac = port->initialized && interface == PHY_INTERFACE_MODE_USXGMII &&
+-		    device_is_compatible(priv->dev, "airoha,an7581-pcs-eth");
++		    (device_is_compatible(priv->dev, "airoha,an7581-pcs-eth") ||
++		     device_is_compatible(priv->dev, "airoha,an7581-pcs-pon"));
+ 	if (defer_mac)
+ 		regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 				AIROHA_PCS_XFI_RXMPI_STOP |
+@@ -1089,15 +1090,36 @@ static int airoha_pcs_link_up_complete(struct phylink_pcs *pcs,
+ {
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_maps *maps = &port->priv->maps[port->index];
++	u32 pause = 0;
+ 	int ret;
+ 
+ 	if (!port->mac_link_up_pending || !port->initialized ||
+ 	    interface != PHY_INTERFACE_MODE_USXGMII ||
+ 	    port->interface != interface ||
+-	    !device_is_compatible(port->priv->dev, "airoha,an7581-pcs-eth"))
++	    (!device_is_compatible(port->priv->dev, "airoha,an7581-pcs-eth") &&
++	     !device_is_compatible(port->priv->dev, "airoha,an7581-pcs-pon")))
+ 		return 0;
+ 
+-	/* The MAC has now programmed the matching FE fragment sizes. */
++	/* permit_pause_to_mac is not the resolved or manually overridden
++	 * direction. Apply the same final values as mac_link_up(), after any
++	 * reset and before enabling traffic, without touching STOP/fragment bits.
++	 */
++	if (duplex == DUPLEX_FULL) {
++		if (tx_pause)
++			pause |= AIROHA_PCS_XFI_TX_FC_EN;
++		if (rx_pause)
++			pause |= AIROHA_PCS_XFI_RX_FC_EN;
++	}
++	ret = regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				 AIROHA_PCS_XFI_TX_FC_EN | AIROHA_PCS_XFI_RX_FC_EN,
++				 pause);
++	if (ret) {
++		dev_err_ratelimited(port->priv->dev,
++				    "failed to configure resolved pause: %d\n", ret);
++		return ret;
++	}
++
++	/* The MAC has now programmed the matching FE fragment sizes and pause. */
+ 	ret = regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+ 				AIROHA_PCS_XFI_RXMPI_STOP |
+ 				AIROHA_PCS_XFI_RXMBI_STOP |
