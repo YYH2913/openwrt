@@ -1,0 +1,217 @@
+From 8cc1407ad9b886147ba149c09aae29d92e1976a0 Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 7 Nov 2026 00:57:58 -0800
+Subject: [RFC PATCH] net: phylink: pass resolved pause to PCS completion
+
+A PCS which owns the flow-control registers needs the same final pause
+settings as the MAC. The post-MAC completion callback currently receives
+only the rate and duplex, and cannot report a programming failure before
+carrier is published.
+
+Pass the final TX/RX pause enables to completion, including receive
+pause required for PHY rate matching. Return completion errors from
+link-up before enabling LPI or reporting carrier. On failure, balance
+the partial link-up with link-down and clear old_link_state so the
+normal in-band PCS poll can retry. Other modes still require a resolve
+event.
+
+Update the Airoha completion callback in the same change to match the
+new signature and report data-path enable errors. Leave flow-control
+programming and ethtool pause configuration to the following driver
+change.
+
+This extends the downstream post-MAC PCS completion hook introduced by
+634-net-pcs-airoha-enable-USXGMII-data-after-MAC-fragment-setup.patch.
+The callback API is an RFC, not a standalone upstream phylink backport.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-6.1-sol
+---
+ drivers/net/pcs/airoha/pcs-airoha-common.c | 26 ++++++++------
+ drivers/net/phy/phylink.c                  | 41 +++++++++++++++-------
+ include/linux/phylink.h                    | 17 ++++++---
+ 3 files changed, 56 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/pcs/airoha/pcs-airoha-common.c b/drivers/net/pcs/airoha/pcs-airoha-common.c
+index 9f92d31a96290e2f3a0d585104b2d51219f7bb4a..4ef5461d683b95c4c13438325b761e6180e15975 100644
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -1081,28 +1081,34 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 		WRITE_ONCE(port->usxgmii_speed, speed);
+ }
+ 
+-static void airoha_pcs_link_up_complete(struct phylink_pcs *pcs,
+-					unsigned int neg_mode,
+-					phy_interface_t interface,
+-					int speed, int duplex)
++static int airoha_pcs_link_up_complete(struct phylink_pcs *pcs,
++				       unsigned int neg_mode,
++				       phy_interface_t interface,
++				       int speed, int duplex,
++				       bool tx_pause, bool rx_pause)
+ {
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_maps *maps = &port->priv->maps[port->index];
++	int ret;
+ 
+ 	if (!port->mac_link_up_pending || !port->initialized ||
+ 	    interface != PHY_INTERFACE_MODE_USXGMII ||
+ 	    port->interface != interface ||
+ 	    !device_is_compatible(port->priv->dev, "airoha,an7581-pcs-eth"))
+-		return;
++		return 0;
+ 
+ 	/* The MAC has now programmed the matching FE fragment sizes. */
+-	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			  AIROHA_PCS_XFI_RXMPI_STOP |
+-			  AIROHA_PCS_XFI_RXMBI_STOP |
+-			  AIROHA_PCS_XFI_TXMPI_STOP |
+-			  AIROHA_PCS_XFI_TXMBI_STOP);
++	ret = regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				AIROHA_PCS_XFI_RXMPI_STOP |
++				AIROHA_PCS_XFI_RXMBI_STOP |
++				AIROHA_PCS_XFI_TXMPI_STOP |
++				AIROHA_PCS_XFI_TXMBI_STOP);
++	if (ret)
++		return ret;
+ 	port->mac_link_up_pending = false;
+ 	WRITE_ONCE(port->usxgmii_speed, speed);
++
++	return 0;
+ }
+ 
+ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index ec5efd454af3cc255b154cac431d8dd89d382820..4d79fa8264041de3353c8171a7c6240a054e2e68 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -993,14 +993,17 @@ static void phylink_pcs_link_down(struct phylink_pcs *pcs)
+ 		pcs->ops->pcs_link_down(pcs);
+ }
+ 
+-static void phylink_pcs_link_up_complete(struct phylink_pcs *pcs,
+-					 unsigned int neg_mode,
+-					 phy_interface_t interface,
+-					 int speed, int duplex)
++static int phylink_pcs_link_up_complete(struct phylink_pcs *pcs,
++					unsigned int neg_mode,
++					phy_interface_t interface,
++					int speed, int duplex,
++					bool tx_pause, bool rx_pause)
+ {
+ 	if (pcs && pcs->ops->pcs_link_up_complete)
+-		pcs->ops->pcs_link_up_complete(pcs, neg_mode, interface, speed,
+-					      duplex);
++		return pcs->ops->pcs_link_up_complete(pcs, neg_mode, interface,
++						 speed, duplex, tx_pause, rx_pause);
++
++	return 0;
+ }
+ 
+ static void phylink_pcs_disable_eee(struct phylink_pcs *pcs)
+@@ -1642,11 +1645,11 @@ static void phylink_activate_lpi(struct phylink *pl)
+ 	pl->mac_enable_tx_lpi = true;
+ }
+ 
+-static void phylink_link_up(struct phylink *pl,
+-			    struct phylink_link_state link_state)
++static int phylink_link_up(struct phylink *pl,
++			   struct phylink_link_state link_state)
+ {
+ 	struct net_device *ndev = pl->netdev;
+-	int speed, duplex;
++	int speed, duplex, ret;
+ 	bool rx_pause;
+ 
+ 	speed = link_state.speed;
+@@ -1683,8 +1686,12 @@ static void phylink_link_up(struct phylink *pl,
+ 				 pl->cur_interface, speed, duplex,
+ 				 !!(link_state.pause & MLO_PAUSE_TX), rx_pause);
+ 
+-	phylink_pcs_link_up_complete(pl->pcs, pl->pcs_neg_mode,
+-				     pl->cur_interface, speed, duplex);
++	ret = phylink_pcs_link_up_complete(pl->pcs, pl->pcs_neg_mode,
++					   pl->cur_interface, speed, duplex,
++					   !!(link_state.pause & MLO_PAUSE_TX),
++					   rx_pause);
++	if (ret)
++		return ret;
+ 
+ 	if (pl->mac_supports_eee && pl->phy_enable_tx_lpi)
+ 		phylink_activate_lpi(pl);
+@@ -1697,6 +1704,8 @@ static void phylink_link_up(struct phylink *pl,
+ 		     phy_speed_to_str(link_state.speed),
+ 		     phy_duplex_to_str(link_state.duplex),
+ 		     phylink_pause_to_str(link_state.pause));
++
++	return 0;
+ }
+ 
+ static void phylink_link_down(struct phylink *pl)
+@@ -1827,8 +1836,14 @@ static void phylink_resolve(struct work_struct *w)
+ 		pl->old_link_state = link_state.link;
+ 		if (!link_state.link)
+ 			phylink_link_down(pl);
+-		else
+-			phylink_link_up(pl, link_state);
++		else if (phylink_link_up(pl, link_state)) {
++			/* Do not publish carrier after failed PCS programming.
++			 * Tear down the partial link; the normal PCS poll can retry
++			 * without a tight resolve loop or a permanently stuck edge.
++			 */
++			pl->old_link_state = false;
++			phylink_link_down(pl);
++		}
+ 	}
+ 	if (!link_state.link && retrigger) {
+ 		pl->link_failed = false;
+diff --git a/include/linux/phylink.h b/include/linux/phylink.h
+index 7c9ddacd05f0a75c95c85a82f610980d9b277c16..7f2eb056db6c11ab4a5b5d3592de515f9599db96 100644
+--- a/include/linux/phylink.h
++++ b/include/linux/phylink.h
+@@ -500,7 +500,9 @@ struct phylink_pcs {
+  * @pcs_link_up: program the PCS for the resolved link configuration
+  *               (where necessary).
+  * @pcs_link_up_complete: optionally enable the PCS data path after the MAC
+- *                       has applied the resolved link configuration.
++ *                       has applied the resolved link configuration, including
++ *                       the final TX/RX pause directions supplied to the MAC.
++ *                       Return an error to keep carrier down on failure.
+  * @pcs_link_down: tear down link between MAC and PCS.
+  * @pcs_disable_eee: optional notification to PCS that EEE has been disabled
+  *		     at the MAC.
+@@ -529,10 +531,11 @@ struct phylink_pcs_ops {
+ 	void (*pcs_an_restart)(struct phylink_pcs *pcs);
+ 	void (*pcs_link_up)(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			    phy_interface_t interface, int speed, int duplex);
+-	void (*pcs_link_up_complete)(struct phylink_pcs *pcs,
++	int (*pcs_link_up_complete)(struct phylink_pcs *pcs,
+ 				     unsigned int neg_mode,
+ 				     phy_interface_t interface,
+-				     int speed, int duplex);
++				     int speed, int duplex,
++				     bool tx_pause, bool rx_pause);
+ 	void (*pcs_link_down)(struct phylink_pcs *pcs);
+ 	void (*pcs_disable_eee)(struct phylink_pcs *pcs);
+ 	void (*pcs_enable_eee)(struct phylink_pcs *pcs);
+@@ -676,14 +679,18 @@ void pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
+  * @interface: link interface mode
+  * @speed: resolved link speed
+  * @duplex: resolved link duplex
++ * @tx_pause: resolved transmit pause enablement supplied to the MAC
++ * @rx_pause: resolved receive pause enablement, including PHY rate matching
+  *
+  * Optional callback made after mac_link_up(), before LPI activation and
+  * carrier publication. A PCS may keep its data interfaces stopped in
+  * pcs_link_up() until the MAC has applied the resolved link parameters.
+  * Callbacks without this method retain their existing link-up behavior.
++ * Return: zero on success or a negative error before carrier publication.
+  */
+-void pcs_link_up_complete(struct phylink_pcs *pcs, unsigned int neg_mode,
+-			  phy_interface_t interface, int speed, int duplex);
++int pcs_link_up_complete(struct phylink_pcs *pcs, unsigned int neg_mode,
++			  phy_interface_t interface, int speed, int duplex,
++			  bool tx_pause, bool rx_pause);
+ 
+ /**
+  * pcs_link_down() - tear down link between MAC and PCS
