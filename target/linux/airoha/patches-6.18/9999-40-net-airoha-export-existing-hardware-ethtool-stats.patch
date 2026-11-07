@@ -1,0 +1,125 @@
+From bb9f39db7913f593e43eeb990a7afe26f272f08e Mon Sep 17 00:00:00 2001
+From: Yanghan Ye <yyh94306@gmail.com>
+Date: Sat, 7 Nov 2026 00:49:34 -0800
+Subject: [PATCH] net: airoha: expose GDM counters through ethtool -S
+
+The driver exports the standard MAC and RMON statistics groups, but lacks
+the private statistics callbacks used by a plain ethtool -S query. Such
+queries therefore report no statistics.
+
+Expose 29 counters from the existing per-netdev GDM/NBQ hardware cache.
+Use one descriptor table for names and offsets, refresh the cache with
+airoha_update_hw_stats(), and take the port lock while copying it.
+u64_stats_sync alone does not serialize a complete snapshot on 64-bit
+systems.
+
+Keep the existing MIB selection, accumulation and wrap handling unchanged.
+Do not export internal baseline fields or unverified pause-frame counters.
+
+Signed-off-by: Yanghan Ye <yyh94306@gmail.com>
+Assisted-by: Codex:GPT-6.1-sol
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 83 ++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index eff556841b7fa1792a8fc5bbfa0c96e1ee8afe9f..80bd7a02b3a2e712cc17a622e72c68dfc44041cb 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3342,6 +3342,86 @@ static void airoha_ethtool_get_drvinfo(struct net_device *netdev,
+ 	strscpy(info->bus_info, dev_name(eth->dev), sizeof(info->bus_info));
+ }
+ 
++struct airoha_ethtool_stat {
++	char name[ETH_GSTRING_LEN];
++	size_t offset;
++};
++
++#define AIROHA_ETHTOOL_STAT(name, member) \
++	{ name, offsetof(struct airoha_hw_stats, member) }
++
++static const struct airoha_ethtool_stat airoha_ethtool_stats[] = {
++	AIROHA_ETHTOOL_STAT("gdm_rx_packets", rx_ok_pkts),
++	AIROHA_ETHTOOL_STAT("gdm_tx_packets", tx_ok_pkts),
++	AIROHA_ETHTOOL_STAT("gdm_rx_bytes", rx_ok_bytes),
++	AIROHA_ETHTOOL_STAT("gdm_tx_bytes", tx_ok_bytes),
++	AIROHA_ETHTOOL_STAT("gdm_rx_multicast", rx_multicast),
++	AIROHA_ETHTOOL_STAT("gdm_rx_errors", rx_errors),
++	AIROHA_ETHTOOL_STAT("gdm_rx_dropped", rx_drops),
++	AIROHA_ETHTOOL_STAT("gdm_tx_dropped", tx_drops),
++	AIROHA_ETHTOOL_STAT("gdm_rx_crc_errors", rx_crc_error),
++	AIROHA_ETHTOOL_STAT("gdm_rx_over_errors", rx_over_errors),
++	AIROHA_ETHTOOL_STAT("gdm_tx_broadcast", tx_broadcast),
++	AIROHA_ETHTOOL_STAT("gdm_tx_multicast", tx_multicast),
++	AIROHA_ETHTOOL_STAT("gdm_rx_broadcast", rx_broadcast),
++	AIROHA_ETHTOOL_STAT("gdm_rx_fragments", rx_fragment),
++	AIROHA_ETHTOOL_STAT("gdm_rx_jabbers", rx_jabber),
++	AIROHA_ETHTOOL_STAT("gdm_tx_0_64_bytes", tx_len[0]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_65_127_bytes", tx_len[1]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_128_255_bytes", tx_len[2]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_256_511_bytes", tx_len[3]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_512_1023_bytes", tx_len[4]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_1024_1518_bytes", tx_len[5]),
++	AIROHA_ETHTOOL_STAT("gdm_tx_1519_10239_bytes", tx_len[6]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_0_64_bytes", rx_len[0]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_65_127_bytes", rx_len[1]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_128_255_bytes", rx_len[2]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_256_511_bytes", rx_len[3]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_512_1023_bytes", rx_len[4]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_1024_1518_bytes", rx_len[5]),
++	AIROHA_ETHTOOL_STAT("gdm_rx_1519_10239_bytes", rx_len[6]),
++};
++
++static int airoha_ethtool_get_sset_count(struct net_device *netdev, int sset)
++{
++	if (sset != ETH_SS_STATS)
++		return -EOPNOTSUPP;
++
++	return ARRAY_SIZE(airoha_ethtool_stats);
++}
++
++static void airoha_ethtool_get_strings(struct net_device *netdev, u32 sset,
++				       u8 *data)
++{
++	int i;
++
++	if (sset != ETH_SS_STATS)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(airoha_ethtool_stats); i++)
++		ethtool_puts(&data, airoha_ethtool_stats[i].name);
++}
++
++static void airoha_ethtool_get_stats(struct net_device *netdev,
++				     struct ethtool_stats *stats, u64 *data)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	int i;
++
++	/* Reuse the MIB reader's per-GDM/NBQ selection and wrap handling. */
++	airoha_update_hw_stats(dev);
++
++	/* u64_stats_sync is a no-op on 64-bit; lock the complete cached copy. */
++	spin_lock(&dev->port->lock);
++	for (i = 0; i < ARRAY_SIZE(airoha_ethtool_stats); i++) {
++		const u8 *counter = (const u8 *)&dev->stats +
++				    airoha_ethtool_stats[i].offset;
++
++		data[i] = *(const u64 *)counter;
++	}
++	spin_unlock(&dev->port->lock);
++}
++
+ static void airoha_ethtool_get_mac_stats(struct net_device *netdev,
+ 					 struct ethtool_eth_mac_stats *stats)
+ {
+@@ -4285,6 +4365,9 @@ static const struct net_device_ops airoha_netdev_ops = {
+ 
+ static const struct ethtool_ops airoha_ethtool_ops = {
+ 	.get_drvinfo		= airoha_ethtool_get_drvinfo,
++	.get_sset_count		= airoha_ethtool_get_sset_count,
++	.get_strings		= airoha_ethtool_get_strings,
++	.get_ethtool_stats	= airoha_ethtool_get_stats,
+ 	.get_eth_mac_stats      = airoha_ethtool_get_mac_stats,
+ 	.get_rmon_stats		= airoha_ethtool_get_rmon_stats,
+ 	.get_link_ksettings	= airoha_ethtool_get_link_ksettings,
